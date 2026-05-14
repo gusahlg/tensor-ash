@@ -84,9 +84,31 @@ impl Buffer {
         if self.location != BufferLocation::Host {
             bail!("write_from_slice: buffer is not host-visible");
         }
-        assert!(bytes.len() as vk::DeviceSize <= self.size);
+        if bytes.len() as vk::DeviceSize > self.size {
+            bail!("write_from_slice: {} bytes > buffer size {}", bytes.len(), self.size);
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.mapped, bytes.len());
+        }
+        Ok(())
+    }
+
+    /// Copy a POD slice into a host-visible buffer.
+    pub fn write_pod_slice<T: bytemuck::Pod>(&self, values: &[T]) -> Result<()> {
+        self.write_from_slice(bytemuck::cast_slice(values))
+    }
+
+    /// Copy host-visible buffer bytes into an existing POD slice.
+    pub fn read_pod_slice<T: bytemuck::Pod>(&self, values: &mut [T]) -> Result<()> {
+        if self.location != BufferLocation::Host {
+            bail!("read_pod_slice: buffer is not host-visible");
+        }
+        let bytes = bytemuck::cast_slice_mut(values);
+        if bytes.len() as vk::DeviceSize > self.size {
+            bail!("read_pod_slice: {} bytes > buffer size {}", bytes.len(), self.size);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.mapped, bytes.as_mut_ptr(), bytes.len());
         }
         Ok(())
     }

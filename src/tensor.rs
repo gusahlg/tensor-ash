@@ -6,11 +6,12 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use ash::vk;
 
 use crate::buffer::{Buffer, BufferLocation};
 use crate::context::VulkanContext;
+use crate::matmul::MatrixShape;
 
 pub struct Tensor {
     pub shape:  Vec<u32>,
@@ -41,11 +42,8 @@ impl Tensor {
 
     /// Returns `(batch, m, k)` for rank-2 (`batch=1`) or rank-3 shapes.
     pub fn as_3d(&self) -> Result<(u32, u32, u32)> {
-        match self.shape.len() {
-            2 => Ok((1, self.shape[0], self.shape[1])),
-            3 => Ok((self.shape[0], self.shape[1], self.shape[2])),
-            r => bail!("tensor rank {r} not supported by matmul (must be 2 or 3)"),
-        }
+        let shape = MatrixShape::from_tensor_shape(&self.shape)?;
+        Ok((shape.batch, shape.rows, shape.cols))
     }
 
     #[inline] pub fn raw_buffer(&self) -> vk::Buffer        { self.buffer.raw }

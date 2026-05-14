@@ -105,7 +105,11 @@ pub fn run_one(
         3 => (shape_b[0], shape_b[1], shape_b[2]),
         _ => unreachable!(),
     };
-    let batch = ba.max(bb);
+    let batch = match shape_c.len() {
+        2 => 1u32,
+        3 => shape_c[0],
+        _ => unreachable!(),
+    };
     let h_a_x = if ba == 1 && batch > 1 {
         let mut v = Vec::with_capacity(batch as usize * h_a.len());
         for _ in 0..batch { v.extend_from_slice(&h_a); }

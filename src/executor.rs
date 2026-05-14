@@ -25,40 +25,17 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use ash::vk;
 use parking_lot::{Condvar, Mutex};
 
 use crate::buffer::{Buffer, BufferLocation};
 use crate::context::VulkanContext;
-use crate::pipeline::{MatmulPipeline, MatmulPushConstants, TILE_M, TILE_N};
+use crate::matmul::{ResolvedMatmul, ResolvedMatmulBatch, total_flops};
+use crate::pipeline::MatmulPipeline;
 use crate::tensor::Tensor;
 
-/// One GEMM problem: `C ← alpha * A @ B  (+ C if accumulate)`.
-#[derive(Copy, Clone)]
-pub struct MatmulCall<'a> {
-    pub a:          &'a Tensor,
-    pub b:          &'a Tensor,
-    pub c:          &'a Tensor,
-    pub alpha:      f32,
-    pub accumulate: bool,
-}
-
-/// Per-run statistics.  `gpu_time_ns` is the on-device GPU time measured
-/// via timestamp queries (or `None` if the device doesn't support them).
-#[derive(Debug, Copy, Clone)]
-pub struct RunStats {
-    pub gpu_time_ns: Option<u64>,
-    pub n_calls:     usize,
-    pub total_flops: u64,
-}
-
-impl RunStats {
-    /// GPU TFLOPS if GPU time was measured, else `None`.
-    pub fn tflops(&self) -> Option<f64> {
-        self.gpu_time_ns.map(|ns| self.total_flops as f64 / ns as f64 * 1e-3)
-    }
-}
+pub use crate::matmul::{MatmulCall, RunStats};
 
 struct Slot {
     cmd_pool:        vk::CommandPool,
@@ -151,35 +128,40 @@ impl Executor {
 
     /// Synchronous host→device upload via a transient staging buffer.
     pub fn upload(&self, src: &[f32], dst: &Tensor) -> Result<()> {
-        let bytes = bytemuck::cast_slice::<f32, u8>(src);
-        if bytes.len() as vk::DeviceSize > dst.size_bytes() {
-            bail!("upload: {} bytes > tensor capacity {}", bytes.len(), dst.size_bytes());
+        let size = size_of_slice(src)?;
+        if size > dst.size_bytes() {
+            bail!("upload: {} bytes > tensor capacity {}", size, dst.size_bytes());
+        }
+        if size == 0 {
+            return Ok(());
         }
         let staging = Buffer::new(
             &self.ctx,
-            bytes.len() as vk::DeviceSize,
+            size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             BufferLocation::Host,
         )?;
-        staging.write_from_slice(bytes)?;
-        self.run_copy(staging.raw, dst.raw_buffer(), bytes.len() as vk::DeviceSize)
+        staging.write_pod_slice(src)?;
+        self.run_copy(staging.raw, dst.raw_buffer(), size)
     }
 
     /// Synchronous device→host download via a transient staging buffer.
     pub fn download(&self, src: &Tensor, dst: &mut [f32]) -> Result<()> {
-        let bytes = bytemuck::cast_slice_mut::<f32, u8>(dst);
-        if bytes.len() as vk::DeviceSize > src.size_bytes() {
-            bail!("download: {} bytes > tensor capacity {}", bytes.len(), src.size_bytes());
+        let size = size_of_slice(dst)?;
+        if size > src.size_bytes() {
+            bail!("download: {} bytes > tensor capacity {}", size, src.size_bytes());
+        }
+        if size == 0 {
+            return Ok(());
         }
         let staging = Buffer::new(
             &self.ctx,
-            bytes.len() as vk::DeviceSize,
+            size,
             vk::BufferUsageFlags::TRANSFER_DST,
             BufferLocation::Host,
         )?;
-        self.run_copy(src.raw_buffer(), staging.raw, bytes.len() as vk::DeviceSize)?;
-        let out = staging.read_into_vec()?;
-        bytes.copy_from_slice(&out[..bytes.len()]);
+        self.run_copy(src.raw_buffer(), staging.raw, size)?;
+        staging.read_pod_slice(dst)?;
         Ok(())
     }
 
@@ -195,12 +177,12 @@ impl Executor {
             );
         }
 
-        let total_flops: u64 = calls.iter()
-            .map(|c| matmul_flops(c).unwrap_or(0))
-            .sum();
+        let resolved = ResolvedMatmulBatch::from_calls(calls)?;
+        let resolved = resolved.as_slice();
+        let total_flops = total_flops(resolved)?;
 
         let mut slot = self.checkout_slot();
-        let result = self.record_and_run(&mut slot, calls);
+        let result = self.record_and_run(&mut slot, calls, &resolved);
         let gpu_time_ns = match &result {
             Ok(t) => *t,
             Err(_) => None,
@@ -230,9 +212,13 @@ impl Executor {
         self.slot_avail.notify_one();
     }
 
-    fn record_and_run(&self, slot: &mut Slot, calls: &[MatmulCall<'_>])
-        -> Result<Option<u64>>
-    {
+    fn record_and_run(
+        &self,
+        slot: &mut Slot,
+        calls: &[MatmulCall<'_>],
+        resolved: &[ResolvedMatmul],
+    ) -> Result<Option<u64>> {
+        debug_assert_eq!(calls.len(), resolved.len());
         let dev = &self.ctx.device;
         let want_timestamps = self.ctx.timestamps_supported;
 
@@ -249,6 +235,13 @@ impl Executor {
                 }
             }
             slot.used = true;
+
+            let descriptor_sets = allocate_matmul_descriptor_sets(
+                &self.ctx,
+                &self.pipeline,
+                slot.descriptor_pool,
+                calls,
+            )?;
 
             // ---- Record -----------------------------------------------------
             dev.begin_command_buffer(
@@ -267,11 +260,14 @@ impl Executor {
                 slot.cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline.pipeline,
             );
 
-            for call in calls {
-                record_one_matmul(
-                    &self.ctx, &self.pipeline, slot.descriptor_pool, slot.cmd, call,
-                )?;
-            }
+            record_matmul_commands(
+                &self.ctx,
+                &self.pipeline,
+                slot.cmd,
+                &descriptor_sets,
+                calls,
+                resolved,
+            );
 
             if want_timestamps {
                 dev.cmd_write_timestamp(
@@ -363,92 +359,128 @@ impl Drop for Executor {
 // Recording helpers
 // ----------------------------------------------------------------------------
 
-fn record_one_matmul(
-    ctx:             &VulkanContext,
-    pipeline:        &MatmulPipeline,
+fn allocate_matmul_descriptor_sets(
+    ctx: &VulkanContext,
+    pipeline: &MatmulPipeline,
     descriptor_pool: vk::DescriptorPool,
-    cb:              vk::CommandBuffer,
-    call:            &MatmulCall<'_>,
-) -> Result<()> {
-    let (ba, m,  k1) = call.a.as_3d()?;
-    let (bb, k2, n1) = call.b.as_3d()?;
-    let (bc, m2, n2) = call.c.as_3d()?;
+    calls: &[MatmulCall<'_>],
+) -> Result<Vec<vk::DescriptorSet>> {
+    macro_rules! storage_buffer_write {
+        ($set:expr, $binding:expr, $info:expr) => {
+            vk::WriteDescriptorSet::default()
+                .dst_set($set)
+                .dst_binding($binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref($info))
+        };
+    }
 
-    if k1 != k2 { bail!("matmul shape mismatch: A.K={k1} vs B.K={k2}"); }
-    if m  != m2 { bail!("matmul shape mismatch: A.M={m} vs C.M={m2}"); }
-    if n1 != n2 { bail!("matmul shape mismatch: B.N={n1} vs C.N={n2}"); }
+    if let [call] = calls {
+        let layouts = [pipeline.set_layout];
+        let sets = unsafe {
+            ctx.device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(descriptor_pool)
+                        .set_layouts(&layouts),
+                )
+                .context("allocate_descriptor_sets")?
+        };
+        let set = sets[0];
+        let buffer_infos = [
+            tensor_descriptor(call.a),
+            tensor_descriptor(call.b),
+            tensor_descriptor(call.c),
+        ];
+        let writes = [
+            storage_buffer_write!(set, 0, &buffer_infos[0]),
+            storage_buffer_write!(set, 1, &buffer_infos[1]),
+            storage_buffer_write!(set, 2, &buffer_infos[2]),
+        ];
 
-    // Batch resolution with broadcast (1 ↔ N): output batch wins,
-    // operands may have batch=1 to broadcast.
-    let batch = match (ba, bb, bc) {
-        (a, b, c) if a == c && (b == a || b == 1) => a,
-        (a, b, c) if b == c && (a == b || a == 1) => b,
-        _ => bail!("matmul incompatible batch dims A.B={ba} B.B={bb} C.B={bc}"),
+        unsafe {
+            ctx.device.update_descriptor_sets(&writes, &[]);
+        }
+
+        return Ok(sets);
+    }
+
+    let layouts = vec![pipeline.set_layout; calls.len()];
+    let sets = unsafe {
+        ctx.device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&layouts),
+            )
+            .context("allocate_descriptor_sets")?
     };
 
-    let pc = MatmulPushConstants {
-        m, n: n1, k: k1,
-        batch_stride_a: if ba == 1 { 0 } else { m  * k1 },
-        batch_stride_b: if bb == 1 { 0 } else { k1 * n1 },
-        batch_stride_c: if bc == 1 { 0 } else { m  * n1 },
-        flags: if call.accumulate { 1 } else { 0 },
-        alpha: call.alpha,
-    };
+    let mut buffer_infos = Vec::with_capacity(calls.len() * 3);
+    for call in calls {
+        buffer_infos.push(tensor_descriptor(call.a));
+        buffer_infos.push(tensor_descriptor(call.b));
+        buffer_infos.push(tensor_descriptor(call.c));
+    }
 
-    // Allocate + write one descriptor set from the slot's pool.
-    let layouts = [pipeline.set_layout];
-    let set = unsafe {
-        ctx.device.allocate_descriptor_sets(
-            &vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(descriptor_pool)
-                .set_layouts(&layouts)
-        ).context("allocate_descriptor_sets")?
-    }[0];
-
-    let a_info = [vk::DescriptorBufferInfo::default()
-        .buffer(call.a.raw_buffer()).offset(0).range(call.a.size_bytes())];
-    let b_info = [vk::DescriptorBufferInfo::default()
-        .buffer(call.b.raw_buffer()).offset(0).range(call.b.size_bytes())];
-    let c_info = [vk::DescriptorBufferInfo::default()
-        .buffer(call.c.raw_buffer()).offset(0).range(call.c.size_bytes())];
-    let writes = [
-        vk::WriteDescriptorSet::default()
-            .dst_set(set).dst_binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&a_info),
-        vk::WriteDescriptorSet::default()
-            .dst_set(set).dst_binding(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&b_info),
-        vk::WriteDescriptorSet::default()
-            .dst_set(set).dst_binding(2)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&c_info),
-    ];
-    unsafe { ctx.device.update_descriptor_sets(&writes, &[]); }
+    let mut writes = Vec::with_capacity(calls.len() * 3);
+    for (i, set) in sets.iter().copied().enumerate() {
+        let base = i * 3;
+        writes.push(storage_buffer_write!(set, 0, &buffer_infos[base]));
+        writes.push(storage_buffer_write!(set, 1, &buffer_infos[base + 1]));
+        writes.push(storage_buffer_write!(set, 2, &buffer_infos[base + 2]));
+    }
 
     unsafe {
-        ctx.device.cmd_bind_descriptor_sets(
-            cb, vk::PipelineBindPoint::COMPUTE,
-            pipeline.pipeline_layout, 0, &[set], &[],
-        );
-        ctx.device.cmd_push_constants(
-            cb, pipeline.pipeline_layout, vk::ShaderStageFlags::COMPUTE,
-            0, bytemuck::bytes_of(&pc),
-        );
-        ctx.device.cmd_dispatch(
-            cb,
-            n1.div_ceil(TILE_N),
-            m .div_ceil(TILE_M),
-            batch,
-        );
+        ctx.device.update_descriptor_sets(&writes, &[]);
     }
-    Ok(())
+
+    Ok(sets)
 }
 
-fn matmul_flops(c: &MatmulCall<'_>) -> Option<u64> {
-    let (ba, m, k) = c.a.as_3d().ok()?;
-    let (bb, _,  n) = c.b.as_3d().ok()?;
-    let batch = ba.max(bb);
-    Some(2u64 * batch as u64 * m as u64 * n as u64 * k as u64)
+fn record_matmul_commands(
+    ctx: &VulkanContext,
+    pipeline: &MatmulPipeline,
+    cb: vk::CommandBuffer,
+    descriptor_sets: &[vk::DescriptorSet],
+    calls: &[MatmulCall<'_>],
+    resolved: &[ResolvedMatmul],
+) {
+    for ((set, call), dims) in descriptor_sets
+        .iter()
+        .copied()
+        .zip(calls.iter())
+        .zip(resolved.iter())
+    {
+        let pc = dims.push_constants(call.alpha, call.accumulate);
+
+        unsafe {
+            ctx.device.cmd_bind_descriptor_sets(
+                cb, vk::PipelineBindPoint::COMPUTE,
+                pipeline.pipeline_layout, 0, std::slice::from_ref(&set), &[],
+            );
+            ctx.device.cmd_push_constants(
+                cb, pipeline.pipeline_layout, vk::ShaderStageFlags::COMPUTE,
+                0, bytemuck::bytes_of(&pc),
+            );
+            ctx.device.cmd_dispatch(
+                cb,
+                dims.groups_x,
+                dims.groups_y,
+                dims.batch,
+            );
+        }
+    }
+}
+
+fn tensor_descriptor(tensor: &Tensor) -> vk::DescriptorBufferInfo {
+    vk::DescriptorBufferInfo::default()
+        .buffer(tensor.raw_buffer())
+        .offset(0)
+        .range(tensor.size_bytes())
+}
+
+fn size_of_slice<T>(slice: &[T]) -> Result<vk::DeviceSize> {
+    let bytes = std::mem::size_of_val(slice);
+    vk::DeviceSize::try_from(bytes).map_err(|_| anyhow!("slice size does not fit VkDeviceSize"))
 }

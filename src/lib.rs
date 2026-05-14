@@ -35,11 +35,13 @@
 pub mod buffer;
 pub mod context;
 pub mod executor;
+pub mod matmul;
 pub mod pipeline;
 pub mod tensor;
 
 pub use buffer::{Buffer, BufferLocation};
 pub use context::VulkanContext;
-pub use executor::{Executor, MatmulCall, RunStats};
+pub use executor::Executor;
+pub use matmul::{MatmulCall, MatrixShape, RunStats};
 pub use pipeline::{MatmulPipeline, MatmulPushConstants, TILE_M, TILE_N};
 pub use tensor::Tensor;

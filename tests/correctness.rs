@@ -104,6 +104,20 @@ fn batched_broadcast_b() {
     assert!(e <= tolerance(k), "broadcast B err={e:.3e}");
 }
 
+#[test] #[ignore]
+fn batched_broadcast_both_inputs() {
+    let (ctx, exec) = make_setup(2, 8);
+    let bsz = 5u32;
+    let (m, n, k) = (32u32, 48u32, 24u32);
+    let (gpu, cpu) = run_one(
+        &ctx, &exec,
+        &[1, m, k], &[1, k, n], &[bsz, m, n],
+        1.0, false, 45, 47, None,
+    );
+    let (e, _) = max_abs_err(&gpu, &cpu);
+    assert!(e <= tolerance(k), "broadcast A+B err={e:.3e}");
+}
+
 // --- 4. alpha + accumulate ------------------------------------------------
 
 #[test] #[ignore]
