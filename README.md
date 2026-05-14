@@ -1,0 +1,2 @@
+This is a tool used to process big clusters of matrix multiplications and similar machine learning operations. It is supposed to be a light weight tool for developing GPU based models with little hassle and low level control. It is made with vulkan for the platform agnositicity and low level control.
+The goal is to get near hardware limit performance and functionality on all major platforms thus providing a solid and lasting GPU abstraction for future machine learning projects.

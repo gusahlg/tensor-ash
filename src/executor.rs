@@ -1,0 +1,454 @@
+//! Thread-safe GEMM dispatcher.
+//!
+//! Architecture
+//! ============
+//! An `Executor` owns a small pool of *slots*.  A slot bundles every
+//! resource that is per-submission (and therefore can't be shared
+//! across in-flight submissions): a command pool, a command buffer, a
+//! fence, a descriptor pool, and a timestamp query pool.
+//!
+//! `run_matmuls` checks out one slot under a mutex, releases the mutex
+//! while it does the actual recording + submit + wait, then returns
+//! the slot.  Multiple host threads can therefore record concurrently
+//! up to `n_slots`, after which they block at checkout.
+//!
+//! The queue submission is serialized by a separate mutex (Vulkan
+//! requires external synchronization on a single VkQueue).
+//!
+//! Why not multi-queue?  On consumer GPUs, multiple compute queues from
+//! the same family time-multiplex on the hardware, so for the GEMM
+//! workload here they provide ~0 throughput benefit but lots of
+//! synchronization complexity.  The pool-of-slots design instead
+//! captures the real benefit (CPU-side recording parallelism, CPU/GPU
+//! overlap of consecutive submissions).
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+use anyhow::{Context, Result, bail};
+use ash::vk;
+use parking_lot::{Condvar, Mutex};
+
+use crate::buffer::{Buffer, BufferLocation};
+use crate::context::VulkanContext;
+use crate::pipeline::{MatmulPipeline, MatmulPushConstants, TILE_M, TILE_N};
+use crate::tensor::Tensor;
+
+/// One GEMM problem: `C ← alpha * A @ B  (+ C if accumulate)`.
+#[derive(Copy, Clone)]
+pub struct MatmulCall<'a> {
+    pub a:          &'a Tensor,
+    pub b:          &'a Tensor,
+    pub c:          &'a Tensor,
+    pub alpha:      f32,
+    pub accumulate: bool,
+}
+
+/// Per-run statistics.  `gpu_time_ns` is the on-device GPU time measured
+/// via timestamp queries (or `None` if the device doesn't support them).
+#[derive(Debug, Copy, Clone)]
+pub struct RunStats {
+    pub gpu_time_ns: Option<u64>,
+    pub n_calls:     usize,
+    pub total_flops: u64,
+}
+
+impl RunStats {
+    /// GPU TFLOPS if GPU time was measured, else `None`.
+    pub fn tflops(&self) -> Option<f64> {
+        self.gpu_time_ns.map(|ns| self.total_flops as f64 / ns as f64 * 1e-3)
+    }
+}
+
+struct Slot {
+    cmd_pool:        vk::CommandPool,
+    cmd:             vk::CommandBuffer,
+    fence:           vk::Fence,
+    descriptor_pool: vk::DescriptorPool,
+    query_pool:      vk::QueryPool, // 2 timestamps: start, end
+    /// Whether the slot was used at least once (fence/query/pool need a reset).
+    used:            bool,
+}
+
+pub struct Executor {
+    ctx:      Arc<VulkanContext>,
+    pipeline: Arc<MatmulPipeline>,
+    /// Available-slot queue with a condvar for blocking checkout.
+    slots:        Mutex<VecDeque<Slot>>,
+    slot_avail:   Condvar,
+    /// Maximum descriptor sets we'll allocate per submission (= max
+    /// matmul calls in one `run_matmuls`).
+    max_calls_per_submit: u32,
+}
+
+impl Executor {
+    /// `n_slots` = how many submissions can be in flight at once. 2 is
+    /// the sweet spot: one being recorded by the host while the other
+    /// runs on the GPU.  Higher values benefit hosts that submit
+    /// concurrently from many threads.
+    pub fn new(
+        ctx:                  Arc<VulkanContext>,
+        pipeline:             Arc<MatmulPipeline>,
+        n_slots:              usize,
+        max_calls_per_submit: u32,
+    ) -> Result<Self> {
+        let n_slots = n_slots.max(1);
+        let mut slots = VecDeque::with_capacity(n_slots);
+        for _ in 0..n_slots {
+            slots.push_back(Self::create_slot(&ctx, max_calls_per_submit)?);
+        }
+        Ok(Self {
+            ctx,
+            pipeline,
+            slots: Mutex::new(slots),
+            slot_avail: Condvar::new(),
+            max_calls_per_submit,
+        })
+    }
+
+    fn create_slot(ctx: &Arc<VulkanContext>, max_sets: u32) -> Result<Slot> {
+        unsafe {
+            let cmd_pool = ctx.device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(ctx.compute_family)
+                    .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                None,
+            ).context("create_command_pool")?;
+            let cmd = ctx.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            ).context("allocate_command_buffers")?[0];
+            let fence = ctx.device.create_fence(&vk::FenceCreateInfo::default(), None)
+                .context("create_fence")?;
+
+            // Descriptor pool sized for `max_sets` matmul calls (3 STORAGE_BUFFER each).
+            let pool_size = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(max_sets * 3)];
+            let descriptor_pool = ctx.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(max_sets)
+                    .pool_sizes(&pool_size),
+                None,
+            ).context("create_descriptor_pool")?;
+
+            let query_pool = ctx.device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2),
+                None,
+            ).context("create_query_pool")?;
+            // Host-reset the pool so the first use has clean state.
+            ctx.device.reset_query_pool(query_pool, 0, 2);
+
+            Ok(Slot {
+                cmd_pool, cmd, fence, descriptor_pool, query_pool, used: false,
+            })
+        }
+    }
+
+    /// Synchronous host→device upload via a transient staging buffer.
+    pub fn upload(&self, src: &[f32], dst: &Tensor) -> Result<()> {
+        let bytes = bytemuck::cast_slice::<f32, u8>(src);
+        if bytes.len() as vk::DeviceSize > dst.size_bytes() {
+            bail!("upload: {} bytes > tensor capacity {}", bytes.len(), dst.size_bytes());
+        }
+        let staging = Buffer::new(
+            &self.ctx,
+            bytes.len() as vk::DeviceSize,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            BufferLocation::Host,
+        )?;
+        staging.write_from_slice(bytes)?;
+        self.run_copy(staging.raw, dst.raw_buffer(), bytes.len() as vk::DeviceSize)
+    }
+
+    /// Synchronous device→host download via a transient staging buffer.
+    pub fn download(&self, src: &Tensor, dst: &mut [f32]) -> Result<()> {
+        let bytes = bytemuck::cast_slice_mut::<f32, u8>(dst);
+        if bytes.len() as vk::DeviceSize > src.size_bytes() {
+            bail!("download: {} bytes > tensor capacity {}", bytes.len(), src.size_bytes());
+        }
+        let staging = Buffer::new(
+            &self.ctx,
+            bytes.len() as vk::DeviceSize,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            BufferLocation::Host,
+        )?;
+        self.run_copy(src.raw_buffer(), staging.raw, bytes.len() as vk::DeviceSize)?;
+        let out = staging.read_into_vec()?;
+        bytes.copy_from_slice(&out[..bytes.len()]);
+        Ok(())
+    }
+
+    /// Run a batch of matmul calls.  Blocks until GPU completion.
+    pub fn run_matmuls(&self, calls: &[MatmulCall<'_>]) -> Result<RunStats> {
+        if calls.is_empty() {
+            return Ok(RunStats { gpu_time_ns: None, n_calls: 0, total_flops: 0 });
+        }
+        if calls.len() > self.max_calls_per_submit as usize {
+            bail!(
+                "run_matmuls: {} calls > max_calls_per_submit {}",
+                calls.len(), self.max_calls_per_submit
+            );
+        }
+
+        let total_flops: u64 = calls.iter()
+            .map(|c| matmul_flops(c).unwrap_or(0))
+            .sum();
+
+        let mut slot = self.checkout_slot();
+        let result = self.record_and_run(&mut slot, calls);
+        let gpu_time_ns = match &result {
+            Ok(t) => *t,
+            Err(_) => None,
+        };
+        self.checkin_slot(slot);
+        result.map(|_| RunStats {
+            gpu_time_ns,
+            n_calls:     calls.len(),
+            total_flops,
+        })
+    }
+
+    // ---- Internals --------------------------------------------------------
+
+    fn checkout_slot(&self) -> Slot {
+        let mut slots = self.slots.lock();
+        loop {
+            if let Some(s) = slots.pop_front() {
+                return s;
+            }
+            self.slot_avail.wait(&mut slots);
+        }
+    }
+
+    fn checkin_slot(&self, slot: Slot) {
+        self.slots.lock().push_back(slot);
+        self.slot_avail.notify_one();
+    }
+
+    fn record_and_run(&self, slot: &mut Slot, calls: &[MatmulCall<'_>])
+        -> Result<Option<u64>>
+    {
+        let dev = &self.ctx.device;
+        let want_timestamps = self.ctx.timestamps_supported;
+
+        unsafe {
+            // Reset slot state from any prior use.
+            if slot.used {
+                dev.reset_command_pool(slot.cmd_pool, vk::CommandPoolResetFlags::empty())
+                    .context("reset_command_pool")?;
+                dev.reset_descriptor_pool(
+                    slot.descriptor_pool, vk::DescriptorPoolResetFlags::empty()
+                ).context("reset_descriptor_pool")?;
+                if want_timestamps {
+                    dev.reset_query_pool(slot.query_pool, 0, 2);
+                }
+            }
+            slot.used = true;
+
+            // ---- Record -----------------------------------------------------
+            dev.begin_command_buffer(
+                slot.cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            ).context("begin_command_buffer")?;
+
+            if want_timestamps {
+                dev.cmd_write_timestamp(
+                    slot.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, slot.query_pool, 0,
+                );
+            }
+
+            dev.cmd_bind_pipeline(
+                slot.cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline.pipeline,
+            );
+
+            for call in calls {
+                record_one_matmul(
+                    &self.ctx, &self.pipeline, slot.descriptor_pool, slot.cmd, call,
+                )?;
+            }
+
+            if want_timestamps {
+                dev.cmd_write_timestamp(
+                    slot.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, slot.query_pool, 1,
+                );
+            }
+
+            dev.end_command_buffer(slot.cmd).context("end_command_buffer")?;
+
+            // ---- Submit (serialized on the single queue) -------------------
+            let cbs = [slot.cmd];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            {
+                let queue = self.ctx.queue.lock();
+                dev.queue_submit(*queue, &[submit], slot.fence)
+                    .context("queue_submit")?;
+            }
+
+            // ---- Wait + read timestamps ------------------------------------
+            dev.wait_for_fences(&[slot.fence], true, u64::MAX)
+                .context("wait_for_fences")?;
+            dev.reset_fences(&[slot.fence]).context("reset_fences")?;
+
+            let gpu_time_ns = if want_timestamps {
+                let mut data = [0u64; 2];
+                dev.get_query_pool_results(
+                    slot.query_pool,
+                    0, &mut data,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                ).context("get_query_pool_results")?;
+                let ticks = data[1].wrapping_sub(data[0]);
+                Some((ticks as f64 * self.ctx.timestamp_period_ns) as u64)
+            } else {
+                None
+            };
+
+            Ok(gpu_time_ns)
+        }
+    }
+
+    fn run_copy(&self, src: vk::Buffer, dst: vk::Buffer, size: vk::DeviceSize) -> Result<()> {
+        let mut slot = self.checkout_slot();
+        let res = unsafe {
+            let dev = &self.ctx.device;
+            if slot.used {
+                dev.reset_command_pool(slot.cmd_pool, vk::CommandPoolResetFlags::empty())?;
+            }
+            slot.used = true;
+            dev.begin_command_buffer(
+                slot.cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            let region = [vk::BufferCopy::default().size(size)];
+            dev.cmd_copy_buffer(slot.cmd, src, dst, &region);
+            dev.end_command_buffer(slot.cmd)?;
+
+            let cbs = [slot.cmd];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            {
+                let q = self.ctx.queue.lock();
+                dev.queue_submit(*q, &[submit], slot.fence)?;
+            }
+            dev.wait_for_fences(&[slot.fence], true, u64::MAX)?;
+            dev.reset_fences(&[slot.fence])?;
+            Ok(())
+        };
+        self.checkin_slot(slot);
+        res
+    }
+}
+
+impl Drop for Executor {
+    fn drop(&mut self) {
+        unsafe { let _ = self.ctx.device.device_wait_idle(); }
+        let slots = std::mem::take(&mut *self.slots.lock());
+        for s in slots {
+            unsafe {
+                self.ctx.device.destroy_query_pool(s.query_pool, None);
+                self.ctx.device.destroy_descriptor_pool(s.descriptor_pool, None);
+                self.ctx.device.destroy_fence(s.fence, None);
+                self.ctx.device.destroy_command_pool(s.cmd_pool, None);
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Recording helpers
+// ----------------------------------------------------------------------------
+
+fn record_one_matmul(
+    ctx:             &VulkanContext,
+    pipeline:        &MatmulPipeline,
+    descriptor_pool: vk::DescriptorPool,
+    cb:              vk::CommandBuffer,
+    call:            &MatmulCall<'_>,
+) -> Result<()> {
+    let (ba, m,  k1) = call.a.as_3d()?;
+    let (bb, k2, n1) = call.b.as_3d()?;
+    let (bc, m2, n2) = call.c.as_3d()?;
+
+    if k1 != k2 { bail!("matmul shape mismatch: A.K={k1} vs B.K={k2}"); }
+    if m  != m2 { bail!("matmul shape mismatch: A.M={m} vs C.M={m2}"); }
+    if n1 != n2 { bail!("matmul shape mismatch: B.N={n1} vs C.N={n2}"); }
+
+    // Batch resolution with broadcast (1 ↔ N): output batch wins,
+    // operands may have batch=1 to broadcast.
+    let batch = match (ba, bb, bc) {
+        (a, b, c) if a == c && (b == a || b == 1) => a,
+        (a, b, c) if b == c && (a == b || a == 1) => b,
+        _ => bail!("matmul incompatible batch dims A.B={ba} B.B={bb} C.B={bc}"),
+    };
+
+    let pc = MatmulPushConstants {
+        m, n: n1, k: k1,
+        batch_stride_a: if ba == 1 { 0 } else { m  * k1 },
+        batch_stride_b: if bb == 1 { 0 } else { k1 * n1 },
+        batch_stride_c: if bc == 1 { 0 } else { m  * n1 },
+        flags: if call.accumulate { 1 } else { 0 },
+        alpha: call.alpha,
+    };
+
+    // Allocate + write one descriptor set from the slot's pool.
+    let layouts = [pipeline.set_layout];
+    let set = unsafe {
+        ctx.device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&layouts)
+        ).context("allocate_descriptor_sets")?
+    }[0];
+
+    let a_info = [vk::DescriptorBufferInfo::default()
+        .buffer(call.a.raw_buffer()).offset(0).range(call.a.size_bytes())];
+    let b_info = [vk::DescriptorBufferInfo::default()
+        .buffer(call.b.raw_buffer()).offset(0).range(call.b.size_bytes())];
+    let c_info = [vk::DescriptorBufferInfo::default()
+        .buffer(call.c.raw_buffer()).offset(0).range(call.c.size_bytes())];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(set).dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&a_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set).dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&b_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set).dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&c_info),
+    ];
+    unsafe { ctx.device.update_descriptor_sets(&writes, &[]); }
+
+    unsafe {
+        ctx.device.cmd_bind_descriptor_sets(
+            cb, vk::PipelineBindPoint::COMPUTE,
+            pipeline.pipeline_layout, 0, &[set], &[],
+        );
+        ctx.device.cmd_push_constants(
+            cb, pipeline.pipeline_layout, vk::ShaderStageFlags::COMPUTE,
+            0, bytemuck::bytes_of(&pc),
+        );
+        ctx.device.cmd_dispatch(
+            cb,
+            n1.div_ceil(TILE_N),
+            m .div_ceil(TILE_M),
+            batch,
+        );
+    }
+    Ok(())
+}
+
+fn matmul_flops(c: &MatmulCall<'_>) -> Option<u64> {
+    let (ba, m, k) = c.a.as_3d().ok()?;
+    let (bb, _,  n) = c.b.as_3d().ok()?;
+    let batch = ba.max(bb);
+    Some(2u64 * batch as u64 * m as u64 * n as u64 * k as u64)
+}
