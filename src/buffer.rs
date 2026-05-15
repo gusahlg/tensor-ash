@@ -2,10 +2,12 @@
 //!
 //! Two flavors:
 //!   * `Device` — device-local memory.  Fastest for the GPU.  Host I/O
-//!                must go through a staging buffer (see `Executor::upload`).
-//!   * `Host`   — host-visible + coherent.  Persistently mapped for the
-//!                whole lifetime of the buffer; cheap to read/write from
-//!                the CPU, slower for the GPU on discrete cards.
+//!     must go through a staging buffer (see `Executor::upload`).
+//!   * `Host` — host-visible memory, preferring coherent writes.
+//!   * `HostCached` — host-visible memory, preferring cached CPU reads.
+//!
+//! Host buffers are persistently mapped for their whole lifetime.  Non-coherent
+//! memory is flushed after CPU writes and invalidated before CPU reads.
 
 use std::sync::Arc;
 
@@ -15,16 +17,21 @@ use ash::vk;
 use crate::context::VulkanContext;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum BufferLocation { Device, Host }
+pub enum BufferLocation {
+    Device,
+    Host,
+    HostCached,
+}
 
 pub struct Buffer {
-    ctx:           Arc<VulkanContext>,
-    pub raw:       vk::Buffer,
-    pub memory:    vk::DeviceMemory,
-    pub size:      vk::DeviceSize,
-    pub location:  BufferLocation,
+    ctx: Arc<VulkanContext>,
+    pub raw: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+    pub size: vk::DeviceSize,
+    pub location: BufferLocation,
+    memory_flags: vk::MemoryPropertyFlags,
     /// Persistent mapping pointer for host-visible buffers; null otherwise.
-    mapped:        *mut u8,
+    mapped: *mut u8,
 }
 
 // The pointer is owned: no aliasing across threads other than synchronized
@@ -34,62 +41,153 @@ unsafe impl Sync for Buffer {}
 
 impl Buffer {
     pub fn new(
-        ctx:      &Arc<VulkanContext>,
-        size:     vk::DeviceSize,
-        usage:    vk::BufferUsageFlags,
+        ctx: &Arc<VulkanContext>,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
         location: BufferLocation,
     ) -> Result<Self> {
         assert!(size > 0, "Buffer::new with size=0");
         unsafe {
-            let raw = ctx.device.create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(size)
-                    .usage(usage)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            ).context("create_buffer")?;
+            let raw = ctx
+                .device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(size)
+                        .usage(usage)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )
+                .context("create_buffer")?;
             let mem_req = ctx.device.get_buffer_memory_requirements(raw);
 
-            let props = match location {
-                BufferLocation::Device => vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                BufferLocation::Host   => vk::MemoryPropertyFlags::HOST_VISIBLE
-                                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+            let (required, preferred) = match location {
+                BufferLocation::Device => (
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    vk::MemoryPropertyFlags::empty(),
+                ),
+                BufferLocation::Host => (
+                    vk::MemoryPropertyFlags::HOST_VISIBLE,
+                    vk::MemoryPropertyFlags::HOST_COHERENT,
+                ),
+                BufferLocation::HostCached => (
+                    vk::MemoryPropertyFlags::HOST_VISIBLE,
+                    vk::MemoryPropertyFlags::HOST_CACHED,
+                ),
             };
-            let mem_type = ctx.find_memory_type(mem_req, props)?;
-            let memory = ctx.device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(mem_req.size)
-                    .memory_type_index(mem_type),
-                None,
-            ).map_err(|e| {
+            let mem_type = match ctx.find_memory_type_preferred(mem_req, required, preferred) {
+                Ok(mem_type) => mem_type,
+                Err(err) => {
+                    ctx.device.destroy_buffer(raw, None);
+                    return Err(err);
+                }
+            };
+            let memory_flags = ctx.memory_properties.memory_types[mem_type as usize].property_flags;
+            let memory = ctx
+                .device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(mem_req.size)
+                        .memory_type_index(mem_type),
+                    None,
+                )
+                .map_err(|e| {
+                    ctx.device.destroy_buffer(raw, None);
+                    anyhow::anyhow!("allocate_memory: {e}")
+                })?;
+            if let Err(err) = ctx.device.bind_buffer_memory(raw, memory, 0) {
+                ctx.device.free_memory(memory, None);
                 ctx.device.destroy_buffer(raw, None);
-                anyhow::anyhow!("allocate_memory: {e}")
-            })?;
-            ctx.device.bind_buffer_memory(raw, memory, 0).context("bind_buffer_memory")?;
+                return Err(err).context("bind_buffer_memory");
+            }
 
-            let mapped = if location == BufferLocation::Host {
-                ctx.device
+            let mapped = if memory_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
+                match ctx
+                    .device
                     .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                    .context("map_memory")? as *mut u8
+                {
+                    Ok(mapped) => mapped as *mut u8,
+                    Err(err) => {
+                        ctx.device.free_memory(memory, None);
+                        ctx.device.destroy_buffer(raw, None);
+                        return Err(err).context("map_memory");
+                    }
+                }
             } else {
                 std::ptr::null_mut()
             };
 
-            Ok(Self { ctx: Arc::clone(ctx), raw, memory, size, location, mapped })
+            Ok(Self {
+                ctx: Arc::clone(ctx),
+                raw,
+                memory,
+                size,
+                location,
+                memory_flags,
+                mapped,
+            })
         }
+    }
+
+    fn is_host_visible(&self) -> bool {
+        self.memory_flags
+            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+    }
+
+    fn is_host_coherent(&self) -> bool {
+        self.memory_flags
+            .contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+    }
+
+    fn flush_host_writes(&self) -> Result<()> {
+        if self.is_host_coherent() {
+            return Ok(());
+        }
+        let range = [vk::MappedMemoryRange::default()
+            .memory(self.memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE)];
+        unsafe {
+            self.ctx
+                .device
+                .flush_mapped_memory_ranges(&range)
+                .context("flush_mapped_memory_ranges")?;
+        }
+        Ok(())
+    }
+
+    fn invalidate_host_reads(&self) -> Result<()> {
+        if self.is_host_coherent() {
+            return Ok(());
+        }
+        let range = [vk::MappedMemoryRange::default()
+            .memory(self.memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE)];
+        unsafe {
+            self.ctx
+                .device
+                .invalidate_mapped_memory_ranges(&range)
+                .context("invalidate_mapped_memory_ranges")?;
+        }
+        Ok(())
     }
 
     /// Copy CPU bytes into a host-visible buffer.
     pub fn write_from_slice(&self, bytes: &[u8]) -> Result<()> {
-        if self.location != BufferLocation::Host {
+        if !self.is_host_visible() {
             bail!("write_from_slice: buffer is not host-visible");
         }
         if bytes.len() as vk::DeviceSize > self.size {
-            bail!("write_from_slice: {} bytes > buffer size {}", bytes.len(), self.size);
+            bail!(
+                "write_from_slice: {} bytes > buffer size {}",
+                bytes.len(),
+                self.size
+            );
         }
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.mapped, bytes.len());
         }
+        self.flush_host_writes()?;
         Ok(())
     }
 
@@ -100,13 +198,18 @@ impl Buffer {
 
     /// Copy host-visible buffer bytes into an existing POD slice.
     pub fn read_pod_slice<T: bytemuck::Pod>(&self, values: &mut [T]) -> Result<()> {
-        if self.location != BufferLocation::Host {
+        if !self.is_host_visible() {
             bail!("read_pod_slice: buffer is not host-visible");
         }
         let bytes = bytemuck::cast_slice_mut(values);
         if bytes.len() as vk::DeviceSize > self.size {
-            bail!("read_pod_slice: {} bytes > buffer size {}", bytes.len(), self.size);
+            bail!(
+                "read_pod_slice: {} bytes > buffer size {}",
+                bytes.len(),
+                self.size
+            );
         }
+        self.invalidate_host_reads()?;
         unsafe {
             std::ptr::copy_nonoverlapping(self.mapped, bytes.as_mut_ptr(), bytes.len());
         }
@@ -115,12 +218,15 @@ impl Buffer {
 
     /// Copy host-visible buffer bytes into a new Vec.
     pub fn read_into_vec(&self) -> Result<Vec<u8>> {
-        if self.location != BufferLocation::Host {
+        if !self.is_host_visible() {
             bail!("read_into_vec: buffer is not host-visible");
         }
         let len = self.size as usize;
         let mut out = vec![0u8; len];
-        unsafe { std::ptr::copy_nonoverlapping(self.mapped, out.as_mut_ptr(), len); }
+        self.invalidate_host_reads()?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.mapped, out.as_mut_ptr(), len);
+        }
         Ok(out)
     }
 }
@@ -128,7 +234,7 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         unsafe {
-            if self.location == BufferLocation::Host && !self.mapped.is_null() {
+            if !self.mapped.is_null() {
                 self.ctx.device.unmap_memory(self.memory);
             }
             self.ctx.device.destroy_buffer(self.raw, None);

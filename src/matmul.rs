@@ -6,7 +6,7 @@
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::pipeline::{MatmulPushConstants, TILE_M, TILE_N};
+use crate::pipeline::MatmulPushConstants;
 use crate::tensor::Tensor;
 
 macro_rules! ensure_dim_eq {
@@ -105,8 +105,6 @@ pub(crate) struct ResolvedMatmul {
     pub batch_stride_a: u32,
     pub batch_stride_b: u32,
     pub batch_stride_c: u32,
-    pub groups_x: u32,
-    pub groups_y: u32,
     pub total_flops: u64,
 }
 
@@ -212,8 +210,6 @@ impl ResolvedMatmul {
             batch_stride_a,
             batch_stride_b,
             batch_stride_c,
-            groups_x: b.cols.div_ceil(TILE_N),
-            groups_y: a.rows.div_ceil(TILE_M),
             total_flops: checked_flops(c.batch, a.rows, b.cols, a.cols)?,
         })
     }

@@ -40,8 +40,11 @@ pub mod pipeline;
 pub mod tensor;
 
 pub use buffer::{Buffer, BufferLocation};
-pub use context::VulkanContext;
+pub use context::{DeviceKind, DevicePreference, DeviceSummary, VulkanContext};
 pub use executor::Executor;
 pub use matmul::{MatmulCall, MatrixShape, RunStats};
-pub use pipeline::{MatmulPipeline, MatmulPushConstants, TILE_M, TILE_N};
+pub use pipeline::{
+    KernelSelection, MatmulKernel, MatmulPipeline, MatmulPushConstants, SMALL_TILE_M, SMALL_TILE_N,
+    TILE_M, TILE_N,
+};
 pub use tensor::Tensor;

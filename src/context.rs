@@ -13,155 +13,353 @@ use anyhow::{Context, Result, anyhow, bail};
 use ash::vk;
 use parking_lot::Mutex;
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum DevicePreference {
+    Auto,
+    Discrete,
+    Integrated,
+    Virtual,
+    Cpu,
+    Index(usize),
+    NameContains(String),
+}
+
+impl DevicePreference {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let raw = raw.trim();
+        let raw_lc = raw.to_ascii_lowercase();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        if raw.eq_ignore_ascii_case("discrete") {
+            return Ok(Self::Discrete);
+        }
+        if raw.eq_ignore_ascii_case("integrated") {
+            return Ok(Self::Integrated);
+        }
+        if raw.eq_ignore_ascii_case("virtual") {
+            return Ok(Self::Virtual);
+        }
+        if raw.eq_ignore_ascii_case("cpu") {
+            return Ok(Self::Cpu);
+        }
+        if let Some(index) = raw_lc.strip_prefix("index:") {
+            let index = index
+                .parse::<usize>()
+                .with_context(|| format!("invalid ML_DEVICE index: {index}"))?;
+            return Ok(Self::Index(index));
+        }
+        if raw_lc.starts_with("name:") {
+            let name = &raw[5..];
+            let name = name.trim();
+            if name.is_empty() {
+                bail!("ML_DEVICE name filter must not be empty");
+            }
+            return Ok(Self::NameContains(name.to_ascii_lowercase()));
+        }
+        if let Ok(index) = raw.parse::<usize>() {
+            return Ok(Self::Index(index));
+        }
+        Ok(Self::NameContains(raw.to_ascii_lowercase()))
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Auto => "auto".into(),
+            Self::Discrete => "discrete".into(),
+            Self::Integrated => "integrated".into(),
+            Self::Virtual => "virtual".into(),
+            Self::Cpu => "cpu".into(),
+            Self::Index(index) => format!("index:{index}"),
+            Self::NameContains(name) => format!("name contains '{name}'"),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum DeviceKind {
+    DiscreteGpu,
+    IntegratedGpu,
+    VirtualGpu,
+    Cpu,
+    Other,
+}
+
+impl DeviceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DiscreteGpu => "discrete",
+            Self::IntegratedGpu => "integrated",
+            Self::VirtualGpu => "virtual",
+            Self::Cpu => "cpu",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceSummary {
+    pub index: usize,
+    pub name: String,
+    pub kind: DeviceKind,
+    pub api_version: (u32, u32, u32),
+    pub driver_version: u32,
+    pub vendor_id: u32,
+    pub device_id: u32,
+}
+
+impl DeviceSummary {
+    fn from_properties(index: usize, props: vk::PhysicalDeviceProperties) -> Self {
+        let name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        Self {
+            index,
+            name,
+            kind: device_kind(props.device_type),
+            api_version: (
+                vk::api_version_major(props.api_version),
+                vk::api_version_minor(props.api_version),
+                vk::api_version_patch(props.api_version),
+            ),
+            driver_version: props.driver_version,
+            vendor_id: props.vendor_id,
+            device_id: props.device_id,
+        }
+    }
+
+    pub fn api_version_string(&self) -> String {
+        format!(
+            "{}.{}.{}",
+            self.api_version.0, self.api_version.1, self.api_version.2
+        )
+    }
+}
+
 pub struct VulkanContext {
-    pub entry:             ash::Entry,
-    pub instance:          ash::Instance,
-    pub physical_device:   vk::PhysicalDevice,
-    pub device:            ash::Device,
+    pub entry: ash::Entry,
+    pub instance: ash::Instance,
+    pub physical_device: vk::PhysicalDevice,
+    pub device_summary: DeviceSummary,
+    pub device: ash::Device,
     pub device_properties: vk::PhysicalDeviceProperties,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
-    pub compute_family:    u32,
+    pub compute_family: u32,
     /// Compute queue.  Vulkan requires external sync on a queue, hence the mutex.
-    pub queue:             Mutex<vk::Queue>,
+    pub queue: Mutex<vk::Queue>,
     /// Nanoseconds-per-tick reported by the driver for GPU timestamps.
     pub timestamp_period_ns: f64,
     pub timestamps_supported: bool,
-    debug_loader:    Option<ash::ext::debug_utils::Instance>,
+    debug_loader: Option<ash::ext::debug_utils::Instance>,
     debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
 }
 
 impl VulkanContext {
-    pub fn new(enable_validation: bool) -> Result<Arc<Self>> { unsafe {
-        let entry = ash::Entry::load()
-            .map_err(|e| anyhow!("failed to load Vulkan loader: {e}"))?;
+    pub fn new(enable_validation: bool) -> Result<Arc<Self>> {
+        Self::new_with_device_preference(enable_validation, DevicePreference::Auto)
+    }
 
-        // ---- Instance ------------------------------------------------------
-        let app_name    = CString::new("ml_project").unwrap();
-        let engine_name = CString::new("ml_project").unwrap();
-        let app_info = vk::ApplicationInfo::default()
-            .application_name(&app_name)
-            .engine_name(&engine_name)
-            .api_version(vk::API_VERSION_1_2);
+    pub fn new_with_device_preference(
+        enable_validation: bool,
+        preference: DevicePreference,
+    ) -> Result<Arc<Self>> {
+        unsafe {
+            let entry =
+                ash::Entry::load().map_err(|e| anyhow!("failed to load Vulkan loader: {e}"))?;
 
-        let validation_name: &CStr =
-            CStr::from_bytes_with_nul(b"VK_LAYER_KHRONOS_validation\0").unwrap();
-        let have_validation = enable_validation
-            && entry.enumerate_instance_layer_properties()?
+            // ---- Instance ------------------------------------------------------
+            let app_name = CString::new("ml_project").unwrap();
+            let engine_name = CString::new("ml_project").unwrap();
+            let app_info = vk::ApplicationInfo::default()
+                .application_name(&app_name)
+                .engine_name(&engine_name)
+                .api_version(vk::API_VERSION_1_2);
+
+            let validation_name: &CStr = c"VK_LAYER_KHRONOS_validation";
+            let have_validation = enable_validation
+                && entry
+                    .enumerate_instance_layer_properties()?
+                    .iter()
+                    .any(|l| CStr::from_ptr(l.layer_name.as_ptr()) == validation_name);
+
+            let debug_utils_name = ash::ext::debug_utils::NAME;
+            let have_debug_utils = have_validation
+                && entry
+                    .enumerate_instance_extension_properties(None)?
+                    .iter()
+                    .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == debug_utils_name);
+
+            let mut layers: Vec<*const i8> = Vec::new();
+            if have_validation {
+                layers.push(validation_name.as_ptr());
+            }
+            let mut exts: Vec<*const i8> = Vec::new();
+            if have_debug_utils {
+                exts.push(debug_utils_name.as_ptr());
+            }
+
+            let instance_ci = vk::InstanceCreateInfo::default()
+                .application_info(&app_info)
+                .enabled_layer_names(&layers)
+                .enabled_extension_names(&exts);
+            let instance = entry
+                .create_instance(&instance_ci, None)
+                .context("create_instance")?;
+
+            // ---- Debug messenger ----------------------------------------------
+            let (debug_loader, debug_messenger) = if have_debug_utils {
+                let loader = ash::ext::debug_utils::Instance::new(&entry, &instance);
+                let ci = vk::DebugUtilsMessengerCreateInfoEXT::default()
+                    .message_severity(
+                        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                            | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+                    )
+                    .message_type(
+                        vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                            | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                            | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+                    )
+                    .pfn_user_callback(Some(debug_callback));
+                let msg = loader
+                    .create_debug_utils_messenger(&ci, None)
+                    .context("create_debug_utils_messenger")?;
+                (Some(loader), Some(msg))
+            } else {
+                (None, None)
+            };
+
+            // ---- Pick physical device -----------------------------------------
+            let phys_devs = instance
+                .enumerate_physical_devices()
+                .context("enumerate_physical_devices")?;
+            if phys_devs.is_empty() {
+                bail!("no Vulkan-capable physical devices found");
+            }
+            let device_summaries = device_summaries(&instance, &phys_devs);
+            let selected_index = select_physical_device(&device_summaries, &preference)?;
+            let physical_device = phys_devs[selected_index];
+            let device_properties = instance.get_physical_device_properties(physical_device);
+            let device_summary = device_summaries[selected_index].clone();
+            let memory_properties = instance.get_physical_device_memory_properties(physical_device);
+            log::info!(
+                "ml_project: using device #{}: {} ({}, Vulkan {})",
+                device_summary.index,
+                device_summary.name,
+                device_summary.kind.as_str(),
+                device_summary.api_version_string(),
+            );
+
+            // ---- Pick compute queue family ------------------------------------
+            let qf_props = instance.get_physical_device_queue_family_properties(physical_device);
+            let compute_family = qf_props
                 .iter()
-                .any(|l| CStr::from_ptr(l.layer_name.as_ptr()) == validation_name);
+                .enumerate()
+                .filter(|(_, p)| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
+                // Prefer a dedicated compute family (no GRAPHICS bit) when available.
+                .min_by_key(|(_, p)| {
+                    if p.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+                        1
+                    } else {
+                        0
+                    }
+                })
+                .map(|(i, _)| i as u32)
+                .ok_or_else(|| anyhow!("no compute-capable queue family"))?;
 
-        let debug_utils_name = ash::ext::debug_utils::NAME;
-        let have_debug_utils = have_validation
-            && entry.enumerate_instance_extension_properties(None)?
-                .iter()
-                .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == debug_utils_name);
+            let timestamps_supported = qf_props[compute_family as usize].timestamp_valid_bits > 0
+                && device_properties.limits.timestamp_period > 0.0;
 
-        let mut layers: Vec<*const i8> = Vec::new();
-        if have_validation { layers.push(validation_name.as_ptr()); }
-        let mut exts: Vec<*const i8> = Vec::new();
-        if have_debug_utils { exts.push(debug_utils_name.as_ptr()); }
+            let priorities = [1.0f32];
+            let queue_ci = [vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(compute_family)
+                .queue_priorities(&priorities)];
 
-        let instance_ci = vk::InstanceCreateInfo::default()
-            .application_info(&app_info)
-            .enabled_layer_names(&layers)
-            .enabled_extension_names(&exts);
-        let instance = entry.create_instance(&instance_ci, None)
-            .context("create_instance")?;
+            let features = vk::PhysicalDeviceFeatures::default();
+            let device_ci = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queue_ci)
+                .enabled_features(&features);
+            let device = instance
+                .create_device(physical_device, &device_ci, None)
+                .context("create_device")?;
+            let queue = device.get_device_queue(compute_family, 0);
 
-        // ---- Debug messenger ----------------------------------------------
-        let (debug_loader, debug_messenger) = if have_debug_utils {
-            let loader = ash::ext::debug_utils::Instance::new(&entry, &instance);
-            let ci = vk::DebugUtilsMessengerCreateInfoEXT::default()
-                .message_severity(
-                    vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                    | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
-                )
-                .message_type(
-                    vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
-                )
-                .pfn_user_callback(Some(debug_callback));
-            let msg = loader.create_debug_utils_messenger(&ci, None)
-                .context("create_debug_utils_messenger")?;
-            (Some(loader), Some(msg))
-        } else { (None, None) };
-
-        // ---- Pick physical device -----------------------------------------
-        let phys_devs = instance.enumerate_physical_devices()
-            .context("enumerate_physical_devices")?;
-        if phys_devs.is_empty() {
-            bail!("no Vulkan-capable physical devices found");
+            Ok(Arc::new(Self {
+                entry,
+                instance,
+                physical_device,
+                device,
+                device_summary,
+                device_properties,
+                memory_properties,
+                compute_family,
+                queue: Mutex::new(queue),
+                timestamp_period_ns: device_properties.limits.timestamp_period as f64,
+                timestamps_supported,
+                debug_loader,
+                debug_messenger,
+            }))
         }
-        let physical_device = pick_physical_device(&instance, &phys_devs);
-        let device_properties = instance.get_physical_device_properties(physical_device);
-        let memory_properties = instance.get_physical_device_memory_properties(physical_device);
-        let device_name = CStr::from_ptr(device_properties.device_name.as_ptr())
-            .to_string_lossy().into_owned();
-        log::info!(
-            "ml_project: using {device_name} (Vulkan {}.{}.{})",
-            vk::api_version_major(device_properties.api_version),
-            vk::api_version_minor(device_properties.api_version),
-            vk::api_version_patch(device_properties.api_version),
-        );
-
-        // ---- Pick compute queue family ------------------------------------
-        let qf_props = instance.get_physical_device_queue_family_properties(physical_device);
-        let compute_family = qf_props.iter().enumerate()
-            .filter(|(_, p)| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
-            // Prefer a dedicated compute family (no GRAPHICS bit) when available.
-            .min_by_key(|(_, p)|
-                if p.queue_flags.contains(vk::QueueFlags::GRAPHICS) { 1 } else { 0 })
-            .map(|(i, _)| i as u32)
-            .ok_or_else(|| anyhow!("no compute-capable queue family"))?;
-
-        let timestamps_supported =
-            qf_props[compute_family as usize].timestamp_valid_bits > 0
-            && device_properties.limits.timestamp_period > 0.0;
-
-        let priorities = [1.0f32];
-        let queue_ci = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(compute_family)
-            .queue_priorities(&priorities)];
-
-        let features = vk::PhysicalDeviceFeatures::default();
-        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
-            .host_query_reset(true);
-        let device_ci = vk::DeviceCreateInfo::default()
-            .queue_create_infos(&queue_ci)
-            .enabled_features(&features)
-            .push_next(&mut features12);
-        let device = instance.create_device(physical_device, &device_ci, None)
-            .context("create_device")?;
-        let queue = device.get_device_queue(compute_family, 0);
-
-        Ok(Arc::new(Self {
-            entry, instance, physical_device, device,
-            device_properties, memory_properties,
-            compute_family,
-            queue: Mutex::new(queue),
-            timestamp_period_ns: device_properties.limits.timestamp_period as f64,
-            timestamps_supported,
-            debug_loader, debug_messenger,
-        }))
-    }}
+    }
 
     /// Find a memory type satisfying `requirements` containing every flag in `props`.
     pub fn find_memory_type(
         &self,
         requirements: vk::MemoryRequirements,
-        props:        vk::MemoryPropertyFlags,
+        props: vk::MemoryPropertyFlags,
     ) -> Result<u32> {
         for i in 0..self.memory_properties.memory_type_count {
             let bit = 1u32 << i;
-            if (requirements.memory_type_bits & bit) == 0 { continue; }
+            if (requirements.memory_type_bits & bit) == 0 {
+                continue;
+            }
             if self.memory_properties.memory_types[i as usize]
-                .property_flags.contains(props)
+                .property_flags
+                .contains(props)
             {
                 return Ok(i);
             }
         }
         bail!("no memory type with properties {:?}", props);
+    }
+
+    /// Find a memory type satisfying `required`, preferring all flags in
+    /// `preferred` when the device exposes a compatible type.
+    pub fn find_memory_type_preferred(
+        &self,
+        requirements: vk::MemoryRequirements,
+        required: vk::MemoryPropertyFlags,
+        preferred: vk::MemoryPropertyFlags,
+    ) -> Result<u32> {
+        if !preferred.is_empty() {
+            let preferred_props = required | preferred;
+            if let Ok(index) = self.find_memory_type(requirements, preferred_props) {
+                return Ok(index);
+            }
+        }
+        self.find_memory_type(requirements, required)
+    }
+
+    pub fn device_name(&self) -> &str {
+        &self.device_summary.name
+    }
+
+    pub fn device_kind(&self) -> DeviceKind {
+        self.device_summary.kind
+    }
+
+    pub fn diagnostics(&self) -> String {
+        format!(
+            "device #{}: {} ({}, Vulkan {}, vendor=0x{:04x}, device=0x{:04x}, driver={}, compute_family={}, timestamps={})",
+            self.device_summary.index,
+            self.device_summary.name,
+            self.device_summary.kind.as_str(),
+            self.device_summary.api_version_string(),
+            self.device_summary.vendor_id,
+            self.device_summary.device_id,
+            self.device_summary.driver_version,
+            self.compute_family,
+            self.timestamps_supported,
+        )
     }
 }
 
@@ -169,9 +367,7 @@ impl Drop for VulkanContext {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            if let (Some(loader), Some(msg)) =
-                (self.debug_loader.as_ref(), self.debug_messenger)
-            {
+            if let (Some(loader), Some(msg)) = (self.debug_loader.as_ref(), self.debug_messenger) {
                 loader.destroy_debug_utils_messenger(msg, None);
             }
             self.device.destroy_device(None);
@@ -180,35 +376,211 @@ impl Drop for VulkanContext {
     }
 }
 
-fn pick_physical_device(
+fn device_summaries(
     instance: &ash::Instance,
-    devices:  &[vk::PhysicalDevice],
-) -> vk::PhysicalDevice {
-    // Score: type-class (discrete > integrated > virtual > cpu) + compute capacity.
-    devices.iter().copied().max_by_key(|&pd| {
-        let p = unsafe { instance.get_physical_device_properties(pd) };
-        let type_score: i64 = match p.device_type {
-            vk::PhysicalDeviceType::DISCRETE_GPU   => 4_000_000_000,
-            vk::PhysicalDeviceType::INTEGRATED_GPU => 2_000_000_000,
-            vk::PhysicalDeviceType::VIRTUAL_GPU    => 1_000_000_000,
-            vk::PhysicalDeviceType::CPU            => 100_000,
-            _                                      => 0,
-        };
-        type_score + p.limits.max_compute_work_group_invocations as i64
-    }).expect("non-empty device list")
+    devices: &[vk::PhysicalDevice],
+) -> Vec<DeviceSummary> {
+    devices
+        .iter()
+        .enumerate()
+        .map(|(index, &pd)| {
+            let props = unsafe { instance.get_physical_device_properties(pd) };
+            DeviceSummary::from_properties(index, props)
+        })
+        .collect()
+}
+
+fn select_physical_device(
+    devices: &[DeviceSummary],
+    preference: &DevicePreference,
+) -> Result<usize> {
+    if devices.is_empty() {
+        bail!("no Vulkan-capable physical devices found");
+    }
+    let selected = match preference {
+        DevicePreference::Auto => auto_select_device(devices),
+        DevicePreference::Discrete => devices.iter().find(|d| d.kind == DeviceKind::DiscreteGpu),
+        DevicePreference::Integrated => {
+            devices.iter().find(|d| d.kind == DeviceKind::IntegratedGpu)
+        }
+        DevicePreference::Virtual => devices.iter().find(|d| d.kind == DeviceKind::VirtualGpu),
+        DevicePreference::Cpu => devices.iter().find(|d| d.kind == DeviceKind::Cpu),
+        DevicePreference::Index(index) => devices.iter().find(|d| d.index == *index),
+        DevicePreference::NameContains(needle) => devices
+            .iter()
+            .find(|d| d.name.to_ascii_lowercase().contains(needle)),
+    };
+    selected.map(|d| d.index).ok_or_else(|| {
+        anyhow!(
+            "no Vulkan device matches ML_DEVICE={} (available: {})",
+            preference.describe(),
+            describe_available_devices(devices),
+        )
+    })
+}
+
+fn describe_available_devices(devices: &[DeviceSummary]) -> String {
+    devices
+        .iter()
+        .map(|d| format!("#{} {} ({})", d.index, d.name, d.kind.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn device_kind(kind: vk::PhysicalDeviceType) -> DeviceKind {
+    match kind {
+        vk::PhysicalDeviceType::DISCRETE_GPU => DeviceKind::DiscreteGpu,
+        vk::PhysicalDeviceType::INTEGRATED_GPU => DeviceKind::IntegratedGpu,
+        vk::PhysicalDeviceType::VIRTUAL_GPU => DeviceKind::VirtualGpu,
+        vk::PhysicalDeviceType::CPU => DeviceKind::Cpu,
+        _ => DeviceKind::Other,
+    }
+}
+
+fn auto_select_device(devices: &[DeviceSummary]) -> Option<&DeviceSummary> {
+    for kind in [
+        DeviceKind::DiscreteGpu,
+        DeviceKind::IntegratedGpu,
+        DeviceKind::VirtualGpu,
+        DeviceKind::Other,
+        DeviceKind::Cpu,
+    ] {
+        if let Some(device) = devices.iter().find(|d| d.kind == kind) {
+            return Some(device);
+        }
+    }
+    None
 }
 
 unsafe extern "system" fn debug_callback(
-    _sev:  vk::DebugUtilsMessageSeverityFlagsEXT,
-    _typ:  vk::DebugUtilsMessageTypeFlagsEXT,
-    data:  *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
+    _sev: vk::DebugUtilsMessageSeverityFlagsEXT,
+    _typ: vk::DebugUtilsMessageTypeFlagsEXT,
+    data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
     _user: *mut std::ffi::c_void,
 ) -> vk::Bool32 {
-    if data.is_null() { return vk::FALSE; }
+    if data.is_null() {
+        return vk::FALSE;
+    }
     let msg_ptr = unsafe { (*data).p_message };
     if !msg_ptr.is_null() {
         let msg = unsafe { CStr::from_ptr(msg_ptr) }.to_string_lossy();
         eprintln!("[vulkan] {msg}");
     }
     vk::FALSE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_device_preferences() {
+        assert_eq!(DevicePreference::parse("").unwrap(), DevicePreference::Auto);
+        assert_eq!(
+            DevicePreference::parse("auto").unwrap(),
+            DevicePreference::Auto
+        );
+        assert_eq!(
+            DevicePreference::parse("discrete").unwrap(),
+            DevicePreference::Discrete
+        );
+        assert_eq!(
+            DevicePreference::parse("integrated").unwrap(),
+            DevicePreference::Integrated
+        );
+        assert_eq!(
+            DevicePreference::parse("virtual").unwrap(),
+            DevicePreference::Virtual
+        );
+        assert_eq!(
+            DevicePreference::parse("cpu").unwrap(),
+            DevicePreference::Cpu
+        );
+        assert_eq!(
+            DevicePreference::parse("index:2").unwrap(),
+            DevicePreference::Index(2)
+        );
+        assert_eq!(
+            DevicePreference::parse("INDEX:4").unwrap(),
+            DevicePreference::Index(4)
+        );
+        assert_eq!(
+            DevicePreference::parse("3").unwrap(),
+            DevicePreference::Index(3)
+        );
+        assert_eq!(
+            DevicePreference::parse("name:RTX 3070").unwrap(),
+            DevicePreference::NameContains("rtx 3070".into())
+        );
+        assert_eq!(
+            DevicePreference::parse("NAME:RTX 4090").unwrap(),
+            DevicePreference::NameContains("rtx 4090".into())
+        );
+        assert_eq!(
+            DevicePreference::parse("llvmpipe").unwrap(),
+            DevicePreference::NameContains("llvmpipe".into())
+        );
+    }
+
+    #[test]
+    fn selects_requested_device_kind() {
+        let devices = vec![
+            DeviceSummary {
+                index: 0,
+                name: "llvmpipe".into(),
+                kind: DeviceKind::Cpu,
+                api_version: (1, 3, 0),
+                driver_version: 1,
+                vendor_id: 1,
+                device_id: 1,
+            },
+            DeviceSummary {
+                index: 1,
+                name: "NVIDIA GeForce RTX 3070".into(),
+                kind: DeviceKind::DiscreteGpu,
+                api_version: (1, 4, 0),
+                driver_version: 2,
+                vendor_id: 0x10de,
+                device_id: 0x2488,
+            },
+        ];
+
+        assert_eq!(
+            select_physical_device(&devices, &DevicePreference::Auto).unwrap(),
+            1
+        );
+        assert_eq!(
+            select_physical_device(&devices, &DevicePreference::Cpu).unwrap(),
+            0
+        );
+        assert_eq!(
+            select_physical_device(&devices, &DevicePreference::Index(1)).unwrap(),
+            1
+        );
+        assert_eq!(
+            select_physical_device(&devices, &DevicePreference::NameContains("rtx".into()))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn reports_available_devices_when_selection_fails() {
+        let devices = vec![DeviceSummary {
+            index: 0,
+            name: "llvmpipe".into(),
+            kind: DeviceKind::Cpu,
+            api_version: (1, 3, 0),
+            driver_version: 1,
+            vendor_id: 1,
+            device_id: 1,
+        }];
+
+        let err = select_physical_device(&devices, &DevicePreference::Discrete)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("ML_DEVICE=discrete"));
+        assert!(err.contains("llvmpipe"));
+    }
 }

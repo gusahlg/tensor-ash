@@ -38,21 +38,23 @@ use crate::tensor::Tensor;
 pub use crate::matmul::{MatmulCall, RunStats};
 
 struct Slot {
-    cmd_pool:        vk::CommandPool,
-    cmd:             vk::CommandBuffer,
-    fence:           vk::Fence,
+    cmd_pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
     descriptor_pool: vk::DescriptorPool,
-    query_pool:      vk::QueryPool, // 2 timestamps: start, end
+    query_pool: vk::QueryPool, // 2 timestamps: start, end
+    upload_staging: Option<Buffer>,
+    download_staging: Option<Buffer>,
     /// Whether the slot was used at least once (fence/query/pool need a reset).
-    used:            bool,
+    used: bool,
 }
 
 pub struct Executor {
-    ctx:      Arc<VulkanContext>,
+    ctx: Arc<VulkanContext>,
     pipeline: Arc<MatmulPipeline>,
     /// Available-slot queue with a condvar for blocking checkout.
-    slots:        Mutex<VecDeque<Slot>>,
-    slot_avail:   Condvar,
+    slots: Mutex<VecDeque<Slot>>,
+    slot_avail: Condvar,
     /// Maximum descriptor sets we'll allocate per submission (= max
     /// matmul calls in one `run_matmuls`).
     max_calls_per_submit: u32,
@@ -64,12 +66,13 @@ impl Executor {
     /// runs on the GPU.  Higher values benefit hosts that submit
     /// concurrently from many threads.
     pub fn new(
-        ctx:                  Arc<VulkanContext>,
-        pipeline:             Arc<MatmulPipeline>,
-        n_slots:              usize,
+        ctx: Arc<VulkanContext>,
+        pipeline: Arc<MatmulPipeline>,
+        n_slots: usize,
         max_calls_per_submit: u32,
     ) -> Result<Self> {
         let n_slots = n_slots.max(1);
+        let max_calls_per_submit = max_calls_per_submit.max(1);
         let mut slots = VecDeque::with_capacity(n_slots);
         for _ in 0..n_slots {
             slots.push_back(Self::create_slot(&ctx, max_calls_per_submit)?);
@@ -85,95 +88,140 @@ impl Executor {
 
     fn create_slot(ctx: &Arc<VulkanContext>, max_sets: u32) -> Result<Slot> {
         unsafe {
-            let cmd_pool = ctx.device.create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(ctx.compute_family)
-                    .flags(vk::CommandPoolCreateFlags::TRANSIENT),
-                None,
-            ).context("create_command_pool")?;
-            let cmd = ctx.device.allocate_command_buffers(
+            let cmd_pool = ctx
+                .device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default()
+                        .queue_family_index(ctx.compute_family)
+                        .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                    None,
+                )
+                .context("create_command_pool")?;
+            let cmd = match ctx.device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
                     .command_pool(cmd_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1),
-            ).context("allocate_command_buffers")?[0];
-            let fence = ctx.device.create_fence(&vk::FenceCreateInfo::default(), None)
-                .context("create_fence")?;
+            ) {
+                Ok(command_buffers) => command_buffers[0],
+                Err(err) => {
+                    ctx.device.destroy_command_pool(cmd_pool, None);
+                    return Err(err).context("allocate_command_buffers");
+                }
+            };
+            let fence = match ctx
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+            {
+                Ok(fence) => fence,
+                Err(err) => {
+                    ctx.device.destroy_command_pool(cmd_pool, None);
+                    return Err(err).context("create_fence");
+                }
+            };
 
             // Descriptor pool sized for `max_sets` matmul calls (3 STORAGE_BUFFER each).
             let pool_size = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(max_sets * 3)];
-            let descriptor_pool = ctx.device.create_descriptor_pool(
+            let descriptor_pool = match ctx.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .max_sets(max_sets)
                     .pool_sizes(&pool_size),
                 None,
-            ).context("create_descriptor_pool")?;
+            ) {
+                Ok(descriptor_pool) => descriptor_pool,
+                Err(err) => {
+                    ctx.device.destroy_fence(fence, None);
+                    ctx.device.destroy_command_pool(cmd_pool, None);
+                    return Err(err).context("create_descriptor_pool");
+                }
+            };
 
-            let query_pool = ctx.device.create_query_pool(
-                &vk::QueryPoolCreateInfo::default()
-                    .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(2),
-                None,
-            ).context("create_query_pool")?;
-            // Host-reset the pool so the first use has clean state.
-            ctx.device.reset_query_pool(query_pool, 0, 2);
+            let query_pool = if ctx.timestamps_supported {
+                match ctx.device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(2),
+                    None,
+                ) {
+                    Ok(query_pool) => query_pool,
+                    Err(err) => {
+                        ctx.device.destroy_descriptor_pool(descriptor_pool, None);
+                        ctx.device.destroy_fence(fence, None);
+                        ctx.device.destroy_command_pool(cmd_pool, None);
+                        return Err(err).context("create_query_pool");
+                    }
+                }
+            } else {
+                vk::QueryPool::null()
+            };
 
             Ok(Slot {
-                cmd_pool, cmd, fence, descriptor_pool, query_pool, used: false,
+                cmd_pool,
+                cmd,
+                fence,
+                descriptor_pool,
+                query_pool,
+                upload_staging: None,
+                download_staging: None,
+                used: false,
             })
         }
     }
 
-    /// Synchronous host→device upload via a transient staging buffer.
+    /// Synchronous host→device upload via the slot-local staging buffer.
     pub fn upload(&self, src: &[f32], dst: &Tensor) -> Result<()> {
         let size = size_of_slice(src)?;
         if size > dst.size_bytes() {
-            bail!("upload: {} bytes > tensor capacity {}", size, dst.size_bytes());
+            bail!(
+                "upload: {} bytes > tensor capacity {}",
+                size,
+                dst.size_bytes()
+            );
         }
         if size == 0 {
             return Ok(());
         }
-        let staging = Buffer::new(
-            &self.ctx,
-            size,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            BufferLocation::Host,
-        )?;
-        staging.write_pod_slice(src)?;
-        self.run_copy(staging.raw, dst.raw_buffer(), size)
+        let mut slot = self.checkout_slot();
+        let res = self.upload_with_slot(&mut slot, src, dst, size);
+        self.checkin_slot(slot);
+        res
     }
 
-    /// Synchronous device→host download via a transient staging buffer.
+    /// Synchronous device→host download via the slot-local staging buffer.
     pub fn download(&self, src: &Tensor, dst: &mut [f32]) -> Result<()> {
         let size = size_of_slice(dst)?;
         if size > src.size_bytes() {
-            bail!("download: {} bytes > tensor capacity {}", size, src.size_bytes());
+            bail!(
+                "download: {} bytes > tensor capacity {}",
+                size,
+                src.size_bytes()
+            );
         }
         if size == 0 {
             return Ok(());
         }
-        let staging = Buffer::new(
-            &self.ctx,
-            size,
-            vk::BufferUsageFlags::TRANSFER_DST,
-            BufferLocation::Host,
-        )?;
-        self.run_copy(src.raw_buffer(), staging.raw, size)?;
-        staging.read_pod_slice(dst)?;
-        Ok(())
+        let mut slot = self.checkout_slot();
+        let res = self.download_with_slot(&mut slot, src, dst, size);
+        self.checkin_slot(slot);
+        res
     }
 
     /// Run a batch of matmul calls.  Blocks until GPU completion.
     pub fn run_matmuls(&self, calls: &[MatmulCall<'_>]) -> Result<RunStats> {
         if calls.is_empty() {
-            return Ok(RunStats { gpu_time_ns: None, n_calls: 0, total_flops: 0 });
+            return Ok(RunStats {
+                gpu_time_ns: None,
+                n_calls: 0,
+                total_flops: 0,
+            });
         }
         if calls.len() > self.max_calls_per_submit as usize {
             bail!(
                 "run_matmuls: {} calls > max_calls_per_submit {}",
-                calls.len(), self.max_calls_per_submit
+                calls.len(),
+                self.max_calls_per_submit
             );
         }
 
@@ -182,7 +230,7 @@ impl Executor {
         let total_flops = total_flops(resolved)?;
 
         let mut slot = self.checkout_slot();
-        let result = self.record_and_run(&mut slot, calls, &resolved);
+        let result = self.record_and_run(&mut slot, calls, resolved);
         let gpu_time_ns = match &result {
             Ok(t) => *t,
             Err(_) => None,
@@ -190,7 +238,7 @@ impl Executor {
         self.checkin_slot(slot);
         result.map(|_| RunStats {
             gpu_time_ns,
-            n_calls:     calls.len(),
+            n_calls: calls.len(),
             total_flops,
         })
     }
@@ -212,6 +260,82 @@ impl Executor {
         self.slot_avail.notify_one();
     }
 
+    fn upload_with_slot(
+        &self,
+        slot: &mut Slot,
+        src: &[f32],
+        dst: &Tensor,
+        size: vk::DeviceSize,
+    ) -> Result<()> {
+        let staging_raw = {
+            let staging = self.ensure_upload_staging(slot, size)?;
+            staging.write_pod_slice(src)?;
+            staging.raw
+        };
+        self.run_copy_on_slot(slot, staging_raw, dst.raw_buffer(), size)
+    }
+
+    fn download_with_slot(
+        &self,
+        slot: &mut Slot,
+        src: &Tensor,
+        dst: &mut [f32],
+        size: vk::DeviceSize,
+    ) -> Result<()> {
+        let staging_raw = self.ensure_download_staging(slot, size)?.raw;
+        self.run_copy_on_slot(slot, src.raw_buffer(), staging_raw, size)?;
+        slot.download_staging
+            .as_ref()
+            .expect("download staging exists after ensure_download_staging")
+            .read_pod_slice(dst)
+    }
+
+    fn ensure_upload_staging<'a>(
+        &self,
+        slot: &'a mut Slot,
+        size: vk::DeviceSize,
+    ) -> Result<&'a Buffer> {
+        let needs_new = slot
+            .upload_staging
+            .as_ref()
+            .is_none_or(|buffer| buffer.size < size);
+        if needs_new {
+            slot.upload_staging = Some(Buffer::new(
+                &self.ctx,
+                size,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                BufferLocation::Host,
+            )?);
+        }
+        Ok(slot
+            .upload_staging
+            .as_ref()
+            .expect("upload staging buffer is initialized"))
+    }
+
+    fn ensure_download_staging<'a>(
+        &self,
+        slot: &'a mut Slot,
+        size: vk::DeviceSize,
+    ) -> Result<&'a Buffer> {
+        let needs_new = slot
+            .download_staging
+            .as_ref()
+            .is_none_or(|buffer| buffer.size < size);
+        if needs_new {
+            slot.download_staging = Some(Buffer::new(
+                &self.ctx,
+                size,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                BufferLocation::HostCached,
+            )?);
+        }
+        Ok(slot
+            .download_staging
+            .as_ref()
+            .expect("download staging buffer is initialized"))
+    }
+
     fn record_and_run(
         &self,
         slot: &mut Slot,
@@ -228,11 +352,10 @@ impl Executor {
                 dev.reset_command_pool(slot.cmd_pool, vk::CommandPoolResetFlags::empty())
                     .context("reset_command_pool")?;
                 dev.reset_descriptor_pool(
-                    slot.descriptor_pool, vk::DescriptorPoolResetFlags::empty()
-                ).context("reset_descriptor_pool")?;
-                if want_timestamps {
-                    dev.reset_query_pool(slot.query_pool, 0, 2);
-                }
+                    slot.descriptor_pool,
+                    vk::DescriptorPoolResetFlags::empty(),
+                )
+                .context("reset_descriptor_pool")?;
             }
             slot.used = true;
 
@@ -248,17 +371,18 @@ impl Executor {
                 slot.cmd,
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            ).context("begin_command_buffer")?;
+            )
+            .context("begin_command_buffer")?;
 
             if want_timestamps {
+                dev.cmd_reset_query_pool(slot.cmd, slot.query_pool, 0, 2);
                 dev.cmd_write_timestamp(
-                    slot.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, slot.query_pool, 0,
+                    slot.cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    slot.query_pool,
+                    0,
                 );
             }
-
-            dev.cmd_bind_pipeline(
-                slot.cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline.pipeline,
-            );
 
             record_matmul_commands(
                 &self.ctx,
@@ -271,11 +395,15 @@ impl Executor {
 
             if want_timestamps {
                 dev.cmd_write_timestamp(
-                    slot.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, slot.query_pool, 1,
+                    slot.cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    slot.query_pool,
+                    1,
                 );
             }
 
-            dev.end_command_buffer(slot.cmd).context("end_command_buffer")?;
+            dev.end_command_buffer(slot.cmd)
+                .context("end_command_buffer")?;
 
             // ---- Submit (serialized on the single queue) -------------------
             let cbs = [slot.cmd];
@@ -295,9 +423,11 @@ impl Executor {
                 let mut data = [0u64; 2];
                 dev.get_query_pool_results(
                     slot.query_pool,
-                    0, &mut data,
+                    0,
+                    &mut data,
                     vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
-                ).context("get_query_pool_results")?;
+                )
+                .context("get_query_pool_results")?;
                 let ticks = data[1].wrapping_sub(data[0]);
                 Some((ticks as f64 * self.ctx.timestamp_period_ns) as u64)
             } else {
@@ -308,9 +438,14 @@ impl Executor {
         }
     }
 
-    fn run_copy(&self, src: vk::Buffer, dst: vk::Buffer, size: vk::DeviceSize) -> Result<()> {
-        let mut slot = self.checkout_slot();
-        let res = unsafe {
+    fn run_copy_on_slot(
+        &self,
+        slot: &mut Slot,
+        src: vk::Buffer,
+        dst: vk::Buffer,
+        size: vk::DeviceSize,
+    ) -> Result<()> {
+        unsafe {
             let dev = &self.ctx.device;
             if slot.used {
                 dev.reset_command_pool(slot.cmd_pool, vk::CommandPoolResetFlags::empty())?;
@@ -334,20 +469,24 @@ impl Executor {
             dev.wait_for_fences(&[slot.fence], true, u64::MAX)?;
             dev.reset_fences(&[slot.fence])?;
             Ok(())
-        };
-        self.checkin_slot(slot);
-        res
+        }
     }
 }
 
 impl Drop for Executor {
     fn drop(&mut self) {
-        unsafe { let _ = self.ctx.device.device_wait_idle(); }
+        unsafe {
+            let _ = self.ctx.device.device_wait_idle();
+        }
         let slots = std::mem::take(&mut *self.slots.lock());
         for s in slots {
             unsafe {
-                self.ctx.device.destroy_query_pool(s.query_pool, None);
-                self.ctx.device.destroy_descriptor_pool(s.descriptor_pool, None);
+                if s.query_pool != vk::QueryPool::null() {
+                    self.ctx.device.destroy_query_pool(s.query_pool, None);
+                }
+                self.ctx
+                    .device
+                    .destroy_descriptor_pool(s.descriptor_pool, None);
                 self.ctx.device.destroy_fence(s.fence, None);
                 self.ctx.device.destroy_command_pool(s.cmd_pool, None);
             }
@@ -446,6 +585,7 @@ fn record_matmul_commands(
     calls: &[MatmulCall<'_>],
     resolved: &[ResolvedMatmul],
 ) {
+    let mut bound_pipeline = vk::Pipeline::null();
     for ((set, call), dims) in descriptor_sets
         .iter()
         .copied()
@@ -453,20 +593,33 @@ fn record_matmul_commands(
         .zip(resolved.iter())
     {
         let pc = dims.push_constants(call.alpha, call.accumulate);
+        let kernel = pipeline.select_kernel(dims.m, dims.n, dims.k);
 
         unsafe {
+            if bound_pipeline != kernel.pipeline {
+                ctx.device
+                    .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, kernel.pipeline);
+                bound_pipeline = kernel.pipeline;
+            }
             ctx.device.cmd_bind_descriptor_sets(
-                cb, vk::PipelineBindPoint::COMPUTE,
-                pipeline.pipeline_layout, 0, std::slice::from_ref(&set), &[],
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                pipeline.pipeline_layout,
+                0,
+                std::slice::from_ref(&set),
+                &[],
             );
             ctx.device.cmd_push_constants(
-                cb, pipeline.pipeline_layout, vk::ShaderStageFlags::COMPUTE,
-                0, bytemuck::bytes_of(&pc),
+                cb,
+                pipeline.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&pc),
             );
             ctx.device.cmd_dispatch(
                 cb,
-                dims.groups_x,
-                dims.groups_y,
+                dims.n.div_ceil(kernel.tile_n),
+                dims.m.div_ceil(kernel.tile_m),
                 dims.batch,
             );
         }
