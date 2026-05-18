@@ -7,6 +7,7 @@
 //! layered on top if needed.
 
 use std::ffi::{CStr, CString};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -150,6 +151,11 @@ pub struct VulkanContext {
     /// Nanoseconds-per-tick reported by the driver for GPU timestamps.
     pub timestamp_period_ns: f64,
     pub timestamps_supported: bool,
+    /// Pipeline cache, seeded from disk on init and flushed back on drop.
+    /// Persisting it avoids the SPIR-V -> ISA recompile (50-200 ms on
+    /// NVIDIA) on every cold start.
+    pub pipeline_cache: vk::PipelineCache,
+    pipeline_cache_path: Option<PathBuf>,
     debug_loader: Option<ash::ext::debug_utils::Instance>,
     debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
 }
@@ -283,6 +289,27 @@ impl VulkanContext {
                 .context("create_device")?;
             let queue = device.get_device_queue(compute_family, 0);
 
+            // ---- Persistent pipeline cache -----------------------------------
+            // Seeded from disk; written back on Drop.  If the on-disk cache
+            // was produced by a different driver/device the loader silently
+            // ignores it and we get an empty cache (no functional impact).
+            let pipeline_cache_path = pipeline_cache_path_for(&device_summary);
+            let cache_data: Vec<u8> = pipeline_cache_path
+                .as_ref()
+                .and_then(|p| std::fs::read(p).ok())
+                .unwrap_or_default();
+            let pipeline_cache = device
+                .create_pipeline_cache(
+                    &vk::PipelineCacheCreateInfo::default().initial_data(&cache_data),
+                    None,
+                )
+                .unwrap_or_else(|err| {
+                    log::warn!(
+                        "ml_project: create_pipeline_cache failed ({err}); proceeding without persistence",
+                    );
+                    vk::PipelineCache::null()
+                });
+
             Ok(Arc::new(Self {
                 entry,
                 instance,
@@ -295,6 +322,8 @@ impl VulkanContext {
                 queue: Mutex::new(queue),
                 timestamp_period_ns: device_properties.limits.timestamp_period as f64,
                 timestamps_supported,
+                pipeline_cache,
+                pipeline_cache_path,
                 debug_loader,
                 debug_messenger,
             }))
@@ -367,6 +396,23 @@ impl Drop for VulkanContext {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            if self.pipeline_cache != vk::PipelineCache::null() {
+                if let Some(path) = self.pipeline_cache_path.as_ref()
+                    && let Ok(data) = self.device.get_pipeline_cache_data(self.pipeline_cache)
+                {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(err) = std::fs::write(path, &data) {
+                        log::warn!(
+                            "ml_project: failed to write pipeline cache to {}: {err}",
+                            path.display(),
+                        );
+                    }
+                }
+                self.device
+                    .destroy_pipeline_cache(self.pipeline_cache, None);
+            }
             if let (Some(loader), Some(msg)) = (self.debug_loader.as_ref(), self.debug_messenger) {
                 loader.destroy_debug_utils_messenger(msg, None);
             }
@@ -374,6 +420,21 @@ impl Drop for VulkanContext {
             self.instance.destroy_instance(None);
         }
     }
+}
+
+/// Per-device location for the persistent pipeline cache.  Uses
+/// `$XDG_CACHE_HOME/ml_project/` (or `$HOME/.cache/ml_project/`) and a
+/// vendor/device-id-qualified filename so caches from different GPUs on
+/// the same host don't stomp on each other.
+fn pipeline_cache_path_for(summary: &DeviceSummary) -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let filename = format!(
+        "pipeline_cache_v{:04x}_{:04x}.bin",
+        summary.vendor_id, summary.device_id
+    );
+    Some(base.join("ml_project").join(filename))
 }
 
 fn device_summaries(

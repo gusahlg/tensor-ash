@@ -32,7 +32,7 @@ use parking_lot::{Condvar, Mutex};
 use crate::buffer::{Buffer, BufferLocation};
 use crate::context::VulkanContext;
 use crate::matmul::{ResolvedMatmul, ResolvedMatmulBatch, total_flops};
-use crate::pipeline::MatmulPipeline;
+use crate::pipeline::{KernelVariant, MatmulPipeline};
 use crate::tensor::Tensor;
 
 pub use crate::matmul::{MatmulCall, RunStats};
@@ -391,7 +391,7 @@ impl Executor {
                 &descriptor_sets,
                 calls,
                 resolved,
-            );
+            )?;
 
             if want_timestamps {
                 dev.cmd_write_timestamp(
@@ -584,7 +584,8 @@ fn record_matmul_commands(
     descriptor_sets: &[vk::DescriptorSet],
     calls: &[MatmulCall<'_>],
     resolved: &[ResolvedMatmul],
-) {
+) -> Result<()> {
+    let max_groups = ctx.device_properties.limits.max_compute_work_group_count;
     let mut bound_pipeline = vk::Pipeline::null();
     for ((set, call), dims) in descriptor_sets
         .iter()
@@ -595,11 +596,40 @@ fn record_matmul_commands(
         let pc = dims.push_constants(call.alpha, call.accumulate);
         let kernel = pipeline.select_kernel(dims.m, dims.n, dims.k);
 
+        // Pick the specialization variant whose constants match this call.
+        // `interior_only` is safe whenever M and N are tile-aligned to the
+        // selected kernel's tile size — the shader then skips all
+        // m_full/n_full bounds checks.
+        let variant = KernelVariant {
+            accumulate: call.accumulate,
+            alpha_is_one: call.alpha == 1.0,
+            interior_only: dims.m.is_multiple_of(kernel.tile_m)
+                && dims.n.is_multiple_of(kernel.tile_n),
+        };
+        let variant_pipeline = kernel.pipeline_for(variant);
+
+        let gx = dims.n.div_ceil(kernel.tile_n);
+        let gy = dims.m.div_ceil(kernel.tile_m);
+        let gz = dims.batch;
+        if gx > max_groups[0] || gy > max_groups[1] || gz > max_groups[2] {
+            bail!(
+                "matmul dispatch ({gx}, {gy}, {gz}) for M={}, N={}, K={}, batch={} \
+                 exceeds device maxComputeWorkGroupCount ({}, {}, {})",
+                dims.m,
+                dims.n,
+                dims.k,
+                dims.batch,
+                max_groups[0],
+                max_groups[1],
+                max_groups[2],
+            );
+        }
+
         unsafe {
-            if bound_pipeline != kernel.pipeline {
+            if bound_pipeline != variant_pipeline {
                 ctx.device
-                    .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, kernel.pipeline);
-                bound_pipeline = kernel.pipeline;
+                    .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, variant_pipeline);
+                bound_pipeline = variant_pipeline;
             }
             ctx.device.cmd_bind_descriptor_sets(
                 cb,
@@ -616,14 +646,10 @@ fn record_matmul_commands(
                 0,
                 bytemuck::bytes_of(&pc),
             );
-            ctx.device.cmd_dispatch(
-                cb,
-                dims.n.div_ceil(kernel.tile_n),
-                dims.m.div_ceil(kernel.tile_m),
-                dims.batch,
-            );
+            ctx.device.cmd_dispatch(cb, gx, gy, gz);
         }
     }
+    Ok(())
 }
 
 fn tensor_descriptor(tensor: &Tensor) -> vk::DescriptorBufferInfo {

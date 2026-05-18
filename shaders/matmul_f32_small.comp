@@ -6,6 +6,11 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+// See matmul_f32.comp for the meaning of these specialization constants.
+layout(constant_id = 0) const bool ACCUMULATE    = false;
+layout(constant_id = 1) const bool ALPHA_IS_ONE  = true;
+layout(constant_id = 2) const bool INTERIOR_ONLY = false;
+
 const uint BM      = 64u;
 const uint BN      = 64u;
 const uint BK      = 32u;
@@ -46,7 +51,8 @@ void load_a_tile(uint a_base, uint block_row, uint k_base,
         const uint g_row = block_row * BM + row;
         const uint g_col = k_base + col;
         float v = 0.0;
-        if ((m_full || g_row < pc.M) && (k_full || g_col < pc.K)) {
+        if ((INTERIOR_ONLY || m_full || g_row < pc.M)
+            && (INTERIOR_ONLY || k_full || g_col < pc.K)) {
             v = a[a_base + g_row * pc.K + g_col];
         }
         As[row][col] = v;
@@ -62,7 +68,8 @@ void load_b_tile(uint b_base, uint block_col, uint k_base,
         const uint g_row = k_base + row;
         const uint g_col = block_col * BN + col;
         float v = 0.0;
-        if ((k_full || g_row < pc.K) && (n_full || g_col < pc.N)) {
+        if ((INTERIOR_ONLY || k_full || g_row < pc.K)
+            && (INTERIOR_ONLY || n_full || g_col < pc.N)) {
             v = b[b_base + g_row * pc.N + g_col];
         }
         Bs[row][col] = v;
@@ -140,18 +147,21 @@ void main() {
         barrier();
     }
 
-    const bool  accumulate = (pc.flags & 1u) != 0u;
-    const float alpha      = pc.alpha;
+    const float alpha = ALPHA_IS_ONE ? 1.0 : pc.alpha;
 
     const uint row_base = block_row * BM + a_row0;
     const uint col_base = block_col * BN + b_col0;
 
-    if (m_full && n_full) {
+    if (INTERIOR_ONLY || (m_full && n_full)) {
         [[unroll]] for (uint i = 0u; i < TM; ++i) {
             const uint row_off = c_base + (row_base + i) * pc.N + col_base;
             [[unroll]] for (uint j = 0u; j < TN; ++j) {
-                const float v = alpha * acc[i][j];
-                c[row_off + j] = accumulate ? (c[row_off + j] + v) : v;
+                const float v = ALPHA_IS_ONE ? acc[i][j] : alpha * acc[i][j];
+                if (ACCUMULATE) {
+                    c[row_off + j] = c[row_off + j] + v;
+                } else {
+                    c[row_off + j] = v;
+                }
             }
         }
     } else {
@@ -162,8 +172,12 @@ void main() {
             [[unroll]] for (uint j = 0u; j < TN; ++j) {
                 const uint g_col = col_base + j;
                 if (g_col >= pc.N) continue;
-                const float v = alpha * acc[i][j];
-                c[row_off + g_col] = accumulate ? (c[row_off + g_col] + v) : v;
+                const float v = ALPHA_IS_ONE ? acc[i][j] : alpha * acc[i][j];
+                if (ACCUMULATE) {
+                    c[row_off + g_col] = c[row_off + g_col] + v;
+                } else {
+                    c[row_off + g_col] = v;
+                }
             }
         }
     }

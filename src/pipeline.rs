@@ -58,12 +58,56 @@ impl KernelSelection {
     }
 }
 
+/// Per-call pipeline specialization.  Selects one of the precompiled
+/// variants of a kernel so the shader sees these as compile-time
+/// constants and can fold out the corresponding branches.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct KernelVariant {
+    /// `C += alpha*A@B` when true, `C = alpha*A@B` when false.
+    pub accumulate: bool,
+    /// Host knows alpha==1.0 — shader skips the multiply.
+    pub alpha_is_one: bool,
+    /// Host knows M and N are multiples of the tile size — shader
+    /// drops all m_full/n_full bounds checks.
+    pub interior_only: bool,
+}
+
+impl KernelVariant {
+    /// Number of distinct variants compiled per kernel (one per
+    /// combination of the three booleans).
+    pub const COUNT: usize = 8;
+
+    #[inline]
+    pub const fn index(self) -> usize {
+        (self.accumulate as usize)
+            | ((self.alpha_is_one as usize) << 1)
+            | ((self.interior_only as usize) << 2)
+    }
+
+    #[inline]
+    pub const fn from_index(idx: usize) -> Self {
+        Self {
+            accumulate: (idx & 0b001) != 0,
+            alpha_is_one: (idx & 0b010) != 0,
+            interior_only: (idx & 0b100) != 0,
+        }
+    }
+}
+
 pub struct MatmulKernel {
     pub name: &'static str,
     pub tile_m: u32,
     pub tile_n: u32,
     pub shader_module: vk::ShaderModule,
-    pub pipeline: vk::Pipeline,
+    /// One pipeline per `KernelVariant`; indexed by `KernelVariant::index()`.
+    pub variants: [vk::Pipeline; KernelVariant::COUNT],
+}
+
+impl MatmulKernel {
+    #[inline]
+    pub fn pipeline_for(&self, variant: KernelVariant) -> vk::Pipeline {
+        self.variants[variant.index()]
+    }
 }
 
 pub struct MatmulPipeline {
@@ -149,7 +193,11 @@ impl MatmulPipeline {
             ) {
                 Ok(small) => small,
                 Err(err) => {
-                    ctx.device.destroy_pipeline(large.pipeline, None);
+                    for p in large.variants.iter().copied() {
+                        if p != vk::Pipeline::null() {
+                            ctx.device.destroy_pipeline(p, None);
+                        }
+                    }
                     ctx.device.destroy_shader_module(large.shader_module, None);
                     ctx.device.destroy_pipeline_layout(pipeline_layout, None);
                     ctx.device.destroy_descriptor_set_layout(set_layout, None);
@@ -179,21 +227,47 @@ impl MatmulPipeline {
 }
 
 fn auto_selects_small_kernel(m: u32, n: u32, k: u32) -> bool {
-    m <= 1024 || n <= 1024 || k <= 128 || !m.is_multiple_of(TILE_M) || !n.is_multiple_of(TILE_N)
+    // Alignment is a hard constraint: the large 128x128 kernel has no
+    // tile-edge fast path that would let it accept off-tile M or N.
+    if !m.is_multiple_of(TILE_M) || !n.is_multiple_of(TILE_N) {
+        return true;
+    }
+    // For tiny K the fixed per-workgroup load + barrier cost dominates,
+    // so the smaller-tile kernel (4x more workgroups, 4x more chances to
+    // overlap latency) wins.
+    if k < 128 {
+        return true;
+    }
+    // The large 128-tile kernel needs roughly 2 workgroups per SM to hide
+    // memory latency.  Mid-range GPUs have 30-80 SMs, so ~256 large-tile
+    // workgroups is the saturation point.  Below that the small kernel
+    // (4x more workgroups for the same output) wins on occupancy despite
+    // its lower arithmetic intensity.
+    //
+    // This was measured on RTX 3070 (46 SMs): at 1024^3 the small kernel
+    // is faster (7.8 vs 7.0 TFLOPS), but at 2048^3 large wins decisively
+    // (9.8 vs 8.6 TFLOPS).
+    let large_tiles = (m / TILE_M) as u64 * (n / TILE_N) as u64;
+    if large_tiles < 256 {
+        return true;
+    }
+    false
 }
 
 impl Drop for MatmulPipeline {
     fn drop(&mut self) {
         unsafe {
             let _ = self.ctx.device.device_wait_idle();
-            self.ctx.device.destroy_pipeline(self.large.pipeline, None);
-            self.ctx
-                .device
-                .destroy_shader_module(self.large.shader_module, None);
-            self.ctx.device.destroy_pipeline(self.small.pipeline, None);
-            self.ctx
-                .device
-                .destroy_shader_module(self.small.shader_module, None);
+            for kernel in [&self.large, &self.small] {
+                for p in kernel.variants.iter().copied() {
+                    if p != vk::Pipeline::null() {
+                        self.ctx.device.destroy_pipeline(p, None);
+                    }
+                }
+                self.ctx
+                    .device
+                    .destroy_shader_module(kernel.shader_module, None);
+            }
             self.ctx
                 .device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
@@ -223,27 +297,84 @@ fn create_kernel(
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
             .context("create_shader_module")?;
         let entry = std::ffi::CString::new("main").unwrap();
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(shader_module)
-            .name(&entry);
-        let ci = vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
-            .layout(pipeline_layout);
-        let pipeline = ctx
+
+        // ---- One pipeline per (accumulate, alpha_is_one, interior_only) tuple,
+        // ---- built in a single batched vkCreateComputePipelines call so the
+        // ---- driver can amortize and de-duplicate ISA compilation.
+
+        // SPIR-V `OpConstantTrue/False` for a bool spec constant takes a
+        // 32-bit value (driver reads the LSB).  Layout: 3 x u32 per variant.
+        let spec_entries = [
+            vk::SpecializationMapEntry::default()
+                .constant_id(0)
+                .offset(0)
+                .size(4),
+            vk::SpecializationMapEntry::default()
+                .constant_id(1)
+                .offset(4)
+                .size(4),
+            vk::SpecializationMapEntry::default()
+                .constant_id(2)
+                .offset(8)
+                .size(4),
+        ];
+
+        let spec_data: Vec<[u32; 3]> = (0..KernelVariant::COUNT)
+            .map(|i| {
+                let v = KernelVariant::from_index(i);
+                [
+                    v.accumulate as u32,
+                    v.alpha_is_one as u32,
+                    v.interior_only as u32,
+                ]
+            })
+            .collect();
+
+        let spec_infos: Vec<vk::SpecializationInfo> = (0..KernelVariant::COUNT)
+            .map(|i| {
+                vk::SpecializationInfo::default()
+                    .map_entries(&spec_entries)
+                    .data(bytemuck::cast_slice(&spec_data[i]))
+            })
+            .collect();
+
+        let stages: Vec<vk::PipelineShaderStageCreateInfo> = (0..KernelVariant::COUNT)
+            .map(|i| {
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::COMPUTE)
+                    .module(shader_module)
+                    .name(&entry)
+                    .specialization_info(&spec_infos[i])
+            })
+            .collect();
+
+        let create_infos: Vec<vk::ComputePipelineCreateInfo> = (0..KernelVariant::COUNT)
+            .map(|i| {
+                vk::ComputePipelineCreateInfo::default()
+                    .stage(stages[i])
+                    .layout(pipeline_layout)
+            })
+            .collect();
+
+        let pipelines = ctx
             .device
-            .create_compute_pipelines(vk::PipelineCache::null(), std::slice::from_ref(&ci), None)
+            .create_compute_pipelines(ctx.pipeline_cache, &create_infos, None)
             .map_err(|(_, err)| {
                 ctx.device.destroy_shader_module(shader_module, None);
                 anyhow::anyhow!("create_compute_pipelines {name}: {err}")
-            })?[0];
+            })?;
+
+        let mut variants = [vk::Pipeline::null(); KernelVariant::COUNT];
+        for (i, p) in pipelines.iter().enumerate() {
+            variants[i] = *p;
+        }
 
         Ok(MatmulKernel {
             name,
             tile_m,
             tile_n,
             shader_module,
-            pipeline,
+            variants,
         })
     }
 }
@@ -272,11 +403,20 @@ mod tests {
 
     #[test]
     fn auto_selector_prefers_small_for_edge_or_small_shapes() {
-        assert!(auto_selects_small_kernel(512, 512, 512));
-        assert!(auto_selects_small_kernel(1024, 1024, 1024));
+        // Tile-misaligned M or N must always go small (large kernel can't
+        // produce partial tiles).
         assert!(auto_selects_small_kernel(1023, 2048, 1024));
         assert!(auto_selects_small_kernel(2048, 1025, 1024));
+        // Tiny K can't amortize the large kernel's fixed per-WG cost.
         assert!(auto_selects_small_kernel(2048, 2048, 64));
+        // Few large-tile workgroups: small kernel saturates the GPU
+        // better.  64 large WGs at 1024^2, 16 at 512^2.
+        assert!(auto_selects_small_kernel(512, 512, 512));
+        assert!(auto_selects_small_kernel(1024, 1024, 1024));
+        // Enough large-tile workgroups to saturate (>=256).
+        assert!(!auto_selects_small_kernel(2048, 2048, 128));
         assert!(!auto_selects_small_kernel(2048, 2048, 2048));
+        assert!(!auto_selects_small_kernel(4096, 1024, 1024));
+        assert!(!auto_selects_small_kernel(1024, 4096, 1024));
     }
 }
