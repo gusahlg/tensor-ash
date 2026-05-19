@@ -8,7 +8,7 @@
     "case_set": "extended",
     "cpu_threads": 1,
     "torch_threads": 1,
-    "self_check": "[2026-05-15T17:09:13Z INFO  ml_project::context] ml_project: using device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329)\n[2026-05-15T17:09:13Z INFO  ml_bench] device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2496561344, compute_family=2, timestamps=true) slots=2\nml_project self-check\nstatus: OK\nselected: device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2496561344, compute_family=2, timestamps=true)\nexecutor_slots: 2\nglslc: /nix/store/gsgx9c110n8kq3q3ryhsq97mmxsrax5i-shaderc-2026.1-bin/bin/glslc\nvulkaninfo: /nix/store/61857bc2nkcv1is2qwwfplfbgba0fkmz-vulkan-tools-1.4.341.0/bin/vulkaninfo\nLD_LIBRARY_PATH: /nix/store/zs7y2aadk71bawprdcn000az9y05s8nf-vulkan-loader-1.4.341.0/lib:/run/opengl-driver/lib:\nVK_ICD_FILENAMES: <unset>"
+    "self_check": "[2026-05-15T17:09:13Z INFO  tensor_ash::context] tensor-ash: using device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329)\n[2026-05-15T17:09:13Z INFO  ml_bench] device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2496561344, compute_family=2, timestamps=true) slots=2\ntensor-ash self-check\nstatus: OK\nselected: device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2496561344, compute_family=2, timestamps=true)\nexecutor_slots: 2\nglslc: /nix/store/gsgx9c110n8kq3q3ryhsq97mmxsrax5i-shaderc-2026.1-bin/bin/glslc\nvulkaninfo: /nix/store/61857bc2nkcv1is2qwwfplfbgba0fkmz-vulkan-tools-1.4.341.0/bin/vulkaninfo\nLD_LIBRARY_PATH: /nix/store/zs7y2aadk71bawprdcn000az9y05s8nf-vulkan-loader-1.4.341.0/lib:/run/opengl-driver/lib:\nVK_ICD_FILENAMES: <unset>"
   },
   "transfer": {
     "status": "ok",
@@ -20,7 +20,7 @@
   },
   "results": [
     {
-      "library": "ml_project",
+      "library": "tensor-ash",
       "case": "square_128",
       "b": 1,
       "m": 128,
@@ -33,7 +33,7 @@
       "details": "NVIDIA GeForce RTX 3070 (discrete)"
     },
     {
-      "library": "ml_project",
+      "library": "tensor-ash",
       "case": "square_256",
       "b": 1,
       "m": 256,
@@ -46,7 +46,7 @@
       "details": "NVIDIA GeForce RTX 3070 (discrete)"
     },
     {
-      "library": "ml_project",
+      "library": "tensor-ash",
       "case": "square_512",
       "b": 1,
       "m": 512,
@@ -59,7 +59,7 @@
       "details": "NVIDIA GeForce RTX 3070 (discrete)"
     },
     {
-      "library": "ml_project",
+      "library": "tensor-ash",
       "case": "batched_4x256",
       "b": 4,
       "m": 256,
@@ -72,7 +72,7 @@
       "details": "NVIDIA GeForce RTX 3070 (discrete)"
     },
     {
-      "library": "ml_project",
+      "library": "tensor-ash",
       "case": "tall_512x256x256",
       "b": 1,
       "m": 512,
@@ -85,7 +85,7 @@
       "details": "NVIDIA GeForce RTX 3070 (discrete)"
     },
     {
-      "library": "ml_project",
+      "library": "tensor-ash",
       "case": "odd_255x257x263",
       "b": 1,
       "m": 255,
@@ -98,7 +98,7 @@
       "details": "NVIDIA GeForce RTX 3070 (discrete)"
     },
     {
-      "library": "ml_project",
+      "library": "tensor-ash",
       "case": "square_1024",
       "b": 1,
       "m": 1024,
@@ -111,7 +111,7 @@
       "details": "NVIDIA GeForce RTX 3070 (discrete)"
     },
     {
-      "library": "ml_project",
+      "library": "tensor-ash",
       "case": "batched_2x512",
       "b": 2,
       "m": 512,
@@ -124,7 +124,7 @@
       "details": "NVIDIA GeForce RTX 3070 (discrete)"
     },
     {
-      "library": "ml_project",
+      "library": "tensor-ash",
       "case": "skinny_1024x128x512",
       "b": 1,
       "m": 1024,
@@ -137,7 +137,7 @@
       "details": "NVIDIA GeForce RTX 3070 (discrete)"
     },
     {
-      "library": "ml_project",
+      "library": "tensor-ash",
       "case": "wide_128x1024x512",
       "b": 1,
       "m": 128,
@@ -150,7 +150,7 @@
       "details": "NVIDIA GeForce RTX 3070 (discrete)"
     },
     {
-      "library": "ml_project",
+      "library": "tensor-ash",
       "case": "small_k_1024x1024x64",
       "b": 1,
       "m": 1024,

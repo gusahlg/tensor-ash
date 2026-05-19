@@ -1,13 +1,13 @@
 # Benchmark Report
 
-This report compares FP32 GEMM throughput for `ml_project`, NumPy, and PyTorch on the current machine.
+This report compares FP32 GEMM throughput for `tensor-ash`, NumPy, and PyTorch on the current machine.
 
 ## Environment
 
 ```text
-[2026-05-15T17:09:13Z INFO  ml_project::context] ml_project: using device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329)
+[2026-05-15T17:09:13Z INFO  tensor_ash::context] tensor-ash: using device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329)
 [2026-05-15T17:09:13Z INFO  ml_bench] device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2496561344, compute_family=2, timestamps=true) slots=2
-ml_project self-check
+tensor-ash self-check
 status: OK
 selected: device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2496561344, compute_family=2, timestamps=true)
 executor_slots: 2
@@ -26,17 +26,17 @@ VK_ICD_FILENAMES: <unset>
 
 | case | library | status | best ms | TFLOPS | details |
 | --- | --- | ---: | ---: | ---: | --- |
-| square_128 | ml_project | ok | 0.011 | 0.377729 | NVIDIA GeForce RTX 3070 (discrete) |
-| square_256 | ml_project | ok | 0.019 | 1.768256 | NVIDIA GeForce RTX 3070 (discrete) |
-| square_512 | ml_project | ok | 0.043 | 6.236883 | NVIDIA GeForce RTX 3070 (discrete) |
-| batched_4x256 | ml_project | ok | 0.024 | 5.629938 | NVIDIA GeForce RTX 3070 (discrete) |
-| tall_512x256x256 | ml_project | ok | 0.018 | 3.705216 | NVIDIA GeForce RTX 3070 (discrete) |
-| odd_255x257x263 | ml_project | ok | 0.019 | 1.841421 | NVIDIA GeForce RTX 3070 (discrete) |
-| square_1024 | ml_project | ok | 0.234 | 9.190477 | NVIDIA GeForce RTX 3070 (discrete) |
-| batched_2x512 | ml_project | ok | 0.064 | 8.367689 | NVIDIA GeForce RTX 3070 (discrete) |
-| skinny_1024x128x512 | ml_project | ok | 0.031 | 4.288654 | NVIDIA GeForce RTX 3070 (discrete) |
-| wide_128x1024x512 | ml_project | ok | 0.031 | 4.310693 | NVIDIA GeForce RTX 3070 (discrete) |
-| small_k_1024x1024x64 | ml_project | ok | 0.026 | 5.184554 | NVIDIA GeForce RTX 3070 (discrete) |
+| square_128 | tensor-ash | ok | 0.011 | 0.377729 | NVIDIA GeForce RTX 3070 (discrete) |
+| square_256 | tensor-ash | ok | 0.019 | 1.768256 | NVIDIA GeForce RTX 3070 (discrete) |
+| square_512 | tensor-ash | ok | 0.043 | 6.236883 | NVIDIA GeForce RTX 3070 (discrete) |
+| batched_4x256 | tensor-ash | ok | 0.024 | 5.629938 | NVIDIA GeForce RTX 3070 (discrete) |
+| tall_512x256x256 | tensor-ash | ok | 0.018 | 3.705216 | NVIDIA GeForce RTX 3070 (discrete) |
+| odd_255x257x263 | tensor-ash | ok | 0.019 | 1.841421 | NVIDIA GeForce RTX 3070 (discrete) |
+| square_1024 | tensor-ash | ok | 0.234 | 9.190477 | NVIDIA GeForce RTX 3070 (discrete) |
+| batched_2x512 | tensor-ash | ok | 0.064 | 8.367689 | NVIDIA GeForce RTX 3070 (discrete) |
+| skinny_1024x128x512 | tensor-ash | ok | 0.031 | 4.288654 | NVIDIA GeForce RTX 3070 (discrete) |
+| wide_128x1024x512 | tensor-ash | ok | 0.031 | 4.310693 | NVIDIA GeForce RTX 3070 (discrete) |
+| small_k_1024x1024x64 | tensor-ash | ok | 0.026 | 5.184554 | NVIDIA GeForce RTX 3070 (discrete) |
 | square_128 | numpy | ok | 0.039 | 0.106293 | numpy 2.4.4, threads=1 |
 | square_256 | numpy | ok | 0.289 | 0.115979 | numpy 2.4.4, threads=1 |
 | square_512 | numpy | ok | 2.256 | 0.119008 | numpy 2.4.4, threads=1 |
@@ -79,8 +79,8 @@ VK_ICD_FILENAMES: <unset>
 
 ## Analysis
 
-- `ml_project` used `NVIDIA GeForce RTX 3070 (discrete)`, so the Vulkan measurements reflect real GPU kernel timings on this host.
-- `ml_project` is the fastest measured backend on 11/11 benchmark cases.
+- `tensor-ash` used `NVIDIA GeForce RTX 3070 (discrete)`, so the Vulkan measurements reflect real GPU kernel timings on this host.
+- `tensor-ash` is the fastest measured backend on 11/11 benchmark cases.
 - Throughput ratio versus `numpy` across 11 shared cases: 3.6x to 72.1x, geometric mean 30.2x.
 - Throughput ratio versus `torch_cpu` across 11 shared cases: 3.6x to 74.4x, geometric mean 30.2x.
 - Some libraries were skipped because their Python modules were unavailable; see details in the table.

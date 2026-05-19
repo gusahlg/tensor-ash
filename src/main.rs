@@ -1,4 +1,4 @@
-//! Benchmark binary for `ml_project`.
+//! Benchmark binary for `tensor-ash`.
 //!
 //! Reports GPU-time TFLOPS (via vkCmdWriteTimestamp) — separating actual
 //! kernel time from CPU-side submission overhead.
@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use ml_project::{
+use tensor_ash::{
     DeviceKind, DevicePreference, Executor, MatmulCall, MatmulPipeline, Tensor, VulkanContext,
 };
 
@@ -663,7 +663,7 @@ fn sweep_cases(mode: SweepMode) -> &'static [BenchCase] {
 }
 
 fn self_check(ctx: &VulkanContext, n_slots: usize) -> Result<()> {
-    println!("ml_project self-check");
+    println!("tensor-ash self-check");
     println!("status: OK");
     println!("selected: {}", ctx.diagnostics());
     println!("executor_slots: {n_slots}");

@@ -12,7 +12,7 @@
 mod common;
 use common::*;
 
-use ml_project::{KernelSelection, MatmulCall, Tensor};
+use tensor_ash::{KernelSelection, MatmulCall, Tensor};
 
 // --- 1. Shape sweep -------------------------------------------------------
 

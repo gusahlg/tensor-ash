@@ -16,7 +16,7 @@ pkgs.mkShell {
 
   shellHook = ''
     export LD_LIBRARY_PATH="${pkgs.vulkan-loader}/lib:/run/opengl-driver/lib:''${LD_LIBRARY_PATH:-}"
-    echo "ml_project dev shell: Vulkan loader and shader tools are on PATH."
+    echo "tensor-ash dev shell: Vulkan loader and shader tools are on PATH."
     echo "Run: cargo run --release --bin ml_bench -- self-check"
   '';
 }

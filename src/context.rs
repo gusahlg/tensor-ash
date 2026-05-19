@@ -174,8 +174,8 @@ impl VulkanContext {
                 ash::Entry::load().map_err(|e| anyhow!("failed to load Vulkan loader: {e}"))?;
 
             // ---- Instance ------------------------------------------------------
-            let app_name = CString::new("ml_project").unwrap();
-            let engine_name = CString::new("ml_project").unwrap();
+            let app_name = CString::new("tensor-ash").unwrap();
+            let engine_name = CString::new("tensor-ash").unwrap();
             let app_info = vk::ApplicationInfo::default()
                 .application_name(&app_name)
                 .engine_name(&engine_name)
@@ -248,7 +248,7 @@ impl VulkanContext {
             let device_summary = device_summaries[selected_index].clone();
             let memory_properties = instance.get_physical_device_memory_properties(physical_device);
             log::info!(
-                "ml_project: using device #{}: {} ({}, Vulkan {})",
+                "tensor-ash: using device #{}: {} ({}, Vulkan {})",
                 device_summary.index,
                 device_summary.name,
                 device_summary.kind.as_str(),
@@ -305,7 +305,7 @@ impl VulkanContext {
                 )
                 .unwrap_or_else(|err| {
                     log::warn!(
-                        "ml_project: create_pipeline_cache failed ({err}); proceeding without persistence",
+                        "tensor-ash: create_pipeline_cache failed ({err}); proceeding without persistence",
                     );
                     vk::PipelineCache::null()
                 });
@@ -405,7 +405,7 @@ impl Drop for VulkanContext {
                     }
                     if let Err(err) = std::fs::write(path, &data) {
                         log::warn!(
-                            "ml_project: failed to write pipeline cache to {}: {err}",
+                            "tensor-ash: failed to write pipeline cache to {}: {err}",
                             path.display(),
                         );
                     }
@@ -423,7 +423,7 @@ impl Drop for VulkanContext {
 }
 
 /// Per-device location for the persistent pipeline cache.  Uses
-/// `$XDG_CACHE_HOME/ml_project/` (or `$HOME/.cache/ml_project/`) and a
+/// `$XDG_CACHE_HOME/tensor-ash/` (or `$HOME/.cache/tensor-ash/`) and a
 /// vendor/device-id-qualified filename so caches from different GPUs on
 /// the same host don't stomp on each other.
 fn pipeline_cache_path_for(summary: &DeviceSummary) -> Option<PathBuf> {
@@ -434,7 +434,7 @@ fn pipeline_cache_path_for(summary: &DeviceSummary) -> Option<PathBuf> {
         "pipeline_cache_v{:04x}_{:04x}.bin",
         summary.vendor_id, summary.device_id
     );
-    Some(base.join("ml_project").join(filename))
+    Some(base.join("tensor-ash").join(filename))
 }
 
 fn device_summaries(

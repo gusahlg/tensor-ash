@@ -1,4 +1,4 @@
-//! `ml_project` — a minimal Vulkan compute library focused on
+//! `tensor-ash` — a minimal Vulkan compute library focused on
 //! high-throughput batched matrix multiplication for AI workloads.
 //!
 //! The public surface is intentionally narrow:
@@ -12,7 +12,7 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use ml_project::{VulkanContext, MatmulPipeline, Executor, Tensor, MatmulCall};
+//! use tensor_ash::{VulkanContext, MatmulPipeline, Executor, Tensor, MatmulCall};
 //!
 //! # fn try_main() -> anyhow::Result<()> {
 //! let ctx       = VulkanContext::new(false)?;

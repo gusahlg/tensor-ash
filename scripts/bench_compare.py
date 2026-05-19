@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare ml_project GEMM throughput with NumPy and PyTorch.
+"""Compare tensor-ash GEMM throughput with NumPy and PyTorch.
 
 The script intentionally keeps dependencies light: NumPy and PyTorch are
 optional, and missing libraries are reported as skipped instead of failing the
@@ -151,14 +151,14 @@ def configure_cpu_threads(threads: int) -> None:
         os.environ[name] = value
 
 
-def ml_project_self_check(path: str) -> str:
+def tensor_ash_self_check(path: str) -> str:
     code, out = run_cmd([path, "self-check"])
     if code != 0:
         return f"FAILED:\n{out.strip()}"
     return out.strip()
 
 
-def bench_ml_project(path: str, cases: list[tuple[str, int, int, int, int]], iters: int, warmup: int) -> list[BenchResult]:
+def bench_tensor_ash(path: str, cases: list[tuple[str, int, int, int, int]], iters: int, warmup: int) -> list[BenchResult]:
     results: list[BenchResult] = []
     for label, b, m, n, k in cases:
         env = os.environ.copy()
@@ -176,7 +176,7 @@ def bench_ml_project(path: str, cases: list[tuple[str, int, int, int, int]], ite
         code, out = run_cmd([path, "single"], env=env)
         flops = flops_for(b, m, n, k)
         if code != 0:
-            results.append(BenchResult("ml_project", label, b, m, n, k, "failed", flops=flops, details=out.strip()))
+            results.append(BenchResult("tensor-ash", label, b, m, n, k, "failed", flops=flops, details=out.strip()))
             continue
 
         lines = out.splitlines()
@@ -186,7 +186,7 @@ def bench_ml_project(path: str, cases: list[tuple[str, int, int, int, int]], ite
             row = next(reader)
             results.append(
                 BenchResult(
-                    "ml_project",
+                    "tensor-ash",
                     label,
                     b,
                     m,
@@ -200,7 +200,7 @@ def bench_ml_project(path: str, cases: list[tuple[str, int, int, int, int]], ite
                 )
             )
         except Exception as exc:  # noqa: BLE001 - report parser failures in benchmark output
-            results.append(BenchResult("ml_project", label, b, m, n, k, "failed", flops=flops, details=f"{exc}\n{out}"))
+            results.append(BenchResult("tensor-ash", label, b, m, n, k, "failed", flops=flops, details=f"{exc}\n{out}"))
     return results
 
 
@@ -430,12 +430,12 @@ def write_outputs(
     best = best_by_case(results)
     self_check_lc = self_check.lower()
     software_vulkan = "llvmpipe" in self_check_lc or "(cpu" in self_check_lc
-    ml_ok = [r for r in results if r.library == "ml_project" and r.status == "ok" and r.tflops]
+    ml_ok = [r for r in results if r.library == "tensor-ash" and r.status == "ok" and r.tflops]
     ml_details = next((r.details for r in ml_ok if r.details), "")
     lines: list[str] = [
         "# Benchmark Report",
         "",
-        "This report compares FP32 GEMM throughput for `ml_project`, NumPy, and PyTorch on the current machine.",
+        "This report compares FP32 GEMM throughput for `tensor-ash`, NumPy, and PyTorch on the current machine.",
         "",
         "## Environment",
         "",
@@ -479,9 +479,9 @@ def write_outputs(
 
     lines.extend(["", "## Analysis", ""])
     if software_vulkan:
-        lines.append("- `ml_project` selected CPU/software Vulkan (`llvmpipe`), so these are correctness and overhead measurements, not real GPU performance numbers.")
+        lines.append("- `tensor-ash` selected CPU/software Vulkan (`llvmpipe`), so these are correctness and overhead measurements, not real GPU performance numbers.")
     elif ml_details:
-        lines.append(f"- `ml_project` used `{ml_details}`, so the Vulkan measurements reflect real GPU kernel timings on this host.")
+        lines.append(f"- `tensor-ash` used `{ml_details}`, so the Vulkan measurements reflect real GPU kernel timings on this host.")
     if ml_ok:
         ratios = []
         wins = 0
@@ -493,8 +493,8 @@ def write_outputs(
                 wins += 1
         if ratios:
             worst = max(ratios, key=lambda item: item[2])
-            lines.append(f"- Largest gap: `{worst[0]}` is {worst[2]:.1f}x faster in `{worst[1]}` than `ml_project` in this environment.")
-        lines.append(f"- `ml_project` is the fastest measured backend on {wins}/{len(ml_ok)} benchmark cases.")
+            lines.append(f"- Largest gap: `{worst[0]}` is {worst[2]:.1f}x faster in `{worst[1]}` than `tensor-ash` in this environment.")
+        lines.append(f"- `tensor-ash` is the fastest measured backend on {wins}/{len(ml_ok)} benchmark cases.")
         ml_by_case = {result.case: result for result in ml_ok}
         for library in ["numpy", "torch_cpu", "torch_cuda"]:
             other_by_case = successful_by_library(results, library)
@@ -546,9 +546,9 @@ def main() -> int:
     cases = CASE_SETS[args.case_set]
     configure_cpu_threads(args.torch_threads)
     ensure_ml_bench(args.ml_bench, args.skip_build)
-    self_check = ml_project_self_check(args.ml_bench)
+    self_check = tensor_ash_self_check(args.ml_bench)
     results = []
-    results.extend(bench_ml_project(args.ml_bench, cases, args.iters, args.warmup))
+    results.extend(bench_tensor_ash(args.ml_bench, cases, args.iters, args.warmup))
     transfer = (
         None
         if args.skip_transfer

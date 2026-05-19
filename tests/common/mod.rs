@@ -1,7 +1,7 @@
 //! Shared test helpers.
 use std::sync::Arc;
 
-use ml_project::{Executor, KernelSelection, MatmulPipeline, Tensor, VulkanContext};
+use tensor_ash::{Executor, KernelSelection, MatmulPipeline, Tensor, VulkanContext};
 
 pub fn make_setup(n_slots: usize, max_calls: u32) -> (Arc<VulkanContext>, Executor) {
     let ctx = VulkanContext::new(false).expect("Vulkan init");
@@ -111,7 +111,7 @@ pub fn run_one(
     seed_b: u64,
     initial_c: Option<&[f32]>,
 ) -> (Vec<f32>, Vec<f32>) {
-    use ml_project::MatmulCall;
+    use tensor_ash::MatmulCall;
     let a = Tensor::zeros_device(ctx, shape_a).unwrap();
     let b = Tensor::zeros_device(ctx, shape_b).unwrap();
     let c = Tensor::zeros_device(ctx, shape_c).unwrap();
