@@ -19,9 +19,9 @@
 //! let pipeline  = Arc::new(MatmulPipeline::new(&ctx)?);
 //! let exec      = Executor::new(ctx.clone(), pipeline, /*n_slots=*/2, /*max_calls=*/64)?;
 //!
-//! let a = Tensor::zeros_device(&ctx, &[8, 256, 256])?;
-//! let b = Tensor::zeros_device(&ctx, &[8, 256, 256])?;
-//! let c = Tensor::zeros_device(&ctx, &[8, 256, 256])?;
+//! let a = Tensor::uninit_device(&ctx, &[8, 256, 256])?;
+//! let b = Tensor::uninit_device(&ctx, &[8, 256, 256])?;
+//! let c = Tensor::uninit_device(&ctx, &[8, 256, 256])?;
 //!
 //! exec.upload(&vec![1.0f32; 8*256*256], &a)?;
 //! exec.upload(&vec![1.0f32; 8*256*256], &b)?;
@@ -38,6 +38,7 @@ pub mod executor;
 pub mod matmul;
 pub mod pipeline;
 pub mod tensor;
+pub mod testing;
 
 pub use buffer::{Buffer, BufferLocation};
 pub use context::{DeviceKind, DevicePreference, DeviceSummary, VulkanContext};

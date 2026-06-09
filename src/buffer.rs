@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use ash::vk;
+use scopeguard::ScopeGuard;
 
 use crate::context::VulkanContext;
 
@@ -48,6 +49,9 @@ impl Buffer {
     ) -> Result<Self> {
         assert!(size > 0, "Buffer::new with size=0");
         unsafe {
+            // Each Vulkan handle we allocate is wrapped in a scopeguard that
+            // destroys it on early return.  On the happy path we disarm the
+            // guards at the end with ScopeGuard::into_inner.
             let raw = ctx
                 .device
                 .create_buffer(
@@ -58,6 +62,8 @@ impl Buffer {
                     None,
                 )
                 .context("create_buffer")?;
+            let raw_guard = scopeguard::guard(raw, |raw| ctx.device.destroy_buffer(raw, None));
+
             let mem_req = ctx.device.get_buffer_memory_requirements(raw);
 
             let (required, preferred) = match location {
@@ -74,14 +80,9 @@ impl Buffer {
                     vk::MemoryPropertyFlags::HOST_CACHED,
                 ),
             };
-            let mem_type = match ctx.find_memory_type_preferred(mem_req, required, preferred) {
-                Ok(mem_type) => mem_type,
-                Err(err) => {
-                    ctx.device.destroy_buffer(raw, None);
-                    return Err(err);
-                }
-            };
+            let mem_type = ctx.find_memory_type_preferred(mem_req, required, preferred)?;
             let memory_flags = ctx.memory_properties.memory_types[mem_type as usize].property_flags;
+
             let memory = ctx
                 .device
                 .allocate_memory(
@@ -90,36 +91,25 @@ impl Buffer {
                         .memory_type_index(mem_type),
                     None,
                 )
-                .map_err(|e| {
-                    ctx.device.destroy_buffer(raw, None);
-                    anyhow::anyhow!("allocate_memory: {e}")
-                })?;
-            if let Err(err) = ctx.device.bind_buffer_memory(raw, memory, 0) {
-                ctx.device.free_memory(memory, None);
-                ctx.device.destroy_buffer(raw, None);
-                return Err(err).context("bind_buffer_memory");
-            }
+                .context("allocate_memory")?;
+            let memory_guard = scopeguard::guard(memory, |m| ctx.device.free_memory(m, None));
+
+            ctx.device
+                .bind_buffer_memory(raw, memory, 0)
+                .context("bind_buffer_memory")?;
 
             let mapped = if memory_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
-                match ctx
-                    .device
+                ctx.device
                     .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                {
-                    Ok(mapped) => mapped as *mut u8,
-                    Err(err) => {
-                        ctx.device.free_memory(memory, None);
-                        ctx.device.destroy_buffer(raw, None);
-                        return Err(err).context("map_memory");
-                    }
-                }
+                    .context("map_memory")? as *mut u8
             } else {
                 std::ptr::null_mut()
             };
 
             Ok(Self {
                 ctx: Arc::clone(ctx),
-                raw,
-                memory,
+                raw: ScopeGuard::into_inner(raw_guard),
+                memory: ScopeGuard::into_inner(memory_guard),
                 size,
                 location,
                 memory_flags,

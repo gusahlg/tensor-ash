@@ -44,9 +44,10 @@ impl Tensor {
             })
     }
 
-    /// Allocate a device-local tensor.  Contents are uninitialized — use
-    /// `Executor::upload` to fill it.
-    pub fn zeros_device(ctx: &Arc<VulkanContext>, shape: &[u32]) -> Result<Self> {
+    /// Allocate a device-local tensor with **uninitialized** contents.
+    /// Use `Executor::upload` (or a matmul that writes the whole tensor
+    /// without `accumulate`) before reading the data.
+    pub fn uninit_device(ctx: &Arc<VulkanContext>, shape: &[u32]) -> Result<Self> {
         let size = Self::numel_checked(shape)?
             .checked_mul(std::mem::size_of::<f32>() as u64)
             .context("tensor byte size overflows u64")?;
@@ -68,6 +69,34 @@ impl Tensor {
     pub fn as_3d(&self) -> Result<(u32, u32, u32)> {
         let shape = MatrixShape::from_tensor_shape(&self.shape)?;
         Ok((shape.batch, shape.rows, shape.cols))
+    }
+
+    /// Read-only view of the shape.  Prefer this over reaching into the
+    /// `shape` field directly so future versions can swap the storage
+    /// type without breaking call sites.
+    #[inline]
+    pub fn shape(&self) -> &[u32] {
+        &self.shape
+    }
+
+    /// Number of dimensions.
+    #[inline]
+    pub fn rank(&self) -> usize {
+        self.shape.len()
+    }
+
+    /// Total f32 element count.  Always non-zero (constructors reject
+    /// zero-valued dims).
+    #[inline]
+    pub fn len(&self) -> u64 {
+        Self::numel(&self.shape)
+    }
+
+    /// Always `false` for a valid tensor — every dim must be non-zero.
+    /// Provided to silence the clippy `len_without_is_empty` lint.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        false
     }
 
     #[inline]
@@ -97,5 +126,12 @@ mod tests {
             .to_string();
 
         assert!(err.contains("overflows"));
+    }
+
+    #[test]
+    fn numel_matches_shape_product() {
+        assert_eq!(Tensor::numel(&[1]), 1);
+        assert_eq!(Tensor::numel(&[2, 3]), 6);
+        assert_eq!(Tensor::numel(&[4, 5, 6]), 120);
     }
 }

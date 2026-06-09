@@ -310,6 +310,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_batch_stride_overflow() {
+        let err = ResolvedMatmul::from_shapes(
+            &[2, u32::MAX, u32::MAX],
+            &[1, u32::MAX, 1],
+            &[2, u32::MAX, 1],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("A batch stride"));
+        assert!(err.contains("overflows"));
+    }
+
+    #[test]
+    fn rejects_flop_count_overflow() {
+        let err = ResolvedMatmul::from_shapes(
+            &[u32::MAX, u32::MAX],
+            &[u32::MAX, u32::MAX],
+            &[u32::MAX, u32::MAX],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("FLOP count overflows"));
+    }
+
+    #[test]
     fn builds_push_constants_from_resolved_shape_and_call_flags() {
         let dims = ResolvedMatmul::from_shapes(&[2, 2, 3], &[1, 3, 4], &[2, 2, 4]).unwrap();
         let pc = dims.push_constants(0.5, true);

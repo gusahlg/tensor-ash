@@ -21,6 +21,8 @@ fn main() {
     for entry in entries {
         let entry = entry.expect("dir entry");
         let path = entry.path();
+        println!("cargo:rerun-if-changed={}", path.display());
+
         let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
             continue;
         };
@@ -31,8 +33,6 @@ fn main() {
 
         let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
         let out = out_dir.join(format!("{stem}.spv"));
-
-        println!("cargo:rerun-if-changed={}", path.display());
 
         let status = Command::new("glslc")
             .args(["--target-env=vulkan1.2", "-O"])

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare tensor-ash GEMM throughput with NumPy and PyTorch.
+"""Compare tensor-ash GEMM throughput with major local array/AI frameworks.
 
 The script intentionally keeps dependencies light: NumPy and PyTorch are
 optional, and missing libraries are reported as skipped instead of failing the
@@ -380,6 +380,93 @@ def bench_torch_cuda(
     return results
 
 
+def bench_jax(cases: list[tuple[str, int, int, int, int]], iters: int, warmup: int) -> list[BenchResult]:
+    try:
+        import jax
+        import jax.numpy as jnp
+    except Exception as exc:  # noqa: BLE001
+        return skipped_results("jax", cases, str(exc))
+
+    key = jax.random.PRNGKey(1234)
+    results: list[BenchResult] = []
+    for label, b, m, n, k in cases:
+        shape_a = (m, k) if b == 1 else (b, m, k)
+        shape_b = (k, n) if b == 1 else (b, k, n)
+        key, key_a, key_b = jax.random.split(key, 3)
+        a = jax.random.normal(key_a, shape_a, dtype=jnp.float32)
+        bb = jax.random.normal(key_b, shape_b, dtype=jnp.float32)
+        for _ in range(warmup):
+            jnp.matmul(a, bb).block_until_ready()
+
+        best = float("inf")
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            jnp.matmul(a, bb).block_until_ready()
+            best = min(best, time.perf_counter() - t0)
+
+        flops = flops_for(b, m, n, k)
+        results.append(
+            BenchResult(
+                "jax",
+                label,
+                b,
+                m,
+                n,
+                k,
+                "ok",
+                tflops=flops / best * 1e-12,
+                best_ms=best * 1000.0,
+                flops=flops,
+                details=f"jax {jax.__version__}, backend={jax.default_backend()}",
+            )
+        )
+    return results
+
+
+def bench_tensorflow(cases: list[tuple[str, int, int, int, int]], iters: int, warmup: int) -> list[BenchResult]:
+    try:
+        import tensorflow as tf
+    except Exception as exc:  # noqa: BLE001
+        return skipped_results("tensorflow", cases, str(exc))
+
+    rng = tf.random.Generator.from_seed(1234)
+    devices = ",".join(device.device_type for device in tf.config.list_logical_devices()) or "unknown"
+    results: list[BenchResult] = []
+    for label, b, m, n, k in cases:
+        shape_a = (m, k) if b == 1 else (b, m, k)
+        shape_b = (k, n) if b == 1 else (b, k, n)
+        a = rng.normal(shape_a, dtype=tf.float32)
+        bb = rng.normal(shape_b, dtype=tf.float32)
+        for _ in range(warmup):
+            c = tf.linalg.matmul(a, bb)
+            float(tf.reshape(c, [-1])[0].numpy())
+
+        best = float("inf")
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            c = tf.linalg.matmul(a, bb)
+            float(tf.reshape(c, [-1])[0].numpy())
+            best = min(best, time.perf_counter() - t0)
+
+        flops = flops_for(b, m, n, k)
+        results.append(
+            BenchResult(
+                "tensorflow",
+                label,
+                b,
+                m,
+                n,
+                k,
+                "ok",
+                tflops=flops / best * 1e-12,
+                best_ms=best * 1000.0,
+                flops=flops,
+                details=f"tensorflow {tf.__version__}, devices={devices}",
+            )
+        )
+    return results
+
+
 def best_by_case(results: list[BenchResult]) -> dict[str, BenchResult]:
     best: dict[str, BenchResult] = {}
     for result in results:
@@ -435,7 +522,7 @@ def write_outputs(
     lines: list[str] = [
         "# Benchmark Report",
         "",
-        "This report compares FP32 GEMM throughput for `tensor-ash`, NumPy, and PyTorch on the current machine.",
+        "This report compares FP32 GEMM throughput for `tensor-ash` against the local framework backends available on this machine.",
         "",
         "## Environment",
         "",
@@ -496,7 +583,7 @@ def write_outputs(
             lines.append(f"- Largest gap: `{worst[0]}` is {worst[2]:.1f}x faster in `{worst[1]}` than `tensor-ash` in this environment.")
         lines.append(f"- `tensor-ash` is the fastest measured backend on {wins}/{len(ml_ok)} benchmark cases.")
         ml_by_case = {result.case: result for result in ml_ok}
-        for library in ["numpy", "torch_cpu", "torch_cuda"]:
+        for library in ["numpy", "torch_cpu", "torch_cuda", "jax", "tensorflow"]:
             other_by_case = successful_by_library(results, library)
             shared = sorted(set(ml_by_case) & set(other_by_case))
             if not shared:
@@ -515,6 +602,8 @@ def write_outputs(
         lines.append("- Some libraries were skipped because their Python modules were unavailable; see details in the table.")
     if any(r.library == "torch_cuda" and r.status == "skipped" for r in results):
         lines.append("- PyTorch CUDA/cuBLAS was not available in this Python environment, so CUDA remains a separate benchmark to run when available.")
+    if any(r.library in {"jax", "tensorflow"} and r.status == "skipped" for r in results):
+        lines.append("- JAX and TensorFlow rows are included when those modules are installed; skipped rows mean the local Python environment does not provide them.")
     if transfer and transfer.status == "ok":
         lines.append(
             f"- Transfer staging bandwidth measured {transfer.upload_gibs:.2f} GiB/s upload "
@@ -557,6 +646,8 @@ def main() -> int:
     results.extend(bench_numpy(cases, args.iters, args.warmup))
     results.extend(bench_torch_cpu(cases, args.iters, args.warmup, args.torch_threads))
     results.extend(bench_torch_cuda(cases, args.iters, args.warmup))
+    results.extend(bench_jax(cases, args.iters, args.warmup))
+    results.extend(bench_tensorflow(cases, args.iters, args.warmup))
     write_outputs(args.output_json, args.output_md, self_check, results, transfer, args)
     print(f"wrote {args.output_json}")
     print(f"wrote {args.output_md}")

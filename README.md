@@ -1,5 +1,7 @@
 # tensor-ash
 
+Version: `1.0.0`
+
 `tensor-ash` is a small Vulkan compute library for high-throughput FP32 matrix
 multiplication, written in Rust on top of [`ash`](https://crates.io/crates/ash).
 It is designed to sit close to the hardware: explicit GPU buffers, explicit
@@ -9,6 +11,21 @@ to inspect and tune.
 The current scope is batched GEMM. The compute backend, kernel selector, and
 executor are deliberately built so other kernels can be added without churning
 the public API.
+
+## Scope and API status
+
+`v1.0.0` is a stable baseline for the current Rust API and benchmark tooling:
+
+- FP32 rank-2/rank-3 GEMM on Vulkan compute.
+- Explicit device-local tensors and explicit upload/download operations.
+- GPU timestamp-based kernel timing.
+- Thread-safe submission through `Executor`.
+- Reproducible local benchmark and correctness workflows.
+
+This release is not yet a drop-in backend for external inference runtimes such
+as Ollama, ggml, PyTorch, or TensorFlow. Those integrations require a separate
+C ABI or backend adapter layer. The current crate is intended as the underlying
+Vulkan GEMM component that such an adapter could call.
 
 ## Features
 
@@ -53,9 +70,9 @@ let ctx = VulkanContext::new(false)?;
 let pipeline = Arc::new(MatmulPipeline::new(&ctx)?);
 let exec = Executor::new(ctx.clone(), pipeline, /*slots=*/ 2, /*max_calls=*/ 64)?;
 
-let a = Tensor::zeros_device(&ctx, &[8, 256, 256])?;
-let b = Tensor::zeros_device(&ctx, &[8, 256, 256])?;
-let c = Tensor::zeros_device(&ctx, &[8, 256, 256])?;
+let a = Tensor::uninit_device(&ctx, &[8, 256, 256])?;
+let b = Tensor::uninit_device(&ctx, &[8, 256, 256])?;
+let c = Tensor::uninit_device(&ctx, &[8, 256, 256])?;
 
 exec.upload(&host_a, &a)?;
 exec.upload(&host_b, &b)?;
@@ -114,6 +131,7 @@ CPU-only unit tests (no GPU required):
 
 ```bash
 cargo test
+cargo clippy --all-targets -- -D warnings
 ```
 
 End-to-end GPU correctness suite (compares every result against an
@@ -129,8 +147,10 @@ flaky driver behavior on some platforms.
 ## Cross-library benchmarks
 
 A Python harness in `scripts/bench_compare.py` benchmarks `tensor-ash`,
-NumPy, PyTorch CPU, optional PyTorch CUDA, and transfer bandwidth. It writes
-raw JSON plus a Markdown report:
+NumPy, PyTorch CPU, optional PyTorch CUDA, optional JAX, optional TensorFlow,
+and transfer bandwidth. Missing Python frameworks are reported as skipped
+instead of failing the whole run. The harness writes raw JSON plus a Markdown
+report:
 
 ```bash
 nix-shell --run 'python3 scripts/bench_compare.py --case-set extended --iters 5 --warmup 2 --torch-threads 1'
@@ -141,10 +161,17 @@ most meaningful after `ml_bench self-check` confirms a real GPU was selected;
 if `llvmpipe` is picked, treat the `tensor-ash` rows as software-Vulkan
 correctness and overhead data, not GPU performance.
 
+The broader refactor, verification, benchmark procedure, and Ollama backend
+attempt are documented in `benchmarks/process.md`.
+
 A recent run on an RTX 3070 (`benchmarks/latest.md`) had `tensor-ash` fastest
 on all 11 shared GEMM cases, with a ~30x geometric-mean throughput ratio
 versus single-threaded NumPy and single-threaded PyTorch CPU. PyTorch CUDA was
 not present in that environment, so cuBLAS comparison is a separate run.
+
+## Release notes
+
+See `CHANGELOG.md` for the `v1.0.0` release summary.
 
 ## Troubleshooting
 
@@ -165,20 +192,28 @@ desired ICD JSON when the loader is seeing the wrong driver set.
 
 ```
 src/
-  context.rs   Vulkan instance, device, queue, persistent pipeline cache
+  context/     Vulkan instance/device setup, selection, debug, cache paths
+  pipeline/    Pipeline layout, kernel variants, selector, creation helpers
+  executor/    Thread-safe executor, submission slots, command recording
+  bench/       `ml_bench` subcommands, output formatting, case definitions
   buffer.rs    Device/staging buffer wrappers
   tensor.rs    Shape + GPU buffer
-  pipeline.rs  Shader modules, descriptor layout, kernel variants
   matmul.rs    MatmulCall, shape validation, RunStats
-  executor.rs  Thread-safe executor: upload/download/run_matmuls
-  main.rs      `ml_bench` CLI
+  testing.rs   Deterministic CPU reference/test helpers
+  main.rs      Thin `ml_bench` entry point
 shaders/
-  matmul_f32.comp        128x128-tile GEMM (large kernel)
-  matmul_f32_small.comp  64x64-tile GEMM  (small kernel)
+  matmul_kernel.glsl     Shared GEMM kernel body (parameterized by tile size)
+  matmul_f32.comp        128x128-tile wrapper (large kernel)
+  matmul_f32_small.comp  64x64-tile wrapper   (small kernel)
 scripts/
   bench_compare.py       Cross-library comparison harness
 benchmarks/
   latest.{json,md}       Last cross-library run
+  process.md             Refactor, verification, and benchmark process notes
+CHANGELOG.md             Release notes
+tests/
+  correctness.rs         Ignored GPU suite entry point
+  correctness/           Topical GPU correctness modules
 ```
 
 ## Vision

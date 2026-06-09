@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-ash"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "ash",
@@ -409,6 +409,7 @@ dependencies = [
  "log",
  "parking_lot",
  "rayon",
+ "scopeguard",
  "thiserror",
 ]
 
