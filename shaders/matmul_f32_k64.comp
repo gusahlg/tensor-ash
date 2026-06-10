@@ -1,0 +1,11 @@
+#version 460
+// 64x64 output tile with a wider K strip.  This halves the barrier count
+// for small-K aligned problems compared with the default small kernel.
+
+#define BM 64u
+#define BN 64u
+#define BK 64u
+#define TM 4u
+#define TN 4u
+
+#include "matmul_kernel.glsl"

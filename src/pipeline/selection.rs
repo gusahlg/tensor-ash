@@ -1,6 +1,6 @@
 use crate::context::DeviceKind;
 
-use super::types::{TILE_M, TILE_N};
+use super::types::{KernelSelection, TILE_M, TILE_N};
 
 /// Threshold (in 128x128 tiles) below which the auto selector prefers
 /// the small kernel.  Tuned per device kind so we don't underuse a beefy
@@ -48,6 +48,52 @@ pub(super) fn auto_selects_small_kernel(m: u32, n: u32, k: u32, min_large_tiles:
     large_tiles < min_large_tiles
 }
 
+pub(super) fn auto_select_kernel(
+    batch: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    min_large_tiles: u64,
+) -> KernelSelection {
+    let min_mn = m.min(n);
+    let max_mn = m.max(n);
+    let near_square = max_mn <= min_mn.saturating_mul(5) / 4;
+
+    // The 64x32 tile reduces N-side edge waste and accumulator pressure
+    // enough to beat the 64x64/k64 paths on small near-square GEMMs.  The
+    // 512^3 case moves to the 128x64xK64 tile below, so keep this rule to
+    // the smaller cases where it clearly wins.
+    if k >= 128 && min_mn >= 128 && max_mn <= 320 && near_square && (batch == 1 || max_mn <= 256) {
+        return KernelSelection::M64N32;
+    }
+
+    if batch == 1 {
+        if m == n && (m == 512 || m == 1024) && k >= 512 {
+            return KernelSelection::M128N64K64;
+        }
+        if min_mn >= 2048 && (128..=1024).contains(&k) {
+            return KernelSelection::M128N64K64;
+        }
+        if min_mn >= 1024 && max_mn >= 4096 && k >= 512 {
+            return KernelSelection::M128N64K64;
+        }
+        if k <= 128 && m >= 2048 && n >= 2048 {
+            return KernelSelection::M128N64;
+        }
+        if min_mn <= 128 && max_mn >= 512 && k >= 256 {
+            return KernelSelection::K64;
+        }
+        if min_mn <= 256 && max_mn == min_mn.saturating_mul(2) && k >= 256 {
+            return KernelSelection::K64;
+        }
+    }
+    if auto_selects_small_kernel(m, n, k, min_large_tiles) {
+        KernelSelection::Small
+    } else {
+        KernelSelection::Large
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +123,57 @@ mod tests {
 
         assert!(auto_selects_small_kernel(1024, 1024, 1024, 256));
         assert!(!auto_selects_small_kernel(1024, 1024, 1024, 64));
+    }
+
+    #[test]
+    fn auto_selector_uses_specialized_variants_for_target_shapes() {
+        assert_eq!(
+            auto_select_kernel(1, 256, 256, 256, 256),
+            KernelSelection::M64N32
+        );
+        assert_eq!(
+            auto_select_kernel(1, 255, 257, 263, 256),
+            KernelSelection::M64N32
+        );
+        assert_eq!(
+            auto_select_kernel(4, 256, 256, 256, 256),
+            KernelSelection::M64N32
+        );
+        assert_eq!(
+            auto_select_kernel(1, 512, 256, 256, 256),
+            KernelSelection::K64
+        );
+        assert_eq!(
+            auto_select_kernel(1, 512, 512, 512, 256),
+            KernelSelection::M128N64K64
+        );
+        assert_eq!(
+            auto_select_kernel(1, 1024, 1024, 64, 256),
+            KernelSelection::Small
+        );
+        assert_eq!(
+            auto_select_kernel(1, 1024, 128, 512, 256),
+            KernelSelection::K64
+        );
+        assert_eq!(
+            auto_select_kernel(1, 128, 1024, 512, 256),
+            KernelSelection::K64
+        );
+        assert_eq!(
+            auto_select_kernel(1, 1024, 1024, 1024, 256),
+            KernelSelection::M128N64K64
+        );
+        assert_eq!(
+            auto_select_kernel(1, 2048, 2048, 512, 256),
+            KernelSelection::M128N64K64
+        );
+        assert_eq!(
+            auto_select_kernel(2, 512, 512, 512, 256),
+            KernelSelection::Small
+        );
+        assert_eq!(
+            auto_select_kernel(1, 2048, 2048, 2048, 256),
+            KernelSelection::Large
+        );
     }
 }

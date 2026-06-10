@@ -1,0 +1,11 @@
+#version 460
+// 128x64 output tile with a deeper K strip.  This trades shared-memory
+// footprint for half as many K-loop barriers versus the default 32-wide strip.
+
+#define BM 128u
+#define BN 64u
+#define BK 64u
+#define TM 8u
+#define TN 4u
+
+#include "matmul_kernel.glsl"

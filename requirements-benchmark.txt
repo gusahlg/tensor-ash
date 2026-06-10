@@ -1,0 +1,9 @@
+# Python packages for CUDA-backed cross-framework benchmark rows.
+# Install inside the flake shell:
+#   uv venv .venv-bench
+#   source .venv-bench/bin/activate
+#   uv pip install -r requirements-benchmark.txt
+--extra-index-url https://download.pytorch.org/whl/cu128
+numpy>=2.0
+torch>=2.6
+cupy-cuda12x>=13.0

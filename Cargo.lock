@@ -414,6 +414,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tensor-ash-capi"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "tensor-ash",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"

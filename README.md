@@ -14,18 +14,20 @@ the public API.
 
 ## Scope and API status
 
-`v1.0.0` is a stable baseline for the current Rust API and benchmark tooling:
+`v1.0.0` is the stable baseline for the Rust API and benchmark tooling. The
+current workspace builds on that baseline with:
 
 - FP32 rank-2/rank-3 GEMM on Vulkan compute.
 - Explicit device-local tensors and explicit upload/download operations.
 - GPU timestamp-based kernel timing.
 - Thread-safe submission through `Executor`.
+- C ABI wrapper crate for C callers.
 - Reproducible local benchmark and correctness workflows.
 
-This release is not yet a drop-in backend for external inference runtimes such
-as Ollama, ggml, PyTorch, or TensorFlow. Those integrations require a separate
-C ABI or backend adapter layer. The current crate is intended as the underlying
-Vulkan GEMM component that such an adapter could call.
+This project is not yet a drop-in backend for external inference runtimes such
+as Ollama, ggml, PyTorch, or TensorFlow. The C ABI exposes this library as a
+callable GEMM component, but those runtimes still need their own adapter layer
+or backend implementation to route model graph matmuls into `tensor-ash`.
 
 ## Features
 
@@ -35,8 +37,8 @@ Vulkan GEMM component that such an adapter could call.
 - Rank-2 and rank-3 row-major FP32 GEMM: `[M, K] @ [K, N]` and batched
   `[B, M, K] @ [B, K, N]`, with batch broadcasting when either side has `B == 1`.
 - Batched submission of many independent `MatmulCall`s in a single GPU submit.
-- Two GEMM kernel variants (64x64 and 128x128 tiles) with automatic shape-based
-  selection, plus a manual override for A/B tuning.
+- Multiple GEMM kernel variants with automatic shape-based selection, plus a
+  manual override for A/B tuning.
 - Thread-safe `Executor` backed by a small pool of submission slots.
 - GPU timestamp queries → per-run kernel time and TFLOPS when the device
   supports them.
@@ -44,6 +46,8 @@ Vulkan GEMM component that such an adapter could call.
   `$XDG_CACHE_HOME/tensor-ash/` to amortize pipeline creation across runs.
 - Device selection by kind, index, or name substring, with a clear failure when
   a discrete GPU is required but unavailable.
+- `tensor-ash-capi` workspace crate that builds `libtensor_ash.so` and
+  `libtensor_ash.a` for C callers.
 
 ## Requirements
 
@@ -58,6 +62,16 @@ Vulkan loader and shader tools on `PATH`:
 ```bash
 nix-shell
 cargo run --release --bin ml_bench -- self-check
+```
+
+The flake shell adds the benchmark tooling, CUDA compiler/runtime packages,
+Python, and `uv`:
+
+```bash
+nix develop .#benchmark
+uv venv .venv-bench
+source .venv-bench/bin/activate
+uv pip install -r requirements-benchmark.txt
 ```
 
 ## Library sketch
@@ -89,6 +103,30 @@ exec.download(&c, &mut host_c)?;
 println!("{:?}", stats.tflops());
 ```
 
+## C ABI
+
+The C ABI lives in the `tensor-ash-capi` workspace crate and is declared in
+`include/tensor_ash.h`. It exposes opaque context, executor, and tensor handles
+plus upload, download, single-GEMM, and batched-GEMM entry points. Errors return
+`-1` or null and can be inspected with `ta_last_error()`.
+
+Build the C library:
+
+```bash
+cargo build --release -p tensor-ash-capi
+```
+
+Compile and run the C smoke example:
+
+```bash
+cc -Iinclude examples/c_smoke.c -Ltarget/release -ltensor_ash \
+  -Wl,-rpath,"$PWD/target/release" -o /tmp/tensor_ash_c_smoke
+nix-shell --run 'env LD_LIBRARY_PATH=target/release:$LD_LIBRARY_PATH /tmp/tensor_ash_c_smoke'
+```
+
+The example computes a 2x3 by 3x2 GEMM through the C API and verifies the
+expected `[58, 64, 139, 154]` result.
+
 ## Benchmark binary (`ml_bench`)
 
 ```bash
@@ -107,7 +145,7 @@ ML_B=4 ML_M=1024 ML_N=1024 ML_K=1024 cargo run --release --bin ml_bench -- singl
 ML_ITERS=100 ML_WARMUP=10 cargo run --release --bin ml_bench -- sweep
 ML_THREADS=8 cargo run --release --bin ml_bench -- concurrent
 ML_DEVICE=discrete cargo run --release --bin ml_bench -- self-check
-ML_KERNEL=small ML_B=1 ML_M=512 ML_N=512 ML_K=512 cargo run --release --bin ml_bench -- single
+ML_KERNEL=k64 ML_B=1 ML_M=256 ML_N=256 ML_K=256 cargo run --release --bin ml_bench -- single
 ML_OUTPUT=csv ML_SWEEP=smoke cargo run --release --bin ml_bench -- sweep
 ML_TRANSFER_MB=64 ML_OUTPUT=csv cargo run --release --bin ml_bench -- transfer
 ```
@@ -119,9 +157,9 @@ ML_TRANSFER_MB=64 ML_OUTPUT=csv cargo run --release --bin ml_bench -- transfer
 - `ML_SWEEP` accepts `smoke` (tiny sanity shapes), `standard` (default
   discrete-GPU sweep), and `full` (largest shape set). CPU/software Vulkan
   defaults to `smoke`.
-- `ML_KERNEL` accepts `auto`, `large`, or `small`. The default `auto` selector
-  picks the 64x64 kernel for small, small-K, or edge-heavy shapes and the
-  128x128 kernel for larger aligned shapes. The override is for benchmark
+- `ML_KERNEL` accepts `auto`, `large`, `small`, `m64n128`, `m128n64`,
+  `m128n64k64`, `m64n32`, or `k64`. The default `auto` selector picks among
+  the tuned variants by shape and batch count. The override is for benchmark
   tuning.
 - `ML_OUTPUT` selects `table` (default) or `csv` output.
 
@@ -147,13 +185,14 @@ flaky driver behavior on some platforms.
 ## Cross-library benchmarks
 
 A Python harness in `scripts/bench_compare.py` benchmarks `tensor-ash`,
-NumPy, PyTorch CPU, optional PyTorch CUDA, optional JAX, optional TensorFlow,
-and transfer bandwidth. Missing Python frameworks are reported as skipped
-instead of failing the whole run. The harness writes raw JSON plus a Markdown
-report:
+NumPy, PyTorch CPU, PyTorch CUDA/cuBLAS, CuPy CUDA/cuBLAS, optional JAX,
+optional TensorFlow, and transfer bandwidth. Missing Python frameworks are
+reported as skipped instead of failing the whole run. The harness writes raw
+JSON plus a Markdown report:
 
 ```bash
-nix-shell --run 'python3 scripts/bench_compare.py --case-set extended --iters 5 --warmup 2 --torch-threads 1'
+nix develop .#benchmark --command bash -lc \
+  '.venv-bench/bin/python scripts/bench_compare.py --case-set extended --iters 20 --warmup 5 --torch-threads 1 --transfer-mb 64'
 ```
 
 Results land in `benchmarks/latest.json` and `benchmarks/latest.md`. These are
@@ -161,13 +200,31 @@ most meaningful after `ml_bench self-check` confirms a real GPU was selected;
 if `llvmpipe` is picked, treat the `tensor-ash` rows as software-Vulkan
 correctness and overhead data, not GPU performance.
 
+For a GPU-focused run without CPU framework baselines:
+
+```bash
+nix develop .#benchmark --command bash -lc \
+  '.venv-bench/bin/python scripts/bench_compare.py --case-set extended --iters 20 --warmup 5 --skip-cpu-frameworks'
+```
+
 The broader refactor, verification, benchmark procedure, and Ollama backend
 attempt are documented in `benchmarks/process.md`.
 
-A recent run on an RTX 3070 (`benchmarks/latest.md`) had `tensor-ash` fastest
-on all 11 shared GEMM cases, with a ~30x geometric-mean throughput ratio
-versus single-threaded NumPy and single-threaded PyTorch CPU. PyTorch CUDA was
-not present in that environment, so cuBLAS comparison is a separate run.
+A recent run on an RTX 3070 (`benchmarks/latest.md`) includes real PyTorch
+CUDA/cuBLAS and CuPy CUDA/cuBLAS rows. In that run, `tensor-ash` was fastest on
+7/11 cases, reached 8.987 TFLOPS on `square_1024`, had a 1.10x geometric-mean
+throughput ratio versus PyTorch CUDA, and had a 2.51x geometric-mean throughput
+ratio versus CuPy CUDA. The single-threaded CPU baselines remain useful for
+context: `tensor-ash` measured about 32x geometric-mean throughput versus both
+NumPy and PyTorch CPU.
+
+Kernel selector tuning can be reproduced without overwriting the benchmark
+report:
+
+```bash
+nix develop .#benchmark --command bash -lc \
+  '.venv-bench/bin/python scripts/tune_kernels.py --case-set extended --iters 50 --warmup 10 --skip-build'
+```
 
 ## Release notes
 
@@ -205,8 +262,20 @@ shaders/
   matmul_kernel.glsl     Shared GEMM kernel body (parameterized by tile size)
   matmul_f32.comp        128x128-tile wrapper (large kernel)
   matmul_f32_small.comp  64x64-tile wrapper   (small kernel)
+  matmul_f32_m64n128.comp    64x128 wrapper
+  matmul_f32_m128n64.comp    128x64 wrapper
+  matmul_f32_m128n64k64.comp 128x64 wrapper with BK=64
+  matmul_f32_m64n32.comp     64x32 wrapper
+  matmul_f32_k64.comp        64x64 wrapper with BK=64
+capi/
+  src/          C ABI wrapper crate over the Rust API
+include/
+  tensor_ash.h  Public C header
+examples/
+  c_smoke.c     C ABI smoke test
 scripts/
   bench_compare.py       Cross-library comparison harness
+  tune_kernels.py        Manual kernel-variant tuning helper
 benchmarks/
   latest.{json,md}       Last cross-library run
   process.md             Refactor, verification, and benchmark process notes

@@ -1,0 +1,11 @@
+#version 460
+// Smaller narrow tile for edge-heavy shapes.  It reduces N-side overcompute
+// relative to the 64x64 kernel.
+
+#define BM 64u
+#define BN 32u
+#define BK 32u
+#define TM 4u
+#define TN 2u
+
+#include "matmul_kernel.glsl"

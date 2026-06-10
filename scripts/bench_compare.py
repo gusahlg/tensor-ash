@@ -3,7 +3,8 @@
 
 The script intentionally keeps dependencies light: NumPy and PyTorch are
 optional, and missing libraries are reported as skipped instead of failing the
-whole benchmark. It writes both raw JSON and a compact Markdown analysis.
+whole benchmark. CUDA-capable Python frameworks are timed with GPU events when
+they are available. It writes both raw JSON and a compact Markdown analysis.
 """
 
 from __future__ import annotations
@@ -45,6 +46,25 @@ CASE_SETS = {
     "extended": EXTENDED_CASES,
 }
 
+RATIO_LIBRARY_ORDER = [
+    "torch_cuda",
+    "cupy_cuda",
+    "jax",
+    "tensorflow",
+    "numpy",
+    "torch_cpu",
+]
+
+NVIDIA_SMI_FIELDS = [
+    "name",
+    "driver",
+    "memory_total_mib",
+    "temperature_c",
+    "utilization_pct",
+    "power_draw_w",
+    "power_limit_w",
+]
+
 
 @dataclass
 class BenchResult:
@@ -57,6 +77,8 @@ class BenchResult:
     status: str
     tflops: float | None = None
     best_ms: float | None = None
+    wall_ms: float | None = None
+    host_overhead_ms: float | None = None
     flops: float | None = None
     details: str = ""
 
@@ -82,6 +104,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--transfer-mb", type=int, default=64)
     parser.add_argument("--skip-transfer", action="store_true")
+    parser.add_argument("--skip-cpu-frameworks", action="store_true")
+    parser.add_argument("--skip-gpu-frameworks", action="store_true")
     parser.add_argument("--case-set", choices=sorted(CASE_SETS), default="base")
     args = parser.parse_args()
     if args.iters < 1:
@@ -130,6 +154,41 @@ def run_cmd(args: list[str], env: dict[str, str] | None = None) -> tuple[int, st
         check=False,
     )
     return proc.returncode, proc.stdout
+
+
+def format_nvidia_smi_summary(output: str) -> str:
+    rows = []
+    for idx, line in enumerate(output.splitlines()):
+        if not line.strip():
+            continue
+        values = [value.strip() for value in line.split(",")]
+        if len(values) == len(NVIDIA_SMI_FIELDS):
+            rows.append(
+                f"gpu{idx}: "
+                + ", ".join(
+                    f"{field}={value}"
+                    for field, value in zip(NVIDIA_SMI_FIELDS, values, strict=True)
+                )
+            )
+        else:
+            rows.append(f"gpu{idx}: {line.strip()}")
+    return "\n".join(rows)
+
+
+def nvidia_smi_summary() -> str:
+    try:
+        code, out = run_cmd(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,driver_version,memory.total,temperature.gpu,utilization.gpu,power.draw,power.limit",
+                "--format=csv,noheader,nounits",
+            ]
+        )
+    except FileNotFoundError:
+        return ""
+    if code == 0:
+        return format_nvidia_smi_summary(out)
+    return ""
 
 
 def ensure_ml_bench(path: str, skip_build: bool) -> None:
@@ -195,6 +254,8 @@ def bench_tensor_ash(path: str, cases: list[tuple[str, int, int, int, int]], ite
                     "ok",
                     tflops=float(row["tflops"]),
                     best_ms=float(row["gpu_ms"]),
+                    wall_ms=float(row["wall_ms"]),
+                    host_overhead_ms=max(0.0, float(row["wall_ms"]) - float(row["gpu_ms"])),
                     flops=flops,
                     details=f"{row['device']} ({row['kind']})",
                 )
@@ -338,7 +399,13 @@ def bench_torch_cuda(
     if not torch.cuda.is_available():
         return skipped_results("torch_cuda", cases, "CUDA unavailable in this Python environment")
 
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
     torch.manual_seed(1234)
+    precision_details = (
+        f"allow_tf32={torch.backends.cuda.matmul.allow_tf32}, "
+        f"precision={torch.get_float32_matmul_precision()}"
+    )
     results: list[BenchResult] = []
     for label, b, m, n, k in cases:
         shape_a = (m, k) if b == 1 else (b, m, k)
@@ -374,7 +441,73 @@ def bench_torch_cuda(
                 tflops=flops / (best_ms / 1000.0) * 1e-12,
                 best_ms=best_ms,
                 flops=flops,
-                details=f"torch {torch.__version__}, {torch.cuda.get_device_name(0)}",
+                details=(
+                    f"torch {torch.__version__}, CUDA/cuBLAS, "
+                    f"{torch.cuda.get_device_name(0)}, {precision_details}"
+                ),
+            )
+        )
+    return results
+
+
+def bench_cupy_cuda(cases: list[tuple[str, int, int, int, int]], iters: int, warmup: int) -> list[BenchResult]:
+    try:
+        import cupy as cp
+    except Exception as exc:  # noqa: BLE001
+        return skipped_results("cupy_cuda", cases, str(exc))
+
+    try:
+        device_count = cp.cuda.runtime.getDeviceCount()
+    except Exception as exc:  # noqa: BLE001
+        return skipped_results("cupy_cuda", cases, f"CUDA device query failed: {exc}")
+    if device_count < 1:
+        return skipped_results("cupy_cuda", cases, "CUDA unavailable in this Python environment")
+
+    try:
+        props = cp.cuda.runtime.getDeviceProperties(0)
+        device_name = props.get("name", "unknown")
+        if isinstance(device_name, bytes):
+            device_name = device_name.decode(errors="replace")
+    except Exception:  # noqa: BLE001
+        device_name = "unknown CUDA device"
+
+    cp.random.seed(1234)
+    results: list[BenchResult] = []
+    for label, b, m, n, k in cases:
+        shape_a = (m, k) if b == 1 else (b, m, k)
+        shape_b = (k, n) if b == 1 else (b, k, n)
+        a = cp.random.standard_normal(shape_a, dtype=cp.float32)
+        bb = cp.random.standard_normal(shape_b, dtype=cp.float32)
+        for _ in range(warmup):
+            c = cp.matmul(a, bb)
+            cp.cuda.Stream.null.synchronize()
+            float(c.ravel()[0].get())
+
+        best_ms = float("inf")
+        for _ in range(iters):
+            start = cp.cuda.Event()
+            end = cp.cuda.Event()
+            start.record()
+            c = cp.matmul(a, bb)
+            end.record()
+            end.synchronize()
+            float(c.ravel()[0].get())
+            best_ms = min(best_ms, cp.cuda.get_elapsed_time(start, end))
+
+        flops = flops_for(b, m, n, k)
+        results.append(
+            BenchResult(
+                "cupy_cuda",
+                label,
+                b,
+                m,
+                n,
+                k,
+                "ok",
+                tflops=flops / (best_ms / 1000.0) * 1e-12,
+                best_ms=best_ms,
+                flops=flops,
+                details=f"cupy {cp.__version__}, CUDA/cuBLAS, {device_name}",
             )
         )
     return results
@@ -486,10 +619,22 @@ def successful_by_library(results: list[BenchResult], library: str) -> dict[str,
     }
 
 
+def result_uses_gpu(result: BenchResult) -> bool:
+    if result.library in {"tensor-ash", "torch_cuda", "cupy_cuda"}:
+        return result.status == "ok"
+    details = result.details.lower()
+    if result.library == "jax":
+        return "backend=gpu" in details or "backend=cuda" in details
+    if result.library == "tensorflow":
+        return "gpu" in details or "cuda" in details
+    return False
+
+
 def write_outputs(
     path_json: str,
     path_md: str,
     self_check: str,
+    nvidia_smi: str,
     results: list[BenchResult],
     transfer: TransferResult | None,
     args: argparse.Namespace,
@@ -508,6 +653,7 @@ def write_outputs(
             "cpu_threads": args.torch_threads,
             "torch_threads": args.torch_threads,
             "self_check": self_check,
+            "nvidia_smi": nvidia_smi,
         },
         "transfer": None if transfer is None else asdict(transfer),
         "results": [asdict(result) for result in results],
@@ -530,20 +676,42 @@ def write_outputs(
         self_check,
         "```",
         "",
+    ]
+    if nvidia_smi:
+        lines.extend(
+            [
+                "NVIDIA-SMI GPU summary:",
+                "",
+                "```text",
+                nvidia_smi,
+                "```",
+                "",
+            ]
+        )
+    lines.extend(
+        [
         f"- Iterations: {args.iters}",
         f"- Warmup iterations: {args.warmup}",
         f"- Case set: {args.case_set}",
         f"- CPU library threads: {args.torch_threads}",
+        f"- CPU framework rows: {'skipped' if args.skip_cpu_frameworks else 'enabled'}",
+        f"- Python GPU framework rows: {'skipped' if args.skip_gpu_frameworks else 'enabled'}",
         "",
         "## Results",
         "",
-        "| case | library | status | best ms | TFLOPS | details |",
-        "| --- | --- | ---: | ---: | ---: | --- |",
-    ]
+        "| case | library | status | gpu ms | wall ms | host overhead ms | TFLOPS | details |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
     for result in results:
         best_ms = "" if result.best_ms is None else f"{result.best_ms:.3f}"
+        wall_ms = "" if result.wall_ms is None else f"{result.wall_ms:.3f}"
+        host_overhead = "" if result.host_overhead_ms is None else f"{result.host_overhead_ms:.3f}"
         tflops = "" if result.tflops is None else f"{result.tflops:.6f}"
-        lines.append(f"| {result.case} | {result.library} | {result.status} | {best_ms} | {tflops} | {result.details.replace('|', '/')} |")
+        lines.append(
+            f"| {result.case} | {result.library} | {result.status} | {best_ms} | "
+            f"{wall_ms} | {host_overhead} | {tflops} | {result.details.replace('|', '/')} |"
+        )
 
     if transfer is not None:
         lines.extend(
@@ -569,6 +737,23 @@ def write_outputs(
         lines.append("- `tensor-ash` selected CPU/software Vulkan (`llvmpipe`), so these are correctness and overhead measurements, not real GPU performance numbers.")
     elif ml_details:
         lines.append(f"- `tensor-ash` used `{ml_details}`, so the Vulkan measurements reflect real GPU kernel timings on this host.")
+    gpu_frameworks = sorted(
+        {
+            result.library
+            for result in results
+            if result.library != "tensor-ash" and result.status == "ok" and result_uses_gpu(result)
+        }
+    )
+    if gpu_frameworks:
+        lines.append(
+            "- Actual GPU framework comparisons succeeded for: "
+            + ", ".join(f"`{library}`" for library in gpu_frameworks)
+            + "."
+        )
+    else:
+        lines.append(
+            "- No CUDA/GPU Python framework rows completed successfully; only the Vulkan `tensor-ash` rows used GPU compute in this report."
+        )
     if ml_ok:
         ratios = []
         wins = 0
@@ -583,7 +768,7 @@ def write_outputs(
             lines.append(f"- Largest gap: `{worst[0]}` is {worst[2]:.1f}x faster in `{worst[1]}` than `tensor-ash` in this environment.")
         lines.append(f"- `tensor-ash` is the fastest measured backend on {wins}/{len(ml_ok)} benchmark cases.")
         ml_by_case = {result.case: result for result in ml_ok}
-        for library in ["numpy", "torch_cpu", "torch_cuda", "jax", "tensorflow"]:
+        for library in RATIO_LIBRARY_ORDER:
             other_by_case = successful_by_library(results, library)
             shared = sorted(set(ml_by_case) & set(other_by_case))
             if not shared:
@@ -595,13 +780,32 @@ def write_outputs(
             geomean = math.prod(speedups) ** (1.0 / len(speedups))
             lines.append(
                 f"- Throughput ratio versus `{library}` across {len(shared)} shared cases: "
-                f"{min(speedups):.1f}x to {max(speedups):.1f}x, geometric mean {geomean:.1f}x."
+                f"{min(speedups):.2f}x to {max(speedups):.2f}x, geometric mean {geomean:.2f}x."
+            )
+        overheads = [
+            result.host_overhead_ms
+            for result in ml_ok
+            if result.host_overhead_ms is not None and result.wall_ms is not None
+        ]
+        if overheads:
+            overheads = sorted(overheads)
+            median = overheads[len(overheads) // 2]
+            lines.append(
+                f"- Median `tensor-ash` host/submission overhead was {median:.3f} ms per synchronous call; "
+                "GPU timestamp TFLOPS excludes that overhead."
             )
     skipped = [r for r in results if r.status == "skipped"]
     if skipped:
-        lines.append("- Some libraries were skipped because their Python modules were unavailable; see details in the table.")
+        skipped_libraries = sorted({r.library for r in skipped})
+        lines.append(
+            "- Some libraries were skipped because their Python modules or device backends were unavailable: "
+            + ", ".join(f"`{library}`" for library in skipped_libraries)
+            + "."
+        )
     if any(r.library == "torch_cuda" and r.status == "skipped" for r in results):
-        lines.append("- PyTorch CUDA/cuBLAS was not available in this Python environment, so CUDA remains a separate benchmark to run when available.")
+        lines.append("- PyTorch CUDA/cuBLAS was not available in this Python environment.")
+    if any(r.library == "cupy_cuda" and r.status == "skipped" for r in results):
+        lines.append("- CuPy CUDA/cuBLAS was not available in this Python environment.")
     if any(r.library in {"jax", "tensorflow"} and r.status == "skipped" for r in results):
         lines.append("- JAX and TensorFlow rows are included when those modules are installed; skipped rows mean the local Python environment does not provide them.")
     if transfer and transfer.status == "ok":
@@ -617,12 +821,12 @@ def write_outputs(
         lines.append("2. Re-run this benchmark on the discrete GPU and compare against PyTorch CUDA when available.")
         lines.append("3. Tune shader variants only after measuring real GPU behavior.")
     else:
-        lines.append("1. Keep benchmarking on this discrete-GPU baseline and tune the shape-based shader selector with more matrix sizes.")
-        lines.append("2. Use `ML_KERNEL=large|small` A/B runs to tune the automatic shader-selector thresholds.")
-        lines.append("3. Add more specialized kernels for skinny, wide, and small-K GEMMs.")
+        lines.append("1. Keep benchmarking on this discrete-GPU baseline and tune the shape-based shader selector with larger production-like matrix sizes.")
+        lines.append("2. Use `scripts/tune_kernels.py` before accepting changes to the automatic selector.")
+        lines.append("3. Focus the next shader pass on large square GEMMs, where PyTorch CUDA still has the largest lead.")
     lines.extend(
         [
-            "4. Run the optional PyTorch CUDA/cuBLAS comparison when the local Python environment provides CUDA.",
+            "4. Keep PyTorch CUDA and CuPy CUDA rows in regular benchmark runs so Vulkan changes are compared against cuBLAS-backed GPU compute.",
             "5. Add CI checks for `cargo fmt`, `cargo clippy`, CPU tests, and an optional GPU correctness job.",
             "",
         ]
@@ -636,6 +840,7 @@ def main() -> int:
     configure_cpu_threads(args.torch_threads)
     ensure_ml_bench(args.ml_bench, args.skip_build)
     self_check = tensor_ash_self_check(args.ml_bench)
+    nvidia_smi = nvidia_smi_summary()
     results = []
     results.extend(bench_tensor_ash(args.ml_bench, cases, args.iters, args.warmup))
     transfer = (
@@ -643,12 +848,15 @@ def main() -> int:
         if args.skip_transfer
         else bench_transfer(args.ml_bench, args.iters, args.transfer_mb)
     )
-    results.extend(bench_numpy(cases, args.iters, args.warmup))
-    results.extend(bench_torch_cpu(cases, args.iters, args.warmup, args.torch_threads))
-    results.extend(bench_torch_cuda(cases, args.iters, args.warmup))
-    results.extend(bench_jax(cases, args.iters, args.warmup))
-    results.extend(bench_tensorflow(cases, args.iters, args.warmup))
-    write_outputs(args.output_json, args.output_md, self_check, results, transfer, args)
+    if not args.skip_cpu_frameworks:
+        results.extend(bench_numpy(cases, args.iters, args.warmup))
+        results.extend(bench_torch_cpu(cases, args.iters, args.warmup, args.torch_threads))
+    if not args.skip_gpu_frameworks:
+        results.extend(bench_torch_cuda(cases, args.iters, args.warmup))
+        results.extend(bench_cupy_cuda(cases, args.iters, args.warmup))
+        results.extend(bench_jax(cases, args.iters, args.warmup))
+        results.extend(bench_tensorflow(cases, args.iters, args.warmup))
+    write_outputs(args.output_json, args.output_md, self_check, nvidia_smi, results, transfer, args)
     print(f"wrote {args.output_json}")
     print(f"wrote {args.output_md}")
     return 0

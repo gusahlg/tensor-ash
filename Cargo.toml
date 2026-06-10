@@ -3,6 +3,10 @@ name = "tensor-ash"
 version = "1.0.0"
 edition = "2024"
 
+[workspace]
+members = [".", "capi"]
+resolver = "2"
+
 [lib]
 name = "tensor_ash"
 path = "src/lib.rs"

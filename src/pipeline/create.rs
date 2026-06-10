@@ -29,6 +29,7 @@ pub(super) fn create_kernel(
     name: &'static str,
     tile_m: u32,
     tile_n: u32,
+    tile_k: u32,
     spv: &[u8],
 ) -> Result<MatmulKernel> {
     unsafe {
@@ -59,15 +60,20 @@ pub(super) fn create_kernel(
                 .constant_id(2)
                 .offset(8)
                 .size(4),
+            vk::SpecializationMapEntry::default()
+                .constant_id(3)
+                .offset(12)
+                .size(4),
         ];
 
-        let spec_data: Vec<[u32; 3]> = (0..KernelVariant::COUNT)
+        let spec_data: Vec<[u32; 4]> = (0..KernelVariant::COUNT)
             .map(|i| {
                 let v = KernelVariant::from_index(i);
                 [
                     v.accumulate as u32,
                     v.alpha_is_one as u32,
                     v.interior_only as u32,
+                    v.k_multiple as u32,
                 ]
             })
             .collect();
@@ -123,6 +129,7 @@ pub(super) fn create_kernel(
             name,
             tile_m,
             tile_n,
+            tile_k,
             shader_module: ScopeGuard::into_inner(shader_guard),
             variants,
         })

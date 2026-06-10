@@ -20,6 +20,11 @@ pub(super) fn update_matmul_descriptor_sets(
 ) {
     debug_assert_eq!(sets.len(), calls.len());
 
+    if let ([set], [call]) = (sets, calls) {
+        update_one_matmul_descriptor_set(ctx, *set, call);
+        return;
+    }
+
     // Build the buffer-info array up front so the &[WriteDescriptorSet]
     // we hand to Vulkan keeps stable references into it.
     let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::with_capacity(calls.len() * 3);
@@ -48,6 +53,39 @@ pub(super) fn update_matmul_descriptor_sets(
     }
 }
 
+fn update_one_matmul_descriptor_set(
+    ctx: &VulkanContext,
+    set: vk::DescriptorSet,
+    call: &MatmulCall<'_>,
+) {
+    let buffer_infos = [
+        tensor_descriptor(call.a),
+        tensor_descriptor(call.b),
+        tensor_descriptor(call.c),
+    ];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&buffer_infos[0])),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&buffer_infos[1])),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&buffer_infos[2])),
+    ];
+
+    unsafe {
+        ctx.device.update_descriptor_sets(&writes, &[]);
+    }
+}
+
 pub(super) fn record_matmul_commands(
     ctx: &VulkanContext,
     pipeline: &MatmulPipeline,
@@ -65,7 +103,7 @@ pub(super) fn record_matmul_commands(
         .zip(resolved.iter())
     {
         let pc = dims.push_constants(call.alpha, call.accumulate);
-        let kernel = pipeline.select_kernel(dims.m, dims.n, dims.k);
+        let kernel = pipeline.select_kernel(dims.batch, dims.m, dims.n, dims.k);
 
         // Pick the specialization variant whose constants match this call.
         // `interior_only` is safe whenever M and N are tile-aligned to the
@@ -76,6 +114,7 @@ pub(super) fn record_matmul_commands(
             alpha_is_one: call.alpha == 1.0,
             interior_only: dims.m.is_multiple_of(kernel.tile_m)
                 && dims.n.is_multiple_of(kernel.tile_n),
+            k_multiple: dims.k.is_multiple_of(kernel.tile_k),
         };
         let variant_pipeline = kernel.pipeline_for(variant);
 

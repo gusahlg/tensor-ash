@@ -44,10 +44,13 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 //   ALPHA_IS_ONE   true  -> skip the `alpha * x` multiply entirely
 //   INTERIOR_ONLY  true  -> host guarantees M and N are tile-aligned;
 //                           drop all m_full/n_full predicates
+//   K_MULTIPLE     true  -> host guarantees K is a multiple of BK;
+//                           drop the K-tail branch and modulo
 // ------------------------------------------------------------------
 layout(constant_id = 0) const bool ACCUMULATE    = false;
 layout(constant_id = 1) const bool ALPHA_IS_ONE  = true;
 layout(constant_id = 2) const bool INTERIOR_ONLY = false;
+layout(constant_id = 3) const bool K_MULTIPLE    = false;
 
 const uint WG_X    = BN / TN;
 const uint WG_Y    = BM / TM;
@@ -137,7 +140,7 @@ void main() {
     const bool n_full = ((block_col + 1u) * BN) <= pc.N;
 
     const uint num_full_k = pc.K / BK;
-    const bool has_k_tail = (pc.K % BK) != 0u;
+    const bool has_k_tail = !K_MULTIPLE && ((pc.K % BK) != 0u);
 
     const uint a_row0 = ty * TM;
     const uint b_col0 = tx * TN;

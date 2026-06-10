@@ -1,0 +1,11 @@
+#version 460
+// Rectangular GEMM variant for tall output tiles.  This keeps the
+// 16x16 workgroup shape but gives each workgroup a 128x64 C tile.
+
+#define BM 128u
+#define BN 64u
+#define BK 32u
+#define TM 8u
+#define TN 4u
+
+#include "matmul_kernel.glsl"
