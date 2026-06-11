@@ -1,0 +1,15 @@
+#version 460
+// Persistent-threads variant with the 128x64/BK=64 BDA + uvec4-Bs tile.
+//
+// Same tile as matmul_f32_m128n64k64_bda_v4.comp; only the dispatch
+// shape changes (the host launches a fixed WG count and the kernel
+// loops on a global atomic counter).
+
+#define BM 128u
+#define BN  64u
+#define BK  64u
+#define TM   8u
+#define TN   4u
+#define TN_RAW 4
+
+#include "matmul_persistent_kernel.glsl"

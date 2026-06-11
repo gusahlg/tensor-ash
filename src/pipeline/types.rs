@@ -300,7 +300,7 @@ impl KernelSelection {
         }
     }
 
-    pub(super) fn from_env() -> Result<Self> {
+    pub fn from_env() -> Result<Self> {
         let value = std::env::var("ML_KERNEL").unwrap_or_else(|_| "auto".into());
         Self::parse(&value)
     }
