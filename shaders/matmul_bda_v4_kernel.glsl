@@ -209,18 +209,43 @@ void main() {
 
         barrier();
 
-        [[unroll]] for (uint k = 0u; k < BK; ++k) {
-            float a_reg[TM];
+        // Register-level inner-k double buffer.  Per the peak-gap
+        // analysis: with a single `a_reg[TM]` SSA value the NVIDIA
+        // Vulkan NVVM backend respects the strict load -> FMA chain and
+        // emits 8 LDS + 1 LDS-vec4 + 8 FMAs as a single ordered block.
+        // Splitting the registers into `[2][TM]` gives the prefetched
+        // k+1 loads a different SSA destination than the in-use k
+        // values, which lets the compiler interleave LDS+FMA inside the
+        // 4-cycle FFMA pipeline.  Confirmed with spirv-dis: the
+        // prefetched OpLoad %v4uint moves above the previous iter's
+        // last OpExtInst Fma.
+        float a_reg[2][TM];
+        vec4  b_vec[2][TN / 4u];
+        [[unroll]] for (uint i = 0u; i < TM; ++i)
+            a_reg[0][i] = As[a_row0 + i][0];
+        [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
+            b_vec[0][j4] = uintBitsToFloat(Bs[0][b_col0_v4 + j4]);
+
+        [[unroll]] for (uint k = 0u; k < BK - 1u; ++k) {
+            const uint cur = k & 1u;
+            const uint nxt = (k + 1u) & 1u;
+            // Prefetch k+1 into the alternate register bank.
             [[unroll]] for (uint i = 0u; i < TM; ++i)
-                a_reg[i] = As[a_row0 + i][k];
-
-            vec4 b_vec[TN / 4u];
+                a_reg[nxt][i] = As[a_row0 + i][k + 1u];
             [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
-                b_vec[j4] = uintBitsToFloat(Bs[k][b_col0_v4 + j4]);
-
+                b_vec[nxt][j4] = uintBitsToFloat(Bs[k + 1u][b_col0_v4 + j4]);
+            // Compute current iter from the cur bank.
             [[unroll]] for (uint i = 0u; i < TM; ++i)
                 [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
-                    acc[i][j4] = fma(vec4(a_reg[i]), b_vec[j4], acc[i][j4]);
+                    acc[i][j4] = fma(vec4(a_reg[cur][i]), b_vec[cur][j4], acc[i][j4]);
+        }
+
+        // Final iter: just compute, nothing left to prefetch.
+        {
+            const uint last = (BK - 1u) & 1u;
+            [[unroll]] for (uint i = 0u; i < TM; ++i)
+                [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
+                    acc[i][j4] = fma(vec4(a_reg[last][i]), b_vec[last][j4], acc[i][j4]);
         }
 
         barrier();
@@ -233,18 +258,43 @@ void main() {
 
         barrier();
 
-        [[unroll]] for (uint k = 0u; k < BK; ++k) {
-            float a_reg[TM];
+        // Register-level inner-k double buffer.  Per the peak-gap
+        // analysis: with a single `a_reg[TM]` SSA value the NVIDIA
+        // Vulkan NVVM backend respects the strict load -> FMA chain and
+        // emits 8 LDS + 1 LDS-vec4 + 8 FMAs as a single ordered block.
+        // Splitting the registers into `[2][TM]` gives the prefetched
+        // k+1 loads a different SSA destination than the in-use k
+        // values, which lets the compiler interleave LDS+FMA inside the
+        // 4-cycle FFMA pipeline.  Confirmed with spirv-dis: the
+        // prefetched OpLoad %v4uint moves above the previous iter's
+        // last OpExtInst Fma.
+        float a_reg[2][TM];
+        vec4  b_vec[2][TN / 4u];
+        [[unroll]] for (uint i = 0u; i < TM; ++i)
+            a_reg[0][i] = As[a_row0 + i][0];
+        [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
+            b_vec[0][j4] = uintBitsToFloat(Bs[0][b_col0_v4 + j4]);
+
+        [[unroll]] for (uint k = 0u; k < BK - 1u; ++k) {
+            const uint cur = k & 1u;
+            const uint nxt = (k + 1u) & 1u;
+            // Prefetch k+1 into the alternate register bank.
             [[unroll]] for (uint i = 0u; i < TM; ++i)
-                a_reg[i] = As[a_row0 + i][k];
-
-            vec4 b_vec[TN / 4u];
+                a_reg[nxt][i] = As[a_row0 + i][k + 1u];
             [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
-                b_vec[j4] = uintBitsToFloat(Bs[k][b_col0_v4 + j4]);
-
+                b_vec[nxt][j4] = uintBitsToFloat(Bs[k + 1u][b_col0_v4 + j4]);
+            // Compute current iter from the cur bank.
             [[unroll]] for (uint i = 0u; i < TM; ++i)
                 [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
-                    acc[i][j4] = fma(vec4(a_reg[i]), b_vec[j4], acc[i][j4]);
+                    acc[i][j4] = fma(vec4(a_reg[cur][i]), b_vec[cur][j4], acc[i][j4]);
+        }
+
+        // Final iter: just compute, nothing left to prefetch.
+        {
+            const uint last = (BK - 1u) & 1u;
+            [[unroll]] for (uint i = 0u; i < TM; ++i)
+                [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
+                    acc[i][j4] = fma(vec4(a_reg[last][i]), b_vec[last][j4], acc[i][j4]);
         }
 
         barrier();
