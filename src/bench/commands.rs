@@ -6,13 +6,22 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tensor_ash::{
-    DeviceKind, Executor, MatmulCall, Tensor, VulkanContext,
+    DeviceKind, Executor, MatmulCall, PersistentMatmul, Tensor, VulkanContext,
     testing::{cpu_bmm, fill_det, max_abs_err},
 };
 
 use super::cases::{BenchCase, BenchResult, host_len, sweep_cases};
 use super::env::{OutputMode, SweepMode, env_u32, env_usize};
 use super::report::{BenchReporter, csv_escape};
+
+/// Match the magic-string the task description used: `ML_KERNEL=persistent_v4`
+/// flips the benchmark over to the persistent-threads kernel instead of
+/// the regular `MatmulPipeline` path.
+fn want_persistent_kernel() -> bool {
+    env::var("ML_KERNEL")
+        .map(|v| v.eq_ignore_ascii_case("persistent_v4"))
+        .unwrap_or(false)
+}
 
 pub(super) fn correctness(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
     let b = env_u32("ML_B", 2);

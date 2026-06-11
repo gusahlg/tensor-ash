@@ -24,9 +24,10 @@
 
 mod recording;
 mod slot;
+mod splitk;
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use ash::vk;
@@ -38,8 +39,12 @@ use crate::matmul::{ResolvedMatmul, ResolvedMatmulBatch, total_flops};
 use crate::pipeline::MatmulPipeline;
 use crate::tensor::Tensor;
 
-use recording::{record_matmul_commands, update_matmul_descriptor_sets};
+use recording::{
+    record_matmul_commands, record_matmul_split_k_commands, update_matmul_descriptor_sets,
+};
 use slot::Slot;
+pub use splitk::default_num_k_splits;
+use splitk::SplitKPipeline;
 
 pub use crate::matmul::{MatmulCall, RunStats};
 
@@ -52,6 +57,10 @@ pub struct Executor {
     /// Maximum descriptor sets we'll allocate per submission (= max
     /// matmul calls in one `run_matmuls`).
     max_calls_per_submit: u32,
+    /// Experimental split-K pipeline, lazily built on first use of
+    /// `run_matmuls_split_k`.  See `executor/splitk.rs` for the design
+    /// rationale.
+    split_k: OnceLock<SplitKPipeline>,
 }
 
 impl Executor {
@@ -81,7 +90,173 @@ impl Executor {
             slots: Mutex::new(slots),
             slot_avail: Condvar::new(),
             max_calls_per_submit,
+            split_k: OnceLock::new(),
         })
+    }
+
+    /// Experimental: dispatch a single matmul using the split-K
+    /// kernel.  Splits the K reduction into `num_k_splits` chunks
+    /// (`0` = pick a default based on the shape), zero-fills C, then
+    /// dispatches one workgroup per (block_row, block_col, batch,
+    /// k_split) and atomically reduces partial sums into C.
+    ///
+    /// Returns the same `RunStats` shape as `run_matmuls`, including
+    /// GPU time over the zero-fill **plus** the dispatch — both
+    /// happen inside the timestamp window.
+    ///
+    /// Caveats:
+    ///   * `accumulate=true` is rejected: split-K's correctness
+    ///     story relies on starting from a zeroed C.
+    ///   * Atomic-add ordering is non-deterministic, so results
+    ///     differ across runs in the low-order bit.  Tests should
+    ///     budget `tolerance(K) * num_k_splits` for the extra
+    ///     rounding.
+    ///
+    /// This entry point is intentionally a *separate* method from
+    /// `run_matmuls` so callers opt in explicitly.
+    pub fn run_matmuls_split_k(
+        &self,
+        call: MatmulCall<'_>,
+        num_k_splits: u32,
+    ) -> Result<RunStats> {
+        if call.accumulate {
+            bail!("run_matmuls_split_k: accumulate=true is not supported");
+        }
+
+        let resolved = crate::matmul::ResolvedMatmul::from_call(&call)?;
+
+        // Stable equivalent of `get_or_try_init`: try-init outside, then
+        // race the get_or_init.  Worst case we build the pipeline twice
+        // on first concurrent access but only the first init wins.
+        let split_k = if let Some(s) = self.split_k.get() {
+            s
+        } else {
+            let built = SplitKPipeline::new(&self.ctx, self.pipeline.pipeline_layout)?;
+            self.split_k.get_or_init(|| built)
+        };
+        let kernel = split_k.pick(resolved.m, resolved.n);
+        let num_k_splits = if num_k_splits == 0 {
+            default_num_k_splits(
+                resolved.batch,
+                resolved.m,
+                resolved.n,
+                resolved.k,
+                kernel.tile_m,
+                kernel.tile_n,
+            )
+        } else {
+            num_k_splits
+        };
+        if num_k_splits == 0 || num_k_splits > 0xFFFF {
+            bail!(
+                "run_matmuls_split_k: num_k_splits={num_k_splits} out of range [1, 65535]"
+            );
+        }
+
+        let mut slot = self.checkout_slot();
+        let result = self.record_and_run_split_k(&mut slot, &call, &resolved, kernel, num_k_splits);
+        self.checkin_slot(slot);
+
+        let gpu_time_ns = result?;
+        Ok(RunStats {
+            gpu_time_ns,
+            n_calls: 1,
+            total_flops: resolved.total_flops,
+        })
+    }
+
+    fn record_and_run_split_k(
+        &self,
+        slot: &mut Slot,
+        call: &MatmulCall<'_>,
+        resolved: &crate::matmul::ResolvedMatmul,
+        kernel: &splitk::SplitKKernel,
+        num_k_splits: u32,
+    ) -> Result<Option<u64>> {
+        let want_timestamps = self.ctx.timestamps_supported;
+        let query_pool = slot.query_pool;
+        let set_count = 1usize;
+        let calls_slice = std::slice::from_ref(call);
+        let max_groups = self.ctx.device_properties.limits.max_compute_work_group_count;
+        let gx = resolved.n.div_ceil(kernel.tile_n);
+        let gy = resolved.m.div_ceil(kernel.tile_m);
+        let gz = resolved
+            .batch
+            .checked_mul(num_k_splits)
+            .ok_or_else(|| anyhow!("split-K dispatch grid Z overflows u32"))?;
+        if gx > max_groups[0] || gy > max_groups[1] || gz > max_groups[2] {
+            bail!(
+                "split-K dispatch ({gx}, {gy}, {gz}) for M={}, N={}, K={}, batch={}, splits={} \
+                 exceeds device maxComputeWorkGroupCount ({}, {}, {})",
+                resolved.m,
+                resolved.n,
+                resolved.k,
+                resolved.batch,
+                num_k_splits,
+                max_groups[0],
+                max_groups[1],
+                max_groups[2],
+            );
+        }
+
+        unsafe {
+            update_matmul_descriptor_sets(
+                &self.ctx,
+                &slot.descriptor_sets[..set_count],
+                calls_slice,
+            );
+
+            self.submit_recorded(slot, |dev, cb, slot| {
+                if want_timestamps {
+                    dev.cmd_reset_query_pool(cb, query_pool, 0, 2);
+                    dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, query_pool, 0);
+                }
+
+                let descriptor_sets = &slot.descriptor_sets[..set_count];
+                record_matmul_split_k_commands(
+                    &self.ctx,
+                    &self.pipeline,
+                    kernel,
+                    cb,
+                    descriptor_sets,
+                    call,
+                    resolved,
+                    num_k_splits,
+                    gx,
+                    gy,
+                    gz,
+                )?;
+
+                if want_timestamps {
+                    dev.cmd_write_timestamp(
+                        cb,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        query_pool,
+                        1,
+                    );
+                }
+                Ok(())
+            })?;
+
+            let gpu_time_ns = if want_timestamps {
+                let mut data = [0u64; 2];
+                self.ctx
+                    .device
+                    .get_query_pool_results(
+                        query_pool,
+                        0,
+                        &mut data,
+                        vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                    )
+                    .context("get_query_pool_results")?;
+                let ticks = data[1].wrapping_sub(data[0]);
+                Some((ticks as f64 * self.ctx.timestamp_period_ns) as u64)
+            } else {
+                None
+            };
+
+            Ok(gpu_time_ns)
+        }
     }
 
     /// Synchronous host->device upload via the slot-local staging buffer.

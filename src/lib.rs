@@ -36,6 +36,7 @@ pub mod buffer;
 pub mod context;
 pub mod executor;
 pub mod matmul;
+pub mod persistent;
 pub mod pipeline;
 pub mod tensor;
 pub mod testing;
@@ -44,6 +45,7 @@ pub use buffer::{Buffer, BufferLocation};
 pub use context::{DeviceKind, DevicePreference, DeviceSummary, VulkanContext};
 pub use executor::Executor;
 pub use matmul::{MatmulCall, MatrixShape, RunStats};
+pub use persistent::PersistentMatmul;
 pub use pipeline::{
     KERNEL_SPECS, KernelSelection, KernelSpec, KernelVariant, MatmulKernel, MatmulPipeline,
     MatmulPushConstants,

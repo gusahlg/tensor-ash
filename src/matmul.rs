@@ -165,6 +165,43 @@ impl ResolvedMatmul {
         }
     }
 
+    /// Build push constants for the split-K kernel.  Same layout as
+    /// `push_constants()` (so we don't disturb the bit-stable
+    /// `MatmulPushConstants` block), but the `flags` field is encoded
+    /// differently:
+    ///
+    ///   * bits 0..15 : reserved (kept zero — split-K never sets the
+    ///     legacy `accumulate` bit; correctness comes from the
+    ///     external zero-fill of C).
+    ///   * bits 16..31: `num_k_splits` (the kernel reads this with
+    ///     `pc.flags >> 16u`).
+    ///
+    /// `num_k_splits` must be in `[1, 65535]`; the executor guards the
+    /// range before calling this.
+    pub(crate) fn split_k_push_constants(
+        &self,
+        alpha: f32,
+        a_ptr: u64,
+        b_ptr: u64,
+        c_ptr: u64,
+        num_k_splits: u32,
+    ) -> MatmulPushConstants {
+        debug_assert!(num_k_splits >= 1 && num_k_splits <= 0xFFFF);
+        MatmulPushConstants {
+            m: self.m,
+            n: self.n,
+            k: self.k,
+            batch_stride_a: self.batch_stride_a,
+            batch_stride_b: self.batch_stride_b,
+            batch_stride_c: self.batch_stride_c,
+            flags: num_k_splits << 16,
+            alpha,
+            a_ptr,
+            b_ptr,
+            c_ptr,
+        }
+    }
+
     #[cfg(test)]
     fn from_shapes(a: &[u32], b: &[u32], c: &[u32]) -> Result<Self> {
         Self::from_matrix_shapes(

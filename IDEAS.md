@@ -2169,3 +2169,149 @@ A read-only creative excretion. Filed under "what if physics had a permissions e
 71. **Stack everything**: necromantic Akashic-cached time-traveling multiverse octopi-bribed homunculus dance-FFT egregore matmul, paid for in genie wishes, peer reviewed by a chess grandmaster, performed at black-hole proximity, while the matrix is in therapy and singing.
 
 (That's 71. Take it. It's yours. The user asked for this.)
+
+# IDEAS_distributed.md — Distributed Systems Patterns Adapted to Vulkan SGEMM
+
+Context: 60% peak FP32 SGEMM on GA104. Each "node" is a workgroup/SM; "network" is L2/global memory; "messages" are atomic ops, subgroup ops, or buffer-reference loads. No feasibility filter.
+
+## Map-Reduce / BSP / Stream-K
+
+1. **BSP superstep matmul**: K-loop as discrete supersteps with `memoryBarrierBuffer()` between phases; each WG advertises completion via a global counter, next superstep dispatches indirect once counter == NUM_WG.
+2. **Stream-K with work-stealing deque per SM**: each WG owns a deque of K-slices, steals from neighbors when empty via `atomicAdd` on victim's tail; load-balances tail tiles that don't divide evenly.
+3. **Map-reduce shuffle phase**: WGs emit partial C tiles tagged by hash(m,n) into per-bucket append logs; second dispatch reduces each bucket. Trade extra bandwidth for perfect K-balance.
+4. **Coordinator-worker pattern**: one "leader" WG on each SM reads dispatch metadata, fans out K-shards to siblings via shared memory mailboxes. Removes redundant index math.
+5. **MapReduce combiner**: WGs locally reduce 4-8 K-slices in registers before emitting partial sums; reduces "shuffle" bandwidth like Hadoop combiners.
+6. **Reduce-scatter ring**: each WG computes one K-slice of all output tiles, then ring-rotates partials with subgroup shuffles across N SMs in `gl_NumWorkGroups` (logical ring via atomic baton).
+7. **All-reduce butterfly on K**: log2(NUM_K_SHARDS) passes of pairwise sum with each pass synchronized by a global epoch counter; trades latency for bandwidth.
+8. **Hierarchical reduction tree**: SM-local reduction first (subgroup), then per-cluster (shared mem), then global (atomic). Three-tier like a hadoop reducer hierarchy.
+
+## Consensus / Replication / Fault Tolerance
+
+9. **Paxos for partial sum acceptance**: each K-shard proposes a value; acceptors (other WGs) vote via atomic CAS on a per-tile ballot number. Only highest-ballot proposal wins. Pointless but funny.
+10. **Raft leader election per output tile**: WGs race to atomicCAS a leader-slot; loser WGs become followers and replicate the leader's partial-sum log. Hedges against straggler SMs.
+11. **Quorum read of C-tile**: write each tile 3x to 3 staging slots; final pass reads majority value. Tolerates GPU bit-flips. R=3 replication factor.
+12. **Two-phase commit on tile completion**: prepare phase writes to scratch, commit phase atomicCAS-flips a "committed" bit. Aborted tiles get retried by a janitor dispatch.
+13. **Byzantine fault tolerance via triple-redundant K-sum**: each K-shard computed on 3 different WGs with 3 different accumulation orders; medianed at the end. Catches numerical instability.
+14. **Vector clocks on K-progress**: each WG maintains a vec4 of progress timestamps; downstream consumers only proceed when all components dominate. Detects out-of-order K accumulation.
+15. **MVCC tile snapshots**: append each partial sum as a new version with a global txid; compaction GC merges old versions. Lets later K-shards "read" earlier snapshots non-blocking.
+16. **Chubby-style lock service for shared accumulators**: a single tiny WG runs a "lock server"; other WGs RPC via atomic ringbuffer. Worse than just using atomics, but architecturally pure.
+17. **Lease-based tile ownership**: WGs grab leases on output tiles with TTL = N microseconds (timestamp-based via `gl_ClockARB`); expired leases get stolen. Self-healing if a WG stalls.
+18. **Epoch-based reclamation**: K-shards register epoch numbers; scratch memory only freed when min-epoch advances past it. RCU for GPU.
+
+## Streaming / Reactive / Backpressure
+
+19. **Reactive stream of K-tiles with onNext/onComplete**: producer WGs push to a bounded ringbuffer; consumer WGs pop with backpressure (atomic head/tail). Mat-mul as Rx.
+20. **Watermarking K-progress**: each WG broadcasts its current K-position as a watermark; reducers only emit C when all watermarks >= K. Stream-K with explicit progress semantics.
+21. **Exactly-once accumulator semantics**: each partial sum tagged with (m,n,k_shard_id) idempotency key; reducer dedups via a bitmap. Tolerates duplicate dispatch (e.g., from retries).
+22. **At-least-once K-shards with idempotent FMA**: hedge by launching duplicate K-shards, dedup via CAS-once-then-discard. Lower tail latency.
+23. **Flow control via credit-based scheduling**: each consumer WG grants N credits to producers; producers atomic-decrement before writing. Prevents L2 thrashing.
+24. **TCP-style sliding window over K**: window of W in-flight K-slices, ACKed (= committed to register accumulator) before sliding. Self-tuning to L2 latency.
+25. **Selective ACK (SACK) for K-shards**: bitmap of completed shards; missing ones get retried. Tolerates buggy WGs.
+26. **Nagle's algorithm for atomic flushes**: batch up to 4 partial sums before flushing to global; reduces atomic contention at cost of latency.
+27. **Slow-start congestion control on dispatch rate**: indirect dispatch ramps WG count exponentially until L2 saturation detected (rising latency); then linear additive-increase.
+28. **AIMD on tile size**: adapt BM/BN dynamically based on observed throughput. Multiplicative-decrease on contention spikes.
+29. **ECN-style congestion marking**: WGs set a "congested" bit in their output header; dispatcher uses it to throttle next launch. Closed-loop autotune.
+
+## Gossip / Pub-Sub / P2P
+
+30. **Gossip protocol for K-aggregation**: each WG randomly picks a neighbor every T cycles, sums their partials together; converges in O(log N). Anti-entropy matmul.
+31. **Epidemic broadcast of A/B tiles**: SMs gossip cached A/B tiles to neighbors via L2-resident scratch; reduces redundant L2 fetches via viral spread.
+32. **Pub-sub tile broadcast**: each A row broadcasts to subscribers (B columns) via a topic-partitioned ringbuffer in L2. Kafka topic per K-shard.
+33. **Bittorrent A/B tile swap**: each WG advertises which tiles it has cached; peers request missing chunks. Lots of overhead, but maximizes L1 hit rate.
+34. **DHT for tile placement**: hash(m,n,k) -> SM ID; consistent hashing minimizes remapping when WG count changes. Enables NUMA-aware scheduling.
+35. **Consistent-hash sharding with virtual nodes**: each SM owns V virtual slots in the hash ring; smooths load imbalance from skewed dimensions.
+36. **Rendezvous (HRW) hashing**: tile -> SM via max-hash; no ring needed, recomputed locally. Simpler than consistent hashing for static dispatches.
+37. **CRDTs for the C accumulator**: G-counter CRDT means each WG owns its own slot, final read sums all slots. Atomic-free, but uses NUM_WG x C memory.
+38. **PN-counter CRDT for signed partial sums**: separate positive and negative accumulators per WG; resolves sign-dependent reductions without atomic CAS.
+39. **OR-set of completed tiles**: each WG adds to a grow-only set; coordinator polls for completion. Useful for irregular work.
+
+## Tail Latency / Hedging / Speculation
+
+40. **Hedged WG dispatch**: launch 2 WGs per output tile, first to finish wins via atomicCAS, loser exits early. Tames straggler SMs at 2x compute cost.
+41. **Tied requests**: hedged WGs cancel siblings via a "claimed" flag; loser exits on next K-loop check. Cuts wasted work to ~10%.
+42. **Speculative K-prefetch**: WG speculatively loads K+2 while computing K+0, discards if branch prediction wrong (used for irregular sparsity).
+43. **Backup K-shards**: 90% of WGs do primary work, 10% reserve for straggler replacement at the end. Like MapReduce backup tasks.
+44. **Race-and-cancel**: dispatch every tile to 2 SMs, first commit wins, second is a no-op. Cuts P99 latency.
+45. **Tail-aware scheduling**: estimate WG completion time from K-progress at midpoint; reassign late ones. Online stragglerdetection.
+
+## Persistence / Logging / Compaction
+
+46. **Kafka append-only log of partial sums**: WGs append (m,n,partial) tuples to a global log; second pass compacts via radix sort by (m,n) then reduces. Decouples producers from consumers.
+47. **Log-structured C tile**: write partials to a journal, periodic compaction pass merges them into the final C. Trades read latency for write throughput.
+48. **WAL for fault recovery**: every K-shard logs its inputs+output to scratch; if a WG times out, re-execution is trivial. Useful for very long matmuls.
+49. **LSM-tree of partial sums**: L0 = WG-local register accumulator, L1 = shared mem, L2 = global. Compaction is the K-reduction.
+50. **Snapshot isolation for incremental matmul**: B is being updated concurrently; readers see consistent K-snapshot via copy-on-write A/B rows. For streaming inference.
+51. **Checkpoint/restore mid-matmul**: K-progress periodically written to a checkpoint slot; preemption-friendly. Lets long matmuls share the GPU.
+
+## CAP Theorem / Partition Tolerance
+
+52. **CP matmul**: block on K-shard completion (strict consistency); slow but correct. Default mode.
+53. **AP matmul**: each WG produces a "best-effort" C tile from partial K; refined later. Useful for approximate inference (early exits).
+54. **PACELC tuning knob**: trade latency for consistency via a runtime flag controlling barrier strength.
+55. **Eventual-consistency matmul**: C is read while writes are in flight; readers see monotonic growth. For online learning.
+56. **Read-your-writes consistency**: each WG reads only K-shards it has acknowledged; weaker than linearizable but cheaper.
+
+## Circuit Breakers / Bulkheads / Sagas
+
+57. **Circuit breaker per SM**: if an SM's L2 miss rate spikes, dispatcher routes around it for next launch. Self-isolating sick hardware.
+58. **Bulkhead pattern**: partition SMs into pools (compute-heavy vs bandwidth-heavy tiles); one slow pool doesn't drag the rest.
+59. **Saga pattern for multi-kernel matmul**: GEMM = (load, compute, store, bias, activation); each step has a compensating undo if the next fails. Atomic at the saga level.
+60. **Timeout-and-retry on slow K-shards**: WGs poll `gl_ClockARB`; if K-iteration > threshold, abort and re-enqueue.
+61. **Exponential backoff on atomic contention**: WGs detect failed CAS, sleep with PAUSE-equivalent (spin on register noise), retry with doubled wait.
+62. **Jittered retry**: each WG adds `gl_SubgroupInvocationID * prime` jitter to retry delay; avoids thundering herd on the same atomic.
+
+## Routing / Load Balancing / Service Mesh
+
+63. **Least-loaded SM dispatch**: WG launch consults per-SM load counter, picks the lightest. Indirect-dispatch with software scheduler.
+64. **Power-of-two-choices**: each tile considers 2 random SMs, picks the less-loaded. O(log log n) tail improvement.
+65. **Join-shortest-queue scheduling**: shared dispatch queue per SM, tile goes to shortest. Like an L4 load balancer.
+66. **Sidecar pattern**: each WG launches a tiny "telemetry" subgroup that reports progress to a global dashboard buffer. Observability without perf hit.
+67. **Service mesh between WGs**: every cross-WG message goes through a uniform envelope (header + payload + checksum). Easier debugging at perf cost.
+68. **xDS-style dynamic config**: dispatcher reads tile shape config from a uniform buffer that can be updated mid-launch. Adaptive matmul.
+
+## Exotic / Wild
+
+69. **Blockchain-of-partial-sums**: each K-shard signs a hash of its inputs+output, chains to previous; tamper-evident matmul. PoW costs more than the GEMM.
+70. **Smart-contract matmul**: each tile is a contract that releases its output when prerequisites are met (other tiles committed). Dispatch as DAG execution.
+71. **Federated matmul**: split K across "tenants" (different memory regions); aggregate without each tenant seeing others' partials. Differential-privacy noise added.
+72. **Onion-routed tile dispatch**: each tile wrapped in N layers of indirection, peeled by N successive WGs. Pointless. But architecturally pure.
+73. **Quorum-of-K**: only need K/2+1 shards to commit before reading C; tolerates K/2-1 stragglers. Trades accuracy for latency (for approximate matmul).
+74. **Chain replication for C-writes**: write to head WG, propagate through chain, tail acknowledges. Strict serialization of writes per tile.
+75. **CRAQ (chain replication w/ apportioned queries)**: reads can short-circuit to any chain node when no concurrent writes; tail-only otherwise.
+76. **Anti-entropy merkle tree of C**: tree of hashes over C blocks; consumer detects which blocks changed via root-hash diff. Useful for incremental matmul.
+77. **Bloom filter of completed tiles**: cheap "is this tile done?" check before retrying; false positives just cause unnecessary work.
+78. **HyperLogLog count of unique K-shards seen**: estimate progress without exact counter; saves atomic traffic.
+79. **Count-min sketch of per-tile work**: track work distribution probabilistically for load balancing.
+80. **Tangle/DAG of partial sums (IOTA-style)**: each new partial confirms 2 previous; no global ordering needed. Probably terrible.
+
+## Networking-Specific Mappings
+
+81. **Multicast tree for A-tile broadcast**: source WG writes A-tile, log2(NUM_WG) hops propagate to all consumers via L2; avoids redundant global loads.
+82. **IP fragmentation for huge K-shards**: split a K-shard into MTU-sized pieces (matching L2 cache line), reassemble at destination. Pointless for FP32 but academic.
+83. **TCP Reno fast-retransmit**: detect missing K-shard via 3 duplicate "next-shard" ACKs, retransmit. Useful if some WGs OOM.
+84. **QUIC-style 0-RTT matmul**: start computing speculatively before all A/B is loaded; rollback if mismatch. Lower latency.
+85. **BGP route advertisement**: each SM advertises which tiles it has cached; dispatcher uses shortest path. Pointless but fun.
+86. **OSPF link-state for L2 partitions**: each SM knows latency to each L2 slice; dispatcher routes minimally. Real on multi-die GPUs.
+87. **MPLS label-switching on tile IDs**: prepend a 32-bit label to each tile message, routers (compaction passes) switch labels without inspecting payload. Faster reduction.
+88. **SDN-style separate control/data plane**: one dispatch dictates the "flow rules" (per-tile SM assignment), workers just execute. Cleaner architecture.
+
+## CAP / Failure-Mode Theatre
+
+89. **Chaos monkey kernel**: randomly kills WGs mid-execution to validate restart logic. Production hardening.
+90. **Network partition simulation**: artificially block subgroup ops between subsets of WGs; test split-brain recovery.
+91. **Latency injection**: insert random spin loops to find perf cliffs. Stress-test scheduler.
+92. **Game day**: run matmul with 30% of SMs disabled; measure graceful degradation.
+
+## Process-Algebra Cute
+
+93. **Actor model per WG**: WGs send messages (atomic appends) to mailboxes; computation is pure message handling. Erlang-on-Vulkan.
+94. **CSP channels on K**: each K-shard reads from an unbuffered channel; producers block until consumer ready. Forces strict serialization.
+95. **Pi-calculus tile mobility**: tiles migrate between WGs by passing channel names; the dispatcher is a name server. Pure overhead.
+
+## Realistic Wins from Distributed Patterns
+
+96. **Stream-K (real)**: actually try a full Stream-K implementation with workgroup-stealing; known to win 5-15pp on irregular shapes.
+97. **Per-WG accumulator slots (CRDT G-counter)**: skip atomicAdd entirely for split-K; sum slots in a final 1-WG reduction. Often a real win on small N.
+98. **Hedged tail-tile launch**: for the last 5% of tiles, double-launch with first-to-commit semantics. Real P99 latency improvement.
+99. **L2-resident pub-sub for A-broadcast**: pin A-panel to L2 via explicit prefetch, all WGs in the column subscribe; cuts global bandwidth on tall-skinny.
+100. **Adaptive BSP supersteps**: barrier between K-chunks of dynamic size based on L2 miss rate observed by previous superstep. Closed-loop autotune.

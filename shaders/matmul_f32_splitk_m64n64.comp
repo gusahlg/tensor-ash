@@ -1,0 +1,12 @@
+#version 460
+// Split-K 64x64/BK=32 variant.  Used for shapes where M and N are too
+// small to fill a single 128x128 tile (`1x64x64x8192`-style).
+
+#define BM 64u
+#define BN 64u
+#define BK 32u
+#define TM  4u
+#define TN  4u
+#define TN_RAW 4
+
+#include "matmul_splitk_kernel.glsl"
