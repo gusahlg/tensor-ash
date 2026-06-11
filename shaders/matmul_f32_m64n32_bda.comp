@@ -1,0 +1,11 @@
+#version 460
+// 64x32/BK=32 BDA variant of the `m64n32` kernel.
+
+#define BM 64u
+#define BN 32u
+#define BK 32u
+#define TM  4u
+#define TN  2u
+#define TN_RAW 2
+
+#include "matmul_bda_kernel.glsl"

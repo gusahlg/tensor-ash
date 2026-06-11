@@ -3,6 +3,12 @@ use ash::vk;
 
 /// Push constants for the matmul shader.  Bit-for-bit identical to the
 /// GLSL `PC` block.
+///
+/// `a_ptr`, `b_ptr`, `c_ptr` are GPU device addresses (Vulkan 1.2
+/// `bufferDeviceAddress`).  Kernels using descriptor bindings ignore
+/// them; the `buffer_reference`-based variants dereference them via
+/// `GL_EXT_buffer_reference` for direct LDG.128 access without the
+/// descriptor indirection.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MatmulPushConstants {
@@ -14,6 +20,9 @@ pub struct MatmulPushConstants {
     pub batch_stride_c: u32,
     pub flags: u32,
     pub alpha: f32,
+    pub a_ptr: u64,
+    pub b_ptr: u64,
+    pub c_ptr: u64,
 }
 
 /// Static description of one matmul kernel: its display name, output-tile
@@ -122,6 +131,55 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_k: 8,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_v3.spv")),
     },
+    KernelSpec {
+        name: "large_bda",
+        tile_m: 128,
+        tile_n: 128,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_large_bda.spv")),
+    },
+    KernelSpec {
+        name: "m128n64k64_bda",
+        tile_m: 128,
+        tile_n: 64,
+        tile_k: 64,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n64k64_bda.spv")),
+    },
+    KernelSpec {
+        name: "k64_bda",
+        tile_m: 64,
+        tile_n: 64,
+        tile_k: 64,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_k64_bda.spv")),
+    },
+    KernelSpec {
+        name: "small_bda",
+        tile_m: 64,
+        tile_n: 64,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_small_bda.spv")),
+    },
+    KernelSpec {
+        name: "m64n32_bda",
+        tile_m: 64,
+        tile_n: 32,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n32_bda.spv")),
+    },
+    KernelSpec {
+        name: "m128n64_bda",
+        tile_m: 128,
+        tile_n: 64,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n64_bda.spv")),
+    },
+    KernelSpec {
+        name: "m64n128_bda",
+        tile_m: 64,
+        tile_n: 128,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n128_bda.spv")),
+    },
 ];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -140,6 +198,13 @@ pub enum KernelSelection {
     M128N128T4,
     M256N64,
     V3,
+    LargeBda,
+    M128N64K64Bda,
+    K64Bda,
+    SmallBda,
+    M64N32Bda,
+    M128N64Bda,
+    M64N128Bda,
 }
 
 impl KernelSelection {
@@ -159,8 +224,15 @@ impl KernelSelection {
             "m128n128_t4" | "128x128_t4" => Ok(Self::M128N128T4),
             "m256n64" | "256x64" => Ok(Self::M256N64),
             "v3" | "128x128bk8static" => Ok(Self::V3),
+            "large_bda" | "128x128_bda" => Ok(Self::LargeBda),
+            "m128n64k64_bda" | "128x64k64_bda" => Ok(Self::M128N64K64Bda),
+            "k64_bda" => Ok(Self::K64Bda),
+            "small_bda" | "64_bda" => Ok(Self::SmallBda),
+            "m64n32_bda" | "64x32_bda" => Ok(Self::M64N32Bda),
+            "m128n64_bda" => Ok(Self::M128N64Bda),
+            "m64n128_bda" => Ok(Self::M64N128Bda),
             other => bail!(
-                "invalid ML_KERNEL '{other}', expected auto, large, small, m64n128, m128n64, m128n64k64, m64n32, k64, bk16, v2, m64n128k64, m128n128_t4, m256n64, or v3"
+                "invalid ML_KERNEL '{other}', expected auto, large, small, m64n128, m128n64, m128n64k64, m64n32, k64, bk16, v2, m64n128k64, m128n128_t4, m256n64, v3, large_bda, m128n64k64_bda, k64_bda, small_bda, m64n32_bda, m128n64_bda, or m64n128_bda"
             ),
         }
     }
@@ -191,6 +263,13 @@ impl KernelSelection {
             Self::M128N128T4 => Some(10),
             Self::M256N64 => Some(11),
             Self::V3 => Some(12),
+            Self::LargeBda => Some(13),
+            Self::M128N64K64Bda => Some(14),
+            Self::K64Bda => Some(15),
+            Self::SmallBda => Some(16),
+            Self::M64N32Bda => Some(17),
+            Self::M128N64Bda => Some(18),
+            Self::M64N128Bda => Some(19),
         }
     }
 }

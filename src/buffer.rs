@@ -52,6 +52,17 @@ impl Buffer {
             // Each Vulkan handle we allocate is wrapped in a scopeguard that
             // destroys it on early return.  On the happy path we disarm the
             // guards at the end with ScopeGuard::into_inner.
+            //
+            // When the context has Vulkan 1.2 `bufferDeviceAddress`
+            // enabled, every buffer gets `SHADER_DEVICE_ADDRESS` so the
+            // kernel-side `buffer_reference` path can dereference it.
+            // We also have to flag the memory allocation with
+            // `MEMORY_ALLOCATE_DEVICE_ADDRESS`.
+            let usage = if ctx.buffer_device_address_enabled {
+                usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            } else {
+                usage
+            };
             let raw = ctx
                 .device
                 .create_buffer(
@@ -83,14 +94,20 @@ impl Buffer {
             let mem_type = ctx.find_memory_type_preferred(mem_req, required, preferred)?;
             let memory_flags = ctx.memory_properties.memory_types[mem_type as usize].property_flags;
 
+            let mut alloc_flags = vk::MemoryAllocateFlagsInfo::default();
+            if ctx.buffer_device_address_enabled {
+                alloc_flags = alloc_flags
+                    .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            }
+            let mut alloc_ci = vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_req.size)
+                .memory_type_index(mem_type);
+            if ctx.buffer_device_address_enabled {
+                alloc_ci = alloc_ci.push_next(&mut alloc_flags);
+            }
             let memory = ctx
                 .device
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(mem_req.size)
-                        .memory_type_index(mem_type),
-                    None,
-                )
+                .allocate_memory(&alloc_ci, None)
                 .context("allocate_memory")?;
             let memory_guard = scopeguard::guard(memory, |m| ctx.device.free_memory(m, None));
 

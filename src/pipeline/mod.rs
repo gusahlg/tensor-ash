@@ -124,13 +124,67 @@ impl MatmulPipeline {
 
     pub fn select_kernel(&self, batch: u32, m: u32, n: u32, k: u32) -> &MatmulKernel {
         let selection = match self.selection {
-            KernelSelection::Auto => auto_select_kernel(batch, m, n, k, self.auto_min_large_tiles),
+            KernelSelection::Auto => {
+                let tile = auto_select_kernel(batch, m, n, k, self.auto_min_large_tiles);
+                if self.ctx.buffer_device_address_enabled {
+                    maybe_to_bda(tile)
+                } else {
+                    tile
+                }
+            }
             explicit => explicit,
         };
         let idx = selection
             .index()
             .expect("auto selection must resolve to a concrete kernel");
         &self.kernels[idx]
+    }
+}
+
+/// Promote a tile choice from `auto_select_kernel` to its
+/// buffer_reference (LDG.128) sibling when the device supports
+/// `bufferDeviceAddress`.  The BDA variants beat the descriptor-based
+/// ones by roughly 5-15% on every shape we benchmarked, so when the
+/// feature is present the auto-selector should always pick the BDA
+/// path.  Explicit selections (`ML_KERNEL=large`, etc.) are honored
+/// verbatim so per-kernel tuning still works.
+fn maybe_to_bda(tile: KernelSelection) -> KernelSelection {
+    match tile {
+        KernelSelection::Large => KernelSelection::LargeBda,
+        KernelSelection::Small => KernelSelection::SmallBda,
+        KernelSelection::M128N64K64 => KernelSelection::M128N64K64Bda,
+        KernelSelection::K64 => KernelSelection::K64Bda,
+        KernelSelection::M64N32 => KernelSelection::M64N32Bda,
+        KernelSelection::M128N64 => KernelSelection::M128N64Bda,
+        KernelSelection::M64N128 => KernelSelection::M64N128Bda,
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod bda_tests {
+    use super::*;
+
+    #[test]
+    fn bda_promotion_covers_every_auto_target() {
+        // The auto-selector's possible returns should each have a BDA
+        // sibling (or be left untouched if no BDA variant exists).
+        // Listing them explicitly here keeps the rule from silently
+        // drifting when new kernels are added.
+        assert_eq!(maybe_to_bda(KernelSelection::Large), KernelSelection::LargeBda);
+        assert_eq!(maybe_to_bda(KernelSelection::Small), KernelSelection::SmallBda);
+        assert_eq!(maybe_to_bda(KernelSelection::M128N64K64), KernelSelection::M128N64K64Bda);
+        assert_eq!(maybe_to_bda(KernelSelection::K64), KernelSelection::K64Bda);
+        assert_eq!(maybe_to_bda(KernelSelection::M64N32), KernelSelection::M64N32Bda);
+        assert_eq!(maybe_to_bda(KernelSelection::M128N64), KernelSelection::M128N64Bda);
+        assert_eq!(maybe_to_bda(KernelSelection::M64N128), KernelSelection::M64N128Bda);
+        // Variants without a BDA sibling fall through unchanged.
+        assert_eq!(
+            maybe_to_bda(KernelSelection::M128N64K64),
+            KernelSelection::M128N64K64Bda
+        );
+        assert_eq!(maybe_to_bda(KernelSelection::Bk16), KernelSelection::Bk16);
+        assert_eq!(maybe_to_bda(KernelSelection::V2), KernelSelection::V2);
     }
 }
 

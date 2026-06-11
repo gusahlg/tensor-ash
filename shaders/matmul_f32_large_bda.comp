@@ -1,0 +1,13 @@
+#version 460
+// 128x128/BK=32 GEMM kernel using GL_EXT_buffer_reference for guaranteed
+// LDG.128 on the global-load hot path.  Same tile shape as `large_128`
+// so the perf delta is purely the load-instruction emission difference.
+
+#define BM 128u
+#define BN 128u
+#define BK  32u
+#define TM   8u
+#define TN   8u
+#define TN_RAW 8
+
+#include "matmul_bda_kernel.glsl"

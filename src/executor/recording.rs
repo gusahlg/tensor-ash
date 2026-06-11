@@ -102,7 +102,16 @@ pub(super) fn record_matmul_commands(
         .zip(calls.iter())
         .zip(resolved.iter())
     {
-        let pc = dims.push_constants(call.alpha, call.accumulate);
+        let (a_ptr, b_ptr, c_ptr) = if ctx.buffer_device_address_enabled {
+            (
+                ctx.buffer_device_address(call.a.raw_buffer()),
+                ctx.buffer_device_address(call.b.raw_buffer()),
+                ctx.buffer_device_address(call.c.raw_buffer()),
+            )
+        } else {
+            (0, 0, 0)
+        };
+        let pc = dims.push_constants(call.alpha, call.accumulate, a_ptr, b_ptr, c_ptr);
         let kernel = pipeline.select_kernel(dims.batch, dims.m, dims.n, dims.k);
 
         // Pick the specialization variant whose constants match this call.

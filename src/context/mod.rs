@@ -37,6 +37,10 @@ pub struct VulkanContext {
     /// Nanoseconds-per-tick reported by the driver for GPU timestamps.
     pub timestamp_period_ns: f64,
     pub timestamps_supported: bool,
+    /// Whether `VK_KHR_buffer_device_address` (= Vulkan 1.2
+    /// `bufferDeviceAddress`) was successfully enabled.  Required for
+    /// the buffer-reference GLSL path used by the LDG.128 kernels.
+    pub buffer_device_address_enabled: bool,
     /// Pipeline cache, seeded from disk on init and flushed back on drop.
     /// Persisting it avoids the SPIR-V -> ISA recompile (50-200 ms on
     /// NVIDIA) on every cold start.
@@ -161,10 +165,30 @@ impl VulkanContext {
                 .queue_family_index(compute_family)
                 .queue_priorities(&priorities)];
 
+            // Probe whether the physical device advertises Vulkan 1.2's
+            // `bufferDeviceAddress`.  It's a core feature on the
+            // Vulkan 1.2 instance we're requesting, so on any post-2020
+            // discrete GPU driver it should be present — but we still
+            // gate enablement on the actual `get` query in case we end
+            // up on a llvmpipe / older mobile GPU.
+            let mut bda_query = vk::PhysicalDeviceVulkan12Features::default();
+            let mut features2 =
+                vk::PhysicalDeviceFeatures2::default().push_next(&mut bda_query);
+            instance.get_physical_device_features2(physical_device, &mut features2);
+            let buffer_device_address_supported =
+                bda_query.buffer_device_address == vk::TRUE;
+
             let features = vk::PhysicalDeviceFeatures::default();
-            let device_ci = vk::DeviceCreateInfo::default()
+            let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
+            if buffer_device_address_supported {
+                vulkan12 = vulkan12.buffer_device_address(true);
+            }
+            let mut device_ci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_ci)
                 .enabled_features(&features);
+            if buffer_device_address_supported {
+                device_ci = device_ci.push_next(&mut vulkan12);
+            }
             let device = instance
                 .create_device(physical_device, &device_ci, None)
                 .context("create_device")?;
@@ -199,6 +223,7 @@ impl VulkanContext {
                 queue: Mutex::new(queue),
                 timestamp_period_ns: device_properties.limits.timestamp_period as f64,
                 timestamps_supported,
+                buffer_device_address_enabled: buffer_device_address_supported,
                 pipeline_cache,
                 pipeline_cache_path,
                 debug_loader,
@@ -243,6 +268,25 @@ impl VulkanContext {
             }
         }
         self.find_memory_type(requirements, required)
+    }
+
+    /// Query the GPU virtual address of `buffer`.  Panics if buffer
+    /// device address was not enabled at context creation (call
+    /// `buffer_device_address_enabled` first).
+    ///
+    /// The address is a 64-bit GPU pointer that can be passed as a
+    /// push constant and dereferenced inside the kernel via
+    /// `GL_EXT_buffer_reference`.
+    pub fn buffer_device_address(&self, buffer: vk::Buffer) -> u64 {
+        assert!(
+            self.buffer_device_address_enabled,
+            "buffer_device_address requested but feature not enabled"
+        );
+        unsafe {
+            self.device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(buffer),
+            )
+        }
     }
 
     pub fn device_name(&self) -> &str {

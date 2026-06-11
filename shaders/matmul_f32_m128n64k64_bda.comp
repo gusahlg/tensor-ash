@@ -1,0 +1,13 @@
+#version 460
+// 128x64/BK=64 GEMM kernel using GL_EXT_buffer_reference for guaranteed
+// LDG.128.  Same tile shape as `m128n64k64`, currently the
+// auto-selector winner for medium-large rectangular shapes.
+
+#define BM 128u
+#define BN  64u
+#define BK  64u
+#define TM   8u
+#define TN   4u
+#define TN_RAW 4
+
+#include "matmul_bda_kernel.glsl"

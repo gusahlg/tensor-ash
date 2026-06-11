@@ -142,7 +142,14 @@ impl ResolvedMatmul {
         Self::from_matrix_shapes(a, b, c)
     }
 
-    pub(crate) fn push_constants(&self, alpha: f32, accumulate: bool) -> MatmulPushConstants {
+    pub(crate) fn push_constants(
+        &self,
+        alpha: f32,
+        accumulate: bool,
+        a_ptr: u64,
+        b_ptr: u64,
+        c_ptr: u64,
+    ) -> MatmulPushConstants {
         MatmulPushConstants {
             m: self.m,
             n: self.n,
@@ -152,6 +159,9 @@ impl ResolvedMatmul {
             batch_stride_c: self.batch_stride_c,
             flags: if accumulate { 1 } else { 0 },
             alpha,
+            a_ptr,
+            b_ptr,
+            c_ptr,
         }
     }
 
@@ -339,7 +349,7 @@ mod tests {
     #[test]
     fn builds_push_constants_from_resolved_shape_and_call_flags() {
         let dims = ResolvedMatmul::from_shapes(&[2, 2, 3], &[1, 3, 4], &[2, 2, 4]).unwrap();
-        let pc = dims.push_constants(0.5, true);
+        let pc = dims.push_constants(0.5, true, 0xAA00, 0xBB00, 0xCC00);
 
         assert_eq!(pc.m, 2);
         assert_eq!(pc.n, 4);
@@ -349,6 +359,9 @@ mod tests {
         assert_eq!(pc.batch_stride_c, 8);
         assert_eq!(pc.flags, 1);
         assert_eq!(pc.alpha, 0.5);
+        assert_eq!(pc.a_ptr, 0xAA00);
+        assert_eq!(pc.b_ptr, 0xBB00);
+        assert_eq!(pc.c_ptr, 0xCC00);
     }
 
     #[test]
