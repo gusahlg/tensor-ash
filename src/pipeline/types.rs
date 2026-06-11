@@ -180,6 +180,48 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n128_bda.spv")),
     },
+    KernelSpec {
+        name: "large_bda_v4",
+        tile_m: 128,
+        tile_n: 128,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_large_bda_v4.spv")),
+    },
+    KernelSpec {
+        name: "m128n64k64_bda_v4",
+        tile_m: 128,
+        tile_n: 64,
+        tile_k: 64,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n64k64_bda_v4.spv")),
+    },
+    KernelSpec {
+        name: "small_bda_v4",
+        tile_m: 64,
+        tile_n: 64,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_small_bda_v4.spv")),
+    },
+    KernelSpec {
+        name: "k64_bda_v4",
+        tile_m: 64,
+        tile_n: 64,
+        tile_k: 64,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_k64_bda_v4.spv")),
+    },
+    KernelSpec {
+        name: "m128n64_bda_v4",
+        tile_m: 128,
+        tile_n: 64,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n64_bda_v4.spv")),
+    },
+    KernelSpec {
+        name: "m64n128_bda_v4",
+        tile_m: 64,
+        tile_n: 128,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n128_bda_v4.spv")),
+    },
 ];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -205,6 +247,12 @@ pub enum KernelSelection {
     M64N32Bda,
     M128N64Bda,
     M64N128Bda,
+    LargeBdaV4,
+    M128N64K64BdaV4,
+    SmallBdaV4,
+    K64BdaV4,
+    M128N64BdaV4,
+    M64N128BdaV4,
 }
 
 impl KernelSelection {
@@ -231,8 +279,14 @@ impl KernelSelection {
             "m64n32_bda" | "64x32_bda" => Ok(Self::M64N32Bda),
             "m128n64_bda" => Ok(Self::M128N64Bda),
             "m64n128_bda" => Ok(Self::M64N128Bda),
+            "large_bda_v4" => Ok(Self::LargeBdaV4),
+            "m128n64k64_bda_v4" => Ok(Self::M128N64K64BdaV4),
+            "small_bda_v4" => Ok(Self::SmallBdaV4),
+            "k64_bda_v4" => Ok(Self::K64BdaV4),
+            "m128n64_bda_v4" => Ok(Self::M128N64BdaV4),
+            "m64n128_bda_v4" => Ok(Self::M64N128BdaV4),
             other => bail!(
-                "invalid ML_KERNEL '{other}', expected auto, large, small, m64n128, m128n64, m128n64k64, m64n32, k64, bk16, v2, m64n128k64, m128n128_t4, m256n64, v3, large_bda, m128n64k64_bda, k64_bda, small_bda, m64n32_bda, m128n64_bda, or m64n128_bda"
+                "invalid ML_KERNEL '{other}', expected one of auto, large, small, m64n128, m128n64, m128n64k64, m64n32, k64, bk16, v2, m64n128k64, m128n128_t4, m256n64, v3, or any *_bda / *_bda_v4 variant"
             ),
         }
     }
@@ -270,6 +324,12 @@ impl KernelSelection {
             Self::M64N32Bda => Some(17),
             Self::M128N64Bda => Some(18),
             Self::M64N128Bda => Some(19),
+            Self::LargeBdaV4 => Some(20),
+            Self::M128N64K64BdaV4 => Some(21),
+            Self::SmallBdaV4 => Some(22),
+            Self::K64BdaV4 => Some(23),
+            Self::M128N64BdaV4 => Some(24),
+            Self::M64N128BdaV4 => Some(25),
         }
     }
 }

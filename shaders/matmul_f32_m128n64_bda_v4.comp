@@ -1,0 +1,11 @@
+#version 460
+// 128x64/BK=32 BDA + uvec4-Bs variant.
+
+#define BM 128u
+#define BN  64u
+#define BK  32u
+#define TM   8u
+#define TN   4u
+#define TN_RAW 4
+
+#include "matmul_bda_v4_kernel.glsl"

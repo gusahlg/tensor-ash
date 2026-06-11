@@ -15,10 +15,21 @@ use super::env::{OutputMode, SweepMode, env_u32, env_usize};
 use super::report::{BenchReporter, csv_escape};
 
 pub(super) fn correctness(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
-    const B: u32 = 2;
-    const M: u32 = 64;
-    const N: u32 = 80;
-    const K: u32 = 48;
+    let b = env_u32("ML_B", 2);
+    let m = env_u32("ML_M", 64);
+    let n = env_u32("ML_N", 80);
+    let k = env_u32("ML_K", 48);
+    correctness_impl(ctx, exec, b, m, n, k)
+}
+
+fn correctness_impl(
+    ctx: &Arc<VulkanContext>,
+    exec: &Executor,
+    #[allow(non_snake_case)] B: u32,
+    #[allow(non_snake_case)] M: u32,
+    #[allow(non_snake_case)] N: u32,
+    #[allow(non_snake_case)] K: u32,
+) -> Result<()> {
 
     let a = Tensor::uninit_device(ctx, &[B, M, K])?;
     let b = Tensor::uninit_device(ctx, &[B, K, N])?;

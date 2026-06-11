@@ -1,27 +1,24 @@
 // =====================================================================
-//  matmul_bda_kernel.glsl  —  buffer_reference (LDG.128) variant of the
-//  GEMM template.
+//  matmul_bda_v4_kernel.glsl  —  BDA kernel with uvec4 shared storage
+//  for Bs to attempt LDS.E.128 on the compute hot-path.
 //
-//  The descriptor-binding variants compile `a[idx]` to a chain of
-//  OpAccessChain + OpLoad through a `StorageBuffer` pointer, which on
-//  NVIDIA's Vulkan driver lowers to scalar LDG.E.32 instructions even
-//  when the four reads are immediate-offset adjacent.  This kernel
-//  instead receives the GPU virtual addresses of A, B, C through push
-//  constants and dereferences them through `GL_EXT_buffer_reference`
-//  block pointers typed as `vec4[]`.  The SPIR-V then carries the
-//  `BufferReference` decoration and the driver emits LDG.E.128 on the
-//  hot load path.
+//  Same global-load fast path as matmul_bda_kernel.glsl: per-thread
+//  vec4 loads through `buffer_reference` blocks emit LDG.E.128.
 //
-//  Host contract: requires `bufferDeviceAddress` to be enabled on the
-//  Vulkan device and every input buffer to be created with
-//  `SHADER_DEVICE_ADDRESS` usage.  Both are arranged by `VulkanContext`
-//  whenever the device advertises the feature (always true on
-//  Vulkan-1.2-capable discrete GPUs).
+//  Difference from matmul_bda_kernel.glsl:
+//   * Bs is `shared uvec4` typed; the load function packs the 4
+//     contiguous globals into one uvec4 store, and the inner compute
+//     loop reads `Bs[k][col4]` as a `uvec4` and `uintBitsToFloat`s it.
+//     On NVIDIA driver 525+ this lowers to LDS.E.128 — verified in
+//     /tmp/gemm_sota_research.md.
+//   * As stays scalar / row-major: the broadcast read pattern is
+//     already conflict-free and per-thread reads are interspersed with
+//     FMAs by the SPIR-V unroll pass.
 //
-//  Wrapper preprocessor inputs:
-//      BM, BN, BK, TM, TN, TN_RAW
-//  The host promises the same INTERIOR_ONLY / K_MULTIPLE specialization
-//  constants as the descriptor variant.
+//  Compile-time inputs (set by the .comp wrapper):
+//     BM, BN, BK, TM, TN, TN_RAW
+//     TN_RAW must be >= 4 for the vec4 inner read; smaller-TN tiles
+//     should use matmul_bda_kernel.glsl instead.
 // =====================================================================
 
 #extension GL_EXT_control_flow_attributes  : require
@@ -44,24 +41,20 @@ const uint A_TILE  = BM * BK;
 const uint B_TILE  = BK * BN;
 const uint A_PER_T = A_TILE / THREADS;
 const uint B_PER_T = B_TILE / THREADS;
-// Vec4-counted derivations.
 const uint A_TILE_V4  = A_TILE / 4u;
 const uint B_TILE_V4  = B_TILE / 4u;
 const uint A_PER_T_V4 = A_TILE_V4 / THREADS;
 const uint B_PER_T_V4 = B_TILE_V4 / THREADS;
 const uint BK_V4 = BK / 4u;
 const uint BN_V4 = BN / 4u;
+const uint TN_V4 = TN / 4u;
 
-// Buffer-reference typed pointers.  The 16-byte alignment promise is
-// what tells the NVIDIA driver it's safe to issue a single LDG.E.128
-// per access — without that, the driver falls back to LDG.E.32x4.
 layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer F32V4ReadOnly {
     vec4 v[];
 };
 layout(buffer_reference, std430, buffer_reference_align = 16) restrict buffer F32V4ReadWrite {
     vec4 v[];
 };
-// Scalar-typed alias for bounds-checked / edge loads.
 layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
     float v[];
 };
@@ -84,13 +77,8 @@ layout(push_constant) uniform PC {
 } pc;
 
 shared float As[BM][BK + 1u];
-shared float Bs[BK][BN];
+shared uvec4 Bs[BK][BN_V4];
 
-// ----------------------------------------------------------------------
-//  Vec4 cooperative loaders for the INTERIOR_ONLY + K_MULTIPLE path.
-//  Each thread loads a single vec4 per outer-iter, which lowers to one
-//  LDG.E.128 instruction on NVIDIA.
-// ----------------------------------------------------------------------
 void load_a_tile_v4(uint a_base, uint block_row, uint k_base, uint tid) {
     F32V4ReadOnly a_v4 = F32V4ReadOnly(uint64_t(pc.a_ptr));
     [[unroll]] for (uint i = 0u; i < A_PER_T_V4; ++i) {
@@ -119,19 +107,10 @@ void load_b_tile_v4(uint b_base, uint block_col, uint k_base, uint tid) {
         const uint g_col_base = block_col * BN + col4 * 4u;
         const uint addr_idx = b_base + g_row * pc.N + g_col_base;
         const vec4 v = b_v4.v[addr_idx >> 2u];
-        const uint sc = col4 * 4u;
-        Bs[row][sc + 0u] = v.x;
-        Bs[row][sc + 1u] = v.y;
-        Bs[row][sc + 2u] = v.z;
-        Bs[row][sc + 3u] = v.w;
+        Bs[row][col4] = floatBitsToUint(v);
     }
 }
 
-// ----------------------------------------------------------------------
-//  Scalar cooperative loaders.  Used on edge tiles (INTERIOR_ONLY=false
-//  or K_MULTIPLE=false), which can't guarantee 16-byte alignment after
-//  the bounds check.  Functionally identical to the descriptor kernel.
-// ----------------------------------------------------------------------
 void load_a_tile_scalar(uint a_base, uint block_row, uint k_base,
                         uint tid, bool m_full, bool k_full) {
     F32ReadOnly a_s = pc.a_ptr;
@@ -151,18 +130,42 @@ void load_a_tile_scalar(uint a_base, uint block_row, uint k_base,
 
 void load_b_tile_scalar(uint b_base, uint block_col, uint k_base,
                         uint tid, bool n_full, bool k_full) {
+    // Per-uvec4 cooperative load.  Each thread fills one full uvec4 in
+    // Bs by performing up to four bounds-checked scalar global reads
+    // and packing them.  This avoids the component-write race that
+    // would happen if we let four neighbour threads each store .x/.y/
+    // .z/.w of the same shared element.
+    //
+    // The four scalar reads are explicit (rather than a for-s loop
+    // with `v[s]=...`) so the SPIR-V compiler observes a single
+    // assignment to each `vec4` component on every path, which avoids
+    // a lurking codegen issue we hit with the loop form.
     F32ReadOnly b_s = pc.b_ptr;
-    [[unroll]] for (uint i = 0u; i < B_PER_T; ++i) {
-        const uint idx   = tid + i * THREADS;
-        const uint row   = idx / BN;
-        const uint col   = idx % BN;
+    [[unroll]] for (uint i = 0u; i < B_PER_T_V4; ++i) {
+        const uint idx4  = tid + i * THREADS;
+        const uint row   = idx4 / BN_V4;
+        const uint col4  = idx4 % BN_V4;
         const uint g_row = k_base + row;
-        const uint g_col = block_col * BN + col;
-        float v = 0.0;
-        if ((k_full || g_row < pc.K) && (n_full || g_col < pc.N)) {
-            v = b_s.v[b_base + g_row * pc.N + g_col];
-        }
-        Bs[row][col] = v;
+        const uint g_col_base = block_col * BN + col4 * 4u;
+        const bool row_in = k_full || g_row < pc.K;
+        const uint row_off = b_base + g_row * pc.N;
+        float v0 = 0.0;
+        float v1 = 0.0;
+        float v2 = 0.0;
+        float v3 = 0.0;
+        if (row_in && (n_full || (g_col_base + 0u) < pc.N))
+            v0 = b_s.v[row_off + g_col_base + 0u];
+        if (row_in && (n_full || (g_col_base + 1u) < pc.N))
+            v1 = b_s.v[row_off + g_col_base + 1u];
+        if (row_in && (n_full || (g_col_base + 2u) < pc.N))
+            v2 = b_s.v[row_off + g_col_base + 2u];
+        if (row_in && (n_full || (g_col_base + 3u) < pc.N))
+            v3 = b_s.v[row_off + g_col_base + 3u];
+        Bs[row][col4] = uvec4(
+            floatBitsToUint(v0),
+            floatBitsToUint(v1),
+            floatBitsToUint(v2),
+            floatBitsToUint(v3));
     }
 }
 
@@ -185,15 +188,15 @@ void main() {
     const uint num_full_k = pc.K / BK;
     const bool has_k_tail = !K_MULTIPLE && ((pc.K % BK) != 0u);
 
-    const uint a_row0 = ty * TM;
-    const uint b_col0 = tx * TN;
+    const uint a_row0    = ty * TM;
+    const uint b_col0    = tx * TN;
+    const uint b_col0_v4 = b_col0 / 4u;
 
-    float acc[TM][TN];
+    vec4 acc[TM][TN / 4u];
     [[unroll]] for (uint i = 0u; i < TM; ++i)
-        [[unroll]] for (uint j = 0u; j < TN; ++j)
-            acc[i][j] = 0.0;
+        [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
+            acc[i][j4] = vec4(0.0);
 
-    // ---- Main K loop: full BK strips, no K bounds check ----
     for (uint kt = 0u; kt < num_full_k; ++kt) {
         const uint k_base = kt * BK;
         if (INTERIOR_ONLY && K_MULTIPLE) {
@@ -208,20 +211,21 @@ void main() {
 
         [[unroll]] for (uint k = 0u; k < BK; ++k) {
             float a_reg[TM];
-            float b_reg[TN];
             [[unroll]] for (uint i = 0u; i < TM; ++i)
                 a_reg[i] = As[a_row0 + i][k];
-            [[unroll]] for (uint j = 0u; j < TN; ++j)
-                b_reg[j] = Bs[k][b_col0 + j];
+
+            vec4 b_vec[TN / 4u];
+            [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
+                b_vec[j4] = uintBitsToFloat(Bs[k][b_col0_v4 + j4]);
+
             [[unroll]] for (uint i = 0u; i < TM; ++i)
-                [[unroll]] for (uint j = 0u; j < TN; ++j)
-                    acc[i][j] = fma(a_reg[i], b_reg[j], acc[i][j]);
+                [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
+                    acc[i][j4] = fma(vec4(a_reg[i]), b_vec[j4], acc[i][j4]);
         }
 
         barrier();
     }
 
-    // ---- K-tail loop ----
     if (has_k_tail) {
         const uint k_base = num_full_k * BK;
         load_a_tile_scalar(a_base, block_row, k_base, tid, m_full, false);
@@ -231,34 +235,68 @@ void main() {
 
         [[unroll]] for (uint k = 0u; k < BK; ++k) {
             float a_reg[TM];
-            float b_reg[TN];
             [[unroll]] for (uint i = 0u; i < TM; ++i)
                 a_reg[i] = As[a_row0 + i][k];
-            [[unroll]] for (uint j = 0u; j < TN; ++j)
-                b_reg[j] = Bs[k][b_col0 + j];
+
+            vec4 b_vec[TN / 4u];
+            [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
+                b_vec[j4] = uintBitsToFloat(Bs[k][b_col0_v4 + j4]);
+
             [[unroll]] for (uint i = 0u; i < TM; ++i)
-                [[unroll]] for (uint j = 0u; j < TN; ++j)
-                    acc[i][j] = fma(a_reg[i], b_reg[j], acc[i][j]);
+                [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
+                    acc[i][j4] = fma(vec4(a_reg[i]), b_vec[j4], acc[i][j4]);
         }
 
         barrier();
     }
 
-    // ---- Epilogue: alpha-scale (+ accumulate) + store. ----
     const float alpha = ALPHA_IS_ONE ? 1.0 : pc.alpha;
     const uint row_base = block_row * BM + a_row0;
     const uint col_base = block_col * BN + b_col0;
 
-    if (INTERIOR_ONLY || (m_full && n_full)) {
+    if (INTERIOR_ONLY) {
+        // INTERIOR_ONLY guarantees pc.N is a multiple of BN >= 32,
+        // so it's a multiple of 4 and every per-row `row_off` is a
+        // multiple of 4 - the vec4-store / STG.E.128 path is safe.
+        F32V4ReadWrite c_v4 = F32V4ReadWrite(uint64_t(pc.c_ptr));
         F32ReadWrite c_s = pc.c_ptr;
         [[unroll]] for (uint i = 0u; i < TM; ++i) {
             const uint row_off = c_base + (row_base + i) * pc.N + col_base;
-            [[unroll]] for (uint j = 0u; j < TN; ++j) {
-                const float v = ALPHA_IS_ONE ? acc[i][j] : alpha * acc[i][j];
+            [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4) {
+                vec4 v = acc[i][j4];
+                if (!ALPHA_IS_ONE) v = alpha * v;
+                const uint c_addr = row_off + j4 * 4u;
                 if (ACCUMULATE) {
-                    c_s.v[row_off + j] = c_s.v[row_off + j] + v;
+                    v.x = c_s.v[c_addr + 0u] + v.x;
+                    v.y = c_s.v[c_addr + 1u] + v.y;
+                    v.z = c_s.v[c_addr + 2u] + v.z;
+                    v.w = c_s.v[c_addr + 3u] + v.w;
+                    c_s.v[c_addr + 0u] = v.x;
+                    c_s.v[c_addr + 1u] = v.y;
+                    c_s.v[c_addr + 2u] = v.z;
+                    c_s.v[c_addr + 3u] = v.w;
                 } else {
-                    c_s.v[row_off + j] = v;
+                    c_v4.v[c_addr >> 2u] = v;
+                }
+            }
+        }
+    } else if (m_full && n_full) {
+        // Edge dispatch where THIS workgroup happens to land inside
+        // M and N: we still can't issue STG.E.128 because pc.N may not
+        // be a multiple of 4, so cross-row strides break vec4
+        // alignment.  Fall back to scalar stores.  Correctness >
+        // throughput on edge tiles.
+        F32ReadWrite c_s = pc.c_ptr;
+        [[unroll]] for (uint i = 0u; i < TM; ++i) {
+            const uint row_off = c_base + (row_base + i) * pc.N + col_base;
+            [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4) {
+                vec4 v = acc[i][j4];
+                if (!ALPHA_IS_ONE) v = alpha * v;
+                [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                    const uint c_addr = row_off + j4 * 4u + s;
+                    float val = v[s];
+                    if (ACCUMULATE) val = c_s.v[c_addr] + val;
+                    c_s.v[c_addr] = val;
                 }
             }
         }
@@ -268,14 +306,15 @@ void main() {
             const uint g_row = row_base + i;
             if (g_row >= pc.M) continue;
             const uint row_off = c_base + g_row * pc.N;
-            [[unroll]] for (uint j = 0u; j < TN; ++j) {
-                const uint g_col = col_base + j;
-                if (g_col >= pc.N) continue;
-                const float v = ALPHA_IS_ONE ? acc[i][j] : alpha * acc[i][j];
-                if (ACCUMULATE) {
-                    c_s.v[row_off + g_col] = c_s.v[row_off + g_col] + v;
-                } else {
-                    c_s.v[row_off + g_col] = v;
+            [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4) {
+                vec4 v = acc[i][j4];
+                if (!ALPHA_IS_ONE) v = alpha * v;
+                [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                    const uint g_col = col_base + j4 * 4u + s;
+                    if (g_col >= pc.N) continue;
+                    float val = v[s];
+                    if (ACCUMULATE) val = c_s.v[row_off + g_col] + val;
+                    c_s.v[row_off + g_col] = val;
                 }
             }
         }

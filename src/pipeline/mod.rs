@@ -148,18 +148,24 @@ impl MatmulPipeline {
 /// feature is present the auto-selector should always pick the BDA
 /// path.  Explicit selections (`ML_KERNEL=large`, etc.) are honored
 /// verbatim so per-kernel tuning still works.
+/// The V4 (uvec4 shared) BDA variants beat the plain BDA variants by
+/// another 5-15% on every TN>=4 tile we measured.  For the TN=2
+/// `m64n32` kernel the V4 path isn't available (LDS.128 over a 2-col
+/// stride is non-sensical), so we fall back to the plain BDA sibling.
 fn maybe_to_bda(tile: KernelSelection) -> KernelSelection {
     match tile {
-        KernelSelection::Large => KernelSelection::LargeBda,
-        KernelSelection::Small => KernelSelection::SmallBda,
-        KernelSelection::M128N64K64 => KernelSelection::M128N64K64Bda,
-        KernelSelection::K64 => KernelSelection::K64Bda,
+        KernelSelection::Large => KernelSelection::LargeBdaV4,
+        KernelSelection::Small => KernelSelection::SmallBdaV4,
+        KernelSelection::M128N64K64 => KernelSelection::M128N64K64BdaV4,
+        KernelSelection::K64 => KernelSelection::K64BdaV4,
+        KernelSelection::M128N64 => KernelSelection::M128N64BdaV4,
+        KernelSelection::M64N128 => KernelSelection::M64N128BdaV4,
+        // TN=2 has no V4 path; use the plain BDA fallback.
         KernelSelection::M64N32 => KernelSelection::M64N32Bda,
-        KernelSelection::M128N64 => KernelSelection::M128N64Bda,
-        KernelSelection::M64N128 => KernelSelection::M64N128Bda,
         other => other,
     }
 }
+
 
 #[cfg(test)]
 mod bda_tests {
@@ -167,22 +173,40 @@ mod bda_tests {
 
     #[test]
     fn bda_promotion_covers_every_auto_target() {
-        // The auto-selector's possible returns should each have a BDA
-        // sibling (or be left untouched if no BDA variant exists).
-        // Listing them explicitly here keeps the rule from silently
-        // drifting when new kernels are added.
-        assert_eq!(maybe_to_bda(KernelSelection::Large), KernelSelection::LargeBda);
-        assert_eq!(maybe_to_bda(KernelSelection::Small), KernelSelection::SmallBda);
-        assert_eq!(maybe_to_bda(KernelSelection::M128N64K64), KernelSelection::M128N64K64Bda);
-        assert_eq!(maybe_to_bda(KernelSelection::K64), KernelSelection::K64Bda);
-        assert_eq!(maybe_to_bda(KernelSelection::M64N32), KernelSelection::M64N32Bda);
-        assert_eq!(maybe_to_bda(KernelSelection::M128N64), KernelSelection::M128N64Bda);
-        assert_eq!(maybe_to_bda(KernelSelection::M64N128), KernelSelection::M64N128Bda);
-        // Variants without a BDA sibling fall through unchanged.
+        // The auto-selector's possible returns should each promote to
+        // their BDA_V4 sibling (or BDA for TN=2 / unchanged when no
+        // BDA path exists).  Listing them explicitly here keeps the
+        // rule from silently drifting when new kernels land.
+        assert_eq!(
+            maybe_to_bda(KernelSelection::Large),
+            KernelSelection::LargeBdaV4
+        );
+        assert_eq!(
+            maybe_to_bda(KernelSelection::Small),
+            KernelSelection::SmallBdaV4
+        );
         assert_eq!(
             maybe_to_bda(KernelSelection::M128N64K64),
-            KernelSelection::M128N64K64Bda
+            KernelSelection::M128N64K64BdaV4
         );
+        assert_eq!(
+            maybe_to_bda(KernelSelection::K64),
+            KernelSelection::K64BdaV4
+        );
+        assert_eq!(
+            maybe_to_bda(KernelSelection::M128N64),
+            KernelSelection::M128N64BdaV4
+        );
+        assert_eq!(
+            maybe_to_bda(KernelSelection::M64N128),
+            KernelSelection::M64N128BdaV4
+        );
+        // TN=2 stays on the plain BDA path (no V4 sibling).
+        assert_eq!(
+            maybe_to_bda(KernelSelection::M64N32),
+            KernelSelection::M64N32Bda
+        );
+        // No BDA sibling at all — pass through.
         assert_eq!(maybe_to_bda(KernelSelection::Bk16), KernelSelection::Bk16);
         assert_eq!(maybe_to_bda(KernelSelection::V2), KernelSelection::V2);
     }
