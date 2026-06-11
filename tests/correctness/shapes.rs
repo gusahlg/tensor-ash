@@ -260,3 +260,74 @@ fn manual_k64_kernel_handles_small_k_and_tail() {
         );
     }
 }
+
+/// Regression: every V4 (uvec4 shared Bs / LDS.128) kernel must be
+/// correct on N-edge shapes where `pc.N` is not a multiple of 4.  The
+/// historic bug was a `c_v4.v[c_addr >> 2u] = v` store in the
+/// "interior workgroup of an edge dispatch" epilogue branch -- the
+/// vec4 store assumed 16-byte alignment that only holds when N % 4
+/// == 0.  Each row stride then mis-aligns the address and the store
+/// hits the wrong cells.  Cover every V4 kernel + each pathological
+/// N value (65, 66, 67) so a future regression would surface here
+/// instead of only in downstream benchmarks.
+#[test]
+#[ignore]
+fn v4_kernels_handle_n_not_multiple_of_4() {
+    let kernels = [
+        ("small_bda_v4", KernelSelection::SmallBdaV4, 64u32, 64u32),
+        ("large_bda_v4", KernelSelection::LargeBdaV4, 128u32, 128u32),
+        ("k64_bda_v4", KernelSelection::K64BdaV4, 64u32, 64u32),
+        ("m128n64_bda_v4", KernelSelection::M128N64BdaV4, 128u32, 64u32),
+        ("m64n128_bda_v4", KernelSelection::M64N128BdaV4, 64u32, 128u32),
+        (
+            "m128n64k64_bda_v4",
+            KernelSelection::M128N64K64BdaV4,
+            128u32,
+            64u32,
+        ),
+    ];
+    for (name, sel, tile_m, tile_n) in kernels {
+        let (ctx, exec) = make_setup_with_kernel(1, 4, sel);
+        for (m, n, k, seed_a, seed_b) in [
+            // M tile-aligned, N just past one tile -> the non-edge
+            // workgroup (block_col = 0) hits the interior-of-edge
+            // epilogue branch with pc.N == tile_n + 1.
+            (tile_m, tile_n + 1u32, 32u32, 101u64, 103u64),
+            // Off-by-two and off-by-three to cover all (N % 4)
+            // residues that matter for vec4 alignment.
+            (tile_m, tile_n + 2u32, 32u32, 107u64, 109u64),
+            (tile_m, tile_n + 3u32, 32u32, 113u64, 127u64),
+            // Larger N with both an interior tile column and a
+            // bounds-checked column.
+            (
+                tile_m * 2u32,
+                tile_n * 2u32 + 1u32,
+                64u32,
+                131u64,
+                137u64,
+            ),
+        ] {
+            let (gpu, cpu) = run_one(
+                &ctx,
+                &exec,
+                &[m, k],
+                &[k, n],
+                &[m, n],
+                1.0,
+                false,
+                seed_a,
+                seed_b,
+                None,
+            );
+            let (e, idx) = max_abs_err(&gpu, &cpu);
+            let tol = tolerance(k);
+            assert!(
+                e <= tol,
+                "{name} M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
+                 at idx {idx}: gpu={:.6} cpu={:.6}",
+                gpu[idx],
+                cpu[idx],
+            );
+        }
+    }
+}

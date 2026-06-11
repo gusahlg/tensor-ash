@@ -112,7 +112,14 @@ pub(super) fn auto_select_kernel(
         if min_mn >= 2048 && (128..=1024).contains(&k) {
             return KernelSelection::M128N64K64;
         }
-        if min_mn >= 1024 && max_mn >= 4096 && k >= 512 {
+        // Skinny tall/wide shapes where one dimension is far bigger
+        // than the other.  For near-square big shapes (e.g. 4096^3)
+        // the Large 128x128 BDA_V4 tile wins by ~4-5pp peak because
+        // its higher arithmetic intensity beats m128n64k64's
+        // narrower N tile.  Limiting this rule to min_mn < 2048 keeps
+        // the win for 1024x8192-style shapes while letting near-
+        // square >= 2048 dispatches fall through to Large.
+        if min_mn >= 1024 && min_mn < 2048 && max_mn >= 4096 && k >= 512 {
             return KernelSelection::M128N64K64;
         }
         if k <= 128 && m >= 2048 && n >= 2048 {
