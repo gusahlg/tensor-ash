@@ -1,6 +1,12 @@
 use crate::context::DeviceKind;
 
-use super::types::{KernelSelection, TILE_M, TILE_N};
+use super::types::{KERNEL_SPECS, KernelSelection};
+
+/// Output-tile dimensions of the large kernel.  The auto-selector
+/// thresholds are all expressed in large-kernel tiles, so we read them
+/// out of the kernel registry rather than duplicating the constants.
+const LARGE_TILE_M: u32 = KERNEL_SPECS[KernelSelection::Large.index().unwrap()].tile_m;
+const LARGE_TILE_N: u32 = KERNEL_SPECS[KernelSelection::Large.index().unwrap()].tile_n;
 
 /// Threshold (in 128x128 tiles) below which the auto selector prefers
 /// the small kernel.  Tuned per device kind so we don't underuse a beefy
@@ -28,7 +34,7 @@ pub(super) fn auto_selects_small_kernel(m: u32, n: u32, k: u32, min_large_tiles:
     // Off-tile M/N shapes waste more work in the large 128x128 kernel
     // and pay its edge-path branches. Prefer the smaller tile for these
     // edge-heavy cases, while still allowing manual large-kernel runs.
-    if !m.is_multiple_of(TILE_M) || !n.is_multiple_of(TILE_N) {
+    if !m.is_multiple_of(LARGE_TILE_M) || !n.is_multiple_of(LARGE_TILE_N) {
         return true;
     }
     // For tiny K the fixed per-workgroup load + barrier cost dominates,
@@ -44,7 +50,7 @@ pub(super) fn auto_selects_small_kernel(m: u32, n: u32, k: u32, min_large_tiles:
     //
     // On RTX 3070 (46 SMs): at 1024^3 the small kernel is faster
     // (7.8 vs 7.0 TFLOPS), at 2048^3 large wins decisively (9.8 vs 8.6).
-    let large_tiles = (m / TILE_M) as u64 * (n / TILE_N) as u64;
+    let large_tiles = (m / LARGE_TILE_M) as u64 * (n / LARGE_TILE_N) as u64;
     large_tiles < min_large_tiles
 }
 
@@ -63,11 +69,43 @@ pub(super) fn auto_select_kernel(
     // enough to beat the 64x64/k64 paths on small near-square GEMMs.  The
     // 512^3 case moves to the 128x64xK64 tile below, so keep this rule to
     // the smaller cases where it clearly wins.
-    if k >= 128 && min_mn >= 128 && max_mn <= 320 && near_square && (batch == 1 || max_mn <= 256) {
+    //
+    // batch>=8 cases are excluded because the extra workgroups make the
+    // 64x32 tile's lower arithmetic intensity per-WG dominate the edge-
+    // waste savings; the 64x64 small kernel wins on batched_8x256 etc.
+    if k >= 128
+        && min_mn >= 128
+        && max_mn <= 320
+        && near_square
+        && (batch == 1 || (max_mn <= 256 && batch < 8))
+    {
         return KernelSelection::M64N32;
     }
 
+    // The k64 (64x64 BK=64) kernel beats the k32 small variant on mid-
+    // square shapes where K reuse can amortize the wider strip.  Found
+    // empirically on medium_384 (384^3) - it's a ~15% win.
+    if batch == 1 && (192..=480).contains(&min_mn) && near_square && k >= 256 {
+        return KernelSelection::K64;
+    }
+
     if batch == 1 {
+        // The m128n64k64 tile is the runaway winner for medium and large
+        // moderately-rectangular (up to ~5x aspect) GEMMs as long as M
+        // and N are big enough to fill a few large tiles.  Bounds tuned
+        // empirically:
+        //   - lower bound 512 (m128n64k64 wins 768^3, non_pow2
+        //     1023x1025x1027, attn_proj 2048x512x512);
+        //   - upper bound max_mn / min_mn <= ~5 covers attention-style
+        //     projection shapes; skinny shapes with min_mn <= 128 still
+        //     go to k64 in the explicit rule below;
+        //   - for min_mn>=2048 the 128x128 Large kernel takes over
+        //     since its higher arithmetic intensity wins once both
+        //     dimensions are big enough to saturate the SMs even at
+        //     low occupancy.
+        if (512..2048).contains(&min_mn) && max_mn <= min_mn.saturating_mul(5) && k >= 256 {
+            return KernelSelection::M128N64K64;
+        }
         if m == n && (m == 512 || m == 1024) && k >= 512 {
             return KernelSelection::M128N64K64;
         }

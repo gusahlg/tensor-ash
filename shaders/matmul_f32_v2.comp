@@ -1,0 +1,12 @@
+#version 460
+// 128x128 / BK=8 SOTA-style v2 kernel: transposed As, +4 leading-dim
+// padding, double-buffered K-loop.  See matmul_v2_kernel.glsl.
+
+#define BM 128u
+#define BN 128u
+#define BK   8u
+#define TM   8u
+#define TN   8u
+#define TN_RAW 8
+
+#include "matmul_v2_kernel.glsl"

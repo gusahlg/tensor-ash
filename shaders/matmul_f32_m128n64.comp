@@ -7,5 +7,6 @@
 #define BK 32u
 #define TM 8u
 #define TN 4u
+#define TN_RAW 4
 
 #include "matmul_kernel.glsl"

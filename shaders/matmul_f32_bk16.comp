@@ -1,0 +1,17 @@
+#version 460
+// 128x128 output tile with a NARROW K strip (BK=16).
+//
+// Why: the 48 KB max compute shared-mem per workgroup on Ampere means
+// the 128x128 BK=32 large kernel uses ~33 KB and only fits 1 WG / SM.
+// Halving BK to 16 cuts shared memory to ~16.5 KB and lets 2 WGs run
+// per SM (16 active warps / SM vs 8).  Higher latency hiding more
+// than compensates for 2x the barriers on big-K problems.
+
+#define BM 128u
+#define BN 128u
+#define BK  16u
+#define TM   8u
+#define TN   8u
+#define TN_RAW 8
+
+#include "matmul_kernel.glsl"

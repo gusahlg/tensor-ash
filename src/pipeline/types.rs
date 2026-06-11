@@ -16,28 +16,113 @@ pub struct MatmulPushConstants {
     pub alpha: f32,
 }
 
-/// Default large-kernel output-tile dimensions.
-pub const TILE_M: u32 = 128;
-pub const TILE_N: u32 = 128;
-pub const TILE_K: u32 = 32;
-pub const SMALL_TILE_M: u32 = 64;
-pub const SMALL_TILE_N: u32 = 64;
-pub const SMALL_TILE_K: u32 = 32;
-pub const M64N128_TILE_M: u32 = 64;
-pub const M64N128_TILE_N: u32 = 128;
-pub const M64N128_TILE_K: u32 = 32;
-pub const M128N64_TILE_M: u32 = 128;
-pub const M128N64_TILE_N: u32 = 64;
-pub const M128N64_TILE_K: u32 = 32;
-pub const M128N64K64_TILE_M: u32 = 128;
-pub const M128N64K64_TILE_N: u32 = 64;
-pub const M128N64K64_TILE_K: u32 = 64;
-pub const M64N32_TILE_M: u32 = 64;
-pub const M64N32_TILE_N: u32 = 32;
-pub const M64N32_TILE_K: u32 = 32;
-pub const K64_TILE_M: u32 = 64;
-pub const K64_TILE_N: u32 = 64;
-pub const K64_TILE_K: u32 = 64;
+/// Static description of one matmul kernel: its display name, output-tile
+/// dimensions, and embedded SPIR-V binary.  All concrete (non-Auto)
+/// `KernelSelection` variants index into `KERNEL_SPECS` in declaration
+/// order; see `KernelSelection::index`.
+pub struct KernelSpec {
+    pub name: &'static str,
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub tile_k: u32,
+    pub spv: &'static [u8],
+}
+
+/// The full registry of compiled matmul kernels.  Order must match the
+/// non-`Auto` order of `KernelSelection`.
+pub const KERNEL_SPECS: &[KernelSpec] = &[
+    KernelSpec {
+        name: "large_128",
+        tile_m: 128,
+        tile_n: 128,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32.spv")),
+    },
+    KernelSpec {
+        name: "small_64",
+        tile_m: 64,
+        tile_n: 64,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_small.spv")),
+    },
+    KernelSpec {
+        name: "m64n128",
+        tile_m: 64,
+        tile_n: 128,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n128.spv")),
+    },
+    KernelSpec {
+        name: "m128n64",
+        tile_m: 128,
+        tile_n: 64,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n64.spv")),
+    },
+    KernelSpec {
+        name: "m128n64k64",
+        tile_m: 128,
+        tile_n: 64,
+        tile_k: 64,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n64k64.spv")),
+    },
+    KernelSpec {
+        name: "m64n32",
+        tile_m: 64,
+        tile_n: 32,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n32.spv")),
+    },
+    KernelSpec {
+        name: "k64",
+        tile_m: 64,
+        tile_n: 64,
+        tile_k: 64,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_k64.spv")),
+    },
+    KernelSpec {
+        name: "bk16_128x128",
+        tile_m: 128,
+        tile_n: 128,
+        tile_k: 16,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_bk16.spv")),
+    },
+    KernelSpec {
+        name: "v2_128x128_bk8",
+        tile_m: 128,
+        tile_n: 128,
+        tile_k: 8,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_v2.spv")),
+    },
+    KernelSpec {
+        name: "m64n128k64",
+        tile_m: 64,
+        tile_n: 128,
+        tile_k: 64,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n128k64.spv")),
+    },
+    KernelSpec {
+        name: "m128n128_t4",
+        tile_m: 128,
+        tile_n: 128,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n128_t4.spv")),
+    },
+    KernelSpec {
+        name: "m256n64",
+        tile_m: 256,
+        tile_n: 64,
+        tile_k: 32,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m256n64.spv")),
+    },
+    KernelSpec {
+        name: "v3_128x128_bk8_static",
+        tile_m: 128,
+        tile_n: 128,
+        tile_k: 8,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_v3.spv")),
+    },
+];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum KernelSelection {
@@ -49,6 +134,12 @@ pub enum KernelSelection {
     M128N64K64,
     M64N32,
     K64,
+    Bk16,
+    V2,
+    M64N128K64,
+    M128N128T4,
+    M256N64,
+    V3,
 }
 
 impl KernelSelection {
@@ -62,8 +153,14 @@ impl KernelSelection {
             "m128n64k64" | "128x64k64" => Ok(Self::M128N64K64),
             "m64n32" | "64x32" => Ok(Self::M64N32),
             "k64" | "small_k64" | "64k" => Ok(Self::K64),
+            "bk16" | "128x128bk16" => Ok(Self::Bk16),
+            "v2" | "128x128bk8" | "sota" => Ok(Self::V2),
+            "m64n128k64" | "64x128k64" => Ok(Self::M64N128K64),
+            "m128n128_t4" | "128x128_t4" => Ok(Self::M128N128T4),
+            "m256n64" | "256x64" => Ok(Self::M256N64),
+            "v3" | "128x128bk8static" => Ok(Self::V3),
             other => bail!(
-                "invalid ML_KERNEL '{other}', expected auto, large, small, m64n128, m128n64, m128n64k64, m64n32, or k64"
+                "invalid ML_KERNEL '{other}', expected auto, large, small, m64n128, m128n64, m128n64k64, m64n32, k64, bk16, v2, m64n128k64, m128n128_t4, m256n64, or v3"
             ),
         }
     }
@@ -71,6 +168,30 @@ impl KernelSelection {
     pub(super) fn from_env() -> Result<Self> {
         let value = std::env::var("ML_KERNEL").unwrap_or_else(|_| "auto".into());
         Self::parse(&value)
+    }
+
+    /// Index into `KERNEL_SPECS` / `MatmulPipeline::kernels` for this
+    /// selection.  `Auto` has no fixed kernel, so it returns `None`; the
+    /// caller is responsible for resolving it to a concrete variant
+    /// before looking up a kernel.
+    #[inline]
+    pub const fn index(self) -> Option<usize> {
+        match self {
+            Self::Auto => None,
+            Self::Large => Some(0),
+            Self::Small => Some(1),
+            Self::M64N128 => Some(2),
+            Self::M128N64 => Some(3),
+            Self::M128N64K64 => Some(4),
+            Self::M64N32 => Some(5),
+            Self::K64 => Some(6),
+            Self::Bk16 => Some(7),
+            Self::V2 => Some(8),
+            Self::M64N128K64 => Some(9),
+            Self::M128N128T4 => Some(10),
+            Self::M256N64 => Some(11),
+            Self::V3 => Some(12),
+        }
     }
 }
 
@@ -200,5 +321,22 @@ mod tests {
             }
         }
         assert!(seen.iter().all(|&b| b));
+    }
+
+    #[test]
+    fn kernel_selection_index_covers_every_spec() {
+        for selection in [
+            KernelSelection::Large,
+            KernelSelection::Small,
+            KernelSelection::M64N128,
+            KernelSelection::M128N64,
+            KernelSelection::M128N64K64,
+            KernelSelection::M64N32,
+            KernelSelection::K64,
+        ] {
+            let idx = selection.index().expect("non-Auto selection has an index");
+            assert!(idx < KERNEL_SPECS.len(), "index {idx} out of range");
+        }
+        assert_eq!(KernelSelection::Auto.index(), None);
     }
 }

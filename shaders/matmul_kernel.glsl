@@ -1,10 +1,9 @@
 // =====================================================================
 //  Shared GEMM (f32) kernel body, parameterized by tile constants.
 //
-//  The two wrapper shaders (matmul_f32.comp, matmul_f32_small.comp) set
-//  BM / BN / BK / TM / TN via preprocessor #defines and then #include
-//  this file.  Keeping the kernel logic in a single place stops the two
-//  variants from drifting apart.
+//  The wrapper shaders (matmul_f32*.comp) set BM / BN / BK / TM / TN
+//  via preprocessor #defines and then #include this file.  All real
+//  optimization work lives here.
 //
 //      C[b]  =  alpha * A[b] @ B[b]   (+ C[b]   if accumulate)
 //
@@ -31,7 +30,10 @@
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_GOOGLE_include_directive   : require
 
-layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+// Local workgroup shape derived from the tile constants so wrappers
+// with non-16x16 thread layouts (e.g. TM=4 TN=8 -> 16x32 = 512 threads)
+// dispatch the right number of invocations.
+layout(local_size_x = (BN / TN), local_size_y = (BM / TM), local_size_z = 1) in;
 
 // ------------------------------------------------------------------
 // Specialization constants.  These are set at pipeline-create time so

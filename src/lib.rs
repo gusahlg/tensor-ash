@@ -45,7 +45,7 @@ pub use context::{DeviceKind, DevicePreference, DeviceSummary, VulkanContext};
 pub use executor::Executor;
 pub use matmul::{MatmulCall, MatrixShape, RunStats};
 pub use pipeline::{
-    KernelSelection, KernelVariant, MatmulKernel, MatmulPipeline, MatmulPushConstants,
-    SMALL_TILE_M, SMALL_TILE_N, TILE_M, TILE_N,
+    KERNEL_SPECS, KernelSelection, KernelSpec, KernelVariant, MatmulKernel, MatmulPipeline,
+    MatmulPushConstants,
 };
 pub use tensor::Tensor;

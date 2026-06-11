@@ -1,2 +1,9 @@
 /target
 .venv-bench/
+scripts/__pycache__/
+benchmarks/cublas_bench/cublas_bench
+*.spv
+.claude/worktrees/
+
+# Local vulkaninfo dumps from one-off device snapshots.
+VP_VULKANINFO_*.json
