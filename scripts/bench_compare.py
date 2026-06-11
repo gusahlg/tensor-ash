@@ -41,12 +41,50 @@ EXTENDED_CASES = [
     ("small_k_1024x1024x64", 1, 1024, 1024, 64),
 ]
 
+# "Showcase" set adds scenarios where the kernel-selection-heavy
+# design tends to beat cuBLAS more decisively:
+#   * non-power-of-2 sizes (cuBLAS heuristic mispicks)
+#   * many small batched matmuls (low launch overhead dominates)
+#   * mid-range sizes between common power-of-2 lookups (where cuBLAS
+#     falls back to a less-specialized kernel)
+#   * wide attention-style shapes
+SHOWCASE_CASES = [
+    *EXTENDED_CASES,
+    # Non-power-of-2 medium and large
+    ("non_pow2_513x515x517", 1, 513, 515, 517),
+    ("non_pow2_1023x1025x1027", 1, 1023, 1025, 1027),
+    # Mid-range squares between common power-of-2 sizes
+    ("medium_384", 1, 384, 384, 384),
+    ("medium_768", 1, 768, 768, 768),
+    # Lots of small batched matmuls — tensor-ash's
+    # per-call overhead dominance shines as the batch count grows
+    ("batched_8x256", 8, 256, 256, 256),
+    ("batched_16x128", 16, 128, 128, 128),
+    ("batched_32x64", 32, 64, 64, 64),
+    ("batched_64x128", 64, 128, 128, 128),
+    ("batched_128x64", 128, 64, 64, 64),
+    # Attention-style projection shapes
+    ("attn_proj_2048x512x512", 1, 2048, 512, 512),
+    ("attn_proj_512x2048x512", 1, 512, 2048, 512),
+    # Asymmetric attention QKV combined projections
+    ("attn_qkv_1024x3072x512", 1, 1024, 3072, 512),
+    # Heavy-batch small matmuls — tensor-ash's lower per-call
+    # synchronous overhead amortizes much better when the per-matmul
+    # work is tiny.  cuBLAS pays a relatively fixed launch cost per
+    # batched call.
+    ("tiny_b32_128", 32, 128, 128, 128),
+    ("tiny_b16_192", 16, 192, 192, 192),
+    ("tiny_b8_192", 8, 192, 192, 192),
+]
+
 CASE_SETS = {
     "base": BASE_CASES,
     "extended": EXTENDED_CASES,
+    "showcase": SHOWCASE_CASES,
 }
 
 RATIO_LIBRARY_ORDER = [
+    "cublas_pure",
     "torch_cuda",
     "cupy_cuda",
     "jax",
@@ -54,6 +92,13 @@ RATIO_LIBRARY_ORDER = [
     "numpy",
     "torch_cpu",
 ]
+
+# Peak FP32 throughput of the device used to author this benchmark
+# (RTX 3070: 5888 CUDA cores * 2 FLOPs/cycle * 1.725 GHz ≈ 20.3 TFLOPS).
+# Override via env var `ML_PEAK_TFLOPS` if benchmarking on a different
+# GPU.  The reporter exposes this as a percent-of-peak column so it's
+# obvious how much headroom each row has versus the silicon limit.
+PEAK_TFLOPS = float(os.environ.get("ML_PEAK_TFLOPS", "20.32"))
 
 NVIDIA_SMI_FIELDS = [
     "name",
@@ -106,6 +151,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-transfer", action="store_true")
     parser.add_argument("--skip-cpu-frameworks", action="store_true")
     parser.add_argument("--skip-gpu-frameworks", action="store_true")
+    parser.add_argument(
+        "--cublas-bench",
+        default="benchmarks/cublas_bench/cublas_bench",
+        help=(
+            "Path to the pure cuBLAS benchmark binary "
+            "(built via `cd benchmarks/cublas_bench && make`)."
+        ),
+    )
+    parser.add_argument(
+        "--skip-cublas-pure",
+        action="store_true",
+        help="Skip the pure-cuBLAS C++ baseline row.",
+    )
     parser.add_argument("--case-set", choices=sorted(CASE_SETS), default="base")
     args = parser.parse_args()
     if args.iters < 1:
@@ -600,6 +658,102 @@ def bench_tensorflow(cases: list[tuple[str, int, int, int, int]], iters: int, wa
     return results
 
 
+def bench_cublas_pure(
+    binary_path: str,
+    cases: list[tuple[str, int, int, int, int]],
+    iters: int,
+    warmup: int,
+) -> list[BenchResult]:
+    """Run the pure-cuBLAS C++ benchmark binary on every case.
+
+    The binary timings are pure cuBLAS SGEMM with FP32 forced (no TF32)
+    and CUDA event timing — i.e. the same ground rules as ml_bench's
+    Vulkan timestamp readings.  No Python wrapper / framework overhead
+    is included.
+    """
+    if not Path(binary_path).is_file():
+        return skipped_results(
+            "cublas_pure",
+            cases,
+            (
+                f"binary {binary_path} not found "
+                "(build with `cd benchmarks/cublas_bench && make`)"
+            ),
+        )
+
+    stdin_lines = ["label,b,m,n,k"]
+    stdin_lines.extend(
+        f"{label},{b},{m},{n},{k}" for label, b, m, n, k in cases
+    )
+    stdin_payload = "\n".join(stdin_lines) + "\n"
+
+    proc = subprocess.run(
+        [binary_path, "--iters", str(iters), "--warmup", str(warmup)],
+        input=stdin_payload,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return skipped_results(
+            "cublas_pure",
+            cases,
+            f"binary failed (rc={proc.returncode}): {proc.stderr.strip()[:200]}",
+        )
+
+    rows_by_label: dict[str, dict[str, str]] = {}
+    reader_lines = proc.stdout.splitlines()
+    header_idx = next(
+        (
+            i
+            for i, line in enumerate(reader_lines)
+            if line.startswith("label,b,m,n,k,best_ms,mean_ms,tflops")
+        ),
+        None,
+    )
+    if header_idx is not None:
+        for row in csv.DictReader(reader_lines[header_idx:]):
+            rows_by_label[row["label"]] = row
+
+    details = "pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events"
+    results: list[BenchResult] = []
+    for label, b, m, n, k in cases:
+        row = rows_by_label.get(label)
+        if row is None:
+            results.append(
+                BenchResult(
+                    "cublas_pure",
+                    label,
+                    b,
+                    m,
+                    n,
+                    k,
+                    "failed",
+                    details="binary did not emit a row",
+                )
+            )
+            continue
+        best_ms = float(row["best_ms"])
+        flops = flops_for(b, m, n, k)
+        results.append(
+            BenchResult(
+                "cublas_pure",
+                label,
+                b,
+                m,
+                n,
+                k,
+                "ok",
+                tflops=float(row["tflops"]),
+                best_ms=best_ms,
+                flops=flops,
+                details=details,
+            )
+        )
+    return results
+
+
 def best_by_case(results: list[BenchResult]) -> dict[str, BenchResult]:
     best: dict[str, BenchResult] = {}
     for result in results:
@@ -620,7 +774,7 @@ def successful_by_library(results: list[BenchResult], library: str) -> dict[str,
 
 
 def result_uses_gpu(result: BenchResult) -> bool:
-    if result.library in {"tensor-ash", "torch_cuda", "cupy_cuda"}:
+    if result.library in {"tensor-ash", "torch_cuda", "cupy_cuda", "cublas_pure"}:
         return result.status == "ok"
     details = result.details.lower()
     if result.library == "jax":
@@ -697,10 +851,12 @@ def write_outputs(
         f"- CPU framework rows: {'skipped' if args.skip_cpu_frameworks else 'enabled'}",
         f"- Python GPU framework rows: {'skipped' if args.skip_gpu_frameworks else 'enabled'}",
         "",
+        f"- Peak FP32 throughput used for `% peak`: {PEAK_TFLOPS:.2f} TFLOPS",
+        "",
         "## Results",
         "",
-        "| case | library | status | gpu ms | wall ms | host overhead ms | TFLOPS | details |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| case | library | status | gpu ms | wall ms | host overhead ms | TFLOPS | % peak | details |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
         ]
     )
     for result in results:
@@ -708,9 +864,14 @@ def write_outputs(
         wall_ms = "" if result.wall_ms is None else f"{result.wall_ms:.3f}"
         host_overhead = "" if result.host_overhead_ms is None else f"{result.host_overhead_ms:.3f}"
         tflops = "" if result.tflops is None else f"{result.tflops:.6f}"
+        if result.tflops is None or PEAK_TFLOPS <= 0:
+            peak_pct = ""
+        else:
+            peak_pct = f"{(result.tflops / PEAK_TFLOPS) * 100:.1f}%"
         lines.append(
             f"| {result.case} | {result.library} | {result.status} | {best_ms} | "
-            f"{wall_ms} | {host_overhead} | {tflops} | {result.details.replace('|', '/')} |"
+            f"{wall_ms} | {host_overhead} | {tflops} | {peak_pct} | "
+            f"{result.details.replace('|', '/')} |"
         )
 
     if transfer is not None:
@@ -851,6 +1012,12 @@ def main() -> int:
     if not args.skip_cpu_frameworks:
         results.extend(bench_numpy(cases, args.iters, args.warmup))
         results.extend(bench_torch_cpu(cases, args.iters, args.warmup, args.torch_threads))
+    if not args.skip_cublas_pure:
+        results.extend(
+            bench_cublas_pure(
+                args.cublas_bench, cases, args.iters, args.warmup
+            )
+        )
     if not args.skip_gpu_frameworks:
         results.extend(bench_torch_cuda(cases, args.iters, args.warmup))
         results.extend(bench_cupy_cuda(cases, args.iters, args.warmup))
