@@ -1,12 +1,17 @@
 # tensor-ash Refactor, Verification, and Benchmark Process
 
-Generated: 2026-06-10
+Generated: 2026-06-10. Updated 2026-06-11 for the BDA / BDA_V4 optimization
+pass and the pure-cuBLAS comparison methodology.
 
 ## Scope
 
 This report records the maintainability audit, post-`v1.0.0` optimization
 work, C ABI port, local verification, cross-framework GEMM benchmark, and
-Ollama backend attempt.
+Ollama backend attempt. The "Performance Changes", "GEMM Benchmark Command",
+"Apples-to-Apples cuBLAS Methodology", and "Optimization Gameplan" sections
+have been refreshed for the data-driven `KERNEL_SPECS` pipeline, the BDA /
+BDA_V4 kernel families, the showcase case set, and the pure-cuBLAS C++
+baseline.
 
 The project now exposes two related surfaces:
 
@@ -46,24 +51,39 @@ and `tensor-ash-capi` as the C ABI wrapper crate.
 
 ## Performance Changes
 
-Two low-risk hot-path changes were made:
+Layered post-`v1.0.0`:
 
-- Descriptor updates now use a stack-allocated fast path for the common case of
+- Descriptor updates use a stack-allocated fast path for the common case of
   one descriptor set and one GEMM call. The previous path always allocated
   vectors sized for batched submissions.
-- The shader now has a `K_MULTIPLE` specialization constant. When the host
-  knows `K` is a multiple of the kernel K tile, the selected pipeline can fold
-  out the K-tail branch and modulo test.
-- Three additional manual/tuned kernels were added after the CUDA comparison:
-  `m64n128`, `m128n64`, and `k64`. The auto selector now uses batch-aware
-  measured rules so the new variants improve batch-1 medium/skinny shapes
-  without regressing the batched benchmark cases.
+- The shader has a `K_MULTIPLE` specialization constant. When the host knows
+  `K` is a multiple of the kernel K tile, the selected pipeline can fold out
+  the K-tail branch and modulo test.
+- Manual/tuned tile family expanded to seven primary shapes after the initial
+  CUDA comparison: `large` (128x128), `small` (64x64), `m64n128`, `m128n64`,
+  `m128n64k64`, `m64n32`, `k64`. The auto-selector uses batch-aware measured
+  rules so the new variants improve batch-1 medium/skinny shapes without
+  regressing batched cases.
+- The pipeline is now data-driven through a single `KERNEL_SPECS` table:
+  pipeline construction, kernel selection, and the `ML_KERNEL=...` parser all
+  read from it, so adding a tile is a two-line registry entry plus a `.comp`
+  wrapper.
+- Vulkan 1.2 `bufferDeviceAddress` is enabled end-to-end (`VulkanContext`,
+  `Buffer`, `MatmulPushConstants.{a,b,c}_ptr`), enabling the
+  `GL_EXT_buffer_reference` BDA kernel family (LDG.E.128 global loads) and
+  the BDA_V4 family on top of that (LDS.E.128 shared reads via `shared uvec4`
+  Bs).
+- The auto-selector promotes its picks to the BDA_V4 sibling when the device
+  exposes `bufferDeviceAddress`, with a plain BDA fallback for the TN=2
+  `m64n32` tile. Explicit `ML_KERNEL=...` selections are honored verbatim.
 
-The `K_MULTIPLE` specialization increased the number of precompiled variants
-per kernel from 8 to 16. The tradeoff is more pipeline variants for less branch
-work in aligned GEMM calls. With five kernel shapes, each run now creates up to
-80 specialized compute pipelines, amortized by the persistent Vulkan pipeline
-cache.
+`KERNEL_SPECS` currently lists 27 SPIR-V variants (7 descriptor-bound primary
+tiles, the 7 BDA siblings, 6 BDA_V4 siblings, plus exploratory entries —
+`bk16`, `v2`, `m64n128k64`, `m128n128_t4`, `m256n64`, `v3` — kept around for
+A/B tuning via `ML_KERNEL`). Multiplied by the `K_MULTIPLE` / `ACCUMULATE` /
+`ALPHA_IS_ONE` / `INTERIOR_ONLY` specialization bits, each run can create a
+few hundred specialized compute pipelines, amortized by the persistent Vulkan
+pipeline cache under `$XDG_CACHE_HOME/tensor-ash/`.
 
 ## Added Tests
 
@@ -158,11 +178,11 @@ source .venv-bench/bin/activate
 uv pip install -r requirements-benchmark.txt
 ```
 
-Extended benchmark command:
+Showcase benchmark command (current default for cross-library runs):
 
 ```bash
 nix develop .#benchmark --command bash -lc \
-  '.venv-bench/bin/python scripts/bench_compare.py --case-set extended --iters 20 --warmup 5 --torch-threads 1 --transfer-mb 64'
+  '.venv-bench/bin/python scripts/bench_compare.py --case-set showcase --iters 30 --warmup 10 --torch-threads 1 --transfer-mb 64'
 ```
 
 Full raw data and table report:
@@ -170,56 +190,71 @@ Full raw data and table report:
 - `benchmarks/latest.json`
 - `benchmarks/latest.md`
 
-Environment:
+Environment (latest recorded run):
 
-- GPU: NVIDIA GeForce RTX 3070
+- GPU: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de)
 - Driver: 595.71.05
-- Vulkan: 1.4.329 on the selected GPU
 - Tensor timestamps: enabled
 - CUDA Python rows: PyTorch 2.11.0+cu128 and CuPy 13.6.0
+- Pure cuBLAS C++ row: `benchmarks/cublas_bench/cublas_bench.cu`,
+  `CUBLAS_PEDANTIC_MATH`, CUDA events
 - CPU framework threads: 1
-- Cases: 11 extended FP32 GEMM shapes
-- Iterations: 40
+- Cases: 26 `showcase` FP32 GEMM shapes (squares, batched, attention-style,
+  non-power-of-two, tall/skinny/wide, small-K, tiny batches)
+- Iterations: 30
 - Warmups: 10
+- Peak FP32 throughput used for `% peak`: 20.32 TFLOPS
+  (RTX 3070; overridable via `ML_PEAK_TFLOPS`)
 
 Summary:
 
 | comparison | result |
 | --- | ---: |
-| `tensor-ash` fastest measured backend | 7 / 11 cases |
-| vs PyTorch CUDA/cuBLAS geomean | 1.10x |
-| vs CuPy CUDA/cuBLAS geomean | 2.51x |
-| vs NumPy single-thread geomean | 31.6x |
-| vs PyTorch CPU single-thread geomean | 31.9x |
-| best `tensor-ash` throughput in this run | 8.987 TFLOPS (`square_1024`) |
-| median synchronous host overhead | 0.019 ms |
-| transfer upload | 9.771 GiB/s |
-| transfer download | 10.335 GiB/s |
+| `tensor-ash` fastest measured backend | 13 / 26 cases |
+| vs pure cuBLAS (apples-to-apples) geomean | 1.11x |
+| vs PyTorch CUDA/cuBLAS geomean | 1.32x |
+| vs CuPy CUDA/cuBLAS geomean | 2.59x |
+| vs NumPy single-thread geomean | 47.56x |
+| vs PyTorch CPU single-thread geomean | 45.33x |
+| best `tensor-ash` throughput | 10.18 TFLOPS / 50.1% peak (`square_1024`) |
+| best `tensor-ash` `attn_qkv_1024x3072x512` | 10.41 TFLOPS / 51.2% peak |
+| pure cuBLAS on `square_1024` | 10.92 TFLOPS / 53.8% peak |
+| pure cuBLAS on `attn_qkv_1024x3072x512` | 11.44 TFLOPS / 56.3% peak |
+| largest single-case gap | `non_pow2_1023x1025x1027`: 1.2x cublas_pure lead |
+| median synchronous host overhead | 0.020 ms |
+| transfer upload | 9.04 GiB/s |
+| transfer download | 9.48 GiB/s |
 
-Selected GPU results:
+Headline cases (TFLOPS, with `% peak` in brackets):
 
-| case | `tensor-ash` TFLOPS | PyTorch CUDA TFLOPS | CuPy CUDA TFLOPS |
-| --- | ---: | ---: | ---: |
-| `square_256` | 2.731 | 2.320 | 0.670 |
-| `square_512` | 5.891 | 6.732 | 3.551 |
-| `batched_4x256` | 5.185 | 3.154 | 1.669 |
-| `tall_512x256x256` | 4.088 | 3.647 | 1.241 |
-| `odd_255x257x263` | 2.352 | 2.263 | 0.697 |
-| `square_1024` | 8.987 | 10.760 | 9.152 |
-| `batched_2x512` | 7.365 | 7.167 | 4.772 |
-| `skinny_1024x128x512` | 4.660 | 4.816 | 2.143 |
-| `wide_128x1024x512` | 4.697 | 4.860 | 2.174 |
-| `small_k_1024x1024x64` | 5.191 | 5.029 | 2.260 |
+| case | `tensor-ash` | pure cuBLAS | PyTorch CUDA | CuPy CUDA |
+| --- | ---: | ---: | ---: | ---: |
+| `square_512` | 6.47 (31.8%) | 7.49 (36.9%) | 6.61 (32.5%) | 3.49 (17.2%) |
+| `square_1024` | 10.18 (50.1%) | 10.92 (53.8%) | 10.65 (52.4%) | 8.98 (44.2%) |
+| `medium_768` | 8.36 (41.2%) | 9.99 (49.1%) | 9.41 (46.3%) | 6.80 (33.4%) |
+| `attn_proj_2048x512x512` | 9.75 (48.0%) | 9.81 (48.3%) | 9.34 (45.9%) | 7.04 (34.6%) |
+| `attn_qkv_1024x3072x512` | 10.41 (51.2%) | 11.44 (56.3%) | 11.18 (55.0%) | 9.90 (48.7%) |
+| `batched_2x512` | 7.65 (37.6%) | 7.83 (38.5%) | 7.09 (34.9%) | 4.63 (22.8%) |
+| `batched_4x256` | 5.66 (27.9%) | 3.58 (17.6%) | 3.09 (15.2%) | 1.61 (7.9%) |
+| `batched_8x256` | 7.24 (35.6%) | 6.72 (33.1%) | 5.73 (28.2%) | 3.08 (15.2%) |
+| `non_pow2_1023x1025x1027` | 8.25 (40.6%) | 10.26 (50.5%) | 10.03 (49.3%) | 8.52 (41.9%) |
+| `tiny_b32_128` | 6.32 (31.1%) | 4.73 (23.3%) | 4.11 (20.2%) | 1.83 (9.0%) |
 
-Performance note:
+Performance notes:
 
-- PyTorch CUDA/cuBLAS is still strongest on large square GEMMs; it leads
-  `square_1024` by about 1.2x and leads the 512 square case.
-- The tuned selector now beats PyTorch CUDA on geometric mean for the extended
-  set by improving small, medium, odd, tall, batched, and small-K cases.
-- Median CPU/submission overhead is about 19 us per synchronous call. The
-  reported TFLOPS uses GPU timestamps, so the remaining large-square gap is
-  shader efficiency rather than upload/download or host timing.
+- Pure cuBLAS is still strongest on the largest GEMMs (`non_pow2_1023^3`,
+  `attn_qkv`, `square_1024`, `medium_768`), where its hand-tuned kernels
+  show their edge. The biggest single-case gap is `non_pow2_1023x1025x1027`
+  at 8.25 vs 10.26 TFLOPS.
+- `tensor-ash` wins decisively on batched and tiny-batch shapes where the
+  per-call submission overhead amortizes over many matmuls (e.g.
+  `batched_4x256`: 5.66 vs cuBLAS 3.58 TFLOPS, `tiny_b32_128`: 6.32 vs
+  cuBLAS 4.73 TFLOPS).
+- `attn_proj_2048x512x512` is now effectively a tie with pure cuBLAS
+  (9.75 vs 9.81 TFLOPS) after the BDA_V4 pass.
+- Median host/submission overhead is ~20 us per synchronous call. Reported
+  TFLOPS uses GPU timestamps, so any remaining gap is shader efficiency,
+  not upload/download or host timing.
 
 Skipped framework rows:
 
@@ -319,13 +354,86 @@ Backend integration status:
 - A real comparison requires a ggml/Ollama adapter that maps model graph matmul
   calls to `ta_matmul` or `ta_matmul_batch`.
 
-## Next Engineering Steps
+## Apples-to-Apples cuBLAS Methodology
 
-1. Implement a ggml/Ollama backend adapter over the C ABI if Ollama integration
-   remains the priority.
-2. Add a benchmark focused on C ABI call overhead and batched-call throughput.
-3. Continue shader work on large square GEMMs and the remaining skinny/wide
-   CUDA deltas.
-4. Keep PyTorch CUDA and CuPy CUDA rows in the standard local benchmark before
-   accepting performance-sensitive shader changes.
-5. Split `scripts/bench_compare.py` into a package if framework coverage grows.
+The Python framework rows (PyTorch CUDA, CuPy CUDA) bundle the kernel with
+wrapper overhead: tensor view bookkeeping, Python-side event allocation,
+dispatch through the framework's autograd/dispatch layer, and (worst of all
+for FP32 comparisons) a silent TF32 fallback for SGEMM on Ampere unless the
+caller explicitly opts out.
+
+The `cublas_pure` row in `benchmarks/latest.md` is driven by
+`benchmarks/cublas_bench/cublas_bench.cu`, a small CUDA C++ binary that:
+
+1. **Calls cuBLAS directly through its C API** (`cublasSgemm` /
+   `cublasSgemmStridedBatched`). No PyTorch, no CuPy, no Python event loop.
+2. **Forces real FP32** via `cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH)`.
+   `CUBLAS_DEFAULT_MATH` on Ampere silently routes SGEMM through TF32, which
+   would slash precision and inflate throughput by roughly 8x — not the
+   comparison we want for an FP32 library.
+3. **Times with CUDA events** (`cudaEventRecord` / `cudaEventElapsedTime`),
+   which is the closest CUDA equivalent to the Vulkan timestamp queries
+   `ml_bench` uses. The two numbers are directly comparable: both exclude
+   host overhead, both measure pure GPU time on the device clock.
+4. **Reads cases from stdin as CSV** and emits CSV on stdout, so
+   `scripts/bench_compare.py` can call it for every case in the showcase set
+   with the same iteration / warmup counts as the Vulkan path.
+
+Row-major / column-major: `tensor-ash` uses row-major tensors and cuBLAS is
+column-major, so the cuBLAS call swaps `A` and `B` and computes `C^T = B^T A^T`.
+That's a transpose-free reinterpretation, not a copy — the SGEMM kernel that
+runs is the same one PyTorch / CuPy dispatch to. See the comment at the top
+of `cublas_bench.cu` for the exact argument mapping.
+
+## Optimization Gameplan
+
+Status legend: DONE, in progress, NEXT.
+
+1. **DONE** — Data-driven `KERNEL_SPECS` pipeline. Adding a tile shape is now
+   a two-line registry entry plus a `.comp` wrapper.
+2. **DONE** — Vulkan 1.2 `bufferDeviceAddress` end-to-end.
+3. **DONE** — BDA kernel family (`GL_EXT_buffer_reference` → `LDG.E.128`).
+   +5-15% on every tile we measured. Variants exist for all seven primary
+   tiles: `large`, `small`, `m64n128`, `m128n64`, `m128n64k64`, `m64n32`,
+   `k64`.
+4. **DONE** — BDA_V4 kernel family (`shared uvec4` Bs → `LDS.E.128`). Another
+   +5-15% over plain BDA on every TN ≥ 4 tile. No V4 path for the TN=2
+   `m64n32` tile (LDS.128 over a 2-column stride is non-sensical); the
+   auto-selector falls back to plain BDA for that one.
+5. **DONE** — Auto-selector promotes its picks to BDA_V4 (with BDA fallback
+   for `m64n32`) when `bufferDeviceAddress` is available. Explicit
+   `ML_KERNEL=...` selections are honored verbatim.
+6. **DONE** — Auto-selector rules retuned: medium rectangular shapes with
+   `min_mn ∈ [512, 2048)` and aspect ≤ 5x go to `m128n64k64`; mid-square
+   `min_mn ∈ [192, 480]` goes to `k64`; the `m64n32` rule is skipped at
+   `batch ≥ 8`.
+7. **DONE** — Pure cuBLAS C++ benchmark, `% peak` column, showcase case set
+   (see "Apples-to-Apples cuBLAS Methodology" above).
+8. **NEXT** — Close the remaining gap on the largest GEMMs. `square_1024`
+   currently hits 50.1% peak (10.18 TFLOPS) vs pure cuBLAS at 53.8%
+   (10.92 TFLOPS); `non_pow2_1023x1025x1027` is the worst single-case gap
+   (8.25 vs 10.26 TFLOPS); `attn_qkv_1024x3072x512` is 51.2% vs 56.3%.
+   Promising directions: register-blocking sweep, double the K-strip
+   prefetch depth on the BDA_V4 path, evaluate `wmma`-style 16x16 tiles
+   once Vulkan cooperative-matrix becomes broadly available.
+9. **NEXT** — Implement a ggml/Ollama backend adapter over the C ABI if
+   Ollama integration remains the priority.
+10. **NEXT** — Add a benchmark focused on C ABI call overhead and
+    batched-call throughput.
+11. **NEXT** — Split `scripts/bench_compare.py` into a package if framework
+    coverage grows.
+
+### Dead Ends — Do Not Retry
+
+- **v3 / double-buffered SMEM with static stage indices**
+  (`shaders/matmul_v3_kernel.glsl`, kernel `v3_128x128_bk8_static`). The
+  premise was that the v2 dynamic `(kt & 1u)` stage index was preventing the
+  NVIDIA driver from interleaving the next-strip global load with the current-
+  strip FFMAs. The v3 kernel manually peels the K loop into stage-0/stage-1
+  pairs so the indices are literal constants. In practice the driver already
+  schedules v2 well, the v3 kernel paid an extra register cost for the
+  unrolled control flow, and it lost on every shape we measured against the
+  BDA / BDA_V4 path. It's kept in the registry as a manual `ML_KERNEL=v3`
+  variant for reproducibility, but the auto-selector ignores it. Don't waste
+  another round on a double-buffer rewrite; the win is in global-load width
+  (BDA) and shared-load width (BDA_V4), not in stage indexing.
