@@ -222,6 +222,13 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n128_bda_v4.spv")),
     },
+    KernelSpec {
+        name: "bk16_bda_v4",
+        tile_m: 128,
+        tile_n: 128,
+        tile_k: 16,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_bk16_bda_v4.spv")),
+    },
 ];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -253,6 +260,7 @@ pub enum KernelSelection {
     K64BdaV4,
     M128N64BdaV4,
     M64N128BdaV4,
+    Bk16BdaV4,
 }
 
 impl KernelSelection {
@@ -285,6 +293,7 @@ impl KernelSelection {
             "k64_bda_v4" => Ok(Self::K64BdaV4),
             "m128n64_bda_v4" => Ok(Self::M128N64BdaV4),
             "m64n128_bda_v4" => Ok(Self::M64N128BdaV4),
+            "bk16_bda_v4" | "128x128bk16_bda_v4" => Ok(Self::Bk16BdaV4),
             other => bail!(
                 "invalid ML_KERNEL '{other}', expected one of auto, large, small, m64n128, m128n64, m128n64k64, m64n32, k64, bk16, v2, m64n128k64, m128n128_t4, m256n64, v3, or any *_bda / *_bda_v4 variant"
             ),
@@ -330,6 +339,7 @@ impl KernelSelection {
             Self::K64BdaV4 => Some(23),
             Self::M128N64BdaV4 => Some(24),
             Self::M64N128BdaV4 => Some(25),
+            Self::Bk16BdaV4 => Some(26),
         }
     }
 }

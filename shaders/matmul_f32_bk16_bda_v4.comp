@@ -1,0 +1,15 @@
+#version 460
+// 128x128/BK=16 BDA+V4 tile.  Smaller K strip than `large_bda_v4` cuts
+// per-WG shared memory from ~33 KB to ~16 KB, letting Ampere host two
+// WGs per SM instead of one.  Useful for medium-square shapes
+// (256-1024 per side) where the 128x64x64 tile underuses the GPU and
+// the 64x64 small tile gives up too much arithmetic intensity.
+
+#define BM 128u
+#define BN 128u
+#define BK  16u
+#define TM   8u
+#define TN   8u
+#define TN_RAW 8
+
+#include "matmul_bda_v4_kernel.glsl"
