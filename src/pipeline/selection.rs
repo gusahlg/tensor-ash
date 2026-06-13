@@ -119,7 +119,7 @@ pub(super) fn auto_select_kernel(
         // narrower N tile.  Limiting this rule to min_mn < 2048 keeps
         // the win for 1024x8192-style shapes while letting near-
         // square >= 2048 dispatches fall through to Large.
-        if min_mn >= 1024 && min_mn < 2048 && max_mn >= 4096 && k >= 512 {
+        if (1024..2048).contains(&min_mn) && max_mn >= 4096 && k >= 512 {
             return KernelSelection::M128N64K64;
         }
         if k <= 128 && m >= 2048 && n >= 2048 {

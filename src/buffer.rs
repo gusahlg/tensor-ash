@@ -96,8 +96,7 @@ impl Buffer {
 
             let mut alloc_flags = vk::MemoryAllocateFlagsInfo::default();
             if ctx.buffer_device_address_enabled {
-                alloc_flags = alloc_flags
-                    .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+                alloc_flags = alloc_flags.flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
             }
             let mut alloc_ci = vk::MemoryAllocateInfo::default()
                 .allocation_size(mem_req.size)

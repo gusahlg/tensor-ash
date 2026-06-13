@@ -33,8 +33,10 @@ use crate::context::VulkanContext;
 
 const SPIRV_TAIL: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_streamk_128x128.spv"));
-const SPIRV_DP: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_streamk_dp_128x128.spv"));
+const SPIRV_DP: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/matmul_f32_streamk_dp_128x128.spv"
+));
 
 /// Push constants for the hybrid Stream-K shader.  Bit-for-bit
 /// identical to the GLSL `PC` block in matmul_streamk_kernel.glsl.
@@ -87,7 +89,7 @@ pub(super) struct StreamKKernel {
 pub(super) struct StreamKPipeline {
     ctx: Arc<VulkanContext>,
     pub(super) pipeline_layout: vk::PipelineLayout,
-    pub(super) k128x128_dp:   StreamKKernel,
+    pub(super) k128x128_dp: StreamKKernel,
     pub(super) k128x128_tail: StreamKKernel,
 }
 
@@ -334,12 +336,9 @@ impl StreamKSchedule {
             preferred_g.min(total_iters_sk.max(1)).max(1)
         };
 
-        let (iters_per_wg_sk, rem_sk) = if g_sk == 0 {
-            (0, 0)
-        } else {
-            let i = total_iters_sk / g_sk;
-            let r = total_iters_sk - i * g_sk;
-            (i, r)
+        let (iters_per_wg_sk, rem_sk) = match total_iters_sk.checked_div(g_sk) {
+            Some(i) => (i, total_iters_sk - i * g_sk),
+            None => (0, 0),
         };
 
         let grid_total = dp_tiles_total + g_sk;
@@ -410,13 +409,7 @@ pub fn default_stream_k_grid(sm_count: u32, total_iters: u32, iters_per_tile: u3
 /// the regular aligned kernel, so SK only wins when the wave-quant
 /// tax decisively exceeds that overhead.  Raise this threshold once
 /// the SK overhead gap is closed.
-pub fn stream_k_should_fire(
-    m: u32,
-    n: u32,
-    k: u32,
-    sm_count: u32,
-    tail_fraction_max: f64,
-) -> bool {
+pub fn stream_k_should_fire(m: u32, n: u32, k: u32, sm_count: u32, tail_fraction_max: f64) -> bool {
     const BM: u32 = 128;
     const BN: u32 = 128;
     const BK: u32 = 32;
@@ -481,10 +474,7 @@ mod tests {
     #[test]
     fn schedule_rem_distributes_correctly_on_sk_tail() {
         let s = StreamKSchedule::for_shape(4096, 4096, 4096, 128, 128, 32, 46);
-        assert_eq!(
-            s.iters_per_wg_sk * s.g_sk + s.rem_sk,
-            s.total_iters_sk
-        );
+        assert_eq!(s.iters_per_wg_sk * s.g_sk + s.rem_sk, s.total_iters_sk);
         assert!(s.rem_sk < s.g_sk);
     }
 

@@ -191,6 +191,22 @@ fn maybe_to_bda(tile: KernelSelection) -> KernelSelection {
     }
 }
 
+impl Drop for MatmulPipeline {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.ctx.device.device_wait_idle();
+            for kernel in self.kernels.drain(..) {
+                destroy_kernel(&self.ctx, kernel);
+            }
+            self.ctx
+                .device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.ctx
+                .device
+                .destroy_descriptor_set_layout(self.set_layout, None);
+        }
+    }
+}
 
 #[cfg(test)]
 mod bda_tests {
@@ -234,22 +250,5 @@ mod bda_tests {
         // No BDA sibling at all — pass through.
         assert_eq!(maybe_to_bda(KernelSelection::Bk16), KernelSelection::Bk16);
         assert_eq!(maybe_to_bda(KernelSelection::V2), KernelSelection::V2);
-    }
-}
-
-impl Drop for MatmulPipeline {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self.ctx.device.device_wait_idle();
-            for kernel in self.kernels.drain(..) {
-                destroy_kernel(&self.ctx, kernel);
-            }
-            self.ctx
-                .device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.ctx
-                .device
-                .destroy_descriptor_set_layout(self.set_layout, None);
-        }
     }
 }

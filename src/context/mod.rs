@@ -179,14 +179,12 @@ impl VulkanContext {
             // gate enablement on the actual `get` queries so the lib
             // remains runnable on llvmpipe / older mobile GPUs.
             let mut bda_query = vk::PhysicalDeviceVulkan12Features::default();
-            let mut atomic_float_query =
-                vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
+            let mut atomic_float_query = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
             let mut features2 = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut bda_query)
                 .push_next(&mut atomic_float_query);
             instance.get_physical_device_features2(physical_device, &mut features2);
-            let buffer_device_address_supported =
-                bda_query.buffer_device_address == vk::TRUE;
+            let buffer_device_address_supported = bda_query.buffer_device_address == vk::TRUE;
             let shader_buffer_float32_atomic_add_supported =
                 atomic_float_query.shader_buffer_float32_atomic_add == vk::TRUE;
 
@@ -198,9 +196,9 @@ impl VulkanContext {
                 .enumerate_device_extension_properties(physical_device)
                 .context("enumerate_device_extension_properties")?;
             let atomic_float_ext_name = ash::ext::shader_atomic_float::NAME;
-            let atomic_float_ext_present = device_exts.iter().any(|ext| {
-                CStr::from_ptr(ext.extension_name.as_ptr()) == atomic_float_ext_name
-            });
+            let atomic_float_ext_present = device_exts
+                .iter()
+                .any(|ext| CStr::from_ptr(ext.extension_name.as_ptr()) == atomic_float_ext_name);
             let enable_shader_atomic_float =
                 shader_buffer_float32_atomic_add_supported && atomic_float_ext_present;
 
@@ -325,9 +323,8 @@ impl VulkanContext {
             "buffer_device_address requested but feature not enabled"
         );
         unsafe {
-            self.device.get_buffer_device_address(
-                &vk::BufferDeviceAddressInfo::default().buffer(buffer),
-            )
+            self.device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
         }
     }
 

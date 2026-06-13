@@ -186,7 +186,7 @@ impl ResolvedMatmul {
         c_ptr: u64,
         num_k_splits: u32,
     ) -> MatmulPushConstants {
-        debug_assert!(num_k_splits >= 1 && num_k_splits <= 0xFFFF);
+        debug_assert!((1..=0xFFFF).contains(&num_k_splits));
         MatmulPushConstants {
             m: self.m,
             n: self.n,

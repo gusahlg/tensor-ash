@@ -192,7 +192,10 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_m: 128,
         tile_n: 64,
         tile_k: 64,
-        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n64k64_bda_v4.spv")),
+        spv: include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/matmul_f32_m128n64k64_bda_v4.spv"
+        )),
     },
     KernelSpec {
         name: "small_bda_v4",
@@ -238,7 +241,10 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_m: 128,
         tile_n: 128,
         tile_k: 32,
-        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_large_bda_v4_aligned.spv")),
+        spv: include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/matmul_f32_large_bda_v4_aligned.spv"
+        )),
     },
     KernelSpec {
         // Aligned-only variant of `m128n64k64_bda_v4`.
@@ -248,7 +254,10 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_m: 128,
         tile_n: 64,
         tile_k: 64,
-        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n64k64_bda_v4_aligned.spv")),
+        spv: include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/matmul_f32_m128n64k64_bda_v4_aligned.spv"
+        )),
     },
 ];
 

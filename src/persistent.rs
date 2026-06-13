@@ -80,10 +80,7 @@ struct SpecData {
 /// INTERIOR_ONLY, K_MULTIPLE) for the persistent shader.
 const VARIANT_COUNT: usize = 16;
 
-const SPV: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/matmul_f32_persistent_v4.spv"
-));
+const SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_persistent_v4.spv"));
 
 pub struct PersistentMatmul {
     ctx: Arc<VulkanContext>,
@@ -125,8 +122,7 @@ impl PersistentMatmul {
             let pipeline_layout = ctx
                 .device
                 .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default()
-                        .push_constant_ranges(&pc_ranges),
+                    &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc_ranges),
                     None,
                 )
                 .context("create_pipeline_layout (persistent)")?;
@@ -141,10 +137,7 @@ impl PersistentMatmul {
                 .collect();
             let shader = ctx
                 .device
-                .create_shader_module(
-                    &vk::ShaderModuleCreateInfo::default().code(&words),
-                    None,
-                )
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
                 .context("create_shader_module (persistent)")?;
             let shader_guard =
                 scopeguard::guard(shader, |m| ctx.device.destroy_shader_module(m, None));
@@ -199,21 +192,21 @@ impl PersistentMatmul {
                         .layout(pipeline_layout)
                 })
                 .collect();
-            let pipelines = match ctx.device.create_compute_pipelines(
-                ctx.pipeline_cache,
-                &create_infos,
-                None,
-            ) {
-                Ok(pipelines) => pipelines,
-                Err((partial, err)) => {
-                    for p in partial {
-                        if p != vk::Pipeline::null() {
-                            ctx.device.destroy_pipeline(p, None);
+            let pipelines =
+                match ctx
+                    .device
+                    .create_compute_pipelines(ctx.pipeline_cache, &create_infos, None)
+                {
+                    Ok(pipelines) => pipelines,
+                    Err((partial, err)) => {
+                        for p in partial {
+                            if p != vk::Pipeline::null() {
+                                ctx.device.destroy_pipeline(p, None);
+                            }
                         }
+                        bail!("create_compute_pipelines (persistent): {err}");
                     }
-                    bail!("create_compute_pipelines (persistent): {err}");
-                }
-            };
+                };
             let mut variants = [vk::Pipeline::null(); VARIANT_COUNT];
             for (i, p) in pipelines.iter().enumerate() {
                 variants[i] = *p;
@@ -367,9 +360,7 @@ impl PersistentMatmul {
         // workgroup loops until the global counter exceeds num_tiles,
         // so an over-allocation just costs the extra WGs one stall on
         // the atomicAdd that sees `>= num_tiles` and exits.
-        let max_wg = WG_PER_SM
-            .checked_mul(self.sm_count)
-            .unwrap_or(u32::MAX);
+        let max_wg = WG_PER_SM.saturating_mul(self.sm_count);
         let dispatch_x = num_tiles.min(max_wg);
 
         let want_timestamps = self.ctx.timestamps_supported;
@@ -401,9 +392,7 @@ impl PersistentMatmul {
             // it via buffer-device-address atomicAdd.
             let buf_barrier = [vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(
-                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                )
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .buffer(self.counter_buffer.raw)

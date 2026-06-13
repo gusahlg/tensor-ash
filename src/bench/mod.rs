@@ -46,7 +46,7 @@ pub fn run() -> Result<()> {
         /*max_calls=*/ 256,
     )?);
 
-    let mut persistent: Option<PersistentMatmul> = if persistent_requested {
+    let persistent: Option<PersistentMatmul> = if persistent_requested {
         Some(PersistentMatmul::new(&ctx)?)
     } else {
         None

@@ -277,8 +277,18 @@ fn v4_kernels_handle_n_not_multiple_of_4() {
         ("small_bda_v4", KernelSelection::SmallBdaV4, 64u32, 64u32),
         ("large_bda_v4", KernelSelection::LargeBdaV4, 128u32, 128u32),
         ("k64_bda_v4", KernelSelection::K64BdaV4, 64u32, 64u32),
-        ("m128n64_bda_v4", KernelSelection::M128N64BdaV4, 128u32, 64u32),
-        ("m64n128_bda_v4", KernelSelection::M64N128BdaV4, 64u32, 128u32),
+        (
+            "m128n64_bda_v4",
+            KernelSelection::M128N64BdaV4,
+            128u32,
+            64u32,
+        ),
+        (
+            "m64n128_bda_v4",
+            KernelSelection::M64N128BdaV4,
+            64u32,
+            128u32,
+        ),
         (
             "m128n64k64_bda_v4",
             KernelSelection::M128N64K64BdaV4,
@@ -299,13 +309,7 @@ fn v4_kernels_handle_n_not_multiple_of_4() {
             (tile_m, tile_n + 3u32, 32u32, 113u64, 127u64),
             // Larger N with both an interior tile column and a
             // bounds-checked column.
-            (
-                tile_m * 2u32,
-                tile_n * 2u32 + 1u32,
-                64u32,
-                131u64,
-                137u64,
-            ),
+            (tile_m * 2u32, tile_n * 2u32 + 1u32, 64u32, 131u64, 137u64),
         ] {
             let (gpu, cpu) = run_one(
                 &ctx,

@@ -82,7 +82,10 @@ impl SplitKPipeline {
     /// STORAGE_BUFFER bindings) and push constant range that the
     /// standard matmul kernels use — split-K is a drop-in replacement
     /// at the descriptor level.
-    pub(super) fn new(ctx: &Arc<VulkanContext>, pipeline_layout: vk::PipelineLayout) -> Result<Self> {
+    pub(super) fn new(
+        ctx: &Arc<VulkanContext>,
+        pipeline_layout: vk::PipelineLayout,
+    ) -> Result<Self> {
         let m128n128 = build_split_k_kernel(ctx, pipeline_layout, 128, 128, SPIRV_M128N128)
             .context("build split-K 128x128 kernel")?;
         let m64n64 = build_split_k_kernel(ctx, pipeline_layout, 64, 64, SPIRV_M64N64)
@@ -196,7 +199,9 @@ impl Drop for SplitKPipeline {
         unsafe {
             let _ = self.ctx.device.device_wait_idle();
             if self.m128n128.pipeline != vk::Pipeline::null() {
-                self.ctx.device.destroy_pipeline(self.m128n128.pipeline, None);
+                self.ctx
+                    .device
+                    .destroy_pipeline(self.m128n128.pipeline, None);
             }
             if self.m128n128.shader_module != vk::ShaderModule::null() {
                 self.ctx

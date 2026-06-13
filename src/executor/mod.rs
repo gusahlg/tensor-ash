@@ -44,12 +44,12 @@ use recording::{
     record_matmul_commands, record_matmul_split_k_commands, update_matmul_descriptor_sets,
 };
 use slot::Slot;
-pub use splitk::default_num_k_splits;
 use splitk::SplitKPipeline;
+pub use splitk::default_num_k_splits;
+use streamk::StreamKPipeline;
 pub use streamk::{
     StreamKPushConstants, StreamKSchedule, default_stream_k_grid, stream_k_should_fire,
 };
-use streamk::StreamKPipeline;
 
 pub use crate::matmul::{MatmulCall, RunStats};
 
@@ -123,11 +123,7 @@ impl Executor {
     ///
     /// This entry point is intentionally a *separate* method from
     /// `run_matmuls` so callers opt in explicitly.
-    pub fn run_matmuls_split_k(
-        &self,
-        call: MatmulCall<'_>,
-        num_k_splits: u32,
-    ) -> Result<RunStats> {
+    pub fn run_matmuls_split_k(&self, call: MatmulCall<'_>, num_k_splits: u32) -> Result<RunStats> {
         if call.accumulate {
             bail!("run_matmuls_split_k: accumulate=true is not supported");
         }
@@ -157,9 +153,7 @@ impl Executor {
             num_k_splits
         };
         if num_k_splits == 0 || num_k_splits > 0xFFFF {
-            bail!(
-                "run_matmuls_split_k: num_k_splits={num_k_splits} out of range [1, 65535]"
-            );
+            bail!("run_matmuls_split_k: num_k_splits={num_k_splits} out of range [1, 65535]");
         }
 
         let mut slot = self.checkout_slot();
@@ -186,7 +180,11 @@ impl Executor {
         let query_pool = slot.query_pool;
         let set_count = 1usize;
         let calls_slice = std::slice::from_ref(call);
-        let max_groups = self.ctx.device_properties.limits.max_compute_work_group_count;
+        let max_groups = self
+            .ctx
+            .device_properties
+            .limits
+            .max_compute_work_group_count;
         let gx = resolved.n.div_ceil(kernel.tile_n);
         let gy = resolved.m.div_ceil(kernel.tile_m);
         let gz = resolved
@@ -292,13 +290,9 @@ impl Executor {
             && {
                 let resolved = crate::matmul::ResolvedMatmul::from_call(&call).ok();
                 match resolved {
-                    Some(r) if r.batch == 1 => stream_k_should_fire(
-                        r.m,
-                        r.n,
-                        r.k,
-                        46,
-                        tail_fraction_max,
-                    ),
+                    Some(r) if r.batch == 1 => {
+                        stream_k_should_fire(r.m, r.n, r.k, 46, tail_fraction_max)
+                    }
                     _ => false,
                 }
             };
@@ -314,6 +308,7 @@ impl Executor {
     ///   * M%128 == N%128 == K%32 == 0
     ///   * batch == 1
     ///   * accumulate == false
+    ///
     /// When restrictions are violated the call is rejected; callers
     /// fall back to `run_matmuls` for those shapes.
     pub fn run_matmuls_stream_k(&self, call: MatmulCall<'_>) -> Result<RunStats> {
@@ -336,7 +331,12 @@ impl Executor {
         {
             bail!(
                 "run_matmuls_stream_k: shape {}x{}x{} not aligned to ({},{},{})",
-                resolved.m, resolved.n, resolved.k, BM, BN, BK
+                resolved.m,
+                resolved.n,
+                resolved.k,
+                BM,
+                BN,
+                BK
             );
         }
         if !self.ctx.buffer_device_address_enabled {
@@ -398,7 +398,11 @@ impl Executor {
         let dp_kernel = stream_k.pick_dp(resolved.m, resolved.n);
         let tail_kernel = stream_k.pick_tail(resolved.m, resolved.n);
         let layout = stream_k.pipeline_layout;
-        let max_groups = self.ctx.device_properties.limits.max_compute_work_group_count;
+        let max_groups = self
+            .ctx
+            .device_properties
+            .limits
+            .max_compute_work_group_count;
         if schedule.grid_total > max_groups[0] {
             bail!(
                 "stream-K grid_total={} exceeds device maxComputeWorkGroupCount[0]={}",
@@ -445,12 +449,7 @@ impl Executor {
             self.submit_recorded(slot, |dev, cb, _slot| {
                 if want_timestamps {
                     dev.cmd_reset_query_pool(cb, query_pool, 0, 2);
-                    dev.cmd_write_timestamp(
-                        cb,
-                        vk::PipelineStageFlags::TOP_OF_PIPE,
-                        query_pool,
-                        0,
-                    );
+                    dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, query_pool, 0);
                 }
 
                 // Zero-fill C so the atomic-add path is correct.
@@ -491,11 +490,7 @@ impl Executor {
                 // tile_id falls in the SK tail.
                 if schedule.dp_tiles_total > 0 {
                     let dp_rows_ceil = schedule.dp_tiles_total.div_ceil(schedule.n_tiles);
-                    dev.cmd_bind_pipeline(
-                        cb,
-                        vk::PipelineBindPoint::COMPUTE,
-                        dp_kernel.pipeline,
-                    );
+                    dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, dp_kernel.pipeline);
                     dev.cmd_dispatch(cb, schedule.n_tiles, dp_rows_ceil, 1);
                 }
 
@@ -529,11 +524,7 @@ impl Executor {
                             &[],
                         );
                     }
-                    dev.cmd_bind_pipeline(
-                        cb,
-                        vk::PipelineBindPoint::COMPUTE,
-                        tail_kernel.pipeline,
-                    );
+                    dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, tail_kernel.pipeline);
                     dev.cmd_dispatch(cb, schedule.g_sk, 1, 1);
                 }
 
