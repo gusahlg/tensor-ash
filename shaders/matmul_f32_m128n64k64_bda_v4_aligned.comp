@@ -1,0 +1,12 @@
+#version 460
+// 128x64/BK=64 strict-aligned (no bounds checks) BDA v4 variant.
+// Dispatcher must guarantee M%128==0, N%64==0, K%64==0.
+
+#define BM 128u
+#define BN  64u
+#define BK  64u
+#define TM   8u
+#define TN   4u
+#define TN_RAW 4
+
+#include "matmul_bda_v4_aligned_kernel.glsl"

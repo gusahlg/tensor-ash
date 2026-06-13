@@ -21,5 +21,7 @@ mod ops;
 mod property;
 #[path = "correctness/shapes.rs"]
 mod shapes;
+#[path = "correctness/streamk.rs"]
+mod streamk;
 #[path = "correctness/submission.rs"]
 mod submission;

@@ -126,11 +126,15 @@ impl MatmulPipeline {
         let selection = match self.selection {
             KernelSelection::Auto => {
                 let tile = auto_select_kernel(batch, m, n, k, self.auto_min_large_tiles);
-                if self.ctx.buffer_device_address_enabled {
+                let promoted = if self.ctx.buffer_device_address_enabled {
                     maybe_to_bda(tile)
                 } else {
                     tile
-                }
+                };
+                // Second-stage promotion: strict-aligned shapes can use
+                // the source-stripped no-bounds-check kernels.  Only the
+                // BDA_V4 tiles have aligned siblings today.
+                maybe_to_aligned(promoted, m, n, k)
             }
             explicit => explicit,
         };
@@ -138,6 +142,27 @@ impl MatmulPipeline {
             .index()
             .expect("auto selection must resolve to a concrete kernel");
         &self.kernels[idx]
+    }
+}
+
+/// Promote a BDA_V4 tile choice to its strict-aligned sibling when the
+/// shape is a clean multiple of the tile.  The aligned kernels drop the
+/// scalar-load fallback and edge-store paths at GLSL preprocessor time
+/// (not just at spec-const fold), which removes any cruft the NVIDIA
+/// driver may leave around the dead branches.
+fn maybe_to_aligned(tile: KernelSelection, m: u32, n: u32, k: u32) -> KernelSelection {
+    match tile {
+        KernelSelection::LargeBdaV4
+            if m.is_multiple_of(128) && n.is_multiple_of(128) && k.is_multiple_of(32) =>
+        {
+            KernelSelection::LargeBdaV4Aligned
+        }
+        KernelSelection::M128N64K64BdaV4
+            if m.is_multiple_of(128) && n.is_multiple_of(64) && k.is_multiple_of(64) =>
+        {
+            KernelSelection::M128N64K64BdaV4Aligned
+        }
+        other => other,
     }
 }
 

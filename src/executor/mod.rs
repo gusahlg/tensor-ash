@@ -25,6 +25,7 @@
 mod recording;
 mod slot;
 mod splitk;
+mod streamk;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
@@ -45,6 +46,8 @@ use recording::{
 use slot::Slot;
 pub use splitk::default_num_k_splits;
 use splitk::SplitKPipeline;
+pub use streamk::{StreamKPushConstants, StreamKSchedule, default_stream_k_grid};
+use streamk::StreamKPipeline;
 
 pub use crate::matmul::{MatmulCall, RunStats};
 
@@ -61,6 +64,9 @@ pub struct Executor {
     /// `run_matmuls_split_k`.  See `executor/splitk.rs` for the design
     /// rationale.
     split_k: OnceLock<SplitKPipeline>,
+    /// Experimental Stream-K pipeline, lazily built on first use of
+    /// `run_matmuls_stream_k`.  See `executor/streamk.rs`.
+    stream_k: OnceLock<StreamKPipeline>,
 }
 
 impl Executor {
@@ -91,6 +97,7 @@ impl Executor {
             slot_avail: Condvar::new(),
             max_calls_per_submit,
             split_k: OnceLock::new(),
+            stream_k: OnceLock::new(),
         })
     }
 
@@ -255,6 +262,203 @@ impl Executor {
                 None
             };
 
+            Ok(gpu_time_ns)
+        }
+    }
+
+    /// Experimental: dispatch a single matmul using the Stream-K
+    /// kernel.  Restrictions (v1):
+    ///   * M%128 == N%128 == K%32 == 0
+    ///   * batch == 1
+    ///   * accumulate == false
+    /// When restrictions are violated the call is rejected; callers
+    /// fall back to `run_matmuls` for those shapes.
+    pub fn run_matmuls_stream_k(&self, call: MatmulCall<'_>) -> Result<RunStats> {
+        if call.accumulate {
+            bail!("run_matmuls_stream_k: accumulate=true is not supported");
+        }
+        let resolved = crate::matmul::ResolvedMatmul::from_call(&call)?;
+        if resolved.batch != 1 {
+            bail!(
+                "run_matmuls_stream_k: only batch==1 is supported (got batch={})",
+                resolved.batch
+            );
+        }
+        const BM: u32 = 128;
+        const BN: u32 = 128;
+        const BK: u32 = 32;
+        if !resolved.m.is_multiple_of(BM)
+            || !resolved.n.is_multiple_of(BN)
+            || !resolved.k.is_multiple_of(BK)
+        {
+            bail!(
+                "run_matmuls_stream_k: shape {}x{}x{} not aligned to ({},{},{})",
+                resolved.m, resolved.n, resolved.k, BM, BN, BK
+            );
+        }
+        if !self.ctx.buffer_device_address_enabled {
+            bail!("run_matmuls_stream_k: bufferDeviceAddress not available on this device");
+        }
+
+        let stream_k = if let Some(s) = self.stream_k.get() {
+            s
+        } else {
+            let built = StreamKPipeline::new(&self.ctx)?;
+            self.stream_k.get_or_init(|| built)
+        };
+        let kernel = stream_k.pick(resolved.m, resolved.n);
+
+        let sm_count = self
+            .ctx
+            .device_properties
+            .limits
+            .max_compute_work_group_count[0]
+            .min(46);
+        let schedule = StreamKSchedule::for_shape(
+            resolved.m,
+            resolved.n,
+            resolved.k,
+            kernel.tile_m,
+            kernel.tile_n,
+            kernel.tile_k,
+            // Hard-coded to 46 for the RTX 3070 we benchmark on; this
+            // can be looked up via VK_NV_compute_shader_derivatives or
+            // a runtime probe in a follow-up.  Today the value is only
+            // used to size G = sm_count * 2 within the two-tile
+            // invariant clamp, so being slightly off is harmless.
+            46,
+        );
+
+        let mut slot = self.checkout_slot();
+        let result = self.record_and_run_stream_k(&mut slot, &call, &resolved, stream_k, &schedule);
+        self.checkin_slot(slot);
+
+        // Suppress unused warning on sm_count; harmless guard for when we
+        // wire in the real SM probe later.
+        let _ = sm_count;
+
+        let gpu_time_ns = result?;
+        Ok(RunStats {
+            gpu_time_ns,
+            n_calls: 1,
+            total_flops: resolved.total_flops,
+        })
+    }
+
+    fn record_and_run_stream_k(
+        &self,
+        slot: &mut Slot,
+        call: &MatmulCall<'_>,
+        resolved: &crate::matmul::ResolvedMatmul,
+        stream_k: &StreamKPipeline,
+        schedule: &StreamKSchedule,
+    ) -> Result<Option<u64>> {
+        let want_timestamps = self.ctx.timestamps_supported;
+        let query_pool = slot.query_pool;
+        let kernel = stream_k.pick(resolved.m, resolved.n);
+        let layout = stream_k.pipeline_layout;
+        let max_groups = self.ctx.device_properties.limits.max_compute_work_group_count;
+        if schedule.grid_g > max_groups[0] {
+            bail!(
+                "stream-K grid_g={} exceeds device maxComputeWorkGroupCount[0]={}",
+                schedule.grid_g,
+                max_groups[0]
+            );
+        }
+        let a_ptr = self.ctx.buffer_device_address(call.a.raw_buffer());
+        let b_ptr = self.ctx.buffer_device_address(call.b.raw_buffer());
+        let c_ptr = self.ctx.buffer_device_address(call.c.raw_buffer());
+
+        let pc = StreamKPushConstants {
+            m: resolved.m,
+            n: resolved.n,
+            k: resolved.k,
+            batch_stride_a: resolved.batch_stride_a,
+            batch_stride_b: resolved.batch_stride_b,
+            batch_stride_c: resolved.batch_stride_c,
+            flags: 0,
+            alpha: call.alpha,
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            iters_per_tile: schedule.iters_per_tile,
+            iters_per_wg: schedule.iters_per_wg,
+            rem: schedule.rem,
+            n_tiles: schedule.n_tiles,
+            total_iters: schedule.total_iters,
+            _pad: 0,
+        };
+
+        unsafe {
+            self.submit_recorded(slot, |dev, cb, _slot| {
+                if want_timestamps {
+                    dev.cmd_reset_query_pool(cb, query_pool, 0, 2);
+                    dev.cmd_write_timestamp(
+                        cb,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        query_pool,
+                        0,
+                    );
+                }
+
+                // Zero-fill C so the atomic-add path is correct.
+                dev.cmd_fill_buffer(cb, call.c.raw_buffer(), 0, vk::WHOLE_SIZE, 0);
+
+                let buf_barrier = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(call.c.raw_buffer())
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE);
+                dev.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    std::slice::from_ref(&buf_barrier),
+                    &[],
+                );
+
+                dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, kernel.pipeline);
+                dev.cmd_push_constants(
+                    cb,
+                    layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    bytemuck::bytes_of(&pc),
+                );
+                dev.cmd_dispatch(cb, schedule.grid_g, 1, 1);
+
+                if want_timestamps {
+                    dev.cmd_write_timestamp(
+                        cb,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        query_pool,
+                        1,
+                    );
+                }
+                Ok(())
+            })?;
+
+            let gpu_time_ns = if want_timestamps {
+                let mut data = [0u64; 2];
+                self.ctx
+                    .device
+                    .get_query_pool_results(
+                        query_pool,
+                        0,
+                        &mut data,
+                        vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                    )
+                    .context("get_query_pool_results (stream-k)")?;
+                let ticks = data[1].wrapping_sub(data[0]);
+                Some((ticks as f64 * self.ctx.timestamp_period_ns) as u64)
+            } else {
+                None
+            };
             Ok(gpu_time_ns)
         }
     }

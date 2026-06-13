@@ -77,10 +77,30 @@ SHOWCASE_CASES = [
     ("tiny_b8_192", 8, 192, 192, 192),
 ]
 
+# Stream-K focused shapes: BM=BN=128 tile, 46 SMs on RTX 3070.
+# Shapes are picked so (M/128) * (N/128) modulo 92 (=46*2 waves) is
+# small but non-zero — i.e. classic wave-quantization tails where
+# Stream-K's even work redistribution should beat a fixed data-parallel
+# tile mapping. Also includes a deep-K shape where Split-K-style
+# accumulation is the natural win.
+STREAMK_CASES = [
+    ("sq_4096", 1, 4096, 4096, 4096),        # 1024 tiles, mod 92 = 12. Big expected win.
+    ("sq_4096_k1024", 1, 4096, 4096, 1024),  # 1024 tiles, K=1024. Same wave quantization.
+    ("sq_2048", 1, 2048, 2048, 2048),        # 256 tiles, mod 92 = 72. Modest expected win.
+    ("attn_2048x4096x512", 1, 2048, 4096, 512),
+    ("attn_4096x2048x512", 1, 4096, 2048, 512),
+    ("attn_qkv_2048x6144x1024", 1, 2048, 6144, 1024),
+    ("ffn_proj_2048x8192x2048", 1, 2048, 8192, 2048),
+    ("sq_3584", 1, 3584, 3584, 3584),        # 784 tiles, mod 92 = 48.
+    ("sq_6144", 1, 6144, 6144, 4096),        # 2304 tiles, mod 92 = 8. Big expected win.
+    ("deep_k_512_8192", 1, 512, 512, 8192),  # 16 tiles, deep K (Split-K-like win).
+]
+
 CASE_SETS = {
     "base": BASE_CASES,
     "extended": EXTENDED_CASES,
     "showcase": SHOWCASE_CASES,
+    "streamk": STREAMK_CASES,
 }
 
 RATIO_LIBRARY_ORDER = [

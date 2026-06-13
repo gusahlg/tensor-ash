@@ -1,0 +1,13 @@
+#version 460
+// 128x128/BK=32 BDA + uvec4-Bs Stream-K variant.
+// 1D persistent grid (G workgroups); host computes the schedule and
+// pre-zeros C.  See matmul_streamk_kernel.glsl for the design.
+
+#define BM 128u
+#define BN 128u
+#define BK  32u
+#define TM   8u
+#define TN   8u
+#define TN_RAW 8
+
+#include "matmul_streamk_kernel.glsl"
