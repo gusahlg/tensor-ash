@@ -314,12 +314,6 @@ impl Executor {
         };
         let kernel = stream_k.pick(resolved.m, resolved.n);
 
-        let sm_count = self
-            .ctx
-            .device_properties
-            .limits
-            .max_compute_work_group_count[0]
-            .min(46);
         let schedule = StreamKSchedule::for_shape(
             resolved.m,
             resolved.n,
@@ -330,18 +324,15 @@ impl Executor {
             // Hard-coded to 46 for the RTX 3070 we benchmark on; this
             // can be looked up via VK_NV_compute_shader_derivatives or
             // a runtime probe in a follow-up.  Today the value is only
-            // used to size G = sm_count * 2 within the two-tile
-            // invariant clamp, so being slightly off is harmless.
+            // used to size the preferred persistent grid (G_pref =
+            // sm_count * 2) within the two-tile invariant clamp on the
+            // tail, so being slightly off is harmless.
             46,
         );
 
         let mut slot = self.checkout_slot();
         let result = self.record_and_run_stream_k(&mut slot, &call, &resolved, stream_k, &schedule);
         self.checkin_slot(slot);
-
-        // Suppress unused warning on sm_count; harmless guard for when we
-        // wire in the real SM probe later.
-        let _ = sm_count;
 
         let gpu_time_ns = result?;
         Ok(RunStats {
@@ -364,11 +355,20 @@ impl Executor {
         let kernel = stream_k.pick(resolved.m, resolved.n);
         let layout = stream_k.pipeline_layout;
         let max_groups = self.ctx.device_properties.limits.max_compute_work_group_count;
-        if schedule.grid_g > max_groups[0] {
+        if schedule.grid_total > max_groups[0] {
             bail!(
-                "stream-K grid_g={} exceeds device maxComputeWorkGroupCount[0]={}",
-                schedule.grid_g,
+                "stream-K grid_total={} exceeds device maxComputeWorkGroupCount[0]={}",
+                schedule.grid_total,
                 max_groups[0]
+            );
+        }
+        if schedule.grid_total == 0 {
+            bail!(
+                "stream-K schedule produced empty grid for {}x{}x{} \
+                 (m_tiles*n_tiles=0)",
+                resolved.m,
+                resolved.n,
+                resolved.k,
             );
         }
         let a_ptr = self.ctx.buffer_device_address(call.a.raw_buffer());
@@ -388,10 +388,12 @@ impl Executor {
             b_ptr,
             c_ptr,
             iters_per_tile: schedule.iters_per_tile,
-            iters_per_wg: schedule.iters_per_wg,
-            rem: schedule.rem,
+            iters_per_wg_sk: schedule.iters_per_wg_sk,
+            rem_sk: schedule.rem_sk,
             n_tiles: schedule.n_tiles,
-            total_iters: schedule.total_iters,
+            dp_tiles_total: schedule.dp_tiles_total,
+            g_sk: schedule.g_sk,
+            total_iters_sk: schedule.total_iters_sk,
             _pad: 0,
         };
 
@@ -436,7 +438,7 @@ impl Executor {
                     0,
                     bytemuck::bytes_of(&pc),
                 );
-                dev.cmd_dispatch(cb, schedule.grid_g, 1, 1);
+                dev.cmd_dispatch(cb, schedule.grid_total, 1, 1);
 
                 if want_timestamps {
                     dev.cmd_write_timestamp(
