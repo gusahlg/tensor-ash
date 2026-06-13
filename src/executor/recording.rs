@@ -14,30 +14,51 @@ use super::splitk::SplitKKernel;
 /// responsible for guaranteeing that the GPU has fenced out of the
 /// previous use of these sets (we wait on the fence at the end of every
 /// submit, so the next submit on the same slot is safe).
+///
+/// BDA kernels read A/B/C through `buffer_reference` pointers in the
+/// push constants and never touch SSBO bindings 0/1/2.  For any call
+/// whose resolved kernel is a BDA kernel we skip the descriptor write
+/// entirely — the shader cannot observe the descriptor and the write
+/// is pure CPU-side overhead.  A pure-BDA submission therefore issues
+/// zero `vkUpdateDescriptorSets` work.
 pub(super) fn update_matmul_descriptor_sets(
     ctx: &VulkanContext,
+    pipeline: &MatmulPipeline,
     sets: &[vk::DescriptorSet],
     calls: &[MatmulCall<'_>],
+    resolved: &[ResolvedMatmul],
 ) {
     debug_assert_eq!(sets.len(), calls.len());
+    debug_assert_eq!(sets.len(), resolved.len());
 
-    if let ([set], [call]) = (sets, calls) {
-        update_one_matmul_descriptor_set(ctx, *set, call);
+    // Build buffer-info + writes only for calls that actually need a
+    // descriptor write.  Keep buffer_infos stable so the
+    // &[WriteDescriptorSet] we hand to Vulkan keeps stable references.
+    let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::with_capacity(calls.len() * 3);
+    let mut needs_write: Vec<bool> = Vec::with_capacity(calls.len());
+    for (call, dims) in calls.iter().zip(resolved.iter()) {
+        let kernel = pipeline.select_kernel(dims.batch, dims.m, dims.n, dims.k);
+        let need = kernel.uses_descriptors;
+        needs_write.push(need);
+        if need {
+            buffer_infos.push(tensor_descriptor(call.a));
+            buffer_infos.push(tensor_descriptor(call.b));
+            buffer_infos.push(tensor_descriptor(call.c));
+        }
+    }
+
+    if buffer_infos.is_empty() {
+        // Pure-BDA submission: nothing to write.
         return;
     }
 
-    // Build the buffer-info array up front so the &[WriteDescriptorSet]
-    // we hand to Vulkan keeps stable references into it.
-    let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::with_capacity(calls.len() * 3);
-    for call in calls {
-        buffer_infos.push(tensor_descriptor(call.a));
-        buffer_infos.push(tensor_descriptor(call.b));
-        buffer_infos.push(tensor_descriptor(call.c));
-    }
-
-    let mut writes: Vec<vk::WriteDescriptorSet> = Vec::with_capacity(calls.len() * 3);
+    let mut writes: Vec<vk::WriteDescriptorSet> =
+        Vec::with_capacity(needs_write.iter().filter(|w| **w).count() * 3);
+    let mut base = 0usize;
     for (i, set) in sets.iter().copied().enumerate() {
-        let base = i * 3;
+        if !needs_write[i] {
+            continue;
+        }
         for binding in 0..3u32 {
             writes.push(
                 vk::WriteDescriptorSet::default()
@@ -47,6 +68,7 @@ pub(super) fn update_matmul_descriptor_sets(
                     .buffer_info(std::slice::from_ref(&buffer_infos[base + binding as usize])),
             );
         }
+        base += 3;
     }
 
     unsafe {
@@ -54,7 +76,14 @@ pub(super) fn update_matmul_descriptor_sets(
     }
 }
 
-fn update_one_matmul_descriptor_set(
+/// Point a single descriptor set at `call`'s A/B/C tensors.  Used by
+/// the split-K path, whose kernels still bind the descriptor set
+/// (carried by the matmul pipeline layout that SplitKKernel was built
+/// against) even though the shader itself addresses A/B/C through
+/// BDA pointers in the push constants.  Kept as a dedicated helper so
+/// the matmul-BDA fast path doesn't have to reason about split-K's
+/// descriptor needs.
+pub(super) fn update_split_k_descriptor_set(
     ctx: &VulkanContext,
     set: vk::DescriptorSet,
     call: &MatmulCall<'_>,
@@ -151,17 +180,25 @@ pub(super) fn record_matmul_commands(
                     .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, variant_pipeline);
                 bound_pipeline = variant_pipeline;
             }
-            ctx.device.cmd_bind_descriptor_sets(
-                cb,
-                vk::PipelineBindPoint::COMPUTE,
-                pipeline.pipeline_layout,
-                0,
-                std::slice::from_ref(&set),
-                &[],
-            );
+            // BDA kernels carry their own push-constant-only pipeline
+            // layout and never read SSBO bindings 0/1/2 — skip the
+            // descriptor-set bind entirely.  Descriptor kernels go
+            // through the matmul pipeline's descriptor-based layout
+            // (which is what `kernel.pipeline_layout` resolves to for
+            // them).
+            if kernel.uses_descriptors {
+                ctx.device.cmd_bind_descriptor_sets(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    kernel.pipeline_layout,
+                    0,
+                    std::slice::from_ref(&set),
+                    &[],
+                );
+            }
             ctx.device.cmd_push_constants(
                 cb,
-                pipeline.pipeline_layout,
+                kernel.pipeline_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
                 bytemuck::bytes_of(&pc),
@@ -169,6 +206,7 @@ pub(super) fn record_matmul_commands(
             ctx.device.cmd_dispatch(cb, gx, gy, gz);
         }
     }
+
     Ok(())
 }
 

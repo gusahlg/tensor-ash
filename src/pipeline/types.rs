@@ -29,12 +29,21 @@ pub struct MatmulPushConstants {
 /// dimensions, and embedded SPIR-V binary.  All concrete (non-Auto)
 /// `KernelSelection` variants index into `KERNEL_SPECS` in declaration
 /// order; see `KernelSelection::index`.
+///
+/// `uses_descriptors` is `true` for kernels whose shader binds A/B/C to
+/// SSBO bindings 0/1/2, and `false` for kernels that address A/B/C via
+/// push-constant `buffer_reference` pointers (the BDA path).  The
+/// dispatcher uses this to skip `vkUpdateDescriptorSets` and
+/// `vkCmdBindDescriptorSets` entirely for BDA kernels — those shaders
+/// never read the descriptor set, so the writes/binds are pure
+/// CPU-side overhead.
 pub struct KernelSpec {
     pub name: &'static str,
     pub tile_m: u32,
     pub tile_n: u32,
     pub tile_k: u32,
     pub spv: &'static [u8],
+    pub uses_descriptors: bool,
 }
 
 /// The full registry of compiled matmul kernels.  Order must match the
@@ -46,6 +55,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 128,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32.spv")),
+        uses_descriptors: true,
     },
     KernelSpec {
         name: "small_64",
@@ -53,6 +63,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 64,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_small.spv")),
+        uses_descriptors: true,
     },
     KernelSpec {
         name: "m64n128",
@@ -60,6 +71,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 128,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n128.spv")),
+        uses_descriptors: true,
     },
     KernelSpec {
         name: "m128n64",
@@ -67,6 +79,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 64,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n64.spv")),
+        uses_descriptors: true,
     },
     KernelSpec {
         name: "m128n64k64",
@@ -74,6 +87,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 64,
         tile_k: 64,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n64k64.spv")),
+        uses_descriptors: true,
     },
     KernelSpec {
         name: "m64n32",
@@ -81,6 +95,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 32,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n32.spv")),
+        uses_descriptors: true,
     },
     KernelSpec {
         name: "k64",
@@ -88,6 +103,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 64,
         tile_k: 64,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_k64.spv")),
+        uses_descriptors: true,
     },
     KernelSpec {
         name: "bk16_128x128",
@@ -95,6 +111,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 128,
         tile_k: 16,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_bk16.spv")),
+        uses_descriptors: true,
     },
     KernelSpec {
         name: "v2_128x128_bk8",
@@ -102,6 +119,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 128,
         tile_k: 8,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_v2.spv")),
+        uses_descriptors: true,
     },
     KernelSpec {
         name: "m64n128k64",
@@ -109,6 +127,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 128,
         tile_k: 64,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n128k64.spv")),
+        uses_descriptors: true,
     },
     KernelSpec {
         name: "m128n128_t4",
@@ -116,6 +135,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 128,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n128_t4.spv")),
+        uses_descriptors: true,
     },
     KernelSpec {
         name: "m256n64",
@@ -123,6 +143,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 64,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m256n64.spv")),
+        uses_descriptors: true,
     },
     KernelSpec {
         name: "v3_128x128_bk8_static",
@@ -130,6 +151,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 128,
         tile_k: 8,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_v3.spv")),
+        uses_descriptors: true,
     },
     KernelSpec {
         name: "large_bda",
@@ -137,6 +159,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 128,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_large_bda.spv")),
+        uses_descriptors: false,
     },
     KernelSpec {
         name: "m128n64k64_bda",
@@ -144,6 +167,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 64,
         tile_k: 64,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n64k64_bda.spv")),
+        uses_descriptors: false,
     },
     KernelSpec {
         name: "k64_bda",
@@ -151,6 +175,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 64,
         tile_k: 64,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_k64_bda.spv")),
+        uses_descriptors: false,
     },
     KernelSpec {
         name: "small_bda",
@@ -158,6 +183,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 64,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_small_bda.spv")),
+        uses_descriptors: false,
     },
     KernelSpec {
         name: "m64n32_bda",
@@ -165,6 +191,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 32,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n32_bda.spv")),
+        uses_descriptors: false,
     },
     KernelSpec {
         name: "m128n64_bda",
@@ -172,6 +199,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 64,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n64_bda.spv")),
+        uses_descriptors: false,
     },
     KernelSpec {
         name: "m64n128_bda",
@@ -179,6 +207,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 128,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n128_bda.spv")),
+        uses_descriptors: false,
     },
     KernelSpec {
         name: "large_bda_v4",
@@ -186,6 +215,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 128,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_large_bda_v4.spv")),
+        uses_descriptors: false,
     },
     KernelSpec {
         name: "m128n64k64_bda_v4",
@@ -196,6 +226,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
             env!("OUT_DIR"),
             "/matmul_f32_m128n64k64_bda_v4.spv"
         )),
+        uses_descriptors: false,
     },
     KernelSpec {
         name: "small_bda_v4",
@@ -203,6 +234,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 64,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_small_bda_v4.spv")),
+        uses_descriptors: false,
     },
     KernelSpec {
         name: "k64_bda_v4",
@@ -210,6 +242,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 64,
         tile_k: 64,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_k64_bda_v4.spv")),
+        uses_descriptors: false,
     },
     KernelSpec {
         name: "m128n64_bda_v4",
@@ -217,6 +250,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 64,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m128n64_bda_v4.spv")),
+        uses_descriptors: false,
     },
     KernelSpec {
         name: "m64n128_bda_v4",
@@ -224,6 +258,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 128,
         tile_k: 32,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_m64n128_bda_v4.spv")),
+        uses_descriptors: false,
     },
     KernelSpec {
         name: "bk16_bda_v4",
@@ -231,6 +266,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         tile_n: 128,
         tile_k: 16,
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_bk16_bda_v4.spv")),
+        uses_descriptors: false,
     },
     KernelSpec {
         // Aligned-only variant of `large_bda_v4`: source-level removes
@@ -245,6 +281,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
             env!("OUT_DIR"),
             "/matmul_f32_large_bda_v4_aligned.spv"
         )),
+        uses_descriptors: false,
     },
     KernelSpec {
         // Aligned-only variant of `m128n64k64_bda_v4`.
@@ -258,6 +295,7 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
             env!("OUT_DIR"),
             "/matmul_f32_m128n64k64_bda_v4_aligned.spv"
         )),
+        uses_descriptors: false,
     },
 ];
 
@@ -428,6 +466,18 @@ pub struct MatmulKernel {
     pub shader_module: vk::ShaderModule,
     /// One pipeline per `KernelVariant`; indexed by `KernelVariant::index()`.
     pub variants: [vk::Pipeline; KernelVariant::COUNT],
+    /// The pipeline layout the kernel's pipelines were built against,
+    /// and the layout the dispatcher must pass to
+    /// `vkCmdPushConstants` / `vkCmdBindDescriptorSets`.  Descriptor
+    /// kernels point at the matmul pipeline's descriptor-set-based
+    /// layout; BDA kernels point at the push-constant-only BDA
+    /// layout.
+    pub pipeline_layout: vk::PipelineLayout,
+    /// `true` if the shader reads A/B/C from SSBO bindings 0/1/2;
+    /// `false` if it dereferences them through `buffer_reference`
+    /// pointers in the push constants.  Mirrors
+    /// `KernelSpec::uses_descriptors`.
+    pub uses_descriptors: bool,
 }
 
 impl MatmulKernel {

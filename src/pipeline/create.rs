@@ -23,6 +23,7 @@ pub(super) unsafe fn destroy_kernel(ctx: &Arc<VulkanContext>, kernel: MatmulKern
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn create_kernel(
     ctx: &Arc<VulkanContext>,
     pipeline_layout: vk::PipelineLayout,
@@ -31,6 +32,7 @@ pub(super) fn create_kernel(
     tile_n: u32,
     tile_k: u32,
     spv: &[u8],
+    uses_descriptors: bool,
 ) -> Result<MatmulKernel> {
     unsafe {
         assert!(spv.len().is_multiple_of(4), "SPIR-V size not 4-aligned");
@@ -132,6 +134,8 @@ pub(super) fn create_kernel(
             tile_k,
             shader_module: ScopeGuard::into_inner(shader_guard),
             variants,
+            pipeline_layout,
+            uses_descriptors,
         })
     }
 }

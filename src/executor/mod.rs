@@ -42,6 +42,7 @@ use crate::tensor::Tensor;
 
 use recording::{
     record_matmul_commands, record_matmul_split_k_commands, update_matmul_descriptor_sets,
+    update_split_k_descriptor_set,
 };
 use slot::Slot;
 use splitk::SplitKPipeline;
@@ -185,7 +186,6 @@ impl Executor {
         let want_timestamps = self.ctx.timestamps_supported;
         let query_pool = slot.query_pool;
         let set_count = 1usize;
-        let calls_slice = std::slice::from_ref(call);
         let max_groups = self
             .ctx
             .device_properties
@@ -213,11 +213,13 @@ impl Executor {
         }
 
         unsafe {
-            update_matmul_descriptor_sets(
-                &self.ctx,
-                &slot.descriptor_sets[..set_count],
-                calls_slice,
-            );
+            // Split-K still binds a descriptor set on the matmul
+            // pipeline layout that SplitKKernel was built against, even
+            // though the shader addresses A/B/C through BDA pointers.
+            // Use the dedicated single-set helper so we don't pull in
+            // the matmul path's per-call BDA-vs-descriptor reasoning.
+            debug_assert_eq!(set_count, 1);
+            update_split_k_descriptor_set(&self.ctx, slot.descriptor_sets[0], call);
 
             self.submit_recorded(slot, |dev, cb, slot| {
                 if want_timestamps {
@@ -751,8 +753,18 @@ impl Executor {
             // Point the slot's pre-allocated descriptor sets at this
             // submission's tensors.  By now the previous submission on
             // this slot has fenced out (see submit_recorded), so the
-            // sets are safe to update.
-            update_matmul_descriptor_sets(&self.ctx, &slot.descriptor_sets[..calls.len()], calls);
+            // sets are safe to update.  `update_matmul_descriptor_sets`
+            // skips writes for any call whose resolved kernel is a BDA
+            // kernel (those shaders ignore the descriptor set), so a
+            // pure-BDA submission incurs zero `vkUpdateDescriptorSets`
+            // overhead here.
+            update_matmul_descriptor_sets(
+                &self.ctx,
+                &self.pipeline,
+                &slot.descriptor_sets[..calls.len()],
+                calls,
+                resolved,
+            );
 
             self.submit_recorded(slot, |dev, cb, slot| {
                 if want_timestamps {

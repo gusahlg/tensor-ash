@@ -25,7 +25,15 @@ pub use types::{
 pub struct MatmulPipeline {
     ctx: Arc<VulkanContext>,
     pub set_layout: vk::DescriptorSetLayout,
+    /// Pipeline layout for the descriptor-based matmul kernels (3
+    /// STORAGE_BUFFER bindings + push constants).
     pub pipeline_layout: vk::PipelineLayout,
+    /// Pipeline layout for the BDA matmul kernels (push constants
+    /// only — A/B/C live as `buffer_reference` pointers inside the
+    /// push constants, so no descriptor set is required).  The BDA
+    /// dispatch path skips `vkUpdateDescriptorSets` and
+    /// `vkCmdBindDescriptorSets` entirely.
+    pub pipeline_layout_bda: vk::PipelineLayout,
     /// One `MatmulKernel` per entry in `KERNEL_SPECS`, in the same order.
     /// Index with `KernelSelection::index()` (after resolving `Auto`).
     kernels: Vec<MatmulKernel>,
@@ -86,6 +94,23 @@ impl MatmulPipeline {
                 ctx.device.destroy_pipeline_layout(l, None)
             });
 
+            // BDA layout: push-constant-only, no descriptor set.  The
+            // BDA shaders address A/B/C through `buffer_reference`
+            // pointers in the push constants and never bind any
+            // descriptor set, so the dispatcher can skip
+            // `vkCmdBindDescriptorSets` and `vkUpdateDescriptorSets`
+            // entirely for these kernels.
+            let pipeline_layout_bda = ctx
+                .device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc_ranges),
+                    None,
+                )
+                .context("create_pipeline_layout (BDA)")?;
+            let pipeline_layout_bda_guard = scopeguard::guard(pipeline_layout_bda, |l| {
+                ctx.device.destroy_pipeline_layout(l, None)
+            });
+
             // Build every kernel in the registry.  We wrap the accumulator
             // in a scopeguard so any already-built kernels are torn down
             // if a later one fails to build.
@@ -96,14 +121,20 @@ impl MatmulPipeline {
                 }
             });
             for spec in KERNEL_SPECS {
+                let layout = if spec.uses_descriptors {
+                    pipeline_layout
+                } else {
+                    pipeline_layout_bda
+                };
                 let kernel = create_kernel(
                     ctx,
-                    pipeline_layout,
+                    layout,
                     spec.name,
                     spec.tile_m,
                     spec.tile_n,
                     spec.tile_k,
                     spec.spv,
+                    spec.uses_descriptors,
                 )
                 .with_context(|| format!("create {} matmul kernel", spec.name))?;
                 kernels_guard.push(kernel);
@@ -115,6 +146,7 @@ impl MatmulPipeline {
                 ctx: Arc::clone(ctx),
                 set_layout: ScopeGuard::into_inner(set_layout_guard),
                 pipeline_layout: ScopeGuard::into_inner(pipeline_layout_guard),
+                pipeline_layout_bda: ScopeGuard::into_inner(pipeline_layout_bda_guard),
                 kernels,
                 selection,
                 auto_min_large_tiles: auto_min_large_tiles_for(ctx.device_kind()),
@@ -182,6 +214,9 @@ impl Drop for MatmulPipeline {
             self.ctx
                 .device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.ctx
+                .device
+                .destroy_pipeline_layout(self.pipeline_layout_bda, None);
             self.ctx
                 .device
                 .destroy_descriptor_set_layout(self.set_layout, None);
