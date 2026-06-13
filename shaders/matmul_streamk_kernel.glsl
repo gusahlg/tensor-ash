@@ -31,6 +31,13 @@
 //  Compile-time inputs (set by the .comp wrapper):
 //     BM, BN, BK, TM, TN, TN_RAW
 //     TN_RAW must be >= 4 for the vec4 inner read.
+//
+//  Inner shape: mac_loop and epilogue are inlined directly into main()
+//  so the [TM][TN/4] per-thread accumulator stays register-resident
+//  across the tile boundary.  Passing the array through an `inout`
+//  parameter materialises it into local memory on the NVIDIA SPIR-V
+//  backend, defeating the BDA_V4 inner-loop shape this kernel is
+//  trying to match byte-for-byte.
 // =====================================================================
 
 #extension GL_EXT_control_flow_attributes  : require
@@ -148,94 +155,6 @@ void atomic_add_f32(uint addr, float val) {
     }
 }
 
-// Run the BK-loop for k-iters [k_lo, k_hi) of tile (block_row,
-// block_col) and accumulate into `acc`.  Identical inner FMA loop as
-// matmul_bda_v4_kernel.glsl so the perf-critical hot path stays
-// byte-for-byte the same.
-void mac_loop(uint a_base, uint b_base,
-              uint block_row, uint block_col,
-              uint k_lo, uint k_hi,
-              uint tid, uint a_row0, uint b_col0_v4,
-              inout vec4 acc[TM][TN / 4u])
-{
-    for (uint kt = k_lo; kt < k_hi; ++kt) {
-        const uint k_base = kt * BK;
-        load_a_tile_v4(a_base, block_row, k_base, tid);
-        load_b_tile_v4(b_base, block_col, k_base, tid);
-
-        barrier();
-
-        // Register-level inner-k double buffer.  Same code as bda_v4.
-        float a_reg[2][TM];
-        vec4  b_vec[2][TN / 4u];
-        [[unroll]] for (uint i = 0u; i < TM; ++i)
-            a_reg[0][i] = As[a_row0 + i][0];
-        [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
-            b_vec[0][j4] = uintBitsToFloat(Bs[0][b_col0_v4 + j4]);
-
-        [[unroll]] for (uint k = 0u; k < BK - 1u; ++k) {
-            const uint cur = k & 1u;
-            const uint nxt = (k + 1u) & 1u;
-            [[unroll]] for (uint i = 0u; i < TM; ++i)
-                a_reg[nxt][i] = As[a_row0 + i][k + 1u];
-            [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
-                b_vec[nxt][j4] = uintBitsToFloat(Bs[k + 1u][b_col0_v4 + j4]);
-            [[unroll]] for (uint i = 0u; i < TM; ++i)
-                [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
-                    acc[i][j4] = fma(vec4(a_reg[cur][i]), b_vec[cur][j4], acc[i][j4]);
-        }
-        {
-            const uint last = (BK - 1u) & 1u;
-            [[unroll]] for (uint i = 0u; i < TM; ++i)
-                [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
-                    acc[i][j4] = fma(vec4(a_reg[last][i]), b_vec[last][j4], acc[i][j4]);
-        }
-
-        barrier();
-    }
-}
-
-// Write our accumulator into C.  If `is_full_owner` is true, we own the
-// whole tile and can plain-store (faster, no contention).  Otherwise we
-// contributed to a seam tile and must atomicAdd our partial.  In both
-// cases the host pre-zeroed C so the math is correct.
-void epilogue(uint c_base, uint block_row, uint block_col,
-              uint a_row0, uint b_col0,
-              bool is_full_owner,
-              vec4 acc[TM][TN / 4u])
-{
-    const float alpha = ALPHA_IS_ONE ? 1.0 : pc.alpha;
-    const uint row_base = block_row * BM + a_row0;
-    const uint col_base = block_col * BN + b_col0;
-
-    if (is_full_owner) {
-        // Single owner of this tile: plain vec4 STG.E.128.
-        F32V4ReadWrite c_v4 = F32V4ReadWrite(uint64_t(pc.c_ptr));
-        [[unroll]] for (uint i = 0u; i < TM; ++i) {
-            const uint row_off = c_base + (row_base + i) * pc.N + col_base;
-            [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4) {
-                vec4 v = acc[i][j4];
-                if (!ALPHA_IS_ONE) v = alpha * v;
-                const uint c_addr = row_off + j4 * 4u;
-                c_v4.v[c_addr >> 2u] = v;
-            }
-        }
-    } else {
-        // Seam tile: contribute partial via float CAS-loop atomicAdd.
-        [[unroll]] for (uint i = 0u; i < TM; ++i) {
-            const uint row_off = c_base + (row_base + i) * pc.N + col_base;
-            [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4) {
-                vec4 v = acc[i][j4];
-                if (!ALPHA_IS_ONE) v = alpha * v;
-                atomic_add_f32(row_off + j4 * 4u + 0u, v.x);
-                atomic_add_f32(row_off + j4 * 4u + 1u, v.y);
-                atomic_add_f32(row_off + j4 * 4u + 2u, v.z);
-                atomic_add_f32(row_off + j4 * 4u + 3u, v.w);
-            }
-        }
-    }
-}
-
 void main() {
     const uint wg  = gl_WorkGroupID.x;
     const uint tid = gl_LocalInvocationIndex;
@@ -251,7 +170,6 @@ void main() {
     if (start_iter >= pc.total_iters) return;
 
     // batch == 1 hard requirement: a_base, b_base, c_base are all 0.
-    // Future: extend `wg`'s decode to include batch.
     const uint a_base = 0u;
     const uint b_base = 0u;
     const uint c_base = 0u;
@@ -259,6 +177,8 @@ void main() {
     const uint a_row0    = ty * TM;
     const uint b_col0    = tx * TN;
     const uint b_col0_v4 = b_col0 / 4u;
+
+    const float alpha = ALPHA_IS_ONE ? 1.0 : pc.alpha;
 
     uint it = start_iter;
     while (it < end_iter) {
@@ -271,18 +191,79 @@ void main() {
         const uint block_row = tile_id / pc.n_tiles;
         const uint block_col = tile_id - block_row * pc.n_tiles;
 
-        // Zero the accumulator for each new tile.
+        // Per-tile accumulator.  Kept local so the NVIDIA SPIR-V backend
+        // keeps the 16 vec4s in registers across the BK-strip loop.
         vec4 acc[TM][TN / 4u];
         [[unroll]] for (uint i = 0u; i < TM; ++i)
             [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
                 acc[i][j4] = vec4(0.0);
 
-        mac_loop(a_base, b_base, block_row, block_col,
-                 k_lo, k_hi, tid, a_row0, b_col0_v4, acc);
+        // Inlined mac_loop: identical inner FMA loop to BDA_V4.
+        for (uint kt = k_lo; kt < k_hi; ++kt) {
+            const uint k_base = kt * BK;
+            load_a_tile_v4(a_base, block_row, k_base, tid);
+            load_b_tile_v4(b_base, block_col, k_base, tid);
 
+            barrier();
+
+            float a_reg[2][TM];
+            vec4  b_vec[2][TN / 4u];
+            [[unroll]] for (uint i = 0u; i < TM; ++i)
+                a_reg[0][i] = As[a_row0 + i][0];
+            [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
+                b_vec[0][j4] = uintBitsToFloat(Bs[0][b_col0_v4 + j4]);
+
+            [[unroll]] for (uint k = 0u; k < BK - 1u; ++k) {
+                const uint cur = k & 1u;
+                const uint nxt = (k + 1u) & 1u;
+                [[unroll]] for (uint i = 0u; i < TM; ++i)
+                    a_reg[nxt][i] = As[a_row0 + i][k + 1u];
+                [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
+                    b_vec[nxt][j4] = uintBitsToFloat(Bs[k + 1u][b_col0_v4 + j4]);
+                [[unroll]] for (uint i = 0u; i < TM; ++i)
+                    [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
+                        acc[i][j4] = fma(vec4(a_reg[cur][i]), b_vec[cur][j4], acc[i][j4]);
+            }
+            {
+                const uint last = (BK - 1u) & 1u;
+                [[unroll]] for (uint i = 0u; i < TM; ++i)
+                    [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
+                        acc[i][j4] = fma(vec4(a_reg[last][i]), b_vec[last][j4], acc[i][j4]);
+            }
+
+            barrier();
+        }
+
+        // Inlined epilogue.  Single owner = plain vec4 STG.E.128;
+        // seam tile = CAS-loop atomicAdd of the partial.
         const bool is_full_owner = (k_lo == 0u) && (k_hi == pc.iters_per_tile);
-        epilogue(c_base, block_row, block_col, a_row0, b_col0,
-                 is_full_owner, acc);
+        const uint row_base = block_row * BM + a_row0;
+        const uint col_base = block_col * BN + b_col0;
+
+        if (is_full_owner) {
+            F32V4ReadWrite c_v4 = F32V4ReadWrite(uint64_t(pc.c_ptr));
+            [[unroll]] for (uint i = 0u; i < TM; ++i) {
+                const uint row_off = c_base + (row_base + i) * pc.N + col_base;
+                [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4) {
+                    vec4 v = acc[i][j4];
+                    if (!ALPHA_IS_ONE) v = alpha * v;
+                    const uint c_addr = row_off + j4 * 4u;
+                    c_v4.v[c_addr >> 2u] = v;
+                }
+            }
+        } else {
+            [[unroll]] for (uint i = 0u; i < TM; ++i) {
+                const uint row_off = c_base + (row_base + i) * pc.N + col_base;
+                [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4) {
+                    vec4 v = acc[i][j4];
+                    if (!ALPHA_IS_ONE) v = alpha * v;
+                    atomic_add_f32(row_off + j4 * 4u + 0u, v.x);
+                    atomic_add_f32(row_off + j4 * 4u + 1u, v.y);
+                    atomic_add_f32(row_off + j4 * 4u + 2u, v.z);
+                    atomic_add_f32(row_off + j4 * 4u + 3u, v.w);
+                }
+            }
+        }
 
         it = tile_end_it;
     }
