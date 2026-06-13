@@ -46,7 +46,9 @@ use recording::{
 use slot::Slot;
 pub use splitk::default_num_k_splits;
 use splitk::SplitKPipeline;
-pub use streamk::{StreamKPushConstants, StreamKSchedule, default_stream_k_grid};
+pub use streamk::{
+    StreamKPushConstants, StreamKSchedule, default_stream_k_grid, stream_k_should_fire,
+};
 use streamk::StreamKPipeline;
 
 pub use crate::matmul::{MatmulCall, RunStats};
@@ -263,6 +265,47 @@ impl Executor {
             };
 
             Ok(gpu_time_ns)
+        }
+    }
+
+    /// Auto-routing wrapper: consult the Stream-K gate and dispatch
+    /// to either Stream-K or the regular DP path.  Single-call only.
+    ///
+    /// Falls through to `run_matmuls(&[call])` whenever the gate
+    /// refuses (unaligned shape, no wave-quantization tail, tail
+    /// fraction too large, batch>1, accumulate=true, extension
+    /// unavailable, etc.).  Callers that want guaranteed Stream-K
+    /// dispatch should use [`run_matmuls_stream_k`] directly.
+    ///
+    /// `tail_fraction_max` matches [`stream_k_should_fire`]; the
+    /// default 0.05 reflects the current hybrid kernel's ~7%
+    /// overhead floor versus the regular DP kernel.  Raise once the
+    /// SK overhead gap is closed.
+    pub fn run_matmuls_auto_stream_k(
+        &self,
+        call: MatmulCall<'_>,
+        tail_fraction_max: f64,
+    ) -> Result<RunStats> {
+        let want_sk = !call.accumulate
+            && self.ctx.buffer_device_address_enabled
+            && self.ctx.shader_buffer_float32_atomic_add_enabled
+            && {
+                let resolved = crate::matmul::ResolvedMatmul::from_call(&call).ok();
+                match resolved {
+                    Some(r) if r.batch == 1 => stream_k_should_fire(
+                        r.m,
+                        r.n,
+                        r.k,
+                        46,
+                        tail_fraction_max,
+                    ),
+                    _ => false,
+                }
+            };
+        if want_sk {
+            self.run_matmuls_stream_k(call)
+        } else {
+            self.run_matmuls(std::slice::from_ref(&call))
         }
     }
 

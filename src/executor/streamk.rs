@@ -386,6 +386,57 @@ pub fn default_stream_k_grid(sm_count: u32, total_iters: u32, iters_per_tile: u3
     preferred.min(max_g_two_tile).min(total_iters.max(1))
 }
 
+/// Heuristic gate: should the auto-selector route this shape to
+/// Stream-K instead of the regular DP kernel?
+///
+/// Stream-K only beats DP when wave-quantization tail is the
+/// dominant perf loss.  Outside that bucket the persistent-grid
+/// bookkeeping and atomic-store costs swamp the savings.  Fire SK
+/// only when:
+///
+///   1. The shape is aligned to (128, 128, 32) (the only tile we
+///      ship today).
+///   2. `total_tiles >= preferred_g`, so DP can fill at least one
+///      full wave cleanly and the SK part only sweeps the tail.
+///   3. `tail = total_tiles % preferred_g` is non-zero (otherwise
+///      DP has no wave-quantization at all).
+///   4. The tail fraction `tail / preferred_g` is below
+///      `tail_fraction_max`, so the wave-quantization tax is small
+///      enough that SK's persistent-grid cost has any chance of
+///      being amortized.
+///
+/// The 0.05 default for `tail_fraction_max` is intentionally tight:
+/// the current hybrid kernel pays ~7% overhead per dispatch versus
+/// the regular aligned kernel, so SK only wins when the wave-quant
+/// tax decisively exceeds that overhead.  Raise this threshold once
+/// the SK overhead gap is closed.
+pub fn stream_k_should_fire(
+    m: u32,
+    n: u32,
+    k: u32,
+    sm_count: u32,
+    tail_fraction_max: f64,
+) -> bool {
+    const BM: u32 = 128;
+    const BN: u32 = 128;
+    const BK: u32 = 32;
+    if !m.is_multiple_of(BM) || !n.is_multiple_of(BN) || !k.is_multiple_of(BK) {
+        return false;
+    }
+    let m_tiles = m / BM;
+    let n_tiles = n / BN;
+    let total_tiles = m_tiles.checked_mul(n_tiles).unwrap_or(0);
+    let preferred_g = sm_count.max(1).saturating_mul(2);
+    if total_tiles < preferred_g {
+        return false;
+    }
+    let tail = total_tiles % preferred_g;
+    if tail == 0 {
+        return false;
+    }
+    (tail as f64) / (preferred_g as f64) <= tail_fraction_max
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +499,41 @@ mod tests {
         assert_eq!(s.total_iters_sk, 0);
         assert_eq!(s.grid_total, 92);
         assert!(s.is_pure_dp());
+    }
+
+    #[test]
+    fn gate_blocks_unaligned_shapes() {
+        // Any unaligned dim should disqualify SK.
+        assert!(!stream_k_should_fire(127, 128, 32, 46, 0.5));
+        assert!(!stream_k_should_fire(128, 127, 32, 46, 0.5));
+        assert!(!stream_k_should_fire(128, 128, 31, 46, 0.5));
+    }
+
+    #[test]
+    fn gate_blocks_small_shapes_with_no_full_wave() {
+        // T < preferred_g => can't fill a full wave => skip SK.
+        // 384x384x128: m_tiles=3, n_tiles=3, T=9.  G_pref=92.
+        assert!(!stream_k_should_fire(384, 384, 128, 46, 0.5));
+    }
+
+    #[test]
+    fn gate_blocks_clean_multiple_shapes_no_tail() {
+        // T % G_pref == 0 => no wave-quant tail => skip SK.
+        assert!(!stream_k_should_fire(512, 2944, 128, 46, 0.5));
+    }
+
+    #[test]
+    fn gate_blocks_when_tail_fraction_too_large() {
+        // sq_2048: T=256, G_pref=92.  tail = 72.  tail/G = 0.78 > 0.5.
+        // Skip SK because the persistent-grid overhead dominates.
+        assert!(!stream_k_should_fire(2048, 2048, 2048, 46, 0.5));
+    }
+
+    #[test]
+    fn gate_fires_on_severe_wave_quant() {
+        // Construct a shape with tail = 1 tile only: T = G+1 = 93.
+        // M=128*1, N=128*93=11904 -> not square but valid.  Tail
+        // fraction = 1/92 = 0.011, well below the default 0.05.
+        assert!(stream_k_should_fire(128, 11904, 128, 46, 0.05));
     }
 }
