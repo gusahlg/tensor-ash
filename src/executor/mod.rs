@@ -47,11 +47,17 @@ use slot::Slot;
 use splitk::SplitKPipeline;
 pub use splitk::default_num_k_splits;
 use streamk::StreamKPipeline;
-pub use streamk::{
-    StreamKPushConstants, StreamKSchedule, default_stream_k_grid, stream_k_should_fire,
-};
+pub use streamk::{StreamKPushConstants, StreamKSchedule, stream_k_should_fire};
 
 pub use crate::matmul::{MatmulCall, RunStats};
+
+/// Fallback SM count for Stream-K's persistent-grid sizing on
+/// devices where we don't have a runtime probe yet.  46 matches the
+/// RTX 3070 we develop on; the value only drives the preferred grid
+/// width `g_pref = sm_count * 2`, so being slightly off is harmless.
+/// `src/persistent.rs::FALLBACK_SM_COUNT` carries the same constant
+/// for the persistent kernel.
+const STREAMK_FALLBACK_SM_COUNT: u32 = 46;
 
 pub struct Executor {
     ctx: Arc<VulkanContext>,
@@ -290,9 +296,13 @@ impl Executor {
             && {
                 let resolved = crate::matmul::ResolvedMatmul::from_call(&call).ok();
                 match resolved {
-                    Some(r) if r.batch == 1 => {
-                        stream_k_should_fire(r.m, r.n, r.k, 46, tail_fraction_max)
-                    }
+                    Some(r) if r.batch == 1 => stream_k_should_fire(
+                        r.m,
+                        r.n,
+                        r.k,
+                        STREAMK_FALLBACK_SM_COUNT,
+                        tail_fraction_max,
+                    ),
                     _ => false,
                 }
             };
@@ -364,13 +374,7 @@ impl Executor {
             kernel.tile_m,
             kernel.tile_n,
             kernel.tile_k,
-            // Hard-coded to 46 for the RTX 3070 we benchmark on; this
-            // can be looked up via VK_NV_compute_shader_derivatives or
-            // a runtime probe in a follow-up.  Today the value is only
-            // used to size the preferred persistent grid (G_pref =
-            // sm_count * 2) within the two-tile invariant clamp on the
-            // tail, so being slightly off is harmless.
-            46,
+            STREAMK_FALLBACK_SM_COUNT,
         );
 
         let mut slot = self.checkout_slot();

@@ -398,20 +398,6 @@ impl StreamKSchedule {
     }
 }
 
-/// Default persistent-grid size for Stream-K (legacy / single-mode).
-/// Target `sm_count * 2`, clamped down to preserve the two-tile
-/// invariant (`iters_per_wg + 1 >= iters_per_tile`).
-pub fn default_stream_k_grid(sm_count: u32, total_iters: u32, iters_per_tile: u32) -> u32 {
-    let preferred = sm_count.max(1).saturating_mul(2);
-    let max_g_two_tile = if iters_per_tile <= 1 {
-        total_iters.max(1)
-    } else {
-        let raw = total_iters / iters_per_tile.saturating_sub(1).max(1);
-        raw.max(1)
-    };
-    preferred.min(max_g_two_tile).min(total_iters.max(1))
-}
-
 /// Heuristic gate: should the auto-selector route this shape to
 /// Stream-K instead of the regular DP kernel?
 ///
