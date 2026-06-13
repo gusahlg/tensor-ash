@@ -4,9 +4,31 @@
 
 Post-`v1.0.0` optimization pass focused on closing the gap to pure cuBLAS on
 the RTX 3070 baseline. The two big structural changes are a data-driven
-kernel registry and end-to-end Vulkan 1.2 `bufferDeviceAddress`.
+kernel registry and end-to-end Vulkan 1.2 `bufferDeviceAddress`; a follow-up
+landed experimental Stream-K and strict-aligned BDA_V4 variants on top.
 
 ### Added
+
+- **Stream-K experimental pipeline.** Hybrid CUTLASS-style DP-flat bulk
+  dispatch + persistent SK-tail with hardware `atomicAdd` from
+  `VK_EXT_shader_atomic_float`. Two new `Executor` entry points:
+  - `run_matmuls_stream_k(call)` — always route through Stream-K.
+  - `run_matmuls_auto_stream_k(call, tail_fraction_max)` — gate by shape
+    and fall back to `run_matmuls` when Stream-K wouldn't help.
+  Restrictions: single matmul, batch == 1, aligned shapes
+  (`M%128 == N%128 == K%32 == 0`), `accumulate == false`, device must
+  expose `shaderBufferFloat32AtomicAdd`. Shipped behind an opt-in entry
+  point — the standard `run_matmuls` path is unchanged.
+- **Strict-aligned BDA_V4 kernels.** `large_bda_v4_aligned` and
+  `m128n64k64_bda_v4_aligned` strip the bounds-checked scalar load
+  helpers and edge epilogue paths at source level; the SPIR-V contains
+  only the LDG.E.128 / LDS.E.128 / FFMA hot path and the STG.E.128
+  epilogue. The dispatcher promotes through `maybe_to_aligned` when the
+  shape is divisible by the tile dims.
+- **`VK_EXT_shader_atomic_float` plumbing** in `VulkanContext`: probe
+  the device extension list + `PhysicalDeviceShaderAtomicFloatFeaturesEXT`
+  for `shaderBufferFloat32AtomicAdd`, enable when present, expose
+  through `ctx.shader_buffer_float32_atomic_add_enabled`.
 
 - **Data-driven kernel pipeline.** All compiled tile variants now live in a
   single `KERNEL_SPECS` table in `src/pipeline/types.rs`. The pipeline

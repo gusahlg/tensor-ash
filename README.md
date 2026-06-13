@@ -52,11 +52,33 @@ descriptor-bound tiles:
   transaction instead of four 32-bit ones).
 - **BDA_V4** — `shared uvec4` Bs staging → `LDS.E.128` shared-memory reads.
   Layers cleanly on top of BDA.
+- **BDA_V4 aligned** — strict no-bounds-check siblings of the 128x128 and
+  m128n64k64 tiles for shapes where `M % BM == N % BN == K % BK == 0`.
+  Sources only emit the LDG.E.128 / LDS.E.128 / FFMA hot path and the
+  STG.E.128 epilogue; the dispatcher promotes through `maybe_to_aligned`
+  when the shape qualifies.
 
 On an RTX 3070, every tile we measured gains roughly +5-15% from BDA and
 another +5-15% from V4. The auto-selector promotes its picks to BDA_V4 at
 runtime when the device exposes `bufferDeviceAddress`, with a BDA fallback for
 `m64n32`. Explicit `ML_KERNEL=...` picks are honored verbatim.
+
+### Stream-K (experimental)
+
+The `Executor` exposes two opt-in entry points for shapes where the regular
+data-parallel dispatch leaves a small partial wave at the end:
+
+- `run_matmuls_stream_k(call)` always routes through the hybrid Stream-K
+  pipeline (CUTLASS-style DP-flat bulk dispatch + persistent SK-tail with
+  hardware `atomicAdd` from `VK_EXT_shader_atomic_float`).
+- `run_matmuls_auto_stream_k(call, tail_fraction_max)` consults a heuristic
+  gate and falls back to `run_matmuls` when Stream-K wouldn't help.
+
+Restrictions: single matmul, batch == 1, aligned shapes
+(`M%128 == N%128 == K%32 == 0`), `accumulate == false`, and the device must
+expose `shaderBufferFloat32AtomicAdd`. The gate is intentionally
+conservative — most showcase shapes still win on plain DP, so callers that
+don't know their workload should stick to `run_matmuls`.
 
 ## Requirements
 
@@ -134,7 +156,10 @@ ML_OUTPUT=csv ML_SWEEP=smoke cargo run --release --bin ml_bench -- sweep
 `ML_KERNEL=auto` is the default. Concrete names span every entry in
 `KERNEL_SPECS`: descriptor-bound tiles (`large`, `small`, `m64n128`,
 `m128n64`, `m128n64k64`, `m64n32`, `k64`, `bk16`, `v2`, `m64n128k64`,
-`m128n128_t4`, `m256n64`, `v3`) and their `*_bda` / `*_bda_v4` siblings.
+`m128n128_t4`, `m256n64`, `v3`), their `*_bda` / `*_bda_v4` siblings,
+and the strict-aligned `large_bda_v4_aligned` /
+`m128n64k64_bda_v4_aligned` variants for shapes divisible by their
+tile dims.
 `ML_DEVICE` accepts `auto`, `discrete`, `integrated`, `virtual`, `cpu`,
 `index:N`, `name:TEXT`, or a bare name substring.
 
@@ -214,16 +239,24 @@ reports `llvmpipe`, results are software-renderer numbers; use
 
 ```
 src/
-  context/   Vulkan instance/device setup, BDA feature wiring, cache paths
-  pipeline/  Data-driven KERNEL_SPECS registry, auto-selector, BDA promotion
-  executor/  Thread-safe executor, submission slots, command recording
-  bench/     ml_bench subcommands, output formatting, case definitions
-  buffer.rs  Device/staging buffer wrappers (BDA-aware)
+  context/         Vulkan instance/device setup, BDA + atomic-float feature
+                   wiring, cache paths
+  pipeline/        Data-driven KERNEL_SPECS registry, auto-selector, BDA and
+                   aligned promotion helpers
+  executor/        Thread-safe executor, submission slots, command recording
+    splitk.rs      Experimental split-K pipeline
+    streamk.rs     Experimental Stream-K (hybrid DP-flat + SK-tail) pipeline
+  bench/           ml_bench subcommands, output formatting, case definitions
+  buffer.rs        Device/staging buffer wrappers (BDA-aware)
 shaders/
-  matmul_kernel.glsl         Original descriptor-bound GEMM body
-  matmul_bda_kernel.glsl     buffer_reference body (LDG.E.128)
-  matmul_bda_v4_kernel.glsl  BDA + shared uvec4 Bs body (LDS.E.128)
-  matmul_f32*.comp           Tile wrappers; *_bda / *_bda_v4 siblings
+  matmul_kernel.glsl              Original descriptor-bound GEMM body
+  matmul_bda_kernel.glsl          buffer_reference body (LDG.E.128)
+  matmul_bda_v4_kernel.glsl       BDA + shared uvec4 Bs body (LDS.E.128)
+  matmul_bda_v4_aligned_kernel.glsl
+                                  Strict no-bounds-check BDA_V4 hot path
+  matmul_streamk_kernel.glsl      Stream-K SK-tail (persistent + atomicAdd)
+  matmul_streamk_dp_kernel.glsl   Stream-K DP-flat bulk dispatch
+  matmul_f32*.comp                Tile wrappers; *_bda / *_bda_v4 siblings
 capi/, include/, examples/   C ABI crate, public header, smoke test
 scripts/
   bench_compare.py   Cross-library harness (cuBLAS pure row, % peak, showcase)
