@@ -299,6 +299,12 @@ impl Executor {
         if !self.ctx.buffer_device_address_enabled {
             bail!("run_matmuls_stream_k: bufferDeviceAddress not available on this device");
         }
+        if !self.ctx.shader_buffer_float32_atomic_add_enabled {
+            bail!(
+                "run_matmuls_stream_k: VK_EXT_shader_atomic_float \
+                 (shaderBufferFloat32AtomicAdd) not available on this device"
+            );
+        }
 
         let stream_k = if let Some(s) = self.stream_k.get() {
             s

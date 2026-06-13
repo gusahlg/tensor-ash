@@ -17,9 +17,12 @@
 //!
 //! ## Atomic implementation
 //!
-//! Same CAS-loop float atomicAdd as the Split-K kernel
-//! (`atomicCompSwap` over a `uint`-aliased view of C) so we don't need
-//! `VK_EXT_shader_atomic_float`.
+//! Uses the hardware `atomicAdd(float, float)` from
+//! `VK_EXT_shader_atomic_float` (`shaderBufferFloat32AtomicAdd`).
+//! Maps to the Ampere `RED.E.ADD.F32` SASS instruction.  Pipeline
+//! creation requires the extension to have been enabled on the
+//! `VulkanContext`; the executor entry point returns an error
+//! otherwise so callers can fall back to the regular DP path.
 
 use std::sync::Arc;
 
@@ -80,6 +83,13 @@ impl StreamKPipeline {
             bail!(
                 "Stream-K kernel requires Vulkan 1.2 bufferDeviceAddress \
                  which is not enabled on this device"
+            );
+        }
+        if !ctx.shader_buffer_float32_atomic_add_enabled {
+            bail!(
+                "Stream-K kernel requires VK_EXT_shader_atomic_float \
+                 (shaderBufferFloat32AtomicAdd) which is not enabled \
+                 on this device"
             );
         }
         unsafe {

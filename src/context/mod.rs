@@ -41,6 +41,12 @@ pub struct VulkanContext {
     /// `bufferDeviceAddress`) was successfully enabled.  Required for
     /// the buffer-reference GLSL path used by the LDG.128 kernels.
     pub buffer_device_address_enabled: bool,
+    /// Whether `VK_EXT_shader_atomic_float` was enabled with
+    /// `shaderBufferFloat32AtomicAdd`.  Required for the hardware
+    /// `atomicAdd(float, float)` path in the Stream-K kernel; absent
+    /// this, Stream-K pipeline creation is rejected and callers fall
+    /// back to the regular DP path.
+    pub shader_buffer_float32_atomic_add_enabled: bool,
     /// Pipeline cache, seeded from disk on init and flushed back on drop.
     /// Persisting it avoids the SPIR-V -> ISA recompile (50-200 ms on
     /// NVIDIA) on every cold start.
@@ -166,28 +172,63 @@ impl VulkanContext {
                 .queue_priorities(&priorities)];
 
             // Probe whether the physical device advertises Vulkan 1.2's
-            // `bufferDeviceAddress`.  It's a core feature on the
-            // Vulkan 1.2 instance we're requesting, so on any post-2020
-            // discrete GPU driver it should be present — but we still
-            // gate enablement on the actual `get` query in case we end
-            // up on a llvmpipe / older mobile GPU.
+            // `bufferDeviceAddress` and the Stream-K
+            // `shaderBufferFloat32AtomicAdd` from
+            // VK_EXT_shader_atomic_float.  Both are core for the
+            // post-2020 NVIDIA / AMD drivers we target but we still
+            // gate enablement on the actual `get` queries so the lib
+            // remains runnable on llvmpipe / older mobile GPUs.
             let mut bda_query = vk::PhysicalDeviceVulkan12Features::default();
-            let mut features2 =
-                vk::PhysicalDeviceFeatures2::default().push_next(&mut bda_query);
+            let mut atomic_float_query =
+                vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
+            let mut features2 = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut bda_query)
+                .push_next(&mut atomic_float_query);
             instance.get_physical_device_features2(physical_device, &mut features2);
             let buffer_device_address_supported =
                 bda_query.buffer_device_address == vk::TRUE;
+            let shader_buffer_float32_atomic_add_supported =
+                atomic_float_query.shader_buffer_float32_atomic_add == vk::TRUE;
+
+            // The feature-bit query above is necessary but not
+            // sufficient: the extension must also appear in the
+            // device's enabled-extension list at create-device time.
+            // Enumerate and check before flipping the enable flag.
+            let device_exts = instance
+                .enumerate_device_extension_properties(physical_device)
+                .context("enumerate_device_extension_properties")?;
+            let atomic_float_ext_name = ash::ext::shader_atomic_float::NAME;
+            let atomic_float_ext_present = device_exts.iter().any(|ext| {
+                CStr::from_ptr(ext.extension_name.as_ptr()) == atomic_float_ext_name
+            });
+            let enable_shader_atomic_float =
+                shader_buffer_float32_atomic_add_supported && atomic_float_ext_present;
+
+            let mut enabled_device_exts: Vec<*const i8> = Vec::new();
+            if enable_shader_atomic_float {
+                enabled_device_exts.push(atomic_float_ext_name.as_ptr());
+            }
 
             let features = vk::PhysicalDeviceFeatures::default();
             let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
             if buffer_device_address_supported {
                 vulkan12 = vulkan12.buffer_device_address(true);
             }
+            let mut atomic_float_features =
+                vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
+            if enable_shader_atomic_float {
+                atomic_float_features =
+                    atomic_float_features.shader_buffer_float32_atomic_add(true);
+            }
             let mut device_ci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_ci)
-                .enabled_features(&features);
+                .enabled_features(&features)
+                .enabled_extension_names(&enabled_device_exts);
             if buffer_device_address_supported {
                 device_ci = device_ci.push_next(&mut vulkan12);
+            }
+            if enable_shader_atomic_float {
+                device_ci = device_ci.push_next(&mut atomic_float_features);
             }
             let device = instance
                 .create_device(physical_device, &device_ci, None)
@@ -224,6 +265,7 @@ impl VulkanContext {
                 timestamp_period_ns: device_properties.limits.timestamp_period as f64,
                 timestamps_supported,
                 buffer_device_address_enabled: buffer_device_address_supported,
+                shader_buffer_float32_atomic_add_enabled: enable_shader_atomic_float,
                 pipeline_cache,
                 pipeline_cache_path,
                 debug_loader,

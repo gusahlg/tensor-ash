@@ -45,6 +45,7 @@
 #extension GL_EXT_buffer_reference         : require
 #extension GL_EXT_buffer_reference2        : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_float      : require
 
 layout(local_size_x = (BN / TN), local_size_y = (BM / TM), local_size_z = 1) in;
 
@@ -76,11 +77,12 @@ layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly b
 layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32ReadWrite {
     float v[];
 };
-// Aliased uint view of C for CAS-loop float atomic add.  Same buffer,
-// different reinterpretation.  `coherent` guarantees cross-WG visibility
-// of atomic updates without needing an extension.
-layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer U32ReadWrite {
-    uint v[];
+// Coherent float view of C for the hardware atomicAdd path
+// (VK_EXT_shader_atomic_float).  `coherent` is required by the
+// extension — without it the spec doesn't permit atomicAdd on the
+// referenced storage.
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer F32CoherentRW {
+    float v[];
 };
 
 layout(push_constant) uniform PC {
@@ -138,21 +140,16 @@ void load_b_tile_v4(uint b_base, uint block_col, uint k_base, uint tid) {
     }
 }
 
-// CAS-loop float atomicAdd: read C[addr] as uint, build the post-add
-// uint bit pattern, atomicCompSwap.  Retry on miss.  Skip the no-op
-// when val == 0.0 to avoid pointless atomic traffic on the rare zero
-// chunk (numerically harmless).
+// Hardware float atomicAdd via VK_EXT_shader_atomic_float
+// (shaderBufferFloat32AtomicAdd).  Maps directly to the Ampere
+// RED.E.ADD.F32 SASS instruction — roughly 2-10x the throughput of
+// the CAS-loop fallback the v1 shader used.  Skip the no-op when val
+// == 0.0 to avoid pointless atomic traffic on the rare zero chunk
+// (numerically harmless).
 void atomic_add_f32(uint addr, float val) {
     if (val == 0.0) return;
-    U32ReadWrite c_u = U32ReadWrite(uint64_t(pc.c_ptr));
-    uint old_u = c_u.v[addr];
-    while (true) {
-        float old_f = uintBitsToFloat(old_u);
-        uint new_u = floatBitsToUint(old_f + val);
-        uint prev = atomicCompSwap(c_u.v[addr], old_u, new_u);
-        if (prev == old_u) break;
-        old_u = prev;
-    }
+    F32CoherentRW c_f = F32CoherentRW(uint64_t(pc.c_ptr));
+    atomicAdd(c_f.v[addr], val);
 }
 
 void main() {
