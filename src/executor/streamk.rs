@@ -31,7 +31,10 @@ use ash::vk;
 
 use crate::context::VulkanContext;
 
-const SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_streamk_128x128.spv"));
+const SPIRV_TAIL: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_streamk_128x128.spv"));
+const SPIRV_DP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_streamk_dp_128x128.spv"));
 
 /// Push constants for the hybrid Stream-K shader.  Bit-for-bit
 /// identical to the GLSL `PC` block in matmul_streamk_kernel.glsl.
@@ -66,9 +69,8 @@ pub struct StreamKPushConstants {
     pub _pad: u32,
 }
 
-/// Static, host-side description of the Stream-K shader's tile.  Today
-/// we only ship the 128x128 BK=32 variant; growing the pick later is a
-/// trivial extension.
+/// Static, host-side description of a Stream-K kernel half (DP-flat
+/// or SK-tail).  Today we only ship the 128x128 BK=32 tile.
 pub(super) struct StreamKKernel {
     pub(super) tile_m: u32,
     pub(super) tile_n: u32,
@@ -77,10 +79,16 @@ pub(super) struct StreamKKernel {
     pub(super) pipeline: vk::Pipeline,
 }
 
+/// Hybrid Stream-K pipeline: separate DP-flat and SK-tail kernels
+/// dispatched in sequence by `record_and_run_stream_k`.  Splitting the
+/// kernels lets the DP path's SPIR-V be byte-for-byte identical to the
+/// BDA_V4 aligned kernel (no extra branches in the binary), while the
+/// SK-tail kernel keeps the persistent-grid + atomicAdd machinery.
 pub(super) struct StreamKPipeline {
     ctx: Arc<VulkanContext>,
     pub(super) pipeline_layout: vk::PipelineLayout,
-    pub(super) k128x128: StreamKKernel,
+    pub(super) k128x128_dp:   StreamKKernel,
+    pub(super) k128x128_tail: StreamKKernel,
 }
 
 impl StreamKPipeline {
@@ -117,18 +125,36 @@ impl StreamKPipeline {
                 ctx.device.destroy_pipeline_layout(l, None)
             });
 
-            let k128x128 = build_kernel(ctx, pipeline_layout, 128, 128, 32, SPIRV)
-                .context("build Stream-K 128x128 kernel")?;
+            let k128x128_dp = build_kernel(ctx, pipeline_layout, 128, 128, 32, SPIRV_DP)
+                .context("build Stream-K DP-flat 128x128 kernel")?;
+            let k128x128_dp_guard = scopeguard::guard(k128x128_dp, |k| {
+                if k.pipeline != vk::Pipeline::null() {
+                    ctx.device.destroy_pipeline(k.pipeline, None);
+                }
+                if k.shader_module != vk::ShaderModule::null() {
+                    ctx.device.destroy_shader_module(k.shader_module, None);
+                }
+            });
+            let k128x128_tail = build_kernel(ctx, pipeline_layout, 128, 128, 32, SPIRV_TAIL)
+                .context("build Stream-K tail 128x128 kernel")?;
             Ok(Self {
                 ctx: Arc::clone(ctx),
                 pipeline_layout: scopeguard::ScopeGuard::into_inner(pipeline_layout_guard),
-                k128x128,
+                k128x128_dp: scopeguard::ScopeGuard::into_inner(k128x128_dp_guard),
+                k128x128_tail,
             })
         }
     }
 
-    pub(super) fn pick(&self, _m: u32, _n: u32) -> &StreamKKernel {
-        &self.k128x128
+    /// Pick the DP-flat kernel for a given (M, N).  Today only one
+    /// tile shape ships; future work will add 64x64 / 64x128 etc.
+    pub(super) fn pick_dp(&self, _m: u32, _n: u32) -> &StreamKKernel {
+        &self.k128x128_dp
+    }
+
+    /// Pick the SK-tail kernel for a given (M, N).
+    pub(super) fn pick_tail(&self, _m: u32, _n: u32) -> &StreamKKernel {
+        &self.k128x128_tail
     }
 }
 
@@ -221,15 +247,15 @@ impl Drop for StreamKPipeline {
     fn drop(&mut self) {
         unsafe {
             let _ = self.ctx.device.device_wait_idle();
-            if self.k128x128.pipeline != vk::Pipeline::null() {
-                self.ctx
-                    .device
-                    .destroy_pipeline(self.k128x128.pipeline, None);
-            }
-            if self.k128x128.shader_module != vk::ShaderModule::null() {
-                self.ctx
-                    .device
-                    .destroy_shader_module(self.k128x128.shader_module, None);
+            for kernel in [&self.k128x128_dp, &self.k128x128_tail] {
+                if kernel.pipeline != vk::Pipeline::null() {
+                    self.ctx.device.destroy_pipeline(kernel.pipeline, None);
+                }
+                if kernel.shader_module != vk::ShaderModule::null() {
+                    self.ctx
+                        .device
+                        .destroy_shader_module(kernel.shader_module, None);
+                }
             }
             if self.pipeline_layout != vk::PipelineLayout::null() {
                 self.ctx

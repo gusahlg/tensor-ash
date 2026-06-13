@@ -1,0 +1,13 @@
+#version 460
+// DP-flat companion to matmul_f32_streamk_128x128.comp.
+// 128x128/BK=32 with 1D-dispatch flat tile decode.
+// See matmul_streamk_dp_kernel.glsl for the design.
+
+#define BM 128u
+#define BN 128u
+#define BK  32u
+#define TM   8u
+#define TN   8u
+#define TN_RAW 8
+
+#include "matmul_streamk_dp_kernel.glsl"

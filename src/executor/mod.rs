@@ -312,7 +312,7 @@ impl Executor {
             let built = StreamKPipeline::new(&self.ctx)?;
             self.stream_k.get_or_init(|| built)
         };
-        let kernel = stream_k.pick(resolved.m, resolved.n);
+        let kernel = stream_k.pick_dp(resolved.m, resolved.n);
 
         let schedule = StreamKSchedule::for_shape(
             resolved.m,
@@ -352,7 +352,8 @@ impl Executor {
     ) -> Result<Option<u64>> {
         let want_timestamps = self.ctx.timestamps_supported;
         let query_pool = slot.query_pool;
-        let kernel = stream_k.pick(resolved.m, resolved.n);
+        let dp_kernel = stream_k.pick_dp(resolved.m, resolved.n);
+        let tail_kernel = stream_k.pick_tail(resolved.m, resolved.n);
         let layout = stream_k.pipeline_layout;
         let max_groups = self.ctx.device_properties.limits.max_compute_work_group_count;
         if schedule.grid_total > max_groups[0] {
@@ -430,7 +431,6 @@ impl Executor {
                     &[],
                 );
 
-                dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, kernel.pipeline);
                 dev.cmd_push_constants(
                     cb,
                     layout,
@@ -438,7 +438,61 @@ impl Executor {
                     0,
                     bytemuck::bytes_of(&pc),
                 );
-                dev.cmd_dispatch(cb, schedule.grid_total, 1, 1);
+
+                // DP-flat dispatch covers tiles [0, dp_tiles_total).
+                // Skipped when the schedule is pure-SK (small shape).
+                // Uses 2D dispatch (n_tiles, dp_rows_ceil) so the
+                // NVIDIA work distributor applies its L2-friendly
+                // swizzle just like the base aligned kernel; the
+                // kernel's tile-id range check drops the few WGs whose
+                // tile_id falls in the SK tail.
+                if schedule.dp_tiles_total > 0 {
+                    let dp_rows_ceil = schedule.dp_tiles_total.div_ceil(schedule.n_tiles);
+                    dev.cmd_bind_pipeline(
+                        cb,
+                        vk::PipelineBindPoint::COMPUTE,
+                        dp_kernel.pipeline,
+                    );
+                    dev.cmd_dispatch(cb, schedule.n_tiles, dp_rows_ceil, 1);
+                }
+
+                // SK-tail dispatch covers tiles
+                // [dp_tiles_total, dp_tiles_total + tail_tiles) via
+                // `g_sk` persistent workgroups.  Skipped when the
+                // schedule is pure-DP.  Both dispatches write to
+                // disjoint C tiles, so no compute->compute barrier is
+                // strictly required by data dependency — but we add
+                // one because Vulkan requires explicit sync between
+                // dispatches that touch the same buffer.
+                if schedule.g_sk > 0 {
+                    if schedule.dp_tiles_total > 0 {
+                        let sk_barrier = vk::BufferMemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .dst_access_mask(
+                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                            )
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .buffer(call.c.raw_buffer())
+                            .offset(0)
+                            .size(vk::WHOLE_SIZE);
+                        dev.cmd_pipeline_barrier(
+                            cb,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            std::slice::from_ref(&sk_barrier),
+                            &[],
+                        );
+                    }
+                    dev.cmd_bind_pipeline(
+                        cb,
+                        vk::PipelineBindPoint::COMPUTE,
+                        tail_kernel.pipeline,
+                    );
+                    dev.cmd_dispatch(cb, schedule.g_sk, 1, 1);
+                }
 
                 if want_timestamps {
                     dev.cmd_write_timestamp(

@@ -1,44 +1,34 @@
 // =====================================================================
-//  matmul_streamk_kernel.glsl  —  Hybrid DP+SK persistent-grid SGEMM.
+//  matmul_streamk_kernel.glsl  —  SK-tail kernel for hybrid Stream-K.
 //
-//  Single kernel, two modes selected per workgroup:
+//  This is the persistent-grid half of the hybrid Stream-K dispatch.
+//  It is dispatched as a single 1D grid of `g_sk` workgroups that
+//  split the iter-space of the wave-quantization tail
+//  `tail_tiles = T - dp_tiles_total` tiles.  Each workgroup processes
+//  a contiguous slice of `iters_per_wg_sk` (or +1) iterations from
+//  the tail iter-space.  Tiles fully owned by one workgroup use a
+//  plain vec4 STG.E.128; tiles split across multiple workgroups
+//  reduce via hardware atomicAdd (VK_EXT_shader_atomic_float).
 //
-//  Mode A (Data-parallel):  workgroups [0, dp_tiles_total) each own
-//    exactly one output tile and run the full K loop end-to-end with
-//    a plain vec4 STG.E.128 epilogue.  Identical FMA hot path to the
-//    BDA_V4 kernel — no atomics, no per-tile bookkeeping.
-//
-//  Mode B (Stream-K tail):  workgroups [dp_tiles_total,
-//    dp_tiles_total + g_sk) split the iter-space of the leftover
-//    `tail_tiles = T - dp_tiles_total` tiles evenly.  Tiles touched
-//    by two WGs (the seam) reduce via hardware atomicAdd; tiles fully
-//    owned by one WG use a plain store.
-//
-//  This is the CUTLASS Stream-K design: amortize the per-tile
-//  bookkeeping cost of the persistent grid only on the wave-quantization
-//  tail.  Pure Stream-K (dp_tiles_total=0, all WGs in mode B) and pure
-//  DP (g_sk=0, all WGs in mode A) are corner cases of the same code
-//  path.
+//  The DP-mode bulk of hybrid Stream-K is handled by
+//  matmul_streamk_dp_kernel.glsl as a separate dispatch.  Keeping the
+//  two kernels separate lets the SPIR-V backend optimise each
+//  independently; in particular, the DP kernel's SPIR-V is
+//  byte-for-byte identical to the BDA_V4 aligned kernel's hot path.
 //
 //  Restrictions (kept tight for v1):
 //   * M, N must be tile-multiples (no bounds checks on the load path).
 //   * K must be a multiple of BK.
 //   * batch == 1 (the persistent grid does not span batches).
-//   * accumulate=false; the kernel always writes C := alpha * A*B.  The
-//     host MUST zero-fill C before the dispatch because the seam path
+//   * accumulate=false; the host pre-zeroes C.  The seam-tile path
 //     atomicAdds into C and relies on the initial value being 0.
 //
 //  Compile-time inputs (set by the .comp wrapper):
 //     BM, BN, BK, TM, TN, TN_RAW
 //     TN_RAW must be >= 4 for the vec4 inner read.
 //
-//  Inner shape: mac_loop and epilogue are inlined directly into main()
-//  so the [TM][TN/4] per-thread accumulator stays register-resident
-//  across the tile boundary in mode B (DP-mode tiles only run one
-//  iteration of the outer loop, so the placement is moot there).
-//
 //  Atomic implementation: VK_EXT_shader_atomic_float hardware
-//  atomicAdd(float, float).  Maps to Ampere RED.E.ADD.F32.  The host
+//  atomicAdd(float, float).  Maps to Ampere RED.E.ADD.F32.  Host
 //  rejects the dispatch when the extension is unavailable.
 // =====================================================================
 
@@ -51,8 +41,6 @@
 
 layout(local_size_x = (BN / TN), local_size_y = (BM / TM), local_size_z = 1) in;
 
-// Specialization constants 0/1 match the standard matmul layout so the
-// host can reuse its 4-entry spec map without changes; 2/3 are ignored.
 layout(constant_id = 0) const bool ACCUMULATE   = false;
 layout(constant_id = 1) const bool ALPHA_IS_ONE = true;
 
@@ -96,14 +84,17 @@ layout(push_constant) uniform PC {
     F32ReadOnly  a_ptr;
     F32ReadOnly  b_ptr;
     F32ReadWrite c_ptr;
-    // Hybrid Stream-K schedule (precomputed on host).
-    uint  iters_per_tile;    // K / BK
-    uint  iters_per_wg_sk;   // total_iters_sk / g_sk  (floor)
-    uint  rem_sk;            // total_iters_sk - iters_per_wg_sk * g_sk
-    uint  n_tiles;           // N / BN
-    uint  dp_tiles_total;    // floor(T / G) * G  (WGs [0, dp_tiles_total) are mode A)
-    uint  g_sk;              // SK persistent grid size  (WGs [dp_tiles_total, dp_tiles_total+g_sk) are mode B)
-    uint  total_iters_sk;    // tail_tiles * iters_per_tile
+    uint  iters_per_tile;
+    uint  iters_per_wg_sk;
+    uint  rem_sk;
+    uint  n_tiles;
+    // Tile id where the SK tail begins.  Tail spans tiles
+    // [dp_tiles_total, dp_tiles_total + tail_tiles).  iters_per_wg_sk
+    // / rem_sk / total_iters_sk describe the iter-space of just the
+    // tail; the global iter offset is dp_tiles_total * iters_per_tile.
+    uint  dp_tiles_total;
+    uint  g_sk;
+    uint  total_iters_sk;
 } pc;
 
 shared float As[BM][BK + 1u];
@@ -141,10 +132,6 @@ void load_b_tile_v4(uint b_base, uint block_col, uint k_base, uint tid) {
     }
 }
 
-// Hardware float atomicAdd via VK_EXT_shader_atomic_float
-// (shaderBufferFloat32AtomicAdd).  Maps directly to the Ampere
-// RED.E.ADD.F32 SASS instruction.  Skip the no-op when val == 0.0 to
-// avoid pointless atomic traffic on zero chunks.
 void atomic_add_f32(uint addr, float val) {
     if (val == 0.0) return;
     F32CoherentRW c_f = F32CoherentRW(uint64_t(pc.c_ptr));
@@ -153,14 +140,11 @@ void atomic_add_f32(uint addr, float val) {
 
 void main() {
     const uint wg  = gl_WorkGroupID.x;
+    if (wg >= pc.g_sk) return;
+
     const uint tid = gl_LocalInvocationIndex;
     const uint tx  = tid % WG_X;
     const uint ty  = tid / WG_X;
-
-    // batch == 1 hard requirement: a_base, b_base, c_base are all 0.
-    const uint a_base = 0u;
-    const uint b_base = 0u;
-    const uint c_base = 0u;
 
     const uint a_row0    = ty * TM;
     const uint b_col0    = tx * TN;
@@ -168,29 +152,19 @@ void main() {
 
     const float alpha = ALPHA_IS_ONE ? 1.0 : pc.alpha;
 
-    // Per-WG iter range.  Mode A: aligned to one full tile.  Mode B:
-    // even slice of the SK tail iter-space.
-    uint start_iter;
-    uint end_iter;
+    const uint sk_extra       = min(wg, pc.rem_sk);
+    const uint sk_start_local = wg * pc.iters_per_wg_sk + sk_extra;
+    const uint sk_end_local   =
+        sk_start_local + pc.iters_per_wg_sk + (wg < pc.rem_sk ? 1u : 0u);
+    if (sk_start_local >= pc.total_iters_sk) return;
 
-    if (wg < pc.dp_tiles_total) {
-        // Mode A (DP): tile_id = wg, full K loop.
-        start_iter = wg * pc.iters_per_tile;
-        end_iter   = start_iter + pc.iters_per_tile;
-    } else {
-        // Mode B (Stream-K tail).
-        const uint sk_wg = wg - pc.dp_tiles_total;
-        if (sk_wg >= pc.g_sk) return;
-        const uint sk_extra      = min(sk_wg, pc.rem_sk);
-        const uint sk_start_local = sk_wg * pc.iters_per_wg_sk + sk_extra;
-        const uint sk_end_local   =
-            sk_start_local + pc.iters_per_wg_sk + (sk_wg < pc.rem_sk ? 1u : 0u);
-        if (sk_start_local >= pc.total_iters_sk) return;
-        // Translate to global iter space (tail tiles start at dp_tiles_total).
-        const uint sk_offset = pc.dp_tiles_total * pc.iters_per_tile;
-        start_iter = sk_start_local + sk_offset;
-        end_iter   = sk_end_local   + sk_offset;
-    }
+    const uint sk_offset = pc.dp_tiles_total * pc.iters_per_tile;
+    const uint start_iter = sk_start_local + sk_offset;
+    const uint end_iter   = sk_end_local   + sk_offset;
+
+    const uint a_base = 0u;
+    const uint b_base = 0u;
+    const uint c_base = 0u;
 
     uint it = start_iter;
     while (it < end_iter) {
@@ -203,14 +177,11 @@ void main() {
         const uint block_row = tile_id / pc.n_tiles;
         const uint block_col = tile_id - block_row * pc.n_tiles;
 
-        // Per-tile accumulator.  Kept local so the NVIDIA SPIR-V backend
-        // keeps the 16 vec4s in registers across the BK-strip loop.
         vec4 acc[TM][TN / 4u];
         [[unroll]] for (uint i = 0u; i < TM; ++i)
             [[unroll]] for (uint j4 = 0u; j4 < TN_V4; ++j4)
                 acc[i][j4] = vec4(0.0);
 
-        // Inlined mac_loop: identical inner FMA loop to BDA_V4.
         for (uint kt = k_lo; kt < k_hi; ++kt) {
             const uint k_base = kt * BK;
             load_a_tile_v4(a_base, block_row, k_base, tid);
@@ -246,8 +217,6 @@ void main() {
             barrier();
         }
 
-        // Inlined epilogue.  Single owner = plain vec4 STG.E.128;
-        // seam tile = hardware atomicAdd of the partial.
         const bool is_full_owner = (k_lo == 0u) && (k_hi == pc.iters_per_tile);
         const uint row_base = block_row * BM + a_row0;
         const uint col_base = block_col * BN + b_col0;
