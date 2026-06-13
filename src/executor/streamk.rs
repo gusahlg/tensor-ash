@@ -1,28 +1,45 @@
-//! Stream-K experimental pipeline.
+//! Stream-K experimental pipeline (CUTLASS-style hybrid DP + SK tail).
 //!
-//! Stream-K replaces the standard one-WG-per-output-tile dispatch with
-//! a fixed grid of `G` persistent workgroups, each consuming a
-//! contiguous slice of the linearized `m_tiles * n_tiles *
-//! iters_per_tile` iteration space.  This eliminates the
-//! wave-quantization tail on shapes where `(m_tiles * n_tiles) mod
-//! num_sms` is small (e.g. 4096^3 with 32x32=1024 output tiles produces
-//! a last-wave of 12/46 SMs busy under data-parallel scheduling;
-//! Stream-K fills the whole GPU evenly).
+//! For shapes where the tile count is close to but not a clean
+//! multiple of the preferred grid size, the regular data-parallel
+//! dispatch ends with a partial wave (e.g. 4096^3 with 32x32=1024
+//! output tiles maps to 11 full waves of 92 WGs + a last wave of 12
+//! WGs on an RTX 3070's 46 SMs).  Stream-K closes that gap by handing
+//! the *bulk* tiles to a normal DP dispatch and routing the *tail*
+//! tiles' work through a fixed-size persistent grid that atomic-adds
+//! partial sums into C.
 //!
-//! Restrictions (v1):
+//! Two pipelines, two dispatches per call:
+//!
+//!   1. **DP-flat kernel** — the standard 128x128 BDA_V4 aligned
+//!      body, dispatched as `(n_tiles, m_tiles)` with an early-exit
+//!      `if tile_id >= dp_tiles_total` so workgroups outside the bulk
+//!      region drop out cheaply.
+//!   2. **SK-tail kernel** — a persistent 1D grid of `g_sk`
+//!      workgroups, each consuming a contiguous slice of the
+//!      remaining `total_iters_sk` MAC iterations.  Tile owners use a
+//!      plain store; partial contributors use `atomicAdd` (hardware
+//!      via `VK_EXT_shader_atomic_float` → Ampere `RED.E.ADD.F32`).
+//!
+//! Splitting the two halves into separate SPIR-V binaries keeps the
+//! DP path's hot loop byte-for-byte identical to BDA_V4 aligned (no
+//! branch on a Stream-K mode bit in the inner loop).
+//!
+//! `StreamKSchedule::for_shape` computes the split and degenerates to
+//! pure-DP (`g_sk == 0`) or pure-SK (`dp_tiles_total == 0`) as
+//! needed.  The executor skips the corresponding dispatch in those
+//! degenerate cases.
+//!
+//! Restrictions:
+//!
 //!   * Aligned shapes only: M%BM == 0, N%BN == 0, K%BK == 0.
 //!   * batch == 1.
-//!   * accumulate == false (host pre-zeros C; kernel atomic-adds for
-//!     partial-tile contributions, plain-stores for single owners).
-//!
-//! ## Atomic implementation
-//!
-//! Uses the hardware `atomicAdd(float, float)` from
-//! `VK_EXT_shader_atomic_float` (`shaderBufferFloat32AtomicAdd`).
-//! Maps to the Ampere `RED.E.ADD.F32` SASS instruction.  Pipeline
-//! creation requires the extension to have been enabled on the
-//! `VulkanContext`; the executor entry point returns an error
-//! otherwise so callers can fall back to the regular DP path.
+//!   * accumulate == false (host pre-zeros C; the kernel
+//!     atomic-adds tail contributions, plain-stores DP and SK owners).
+//!   * `VK_EXT_shader_atomic_float` with
+//!     `shaderBufferFloat32AtomicAdd` must be enabled on the
+//!     `VulkanContext`; pipeline creation returns an error otherwise
+//!     and callers should fall back to `run_matmuls`.
 
 use std::sync::Arc;
 
@@ -38,12 +55,15 @@ const SPIRV_DP: &[u8] = include_bytes!(concat!(
     "/matmul_f32_streamk_dp_128x128.spv"
 ));
 
-/// Push constants for the hybrid Stream-K shader.  Bit-for-bit
-/// identical to the GLSL `PC` block in matmul_streamk_kernel.glsl.
+/// Push constants for the hybrid Stream-K shaders.  Bit-for-bit
+/// identical to the GLSL `PC` blocks in matmul_streamk_kernel.glsl
+/// (SK tail) and matmul_streamk_dp_kernel.glsl (DP flat).  Both
+/// kernels share the layout so the executor can write the struct
+/// once and bind it to both dispatches.
 ///
-/// Mode A (DP) covers workgroups [0, dp_tiles_total); mode B (SK tail)
-/// covers workgroups [dp_tiles_total, dp_tiles_total + g_sk).  The
-/// remaining fields describe the SK-tail iter-space.
+/// `dp_tiles_total` bounds the DP dispatch's early-exit check;
+/// `g_sk`, `total_iters_sk`, `iters_per_wg_sk`, `rem_sk`, and
+/// `iters_per_tile` describe the SK-tail iter-space.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct StreamKPushConstants {
@@ -271,18 +291,22 @@ impl Drop for StreamKPipeline {
 /// Hybrid Stream-K schedule precomputed on host.  Stored as `u32` so
 /// it goes straight into the push constant block.
 ///
-/// The dispatch grid is a single 1D dispatch of `grid_total =
-/// dp_tiles_total + g_sk` workgroups.  Workgroup IDs in
-/// `[0, dp_tiles_total)` run in DP mode (one full tile each, plain
-/// store epilogue, no atomics).  Workgroup IDs in `[dp_tiles_total,
-/// dp_tiles_total + g_sk)` run in SK mode and split the tail iter
-/// space `total_iters_sk = (T - dp_tiles_total) * iters_per_tile`
-/// evenly across `g_sk` workgroups.
+/// The executor issues two dispatches sharing this schedule:
+///
+///   * DP-flat: 2D `(n_tiles, m_tiles)` covering tiles
+///     `[0, dp_tiles_total)`.  Each WG plain-stores its tile.
+///   * SK-tail: 1D `g_sk` persistent workgroups splitting the tail
+///     iter-space `total_iters_sk = (T - dp_tiles_total) *
+///     iters_per_tile` evenly.  Single-owner tiles plain-store;
+///     seam tiles atomic-add.
+///
+/// `grid_total = dp_tiles_total + g_sk` is retained only as a
+/// device-limit sanity check (no single dispatch ever reaches it).
 ///
 /// When `T <= preferred_g`, `dp_tiles_total = 0` and the schedule
-/// degenerates to pure Stream-K (single persistent grid that owns the
-/// whole iter space).  When `T % preferred_g == 0`, `g_sk = 0` and the
-/// schedule degenerates to pure DP (one workgroup per tile).
+/// degenerates to pure Stream-K — the DP dispatch is skipped.  When
+/// `T % preferred_g == 0`, `g_sk = 0` and the schedule degenerates
+/// to pure DP — the SK-tail dispatch is skipped.
 #[derive(Copy, Clone, Debug)]
 pub struct StreamKSchedule {
     pub iters_per_tile: u32,
@@ -292,7 +316,10 @@ pub struct StreamKSchedule {
     pub dp_tiles_total: u32,
     pub g_sk: u32,
     pub total_iters_sk: u32,
-    /// Total workgroups in the 1D dispatch grid.
+    /// `dp_tiles_total + g_sk`, retained as a device-limit sanity
+    /// check against `maxComputeWorkGroupCount[0]`.  No single
+    /// dispatch reaches this size — the two halves dispatch
+    /// independently.
     pub grid_total: u32,
 }
 

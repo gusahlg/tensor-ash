@@ -2,13 +2,13 @@
 //  matmul_streamk_dp_kernel.glsl  —  DP-flat kernel for Stream-K's
 //  bulk dispatch.
 //
-//  1D dispatch: gl_WorkGroupID.x selects one output tile in flat
-//  row-major order from `tile_id = wg.x` in [0, dp_tiles_total).  The
-//  shape and load pattern are byte-for-byte identical to the
-//  BDA_V4 aligned kernel; the only difference is one extra
-//  `wg / n_tiles` to translate the flat workgroup ID back to the
-//  (block_row, block_col) pair that the 2D dispatch would have
-//  provided for free.
+//  2D dispatch: gl_WorkGroupID = (block_col, block_row).  The
+//  dispatch shape matches the regular BDA_V4 aligned kernel so the
+//  NVIDIA work distributor's L2-friendly swizzle still applies.
+//  Workgroups whose flat `tile_id = block_row * n_tiles + block_col`
+//  exceeds `dp_tiles_total` early-out; the SK-tail kernel covers
+//  those tiles.  The load + MAC + epilogue path is otherwise
+//  byte-for-byte identical to the BDA_V4 aligned kernel.
 //
 //  This kernel is the "bulk" half of the hybrid Stream-K dispatch.
 //  The SK-tail kernel (matmul_streamk_kernel.glsl) handles the
