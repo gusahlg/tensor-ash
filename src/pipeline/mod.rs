@@ -195,7 +195,14 @@ fn maybe_to_bda(tile: KernelSelection) -> KernelSelection {
         KernelSelection::Large => KernelSelection::LargeBdaV4,
         KernelSelection::Small => KernelSelection::SmallBdaV4,
         KernelSelection::M128N64K64 => KernelSelection::M128N64K64BdaV4,
-        KernelSelection::K64 => KernelSelection::K64BdaV4,
+        // K64 promotes to the TM=8 TN=4 register-tile variant: empirically
+        // wins +6-7% on every K64-routed shape (medium_384,
+        // skinny_1024x128x512, wide_128x1024x512) vs the TM=4 TN=4 default
+        // by trading half the active threads for double the M-side
+        // register strip per thread (verified with 10-round interleaved
+        // A/B on RTX 3070).  The plain V4 sibling stays selectable via
+        // ML_KERNEL=k64_bda_v4 for back-comparison.
+        KernelSelection::K64 => KernelSelection::K64BdaV4Tm8Tn4,
         KernelSelection::M128N64 => KernelSelection::M128N64BdaV4,
         KernelSelection::M64N128 => KernelSelection::M64N128BdaV4,
         // TN=2 has no V4 path; use the plain BDA fallback.
@@ -248,7 +255,7 @@ mod bda_tests {
         );
         assert_eq!(
             maybe_to_bda(KernelSelection::K64),
-            KernelSelection::K64BdaV4
+            KernelSelection::K64BdaV4Tm8Tn4
         );
         assert_eq!(
             maybe_to_bda(KernelSelection::M128N64),

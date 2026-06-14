@@ -295,6 +295,13 @@ fn v4_kernels_handle_n_not_multiple_of_4() {
             128u32,
             64u32,
         ),
+        // Register-tile sweep variant that auto routes to via K64.
+        (
+            "k64_bda_v4_tm8_tn4",
+            KernelSelection::K64BdaV4Tm8Tn4,
+            64u32,
+            64u32,
+        ),
     ];
     for (name, sel, tile_m, tile_n) in kernels {
         let (ctx, exec) = make_setup_with_kernel(1, 4, sel);
