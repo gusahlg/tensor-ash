@@ -2,15 +2,17 @@
 
 ## [Unreleased]
 
-## v1.1.0 - 2026-06-14
+## v1.2.0 - 2026-06-14
 
-Post-`v1.0.0` optimization pass focused on closing the gap to pure cuBLAS on
-the RTX 3070 baseline. The headline changes are a data-driven kernel
-registry, end-to-end Vulkan 1.2 `bufferDeviceAddress` (BDA + BDA_V4 kernel
-families), an experimental Stream-K pipeline, descriptor-set elision on the
-BDA hot path, and a register-tile (TM/TN) variant of the K64 kernel that
-unlocks +6% on the K64-routed shape band. Final geomean vs pure cuBLAS:
-**1.146x** across 26 showcase cases, fastest on **14/26**.
+Follow-up release on top of `v1.1.0` focused on closing more cuBLAS-loss
+cases and cleaning up the experimental Stream-K / Split-K paths. Headline
+wins: a register-tile (TM/TN) variant of the K64 kernel that unlocks +6%
+on the K64-routed shape band, descriptor-set elision on the BDA hot path
+(~2-4% wall-time on small/batched shapes), Stream-K DP-flat kernel quality
+fix that closes a 12% glslang `OpSwitch` overhead by reusing the regular
+`large_bda_v4` SPIR-V, and a hardware float32 atomicAdd in the (still
+opt-in) Split-K kernel. Final geomean vs pure cuBLAS: **1.146x** across
+26 showcase cases (up from 1.12x in v1.1.0), fastest on **14/26**.
 
 ### Added
 

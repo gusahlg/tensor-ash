@@ -1,6 +1,6 @@
 # tensor-ash
 
-Version: `1.1.0-dev` (post-`v1.0.0` optimization pass)
+Version: `1.2.0`
 
 `tensor-ash` is a small Vulkan compute library for high-throughput FP32 matrix
 multiplication, written in Rust on top of [`ash`](https://crates.io/crates/ash).
@@ -210,7 +210,7 @@ GPUs).
 - Headline silicon-limit points: `attn_qkv_1024x3072x512` hits **51.2% peak**
   (10.41 TFLOPS) vs pure cuBLAS at **56.1%**; `square_1024` hits **50.1%
   peak** (10.17 TFLOPS) vs pure cuBLAS at **54.0%**.
-- New cuBLAS-beating shapes in v1.1.0: `medium_384` (1.045x) and
+- New cuBLAS-beating shapes in v1.2.0: `medium_384` (1.045x) and
   `tall_512x256x256` (essentially tied, 0.998x); `skinny_1024x128x512` and
   `wide_128x1024x512` close from ~0.88x to ~0.93-0.98x.
 - Median synchronous host/submission overhead: ~0.022 ms per GEMM call;
@@ -222,7 +222,7 @@ hand-tuned kernels show their edge. The BDA / BDA_V4 path is where the bulk
 of recent gains came from — every tile we measured gains ~5-15% from
 `LDG.E.128` and another ~5-15% from `LDS.E.128` — plus a +4-7% win on the
 K64-routed shape band from the `k64_bda_v4_tm8_tn4` register-tile variant
-landed in v1.1.0.
+landed in v1.2.0.
 
 Selector tuning without overwriting the benchmark report:
 
