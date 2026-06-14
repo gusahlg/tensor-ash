@@ -268,6 +268,68 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_bk16_bda_v4.spv")),
         uses_descriptors: false,
     },
+    // ---- Register-tile (TM/TN) sweep variants of m128n64k64_bda_v4 ----
+    // Default m128n64k64_bda_v4 is TM=8 TN=4 (256 threads).  These probe
+    // whether redistributing thread vs register-tile budget wins on
+    // cuBLAS-losing shapes (square_512, medium_768, square_1024,
+    // non_pow2_1023x1025x1027).  Selectable via ML_KERNEL=...
+    KernelSpec {
+        name: "m128n64k64_bda_v4_tm8_tn8",
+        tile_m: 128,
+        tile_n: 64,
+        tile_k: 64,
+        spv: include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/matmul_f32_m128n64k64_bda_v4_tm8_tn8.spv"
+        )),
+        uses_descriptors: false,
+    },
+    KernelSpec {
+        name: "m128n64k64_bda_v4_tm16_tn4",
+        tile_m: 128,
+        tile_n: 64,
+        tile_k: 64,
+        spv: include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/matmul_f32_m128n64k64_bda_v4_tm16_tn4.spv"
+        )),
+        uses_descriptors: false,
+    },
+    // ---- Register-tile (TM/TN) sweep variants of k64_bda_v4 ----
+    // Default k64_bda_v4 is TM=4 TN=4 (256 threads).
+    KernelSpec {
+        name: "k64_bda_v4_tm8_tn4",
+        tile_m: 64,
+        tile_n: 64,
+        tile_k: 64,
+        spv: include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/matmul_f32_k64_bda_v4_tm8_tn4.spv"
+        )),
+        uses_descriptors: false,
+    },
+    KernelSpec {
+        name: "k64_bda_v4_tm4_tn8",
+        tile_m: 64,
+        tile_n: 64,
+        tile_k: 64,
+        spv: include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/matmul_f32_k64_bda_v4_tm4_tn8.spv"
+        )),
+        uses_descriptors: false,
+    },
+    KernelSpec {
+        name: "k64_bda_v4_tm8_tn8",
+        tile_m: 64,
+        tile_n: 64,
+        tile_k: 64,
+        spv: include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/matmul_f32_k64_bda_v4_tm8_tn8.spv"
+        )),
+        uses_descriptors: false,
+    },
     KernelSpec {
         // Aligned-only variant of `large_bda_v4`: source-level removes
         // every bounds-check branch and the scalar fallback loaders.
@@ -329,6 +391,11 @@ pub enum KernelSelection {
     M128N64BdaV4,
     M64N128BdaV4,
     Bk16BdaV4,
+    M128N64K64BdaV4Tm8Tn8,
+    M128N64K64BdaV4Tm16Tn4,
+    K64BdaV4Tm8Tn4,
+    K64BdaV4Tm4Tn8,
+    K64BdaV4Tm8Tn8,
     LargeBdaV4Aligned,
     M128N64K64BdaV4Aligned,
 }
@@ -364,6 +431,11 @@ impl KernelSelection {
             "m128n64_bda_v4" => Ok(Self::M128N64BdaV4),
             "m64n128_bda_v4" => Ok(Self::M64N128BdaV4),
             "bk16_bda_v4" | "128x128bk16_bda_v4" => Ok(Self::Bk16BdaV4),
+            "m128n64k64_bda_v4_tm8_tn8" => Ok(Self::M128N64K64BdaV4Tm8Tn8),
+            "m128n64k64_bda_v4_tm16_tn4" => Ok(Self::M128N64K64BdaV4Tm16Tn4),
+            "k64_bda_v4_tm8_tn4" => Ok(Self::K64BdaV4Tm8Tn4),
+            "k64_bda_v4_tm4_tn8" => Ok(Self::K64BdaV4Tm4Tn8),
+            "k64_bda_v4_tm8_tn8" => Ok(Self::K64BdaV4Tm8Tn8),
             "large_bda_v4_aligned" | "128x128_bda_v4_aligned" => Ok(Self::LargeBdaV4Aligned),
             "m128n64k64_bda_v4_aligned" => Ok(Self::M128N64K64BdaV4Aligned),
             other => bail!(
@@ -412,8 +484,13 @@ impl KernelSelection {
             Self::M128N64BdaV4 => Some(24),
             Self::M64N128BdaV4 => Some(25),
             Self::Bk16BdaV4 => Some(26),
-            Self::LargeBdaV4Aligned => Some(27),
-            Self::M128N64K64BdaV4Aligned => Some(28),
+            Self::M128N64K64BdaV4Tm8Tn8 => Some(27),
+            Self::M128N64K64BdaV4Tm16Tn4 => Some(28),
+            Self::K64BdaV4Tm8Tn4 => Some(29),
+            Self::K64BdaV4Tm4Tn8 => Some(30),
+            Self::K64BdaV4Tm8Tn8 => Some(31),
+            Self::LargeBdaV4Aligned => Some(32),
+            Self::M128N64K64BdaV4Aligned => Some(33),
         }
     }
 }

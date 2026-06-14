@@ -1,0 +1,16 @@
+#version 460
+// 64x64/BK=64 BDA+V4: TM=4 TN=8 register-tile variant.
+// Default k64_bda_v4 is TM=4 TN=4 (256 threads, 16 outputs/thread).
+// This variant uses TM=4 TN=8 (128 threads, 32 outputs/thread): trades
+// half the active threads for double the N-side register tile, increasing
+// vec4 LDS.128 amortization on shapes where the k64 default underutilizes
+// the SM.
+
+#define BM 64u
+#define BN 64u
+#define BK 64u
+#define TM  4u
+#define TN  8u
+#define TN_RAW 8
+
+#include "matmul_bda_v4_kernel.glsl"
