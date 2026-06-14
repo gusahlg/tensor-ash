@@ -10,12 +10,12 @@
 //  `num_k_splits`-way atomic contention on each C tile.
 //
 //  Implementation choices:
-//   * Atomic add: this kernel uses the CAS-loop form
-//     (`atomicCompSwap` on `floatBitsToUint`) so we don't have to
-//     enable `VK_EXT_shader_atomic_float` at the context level.  On
-//     RTX 3070 a hardware `atomicAdd` on float32 is available but
-//     wasn't needed to demonstrate the idea — the CAS loop is what
-//     ships here.
+//   * Atomic add: this kernel uses the hardware float32 atomicAdd via
+//     `VK_EXT_shader_atomic_float`.  The Stream-K work already turned
+//     that extension on at the context level (commit 171d8ac), so it
+//     is free here.  Maps to Ampere `RED.E.ADD.F32` — the CAS-loop
+//     fallback the prior version shipped was ~3-5x slower.  The host
+//     guards the dispatch when the extension is missing.
 //   * Always-bounded loads (load_a/load_b are scalar with bounds
 //     checks). The split-K kernel is meant for shapes where M, N,
 //     and k_chunk may not all be tile-multiples, so the v4 fast
@@ -44,6 +44,7 @@
 #extension GL_EXT_buffer_reference         : require
 #extension GL_EXT_buffer_reference2        : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_float      : require
 
 layout(local_size_x = (BN / TN), local_size_y = (BM / TM), local_size_z = 1) in;
 
@@ -69,10 +70,14 @@ const uint TN_V4 = TN / 4u;
 layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
     float v[];
 };
-layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer U32ReadWrite {
-    uint v[];
-};
 layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32ReadWrite {
+    float v[];
+};
+// Coherent float view of C used by the hardware atomicAdd.  The host
+// guarantees `VK_EXT_shader_atomic_float` with `shaderBufferFloat32AtomicAdd`
+// before this kernel is dispatched, so the atomic-add op below maps
+// directly to Ampere `RED.E.ADD.F32` (no CAS loop).
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer F32CoherentRW {
     float v[];
 };
 
@@ -141,24 +146,14 @@ void load_b_tile_scalar(uint b_base, uint block_col, uint k_base, uint k_lo, uin
     }
 }
 
-// CAS-loop float atomic add: read C[addr] as a uint, try to CAS
-// floatBitsToUint(old + val) in place.  Loop until CAS succeeds.  This
-// is the standard portable f32 atomicAdd for shaders that don't enable
-// VK_EXT_shader_atomic_float.
+// Hardware float32 atomicAdd.  Requires `VK_EXT_shader_atomic_float`
+// + `shaderBufferFloat32AtomicAdd`, both enabled by the context (see
+// `VulkanContext::new_with_device_preference`).  Replaces the CAS
+// loop we used to ship — measured ~3-5x faster on Ampere.
 void atomic_add_f32(uint addr, float val) {
     if (val == 0.0) return; // small skip — split-K with zero partial is common at edges
-    U32ReadWrite c_u = U32ReadWrite(uint64_t(pc.c_ptr));
-    uint old_u = c_u.v[addr];
-    uint new_u;
-    while (true) {
-        float old_f = uintBitsToFloat(old_u);
-        new_u = floatBitsToUint(old_f + val);
-        uint prev = atomicCompSwap(c_u.v[addr], old_u, new_u);
-        if (prev == old_u) {
-            break;
-        }
-        old_u = prev;
-    }
+    F32CoherentRW c_f = F32CoherentRW(uint64_t(pc.c_ptr));
+    atomicAdd(c_f.v[addr], val);
 }
 
 void main() {

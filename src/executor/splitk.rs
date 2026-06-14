@@ -34,14 +34,15 @@
 //!
 //! ## Atomic implementation
 //!
-//! The shader uses a CAS-loop (atomicCompSwap on a uint-aliased view
-//! of C) instead of the hardware `atomicAdd<float>` from
-//! VK_EXT_shader_atomic_float.  This lets us run the experiment
-//! without enabling a new device extension — the existing
-//! VulkanContext doesn't request VK_EXT_shader_atomic_float.  On
-//! RTX 3070 the CAS loop costs ~3-5x what a hardware atomic would,
-//! which shows up clearly in the perf numbers vs the
-//! `m128n64k64_bda_v4` baseline.
+//! The shader uses the hardware float32 `atomicAdd` exposed by
+//! `VK_EXT_shader_atomic_float` (specifically
+//! `shaderBufferFloat32AtomicAdd`).  The Stream-K work already turned
+//! that extension on at the context level (commit 171d8ac), so
+//! Split-K rides for free.  On Ampere this lowers to a single
+//! `RED.E.ADD.F32` instruction — measured ~3-5x faster than the
+//! CAS-loop fallback the prior version of this kernel shipped.
+//! `Executor::run_matmuls_split_k` refuses the call if the extension
+//! is unavailable, so the kernel never has to fall back at runtime.
 
 use std::sync::Arc;
 

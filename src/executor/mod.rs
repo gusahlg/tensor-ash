@@ -134,6 +134,15 @@ impl Executor {
         if call.accumulate {
             bail!("run_matmuls_split_k: accumulate=true is not supported");
         }
+        if !self.ctx.buffer_device_address_enabled {
+            bail!("run_matmuls_split_k: bufferDeviceAddress not enabled");
+        }
+        if !self.ctx.shader_buffer_float32_atomic_add_enabled {
+            bail!(
+                "run_matmuls_split_k: VK_EXT_shader_atomic_float (shaderBufferFloat32AtomicAdd) \
+                 not enabled — kernel relies on the hardware atomicAdd path"
+            );
+        }
 
         let resolved = crate::matmul::ResolvedMatmul::from_call(&call)?;
 
