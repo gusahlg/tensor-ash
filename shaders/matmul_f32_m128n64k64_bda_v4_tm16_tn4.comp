@@ -1,0 +1,16 @@
+#version 460
+// 128x64/BK=64 BDA+V4: TM=16 TN=4 register-tile variant.
+// Default m128n64k64_bda_v4 is TM=8 TN=4 (256 threads). This variant uses
+// TM=16 TN=4 (128 threads): doubles the M-side register tile per thread
+// and halves the active threads. Tests whether a taller register strip
+// helps on shapes where the default is bottlenecked on broadcast reuse
+// from As rather than from Bs.
+
+#define BM 128u
+#define BN  64u
+#define BK  64u
+#define TM  16u
+#define TN   4u
+#define TN_RAW 4
+
+#include "matmul_bda_v4_kernel.glsl"

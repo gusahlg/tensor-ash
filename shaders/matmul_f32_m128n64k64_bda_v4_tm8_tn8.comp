@@ -1,0 +1,17 @@
+#version 460
+// 128x64/BK=64 BDA+V4: TM=8 TN=8 register-tile variant.
+// Default m128n64k64_bda_v4 is TM=8 TN=4 (256 threads, 32 outputs/thread).
+// This variant uses TM=8 TN=8 (128 threads, 64 outputs/thread): trades half
+// the active threads for double the per-thread register tile, increasing
+// ILP/B-broadcast reuse on shapes where the m128n64k64 default is
+// memory-bound but cuBLAS-losing (square_512, medium_768, square_1024,
+// non_pow2_1023x1025x1027).
+
+#define BM 128u
+#define BN  64u
+#define BK  64u
+#define TM   8u
+#define TN   8u
+#define TN_RAW 8
+
+#include "matmul_bda_v4_kernel.glsl"
