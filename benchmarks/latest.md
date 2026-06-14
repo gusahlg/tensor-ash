@@ -5,8 +5,8 @@ This report compares FP32 GEMM throughput for `tensor-ash` against the local fra
 ## Environment
 
 ```text
-[2026-06-13T19:18:56Z INFO  tensor_ash::context] tensor-ash: using device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329)
-[2026-06-13T19:18:57Z INFO  ml_bench::bench] device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2496774464, compute_family=2, timestamps=true) slots=2 kernel=auto
+[2026-06-14T09:02:15Z INFO  tensor_ash::context] tensor-ash: using device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329)
+[2026-06-14T09:02:15Z INFO  ml_bench::bench] device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2496774464, compute_family=2, timestamps=true) slots=2 kernel=auto
 tensor-ash self-check
 status: OK
 selected: device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2496774464, compute_family=2, timestamps=true)
@@ -20,7 +20,7 @@ VK_ICD_FILENAMES: <unset>
 NVIDIA-SMI GPU summary:
 
 ```text
-gpu0: name=NVIDIA GeForce RTX 3070, driver=595.71.05, memory_total_mib=8192, temperature_c=38, utilization_pct=0, power_draw_w=23.44, power_limit_w=220.00
+gpu0: name=NVIDIA GeForce RTX 3070, driver=595.71.05, memory_total_mib=8192, temperature_c=36, utilization_pct=0, power_draw_w=21.65, power_limit_w=220.00
 ```
 
 - Iterations: 5
@@ -36,57 +36,57 @@ gpu0: name=NVIDIA GeForce RTX 3070, driver=595.71.05, memory_total_mib=8192, tem
 
 | case | library | status | gpu ms | wall ms | host overhead ms | TFLOPS | % peak | details |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| square_128 | tensor-ash | ok | 0.006 | 0.025 | 0.018 | 0.661980 | 3.3% | NVIDIA GeForce RTX 3070 (discrete) |
-| square_256 | tensor-ash | ok | 0.011 | 0.031 | 0.020 | 2.970470 | 14.6% | NVIDIA GeForce RTX 3070 (discrete) |
-| square_512 | tensor-ash | ok | 0.042 | 0.061 | 0.019 | 6.423130 | 31.6% | NVIDIA GeForce RTX 3070 (discrete) |
-| batched_4x256 | tensor-ash | ok | 0.024 | 0.051 | 0.027 | 5.562737 | 27.4% | NVIDIA GeForce RTX 3070 (discrete) |
-| tall_512x256x256 | tensor-ash | ok | 0.016 | 0.084 | 0.069 | 4.271185 | 21.0% | NVIDIA GeForce RTX 3070 (discrete) |
-| odd_255x257x263 | tensor-ash | ok | 0.014 | 0.034 | 0.020 | 2.453830 | 12.1% | NVIDIA GeForce RTX 3070 (discrete) |
-| square_1024 | tensor-ash | ok | 0.211 | 0.235 | 0.024 | 10.191171 | 50.2% | NVIDIA GeForce RTX 3070 (discrete) |
-| batched_2x512 | tensor-ash | ok | 0.068 | 0.087 | 0.020 | 7.902598 | 38.9% | NVIDIA GeForce RTX 3070 (discrete) |
-| skinny_1024x128x512 | tensor-ash | ok | 0.028 | 0.047 | 0.019 | 4.826587 | 23.8% | NVIDIA GeForce RTX 3070 (discrete) |
-| wide_128x1024x512 | tensor-ash | ok | 0.028 | 0.047 | 0.019 | 4.821039 | 23.7% | NVIDIA GeForce RTX 3070 (discrete) |
-| small_k_1024x1024x64 | tensor-ash | ok | 0.020 | 0.088 | 0.068 | 6.710886 | 33.0% | NVIDIA GeForce RTX 3070 (discrete) |
-| non_pow2_513x515x517 | tensor-ash | ok | 0.053 | 0.071 | 0.018 | 5.164429 | 25.4% | NVIDIA GeForce RTX 3070 (discrete) |
-| non_pow2_1023x1025x1027 | tensor-ash | ok | 0.250 | 0.349 | 0.099 | 8.632219 | 42.5% | NVIDIA GeForce RTX 3070 (discrete) |
-| medium_384 | tensor-ash | ok | 0.022 | 0.044 | 0.022 | 5.114081 | 25.2% | NVIDIA GeForce RTX 3070 (discrete) |
-| medium_768 | tensor-ash | ok | 0.108 | 0.169 | 0.061 | 8.366298 | 41.2% | NVIDIA GeForce RTX 3070 (discrete) |
-| batched_8x256 | tensor-ash | ok | 0.037 | 0.065 | 0.028 | 7.332699 | 36.1% | NVIDIA GeForce RTX 3070 (discrete) |
-| batched_16x128 | tensor-ash | ok | 0.014 | 0.035 | 0.021 | 4.854519 | 23.9% | NVIDIA GeForce RTX 3070 (discrete) |
-| batched_32x64 | tensor-ash | ok | 0.006 | 0.084 | 0.079 | 2.995931 | 14.7% | NVIDIA GeForce RTX 3070 (discrete) |
-| batched_64x128 | tensor-ash | ok | 0.039 | 0.103 | 0.064 | 6.892858 | 33.9% | NVIDIA GeForce RTX 3070 (discrete) |
-| batched_128x64 | tensor-ash | ok | 0.016 | 0.035 | 0.019 | 4.080062 | 20.1% | NVIDIA GeForce RTX 3070 (discrete) |
-| attn_proj_2048x512x512 | tensor-ash | ok | 0.111 | 0.181 | 0.070 | 9.655952 | 47.5% | NVIDIA GeForce RTX 3070 (discrete) |
-| attn_proj_512x2048x512 | tensor-ash | ok | 0.109 | 0.138 | 0.029 | 9.834242 | 48.4% | NVIDIA GeForce RTX 3070 (discrete) |
-| attn_qkv_1024x3072x512 | tensor-ash | ok | 0.309 | 0.348 | 0.039 | 10.412008 | 51.2% | NVIDIA GeForce RTX 3070 (discrete) |
-| tiny_b32_128 | tensor-ash | ok | 0.022 | 0.042 | 0.020 | 6.159037 | 30.3% | NVIDIA GeForce RTX 3070 (discrete) |
-| tiny_b16_192 | tensor-ash | ok | 0.036 | 0.056 | 0.019 | 6.208674 | 30.6% | NVIDIA GeForce RTX 3070 (discrete) |
-| tiny_b8_192 | tensor-ash | ok | 0.019 | 0.040 | 0.020 | 5.811074 | 28.6% | NVIDIA GeForce RTX 3070 (discrete) |
-| square_128 | cublas_pure | ok | 0.008 |  |  | 0.532813 | 2.6% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| square_128 | tensor-ash | ok | 0.006 | 0.026 | 0.020 | 0.661980 | 3.3% | NVIDIA GeForce RTX 3070 (discrete) |
+| square_256 | tensor-ash | ok | 0.012 | 0.044 | 0.032 | 2.912711 | 14.3% | NVIDIA GeForce RTX 3070 (discrete) |
+| square_512 | tensor-ash | ok | 0.042 | 0.062 | 0.020 | 6.457743 | 31.8% | NVIDIA GeForce RTX 3070 (discrete) |
+| batched_4x256 | tensor-ash | ok | 0.024 | 0.045 | 0.020 | 5.562737 | 27.4% | NVIDIA GeForce RTX 3070 (discrete) |
+| tall_512x256x256 | tensor-ash | ok | 0.015 | 0.048 | 0.033 | 4.359983 | 21.5% | NVIDIA GeForce RTX 3070 (discrete) |
+| odd_255x257x263 | tensor-ash | ok | 0.014 | 0.034 | 0.019 | 2.431674 | 12.0% | NVIDIA GeForce RTX 3070 (discrete) |
+| square_1024 | tensor-ash | ok | 0.211 | 0.245 | 0.034 | 10.171092 | 50.1% | NVIDIA GeForce RTX 3070 (discrete) |
+| batched_2x512 | tensor-ash | ok | 0.068 | 0.088 | 0.020 | 7.858181 | 38.7% | NVIDIA GeForce RTX 3070 (discrete) |
+| skinny_1024x128x512 | tensor-ash | ok | 0.026 | 0.047 | 0.021 | 5.152708 | 25.4% | NVIDIA GeForce RTX 3070 (discrete) |
+| wide_128x1024x512 | tensor-ash | ok | 0.026 | 0.047 | 0.020 | 5.108775 | 25.1% | NVIDIA GeForce RTX 3070 (discrete) |
+| small_k_1024x1024x64 | tensor-ash | ok | 0.020 | 0.041 | 0.020 | 6.689480 | 32.9% | NVIDIA GeForce RTX 3070 (discrete) |
+| non_pow2_513x515x517 | tensor-ash | ok | 0.053 | 0.073 | 0.020 | 5.114920 | 25.2% | NVIDIA GeForce RTX 3070 (discrete) |
+| non_pow2_1023x1025x1027 | tensor-ash | ok | 0.249 | 0.270 | 0.021 | 8.639975 | 42.5% | NVIDIA GeForce RTX 3070 (discrete) |
+| medium_384 | tensor-ash | ok | 0.021 | 0.041 | 0.020 | 5.345837 | 26.3% | NVIDIA GeForce RTX 3070 (discrete) |
+| medium_768 | tensor-ash | ok | 0.109 | 0.132 | 0.023 | 8.339191 | 41.0% | NVIDIA GeForce RTX 3070 (discrete) |
+| batched_8x256 | tensor-ash | ok | 0.037 | 0.057 | 0.020 | 7.351979 | 36.2% | NVIDIA GeForce RTX 3070 (discrete) |
+| batched_16x128 | tensor-ash | ok | 0.014 | 0.033 | 0.020 | 4.922892 | 24.2% | NVIDIA GeForce RTX 3070 (discrete) |
+| batched_32x64 | tensor-ash | ok | 0.006 | 0.025 | 0.019 | 2.702515 | 13.3% | NVIDIA GeForce RTX 3070 (discrete) |
+| batched_64x128 | tensor-ash | ok | 0.039 | 0.060 | 0.021 | 6.932734 | 34.1% | NVIDIA GeForce RTX 3070 (discrete) |
+| batched_128x64 | tensor-ash | ok | 0.017 | 0.038 | 0.021 | 4.025244 | 19.8% | NVIDIA GeForce RTX 3070 (discrete) |
+| attn_proj_2048x512x512 | tensor-ash | ok | 0.111 | 0.144 | 0.033 | 9.661512 | 47.5% | NVIDIA GeForce RTX 3070 (discrete) |
+| attn_proj_512x2048x512 | tensor-ash | ok | 0.110 | 0.132 | 0.022 | 9.728742 | 47.9% | NVIDIA GeForce RTX 3070 (discrete) |
+| attn_qkv_1024x3072x512 | tensor-ash | ok | 0.310 | 0.377 | 0.067 | 10.375520 | 51.1% | NVIDIA GeForce RTX 3070 (discrete) |
+| tiny_b32_128 | tensor-ash | ok | 0.021 | 0.053 | 0.032 | 6.384024 | 31.4% | NVIDIA GeForce RTX 3070 (discrete) |
+| tiny_b16_192 | tensor-ash | ok | 0.037 | 0.061 | 0.024 | 6.160042 | 30.3% | NVIDIA GeForce RTX 3070 (discrete) |
+| tiny_b8_192 | tensor-ash | ok | 0.020 | 0.041 | 0.021 | 5.698783 | 28.0% | NVIDIA GeForce RTX 3070 (discrete) |
+| square_128 | cublas_pure | ok | 0.009 |  |  | 0.456697 | 2.2% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
 | square_256 | cublas_pure | ok | 0.012 |  |  | 2.730667 | 13.4% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| square_512 | cublas_pure | ok | 0.036 |  |  | 7.489828 | 36.9% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| batched_4x256 | cublas_pure | ok | 0.037 |  |  | 3.640889 | 17.9% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| tall_512x256x256 | cublas_pure | ok | 0.015 |  |  | 4.405782 | 21.7% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| odd_255x257x263 | cublas_pure | ok | 0.012 |  |  | 2.872617 | 14.1% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| square_1024 | cublas_pure | ok | 0.195 |  |  | 11.037642 | 54.3% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| square_512 | cublas_pure | ok | 0.038 |  |  | 7.157516 | 35.2% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| batched_4x256 | cublas_pure | ok | 0.038 |  |  | 3.557510 | 17.5% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| tall_512x256x256 | cublas_pure | ok | 0.015 |  |  | 4.369067 | 21.5% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| odd_255x257x263 | cublas_pure | ok | 0.013 |  |  | 2.633818 | 13.0% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| square_1024 | cublas_pure | ok | 0.196 |  |  | 10.979853 | 54.0% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
 | batched_2x512 | cublas_pure | ok | 0.069 |  |  | 7.825194 | 38.5% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| skinny_1024x128x512 | cublas_pure | ok | 0.025 |  |  | 5.461333 | 26.9% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| wide_128x1024x512 | cublas_pure | ok | 0.025 |  |  | 5.468454 | 26.9% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| small_k_1024x1024x64 | cublas_pure | ok | 0.022 |  |  | 6.000435 | 29.5% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| non_pow2_513x515x517 | cublas_pure | ok | 0.049 |  |  | 5.557813 | 27.4% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| non_pow2_1023x1025x1027 | cublas_pure | ok | 0.209 |  |  | 10.310265 | 50.7% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| medium_384 | cublas_pure | ok | 0.021 |  |  | 5.289902 | 26.0% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| skinny_1024x128x512 | cublas_pure | ok | 0.026 |  |  | 5.256020 | 25.9% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| wide_128x1024x512 | cublas_pure | ok | 0.025 |  |  | 5.461333 | 26.9% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| small_k_1024x1024x64 | cublas_pure | ok | 0.024 |  |  | 5.698782 | 28.0% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| non_pow2_513x515x517 | cublas_pure | ok | 0.050 |  |  | 5.451341 | 26.8% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| non_pow2_1023x1025x1027 | cublas_pure | ok | 0.210 |  |  | 10.280344 | 50.6% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| medium_384 | cublas_pure | ok | 0.022 |  |  | 5.114081 | 25.2% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
 | medium_768 | cublas_pure | ok | 0.090 |  |  | 10.053818 | 49.5% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| batched_8x256 | cublas_pure | ok | 0.041 |  |  | 6.610408 | 32.5% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| batched_16x128 | cublas_pure | ok | 0.022 |  |  | 3.013149 | 14.8% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| batched_32x64 | cublas_pure | ok | 0.015 |  |  | 1.103764 | 5.4% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| batched_64x128 | cublas_pure | ok | 0.043 |  |  | 6.241524 | 30.7% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| batched_128x64 | cublas_pure | ok | 0.035 |  |  | 1.927529 | 9.5% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| attn_proj_2048x512x512 | cublas_pure | ok | 0.110 |  |  | 9.805503 | 48.3% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| attn_proj_512x2048x512 | cublas_pure | ok | 0.105 |  |  | 10.202017 | 50.2% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| attn_qkv_1024x3072x512 | cublas_pure | ok | 0.282 |  |  | 11.439011 | 56.3% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| tiny_b32_128 | cublas_pure | ok | 0.027 |  |  | 5.041231 | 24.8% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
-| tiny_b16_192 | cublas_pure | ok | 0.054 |  |  | 4.230656 | 20.8% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| batched_8x256 | cublas_pure | ok | 0.041 |  |  | 6.558724 | 32.3% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| batched_16x128 | cublas_pure | ok | 0.023 |  |  | 2.978909 | 14.7% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| batched_32x64 | cublas_pure | ok | 0.014 |  |  | 1.170286 | 5.8% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| batched_64x128 | cublas_pure | ok | 0.044 |  |  | 6.100806 | 30.0% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| batched_128x64 | cublas_pure | ok | 0.035 |  |  | 1.908237 | 9.4% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| attn_proj_2048x512x512 | cublas_pure | ok | 0.110 |  |  | 9.791197 | 48.2% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| attn_proj_512x2048x512 | cublas_pure | ok | 0.105 |  |  | 10.198916 | 50.2% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| attn_qkv_1024x3072x512 | cublas_pure | ok | 0.282 |  |  | 11.409192 | 56.1% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| tiny_b32_128 | cublas_pure | ok | 0.027 |  |  | 4.882775 | 24.0% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
+| tiny_b16_192 | cublas_pure | ok | 0.054 |  |  | 4.198036 | 20.7% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
 | tiny_b8_192 | cublas_pure | ok | 0.030 |  |  | 3.813517 | 18.8% | pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events |
 | square_128 | torch_cuda | skipped |  |  |  |  |  | No module named 'torch' |
 | square_256 | torch_cuda | skipped |  |  |  |  |  | No module named 'torch' |
@@ -198,9 +198,9 @@ gpu0: name=NVIDIA GeForce RTX 3070, driver=595.71.05, memory_total_mib=8192, tem
 - `tensor-ash` used `NVIDIA GeForce RTX 3070 (discrete)`, so the Vulkan measurements reflect real GPU kernel timings on this host.
 - Actual GPU framework comparisons succeeded for: `cublas_pure`.
 - Largest gap: `medium_768` is 1.2x faster in `cublas_pure` than `tensor-ash` in this environment.
-- `tensor-ash` is the fastest measured backend on 13/26 benchmark cases.
-- Throughput ratio versus `cublas_pure` across 26 shared cases: 0.83x to 2.71x, geometric mean 1.12x.
-- Median `tensor-ash` host/submission overhead was 0.022 ms per synchronous call; GPU timestamp TFLOPS excludes that overhead.
+- `tensor-ash` is the fastest measured backend on 14/26 benchmark cases.
+- Throughput ratio versus `cublas_pure` across 26 shared cases: 0.83x to 2.31x, geometric mean 1.15x.
+- Median `tensor-ash` host/submission overhead was 0.021 ms per synchronous call; GPU timestamp TFLOPS excludes that overhead.
 - Some libraries were skipped because their Python modules or device backends were unavailable: `cupy_cuda`, `jax`, `tensorflow`, `torch_cuda`.
 - PyTorch CUDA/cuBLAS was not available in this Python environment.
 - CuPy CUDA/cuBLAS was not available in this Python environment.
