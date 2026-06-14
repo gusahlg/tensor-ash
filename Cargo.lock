@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-ash"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "ash",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-ash-capi"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "tensor-ash",

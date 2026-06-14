@@ -199,24 +199,30 @@ Latest run: `showcase` set on an RTX 3070 (`benchmarks/latest.md`), 30 iters /
 3070's 20.32 TFLOPS FP32 ceiling (`ML_PEAK_TFLOPS`, overridable for other
 GPUs).
 
-- `tensor-ash` is the fastest measured backend on **13/26** showcase cases.
-- vs the apples-to-apples **pure cuBLAS** baseline: geomean **1.11x** across
-  26 shared cases (range 0.80x-2.53x).
-- vs **PyTorch CUDA/cuBLAS**: geomean **1.32x** (range 0.82x-3.62x) — the
-  wrapper overhead alone shows up as a meaningful gap.
-- vs **CuPy CUDA/cuBLAS**: geomean **2.59x**.
+- `tensor-ash` is the fastest measured backend on **14/26** showcase cases.
+- vs the apples-to-apples **pure cuBLAS** baseline: geomean **1.146x** across
+  26 shared cases (range 0.83x-2.31x).
+- vs **PyTorch CUDA/cuBLAS**: geomean **~1.32x** when PyTorch is installed
+  (range 0.82x-3.62x in earlier runs) — the wrapper overhead alone shows up
+  as a meaningful gap.
+- vs **CuPy CUDA/cuBLAS** when installed: geomean **~2.6x**.
 - vs single-threaded **NumPy / PyTorch CPU**: ~45-48x.
-- Headline silicon-limit points: `square_1024` hits **50.1% peak** (10.18
-  TFLOPS) vs pure cuBLAS at **53.8%**; `attn_qkv_1024x3072x512` hits
-  **51.2% peak** (10.41 TFLOPS) vs pure cuBLAS at **56.3%**.
-- Median synchronous host/submission overhead: 0.020 ms per GEMM call;
+- Headline silicon-limit points: `attn_qkv_1024x3072x512` hits **51.2% peak**
+  (10.41 TFLOPS) vs pure cuBLAS at **56.1%**; `square_1024` hits **50.1%
+  peak** (10.17 TFLOPS) vs pure cuBLAS at **54.0%**.
+- New cuBLAS-beating shapes in v1.1.0: `medium_384` (1.045x) and
+  `tall_512x256x256` (essentially tied, 0.998x); `skinny_1024x128x512` and
+  `wide_128x1024x512` close from ~0.88x to ~0.93-0.98x.
+- Median synchronous host/submission overhead: ~0.022 ms per GEMM call;
   reported TFLOPS uses GPU timestamps and excludes it.
 
 So: ahead of pure cuBLAS on geomean, decisively ahead of PyTorch CUDA, still
-trailing cuBLAS on the big square / asymmetric-attention cases where its
-hand-tuned kernels show their edge. The BDA / BDA_V4 path is where the recent
-gains came from — every tile we measured gains ~5-15% from `LDG.E.128` and
-another ~5-15% from `LDS.E.128`.
+trailing cuBLAS on a handful of big square / non-pow2 cases where its
+hand-tuned kernels show their edge. The BDA / BDA_V4 path is where the bulk
+of recent gains came from — every tile we measured gains ~5-15% from
+`LDG.E.128` and another ~5-15% from `LDS.E.128` — plus a +4-7% win on the
+K64-routed shape band from the `k64_bda_v4_tm8_tn4` register-tile variant
+landed in v1.1.0.
 
 Selector tuning without overwriting the benchmark report:
 

@@ -2,10 +2,15 @@
 
 ## [Unreleased]
 
+## v1.1.0 - 2026-06-14
+
 Post-`v1.0.0` optimization pass focused on closing the gap to pure cuBLAS on
-the RTX 3070 baseline. The two big structural changes are a data-driven
-kernel registry and end-to-end Vulkan 1.2 `bufferDeviceAddress`; a follow-up
-landed experimental Stream-K and strict-aligned BDA_V4 variants on top.
+the RTX 3070 baseline. The headline changes are a data-driven kernel
+registry, end-to-end Vulkan 1.2 `bufferDeviceAddress` (BDA + BDA_V4 kernel
+families), an experimental Stream-K pipeline, descriptor-set elision on the
+BDA hot path, and a register-tile (TM/TN) variant of the K64 kernel that
+unlocks +6% on the K64-routed shape band. Final geomean vs pure cuBLAS:
+**1.146x** across 26 showcase cases, fastest on **14/26**.
 
 ### Added
 
@@ -19,12 +24,36 @@ landed experimental Stream-K and strict-aligned BDA_V4 variants on top.
   (`M%128 == N%128 == K%32 == 0`), `accumulate == false`, device must
   expose `shaderBufferFloat32AtomicAdd`. Shipped behind an opt-in entry
   point — the standard `run_matmuls` path is unchanged.
-- **Strict-aligned BDA_V4 kernels.** `large_bda_v4_aligned` and
-  `m128n64k64_bda_v4_aligned` strip the bounds-checked scalar load
-  helpers and edge epilogue paths at source level; the SPIR-V contains
-  only the LDG.E.128 / LDS.E.128 / FFMA hot path and the STG.E.128
-  epilogue. The dispatcher promotes through `maybe_to_aligned` when the
-  shape is divisible by the tile dims.
+- **Strict-aligned BDA_V4 kernels** (opt-in only, see below).
+  `large_bda_v4_aligned` and `m128n64k64_bda_v4_aligned` strip the
+  bounds-checked scalar load helpers and edge epilogue paths at source
+  level; the SPIR-V contains only the LDG.E.128 / LDS.E.128 / FFMA hot
+  path and the STG.E.128 epilogue. Still selectable via
+  `ML_KERNEL=*_bda_v4_aligned` for shape-specific A/B work; **no longer
+  auto-promoted** — see the Changed section below.
+- **Descriptor-set elision on the BDA hot path.** BDA kernels carry A/B/C
+  device addresses in push constants, so they don't need descriptor-bound
+  SSBOs. A second push-constant-only `pipeline_layout_bda` short-circuits
+  `update_descriptor_sets` + `cmd_bind_descriptor_sets` on every BDA
+  dispatch. Wall-time wins of ~2-4% on small/batched shapes; TF/s metric
+  is flat (the savings are host-side).
+- **Hardware float32 atomicAdd in the Split-K kernel** via
+  `VK_EXT_shader_atomic_float` (Ampere `RED.E.ADD.F32`). Replaces the
+  emulated `atomicCompSwap` CAS loop that prior versions shipped.
+  Split-K remains opt-in via `Executor::run_matmuls_split_k`; the
+  hardware atomic makes the API correct + competitive on deep-K shapes
+  if ever wired into auto.
+- **`k64_bda_v4_tm8_tn4` register-tile variant.** Same shader as
+  `k64_bda_v4` (BM=BN=64, BK=64, all v4 features) but with TM=8, TN=4
+  and a 128-thread workgroup instead of 256. Halving the active thread
+  count + doubling per-thread arithmetic hits a clean register-blocking
+  sweet spot for K64-routed shapes (+6% on `medium_384`, +7.5% on
+  `skinny_1024x128x512`, +6.4% on `wide_128x1024x512`, +4.0% on
+  `tall_512x256x256`). Auto-selector promotes the K64 path to this
+  variant. Companion experimental variants (`k64_bda_v4_tm4_tn8`,
+  `k64_bda_v4_tm8_tn8`, `m128n64k64_bda_v4_tm8_tn8`,
+  `m128n64k64_bda_v4_tm16_tn4`) ship as ML_KERNEL-selectable repro
+  artifacts but lose on this device.
 - **`VK_EXT_shader_atomic_float` plumbing** in `VulkanContext`: probe
   the device extension list + `PhysicalDeviceShaderAtomicFloatFeaturesEXT`
   for `shaderBufferFloat32AtomicAdd`, enable when present, expose
@@ -79,6 +108,22 @@ landed experimental Stream-K and strict-aligned BDA_V4 variants on top.
     on `batched_8x256`).
 - Pipeline construction reads tile dimensions out of `KERNEL_SPECS` instead
   of duplicating constants in the selector.
+- **Auto-selector no longer promotes the aligned variants.** Interleaved A/B
+  sampling showed the source-stripped `*_bda_v4_aligned` kernels consistently
+  measure 2-5% slower than their bounds-checked siblings on this device, so
+  `maybe_to_aligned` is gone. The kernels stay built and ML_KERNEL-selectable
+  for cross-device validation.
+- **Auto-selector promotes the `K64` path to `k64_bda_v4_tm8_tn4`** (rather
+  than `k64_bda_v4`) on devices that support `bufferDeviceAddress`. See the
+  Added section for the magnitude on each routed shape.
+- **Stream-K DP-flat kernel reuses unmodified `large_bda_v4` SPIR-V.** The
+  prior standalone `matmul_streamk_dp_kernel.glsl` contained an early-out
+  `return` that forced glslang to wrap `main()` in an OpSwitch structured
+  control-flow merge — costing ~12% on Ampere. The hybrid schedule now
+  rounds `dp_tiles_total` down to a multiple of `n_tiles` so DP-flat needs
+  no return statement and runs the regular BDA_V4 kernel byte-for-byte.
+  Deletes 219 lines of redundant shader; full Stream-K is now within 1-3%
+  of `large_bda_v4` on aligned big shapes (was 7-25% behind).
 
 ### Performance
 
@@ -87,31 +132,36 @@ Latest `showcase` run on an RTX 3070 (`benchmarks/latest.md`), 30 iters /
 
 | comparison | result |
 | --- | ---: |
-| `tensor-ash` fastest measured backend | 13 / 26 cases |
-| vs pure cuBLAS (apples-to-apples) geomean | 1.11x |
-| vs PyTorch CUDA / cuBLAS geomean | 1.32x |
-| vs CuPy CUDA / cuBLAS geomean | 2.59x |
-| vs NumPy single-thread geomean | 47.56x |
-| vs PyTorch CPU single-thread geomean | 45.33x |
-| best `tensor-ash` throughput | 10.18 TFLOPS / 50.1% peak (`square_1024`) |
-| best `tensor-ash` `attn_qkv_1024x3072x512` | 10.41 TFLOPS / 51.2% peak |
-| pure cuBLAS on `square_1024` | 10.92 TFLOPS / 53.8% peak |
-| pure cuBLAS on `attn_qkv_1024x3072x512` | 11.44 TFLOPS / 56.3% peak |
-| median synchronous host overhead | 0.020 ms / GEMM call |
-| transfer upload / download | 9.04 / 9.48 GiB/s |
+| `tensor-ash` fastest measured backend | 14 / 26 cases |
+| vs pure cuBLAS (apples-to-apples) geomean | 1.146x |
+| best `tensor-ash` throughput | 10.41 TFLOPS / 51.2% peak (`attn_qkv_1024x3072x512`) |
+| best `tensor-ash` `square_1024` | 10.17 TFLOPS / 50.1% peak |
+| pure cuBLAS on `attn_qkv_1024x3072x512` | 11.41 TFLOPS / 56.1% peak |
+| pure cuBLAS on `square_1024` | 10.98 TFLOPS / 54.0% peak |
+| median synchronous host overhead | ~0.022 ms / GEMM call |
 
 Per-tile, the BDA path gains ~5-15% over the descriptor-bound original on
 every tile we measured, and the BDA_V4 path gains another ~5-15% over plain
-BDA. The auto-selector's promotion captures roughly +10-30% across the
-showcase set "for free" relative to v1.0.0.
+BDA. The descriptor-set elision shaves another ~2-4% wall time on small/
+batched shapes (host-side savings invisible to TF/s). The K64 register-tile
+change captures another +4-7% on the K64-routed shape band. The
+auto-selector's overall promotion captures roughly +10-40% across the
+showcase set relative to v1.0.0.
 
-The largest remaining gap to pure cuBLAS is on `attn_qkv_1024x3072x512`
-(51.2% vs 56.3% peak) and `square_1024` (50.1% vs 53.8% peak), where its
-hand-tuned kernels still show their edge.
+Two shapes that lost to cuBLAS in earlier v1.x snapshots now beat it:
+`medium_384` (1.045x) and `tall_512x256x256` (essentially tied at 0.998x);
+plus `skinny_1024x128x512` and `wide_128x1024x512` close from ~0.88x to
+~0.93-0.98x. The largest remaining gaps to pure cuBLAS are on `medium_768`
+(0.83x), `non_pow2_1023x1025x1027` (0.84x), `odd_255x257x263` (0.92x), and
+`square_1024` (0.93x), where its hand-tuned kernels still show their edge —
+the FP32 SIMT compiler's FMA throughput ceiling on GA104 appears to be the
+structural limit, not selector quality. See `feedback_*_dead_end` notes in
+session memory for the ruled-out levers (Stream-K, Split-K w/ hardware
+atomic, CTA swizzle, subgroupShuffle).
 
 ### Verification
 
-Validated locally on 2026-06-11 with:
+Validated locally on 2026-06-14 with:
 
 ```bash
 cargo fmt --check
