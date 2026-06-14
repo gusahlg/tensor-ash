@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+## v1.2.1 - 2026-06-14
+
+Hygiene patch on top of v1.2.0. No perf changes, no public-API changes.
+
+### Changed
+- **Removed dead `persistent_v4` branch in `src/bench/mod.rs`.** The
+  bench was building a `PersistentMatmul` whenever `ML_KERNEL=persistent_v4`
+  was set, then discarding it via `let _ = &persistent;` because
+  `commands::single_persistent` was never wired up. The branch now just
+  routes through the regular `KernelSelection::from_env()` path. Users
+  who had `ML_KERNEL=persistent_v4` will now get a clear parse error
+  instead of silently running the default kernel; the public
+  `PersistentMatmul` re-export in `lib.rs` is unchanged (its removal is
+  reserved for a future major bump).
+- **Remote URL**: tracked origin updated from `gusahlg/ml-project.git`
+  to `gusahlg/tensor-ash.git` (GitHub had been serving a redirect).
+
+### Removed
+- Two orphan experimental shader files with no Rust references:
+  `shaders/matmul_f32_strassen.comp` and
+  `shaders/matmul_strassen_kernel.glsl`.
+
+### Verified
+- `cargo build --release`, `--examples`, `-p tensor-ash-capi` clean.
+- `cargo test --release`, `--doc`, and `--test correctness -- --ignored`
+  (29 GPU tests) all pass.
+- `cargo clippy --release --all-targets` clean.
+- `cargo fmt --check` clean.
+
 ## v1.2.0 - 2026-06-14
 
 Follow-up release on top of `v1.1.0` focused on closing more cuBLAS-loss

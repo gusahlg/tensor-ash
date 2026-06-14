@@ -1,6 +1,6 @@
 # tensor-ash
 
-Version: `1.2.0`
+Version: `1.2.1`
 
 `tensor-ash` is a small Vulkan compute library for high-throughput FP32 matrix
 multiplication, written in Rust on top of [`ash`](https://crates.io/crates/ash).
