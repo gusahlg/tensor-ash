@@ -400,6 +400,77 @@ impl Executor {
         })
     }
 
+    /// Debug probe: dispatch the Stream-K DP-flat kernel covering *every*
+    /// tile (no SK-tail, no pre-fill).  This isolates the DP-flat
+    /// kernel's per-tile throughput from the persistent-grid /
+    /// atomic-add / fill overhead of the full hybrid dispatch.  Use only
+    /// for benchmarking; for production traffic use
+    /// [`run_matmuls_stream_k`] or [`run_matmuls_auto_stream_k`].
+    pub fn run_matmuls_stream_k_dp_only(&self, call: MatmulCall<'_>) -> Result<RunStats> {
+        if call.accumulate {
+            bail!("run_matmuls_stream_k_dp_only: accumulate=true is not supported");
+        }
+        let resolved = crate::matmul::ResolvedMatmul::from_call(&call)?;
+        if resolved.batch != 1 {
+            bail!(
+                "run_matmuls_stream_k_dp_only: only batch==1 is supported (got batch={})",
+                resolved.batch
+            );
+        }
+        const BM: u32 = 128;
+        const BN: u32 = 128;
+        const BK: u32 = 32;
+        if !resolved.m.is_multiple_of(BM)
+            || !resolved.n.is_multiple_of(BN)
+            || !resolved.k.is_multiple_of(BK)
+        {
+            bail!(
+                "run_matmuls_stream_k_dp_only: shape {}x{}x{} not aligned",
+                resolved.m,
+                resolved.n,
+                resolved.k,
+            );
+        }
+        if !self.ctx.buffer_device_address_enabled {
+            bail!("run_matmuls_stream_k_dp_only: bufferDeviceAddress not available");
+        }
+        if !self.ctx.shader_buffer_float32_atomic_add_enabled {
+            bail!("run_matmuls_stream_k_dp_only: VK_EXT_shader_atomic_float not available");
+        }
+        let stream_k = if let Some(s) = self.stream_k.get() {
+            s
+        } else {
+            let built = StreamKPipeline::new(&self.ctx)?;
+            self.stream_k.get_or_init(|| built)
+        };
+        let kernel = stream_k.pick_dp(resolved.m, resolved.n);
+        // Construct a schedule where every tile is owned by DP and
+        // there is no SK-tail dispatch.
+        let m_tiles = resolved.m / kernel.tile_m;
+        let n_tiles = resolved.n / kernel.tile_n;
+        let total_tiles = m_tiles * n_tiles;
+        let iters_per_tile = (resolved.k / kernel.tile_k).max(1);
+        let schedule = StreamKSchedule {
+            iters_per_tile,
+            iters_per_wg_sk: 0,
+            rem_sk: 0,
+            n_tiles,
+            dp_tiles_total: total_tiles,
+            g_sk: 0,
+            total_iters_sk: 0,
+            grid_total: total_tiles,
+        };
+        let mut slot = self.checkout_slot();
+        let result = self.record_and_run_stream_k(&mut slot, &call, &resolved, stream_k, &schedule);
+        self.checkin_slot(slot);
+        let gpu_time_ns = result?;
+        Ok(RunStats {
+            gpu_time_ns,
+            n_calls: 1,
+            total_flops: resolved.total_flops,
+        })
+    }
+
     fn record_and_run_stream_k(
         &self,
         slot: &mut Slot,
@@ -410,6 +481,10 @@ impl Executor {
     ) -> Result<Option<u64>> {
         let want_timestamps = self.ctx.timestamps_supported;
         let query_pool = slot.query_pool;
+        // `StreamKSchedule::for_shape` guarantees `dp_tiles_total` is
+        // a clean multiple of `n_tiles`, so the DP dispatch grid is
+        // always a clean 2D rectangle (no idle workgroups) and we
+        // can use the branchless large_bda_v4 SPIR-V directly.
         let dp_kernel = stream_k.pick_dp(resolved.m, resolved.n);
         let tail_kernel = stream_k.pick_tail(resolved.m, resolved.n);
         let layout = stream_k.pipeline_layout;
@@ -467,26 +542,37 @@ impl Executor {
                     dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, query_pool, 0);
                 }
 
-                // Zero-fill C so the atomic-add path is correct.
-                dev.cmd_fill_buffer(cb, call.c.raw_buffer(), 0, vk::WHOLE_SIZE, 0);
+                // Zero-fill C so the SK-tail atomic-add path is correct.
+                // DP-flat tiles plain-store, so when the schedule is
+                // pure-DP (g_sk == 0) the fill+barrier are pure overhead
+                // and we skip them entirely.  Hybrid mode still fills
+                // the whole buffer; the SK-tail tiles may be scattered
+                // across rows and a sub-range fill costs more in CPU
+                // bookkeeping than it saves in transfer bytes for the
+                // typical (small tail) hybrid case.
+                if schedule.g_sk > 0 {
+                    dev.cmd_fill_buffer(cb, call.c.raw_buffer(), 0, vk::WHOLE_SIZE, 0);
 
-                let buf_barrier = vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(call.c.raw_buffer())
-                    .offset(0)
-                    .size(vk::WHOLE_SIZE);
-                dev.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    std::slice::from_ref(&buf_barrier),
-                    &[],
-                );
+                    let buf_barrier = vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(call.c.raw_buffer())
+                        .offset(0)
+                        .size(vk::WHOLE_SIZE);
+                    dev.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        std::slice::from_ref(&buf_barrier),
+                        &[],
+                    );
+                }
 
                 dev.cmd_push_constants(
                     cb,
@@ -498,15 +584,16 @@ impl Executor {
 
                 // DP-flat dispatch covers tiles [0, dp_tiles_total).
                 // Skipped when the schedule is pure-SK (small shape).
-                // Uses 2D dispatch (n_tiles, dp_rows_ceil) so the
-                // NVIDIA work distributor applies its L2-friendly
-                // swizzle just like the base aligned kernel; the
-                // kernel's tile-id range check drops the few WGs whose
-                // tile_id falls in the SK tail.
+                // `dp_tiles_total` is guaranteed to be a multiple of
+                // `n_tiles` by `StreamKSchedule::for_shape`, so the 2D
+                // dispatch (n_tiles, dp_rows) is exact and contains
+                // no idle workgroups; the NVIDIA work distributor
+                // applies its L2-friendly swizzle just like the
+                // standalone BDA_V4 dispatch.
                 if schedule.dp_tiles_total > 0 {
-                    let dp_rows_ceil = schedule.dp_tiles_total.div_ceil(schedule.n_tiles);
+                    let dp_rows = schedule.dp_tiles_total / schedule.n_tiles;
                     dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, dp_kernel.pipeline);
-                    dev.cmd_dispatch(cb, schedule.n_tiles, dp_rows_ceil, 1);
+                    dev.cmd_dispatch(cb, schedule.n_tiles, dp_rows, 1);
                 }
 
                 // SK-tail dispatch covers tiles

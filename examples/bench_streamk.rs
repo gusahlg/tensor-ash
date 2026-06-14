@@ -1,8 +1,21 @@
 //! Stream-K head-to-head benchmark.
 //!
-//! Runs each shape through both `Executor::run_matmuls` (the regular
-//! auto-selected kernel) and `Executor::run_matmuls_stream_k`, then
-//! prints a comparison table.
+//! Runs each shape through:
+//!   - `Executor::run_matmuls` (the regular auto-selected kernel,
+//!     i.e. the BDA_V4 large kernel for square inputs)
+//!   - `Executor::run_matmuls_stream_k_dp_only` (Stream-K's DP-flat
+//!     kernel only, no SK-tail, no pre-fill — isolates the DP-flat
+//!     kernel's per-tile throughput)
+//!   - `Executor::run_matmuls_stream_k` (full hybrid: DP + SK-tail
+//!     + pre-fill if needed)
+//!
+//! The DP-only probe is for diagnosis: it tells us whether the gap
+//! between Stream-K and the base path is in kernel quality or in
+//! persistent-grid + atomic-add + pre-fill overhead.
+//!
+//! Samples are interleaved (base, dp, sk repeated per round, 5 rounds
+//! of 30 iters each) to absorb GPU noise from another agent that may
+//! be running in parallel.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -30,7 +43,8 @@ const SHAPES: &[(&str, u32, u32, u32)] = &[
 ];
 
 const WARMUP: u32 = 5;
-const ITERS: u32 = 30;
+const ROUNDS: u32 = 5;
+const ITERS_PER_ROUND: u32 = 30;
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
@@ -42,14 +56,10 @@ fn main() -> Result<()> {
     let exec = Executor::new(ctx.clone(), pipe, 2, 32)?;
 
     println!(
-        "{:<28} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9}",
-        "case", "base_ms", "base_TF", "sk_ms", "sk_TF", "speedup", "max_err"
+        "{:<28} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {:>9}",
+        "case", "base_TF", "dp_TF", "sk_TF", "dp/base", "sk/base", "sk/dp", "best_TF", "max_err"
     );
-    println!("{}", "-".repeat(86));
-
-    let mut wins = 0;
-    let mut losses = 0;
-    let mut tied = 0;
+    println!("{}", "-".repeat(100));
 
     for &(name, m, n, k) in SHAPES {
         let nm = (m as usize) * (k as usize);
@@ -57,7 +67,6 @@ fn main() -> Result<()> {
         let nc = (m as usize) * (n as usize);
         let mut h_a = vec![0.0f32; nm];
         let mut h_b = vec![0.0f32; nb];
-        // Simple deterministic fill.
         for (i, v) in h_a.iter_mut().enumerate() {
             *v = ((i as u32).wrapping_mul(2654435761) as f32 / u32::MAX as f32) - 0.5;
         }
@@ -67,6 +76,7 @@ fn main() -> Result<()> {
         let a = Tensor::uninit_device(&ctx, &[m, k])?;
         let b = Tensor::uninit_device(&ctx, &[k, n])?;
         let c_base = Tensor::uninit_device(&ctx, &[m, n])?;
+        let c_dp = Tensor::uninit_device(&ctx, &[m, n])?;
         let c_sk = Tensor::uninit_device(&ctx, &[m, n])?;
         exec.upload(&h_a, &a)?;
         exec.upload(&h_b, &b)?;
@@ -78,6 +88,13 @@ fn main() -> Result<()> {
             alpha: 1.0,
             accumulate: false,
         };
+        let call_dp = || MatmulCall {
+            a: &a,
+            b: &b,
+            c: &c_dp,
+            alpha: 1.0,
+            accumulate: false,
+        };
         let call_sk = || MatmulCall {
             a: &a,
             b: &b,
@@ -86,68 +103,108 @@ fn main() -> Result<()> {
             accumulate: false,
         };
 
-        // Warmup both paths.
+        // Probe whether DP-only mode is supported for this shape (it
+        // requires 128x128/BK=32 alignment).  If not, just measure
+        // base + sk.
+        let dp_ok = m.is_multiple_of(128) && n.is_multiple_of(128) && k.is_multiple_of(32);
+
+        // Warmup.
         for _ in 0..WARMUP {
             exec.run_matmuls(&[call_base()])?;
-            exec.run_matmuls_stream_k(call_sk())?;
+            if dp_ok {
+                let _ = exec.run_matmuls_stream_k_dp_only(call_dp());
+            }
+            let _ = exec.run_matmuls_stream_k(call_sk());
         }
 
-        // Time baseline.
-        let t0 = Instant::now();
-        let mut base_gpu_total_ns: u64 = 0;
-        for _ in 0..ITERS {
-            let stats = exec.run_matmuls(&[call_base()])?;
-            base_gpu_total_ns += stats.gpu_time_ns.unwrap_or(0);
+        // Interleaved sampling: ROUNDS rounds, each with
+        // ITERS_PER_ROUND base, ITERS_PER_ROUND dp, ITERS_PER_ROUND sk,
+        // rotating order each round.
+        let mut base_ns: u64 = 0;
+        let mut dp_ns: u64 = 0;
+        let mut sk_ns: u64 = 0;
+        let mut total_iters: u32 = 0;
+        for _ in 0..ROUNDS {
+            for _ in 0..ITERS_PER_ROUND {
+                let s = exec.run_matmuls(&[call_base()])?;
+                base_ns += s.gpu_time_ns.unwrap_or(0);
+                if dp_ok && let Ok(s) = exec.run_matmuls_stream_k_dp_only(call_dp()) {
+                    dp_ns += s.gpu_time_ns.unwrap_or(0);
+                }
+                let s = exec.run_matmuls_stream_k(call_sk())?;
+                sk_ns += s.gpu_time_ns.unwrap_or(0);
+            }
+            total_iters += ITERS_PER_ROUND;
         }
-        let base_wall_ms = t0.elapsed().as_secs_f64() * 1000.0 / ITERS as f64;
-        let base_gpu_ms = base_gpu_total_ns as f64 / ITERS as f64 / 1_000_000.0;
 
-        // Time Stream-K.
-        let t1 = Instant::now();
-        let mut sk_gpu_total_ns: u64 = 0;
-        for _ in 0..ITERS {
-            let stats = exec.run_matmuls_stream_k(call_sk())?;
-            sk_gpu_total_ns += stats.gpu_time_ns.unwrap_or(0);
-        }
-        let sk_wall_ms = t1.elapsed().as_secs_f64() * 1000.0 / ITERS as f64;
-        let sk_gpu_ms = sk_gpu_total_ns as f64 / ITERS as f64 / 1_000_000.0;
+        let base_ms = base_ns as f64 / total_iters as f64 / 1_000_000.0;
+        let dp_ms = dp_ns as f64 / total_iters as f64 / 1_000_000.0;
+        let sk_ms = sk_ns as f64 / total_iters as f64 / 1_000_000.0;
 
-        // FLOPs.
         let flops = 2.0 * (m as f64) * (n as f64) * (k as f64);
-        let base_tf = flops / (base_gpu_ms * 1e6) / 1e3;
-        let sk_tf = flops / (sk_gpu_ms * 1e6) / 1e3;
-        let speedup = base_gpu_ms / sk_gpu_ms;
+        let base_tf = flops / (base_ms * 1e6) / 1e3;
+        let dp_tf = if dp_ok && dp_ms > 0.0 {
+            flops / (dp_ms * 1e6) / 1e3
+        } else {
+            0.0
+        };
+        let sk_tf = flops / (sk_ms * 1e6) / 1e3;
 
-        // Correctness diff.
+        let dp_speedup = if dp_ok { dp_tf / base_tf } else { 0.0 };
+        let sk_speedup = sk_tf / base_tf;
+        let sk_vs_dp = if dp_ok && dp_tf > 0.0 {
+            sk_tf / dp_tf
+        } else {
+            0.0
+        };
+
+        let best_tf = base_tf.max(dp_tf).max(sk_tf);
+
+        // Correctness check vs base.
         let mut out_base = vec![0.0f32; nc];
         let mut out_sk = vec![0.0f32; nc];
         exec.download(&c_base, &mut out_base)?;
         exec.download(&c_sk, &mut out_sk)?;
-        let max_err = out_base
+        let max_err_sk = out_base
             .iter()
             .zip(out_sk.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-
-        let tag = if speedup > 1.02 {
-            wins += 1;
-            "WIN"
-        } else if speedup < 0.98 {
-            losses += 1;
-            "LOSS"
+        let max_err_dp = if dp_ok {
+            let mut out_dp = vec![0.0f32; nc];
+            exec.download(&c_dp, &mut out_dp)?;
+            out_base
+                .iter()
+                .zip(out_dp.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
         } else {
-            tied += 1;
-            ""
+            0.0
+        };
+        let max_err = max_err_sk.max(max_err_dp);
+
+        let dp_disp = if dp_ok {
+            format!("{:>7.3}", dp_tf)
+        } else {
+            "    n/a".to_string()
+        };
+        let dp_sp = if dp_ok {
+            format!("{:>6.3}x", dp_speedup)
+        } else {
+            "    n/a".to_string()
+        };
+        let sk_dp_sp = if dp_ok && sk_vs_dp > 0.0 {
+            format!("{:>6.3}x", sk_vs_dp)
+        } else {
+            "    n/a".to_string()
         };
         println!(
-            "{:<28} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>7.3}x {:>9.2e} {}",
-            name, base_gpu_ms, base_tf, sk_gpu_ms, sk_tf, speedup, max_err, tag
+            "{:<28} {:>7.3} {} {:>7.3} {} {:>6.3}x {} {:>8.3} {:>9.2e}",
+            name, base_tf, dp_disp, sk_tf, dp_sp, sk_speedup, sk_dp_sp, best_tf, max_err
         );
-        // Suppress wall-clock unused warnings.
-        let _ = (base_wall_ms, sk_wall_ms);
+        let _ = Instant::now();
     }
 
-    println!("{}", "-".repeat(86));
-    println!("wins={wins}  losses={losses}  unchanged={tied}");
+    println!("{}", "-".repeat(100));
     Ok(())
 }

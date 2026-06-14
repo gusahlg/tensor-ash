@@ -50,10 +50,17 @@ use crate::context::VulkanContext;
 
 const SPIRV_TAIL: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_streamk_128x128.spv"));
-const SPIRV_DP: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/matmul_f32_streamk_dp_128x128.spv"
-));
+// DP-flat shader: reuse matmul_f32_large_bda_v4 directly.  Its PC
+// block (56 bytes) is a prefix of StreamKPushConstants (88 bytes),
+// so the host can push the full StreamK PC and the shader silently
+// ignores the trailing Stream-K-specific fields per the Vulkan PC
+// rules.  Using the base kernel — instead of a Stream-K-specific
+// clone with a tile_id early-out — sidesteps glslang's structured-
+// control-flow OpSwitch wrapper around main(), which on Ampere
+// costs ~12% on the aligned hot path even with the early-out branch
+// spec-const-elided.  This requires `dp_tiles_total` to be a clean
+// multiple of `n_tiles` (see `StreamKSchedule::for_shape`).
+const SPIRV_DP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_large_bda_v4.spv"));
 
 /// Push constants for the hybrid Stream-K shaders.  Bit-for-bit
 /// identical to the GLSL `PC` blocks in matmul_streamk_kernel.glsl
@@ -102,10 +109,12 @@ pub(super) struct StreamKKernel {
 }
 
 /// Hybrid Stream-K pipeline: separate DP-flat and SK-tail kernels
-/// dispatched in sequence by `record_and_run_stream_k`.  Splitting the
-/// kernels lets the DP path's SPIR-V be byte-for-byte identical to the
-/// BDA_V4 aligned kernel (no extra branches in the binary), while the
-/// SK-tail kernel keeps the persistent-grid + atomicAdd machinery.
+/// dispatched in sequence by `record_and_run_stream_k`.  The DP-flat
+/// kernel is the regular `matmul_f32_large_bda_v4` SPIR-V (shared
+/// with the auto path's main BDA_V4 dispatch); `StreamKSchedule`
+/// guarantees the DP dispatch always lands on a clean 2D rectangle
+/// of tiles, so no early-out branch is needed.  The SK-tail kernel
+/// keeps the persistent-grid + atomicAdd machinery.
 pub(super) struct StreamKPipeline {
     ctx: Arc<VulkanContext>,
     pub(super) pipeline_layout: vk::PipelineLayout,
@@ -200,9 +209,13 @@ fn build_kernel(
             .context("create_shader_module (stream-k)")?;
         let entry = std::ffi::CString::new("main").unwrap();
 
-        // The Stream-K shader only declares constant_ids 0 and 1
-        // (ACCUMULATE, ALPHA_IS_ONE).  We still write 4 entries to keep
-        // the dispatch convention uniform; entries for missing IDs are
+        // Spec constants used by the DP-flat shader (matmul_f32_large_bda_v4):
+        //   0 = ACCUMULATE    (false: kernel plain-stores)
+        //   1 = ALPHA_IS_ONE  (true:  skip the alpha multiply)
+        //   2 = INTERIOR_ONLY (true:  M%BM == 0, N%BN == 0)
+        //   3 = K_MULTIPLE    (true:  K%BK == 0)
+        // SK-tail shader (matmul_f32_streamk_128x128) only declares
+        // IDs 0 and 1; entries for IDs not present in the shader are
         // ignored per Vulkan §11.4.1.
         let spec_entries = [
             vk::SpecializationMapEntry::default()
@@ -344,7 +357,18 @@ impl StreamKSchedule {
             // Hybrid: clean waves go through DP, tail through SK.
             // When T % preferred_g == 0 this degenerates to pure DP
             // (tail_tiles = 0, g_sk = 0).
-            let dp = (total_tiles / preferred_g) * preferred_g;
+            let dp_raw = (total_tiles / preferred_g) * preferred_g;
+            // Round dp_tiles_total down to a multiple of n_tiles so the
+            // DP dispatch is a clean 2D rectangle.  This lets the
+            // dispatcher use the branchless BDA_V4 kernel — the
+            // tile_id early-out, even when spec-const-elided, forces
+            // glslang to wrap main() in an OpSwitch structural merge
+            // that the NVIDIA driver does not fully optimise away.
+            // Empirically the wrapper costs ~12% on the aligned hot
+            // path.  The cost of pushing 0-31 tiles back into the SK
+            // tail is small (each SK tile is ~iters_per_tile FFMAs
+            // through the atomic-add path); the DP-side gain dominates.
+            let dp = (dp_raw / n_tiles) * n_tiles;
             (dp, total_tiles - dp)
         };
 
@@ -450,23 +474,30 @@ mod tests {
     #[test]
     fn hybrid_schedule_for_aligned_4096_cube() {
         // 4096^3 / 128x128/BK=32: m_tiles=32, n_tiles=32, T=1024.
-        // G_pref=92.  dp_tiles_total = 11*92 = 1012.  tail = 12.
-        // iters_per_tile=128; total_iters_sk = 12*128 = 1536.
+        // G_pref=92.  Raw dp = 11*92 = 1012, then rounded down to a
+        // multiple of n_tiles=32: 992 = 31 full rows.  Tail = 32 tiles.
+        // The round-down keeps the DP dispatch a clean 2D rectangle so
+        // the dispatcher can use the branchless BDA_V4 kernel — see
+        // `for_shape` for the motivation.
+        // iters_per_tile=128; total_iters_sk = 32*128 = 4096.
         let s = StreamKSchedule::for_shape(4096, 4096, 4096, 128, 128, 32, 46);
         assert_eq!(s.iters_per_tile, 128);
         assert_eq!(s.n_tiles, 32);
-        assert_eq!(s.dp_tiles_total, 1012);
+        assert_eq!(s.dp_tiles_total, 992);
         assert_eq!(s.g_sk, 92);
-        assert_eq!(s.total_iters_sk, 12 * 128);
-        assert_eq!(s.iters_per_wg_sk, 1536 / 92);
-        assert_eq!(s.rem_sk, 1536 - (1536 / 92) * 92);
-        assert_eq!(s.grid_total, 1012 + 92);
+        assert_eq!(s.total_iters_sk, 32 * 128);
+        let total_iters = 32 * 128;
+        assert_eq!(s.iters_per_wg_sk, total_iters / 92);
+        assert_eq!(s.rem_sk, total_iters - (total_iters / 92) * 92);
+        assert_eq!(s.grid_total, 992 + 92);
         // The two-tile clamp from v1 was removed: g_sk is sized to the
         // full preferred grid, so a tail tile may be touched by many
         // more than 2 WGs.  The shader's atomicAdd path handles this
         // correctly.
         assert!(!s.is_pure_dp());
         assert!(!s.is_pure_sk());
+        // The DP grid is always a clean rectangle.
+        assert_eq!(s.dp_tiles_total % s.n_tiles, 0);
     }
 
     #[test]
