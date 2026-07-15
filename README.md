@@ -119,6 +119,23 @@ uv venv .venv-bench && source .venv-bench/bin/activate
 uv pip install -r requirements-benchmark.txt
 ```
 
+## Learning the API (start here)
+
+Four short, heavily-commented tutorials live in `examples/`, written for
+people who have used PyTorch a little but never touched explicit GPU
+programming. Each builds on the previous one:
+
+```bash
+cargo run --release --example tutorial_1_hello_matmul       # context/pipeline/executor, upload, matmul, download
+cargo run --release --example tutorial_2_batching_and_timing # rank-3 batching, broadcasting, accumulate, GPU vs wall timing
+cargo run --release --example tutorial_3_fused_linear_layer  # relu(x@W + b) as ONE dispatch via fused epilogues
+cargo run --release --example tutorial_4_mlp_in_one_graph    # a whole MLP forward in one submission with run_op_graph
+```
+
+After those, `examples/synth_llama_layer.rs` shows a transformer-style
+layer (graph submission + fused SwiGLU), and `examples/bench_splitk2.rs`
+compares the reduction strategies.
+
 ## Library sketch
 
 ```rust
