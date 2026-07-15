@@ -21,6 +21,9 @@ pub(super) struct Slot {
     pub(super) query_pool: vk::QueryPool,
     pub(super) upload_staging: Option<Buffer>,
     pub(super) download_staging: Option<Buffer>,
+    /// Device-local scratch for the two-stage split-K partials, grown
+    /// on demand.  Slot-owned so concurrent submissions never share it.
+    pub(super) splitk2_scratch: Option<Buffer>,
     /// Whether the slot was used at least once (cmd pool / fence need a reset).
     pub(super) used: bool,
 }
@@ -117,6 +120,7 @@ impl Slot {
                 query_pool,
                 upload_staging: None,
                 download_staging: None,
+                splitk2_scratch: None,
                 used: false,
             })
         }

@@ -1,0 +1,11 @@
+#version 460
+// Two-stage split-K stage 1, 64x64/BK=32 tile for small-M/N shapes.
+
+#define BM 64u
+#define BN 64u
+#define BK 32u
+#define TM  4u
+#define TN  4u
+#define TN_RAW 4
+
+#include "matmul_splitk2_kernel.glsl"

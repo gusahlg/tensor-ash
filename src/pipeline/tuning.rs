@@ -1,0 +1,156 @@
+//! Measured kernel selection with a persistent per-device store.
+//!
+//! The static heuristic in `selection.rs` is the prior; when tuning is
+//! enabled (`ML_TUNE=1`) the executor measures every eligible kernel on
+//! the real shape and records the winner here.  Winners persist across
+//! processes in `$XDG_CACHE_HOME/tensor-ash/`, keyed by GPU
+//! vendor/device id in the filename and validated against the driver
+//! version + a hash of every embedded SPIR-V binary in the header, so a
+//! driver update or kernel rebuild invalidates stale entries instead of
+//! silently serving them.
+
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::PathBuf;
+
+use crate::context::VulkanContext;
+
+use super::types::KERNEL_SPECS;
+
+/// One GEMM problem shape.  `accumulate` / `alpha` / epilogues change
+/// only the store path, which never flips the kernel ranking, so they
+/// are deliberately not part of the key.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct TuneKey {
+    pub batch: u32,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+}
+
+/// Measured winner for one shape.
+#[derive(Copy, Clone, Debug)]
+pub struct TuneEntry {
+    /// Best data-parallel kernel (index into `KERNEL_SPECS`).  Used by
+    /// every dispatch of this shape, including batched submissions,
+    /// accumulate, and epilogue ops.
+    pub kernel: usize,
+    /// When set, single plain (non-accumulate, no-epilogue) calls
+    /// route through the two-stage split-K path with this split count
+    /// instead — it measured faster than every DP kernel.
+    pub splitk2_splits: Option<u32>,
+}
+
+/// FNV-1a over every embedded kernel binary.  Any shader edit or
+/// registry reorder changes this, invalidating persisted winners.
+pub(super) fn shader_registry_hash() -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for spec in KERNEL_SPECS {
+        for &b in spec.spv {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+
+pub(super) fn tune_store_path(ctx: &VulkanContext) -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let filename = format!(
+        "tuned_kernels_v{:04x}_{:04x}.txt",
+        ctx.device_summary.vendor_id, ctx.device_summary.device_id
+    );
+    Some(base.join("tensor-ash").join(filename))
+}
+
+fn header_line(ctx: &VulkanContext, shader_hash: u64) -> String {
+    format!(
+        "tensor-ash-tune-v1 driver={} shaders={shader_hash:016x}",
+        ctx.device_summary.driver_version
+    )
+}
+
+/// Load persisted winners.  Returns an empty map when the file is
+/// missing, malformed, or was written for a different driver / shader
+/// build.
+pub(super) fn load_tuned(ctx: &VulkanContext, shader_hash: u64) -> HashMap<TuneKey, TuneEntry> {
+    let mut map = HashMap::new();
+    let Some(path) = tune_store_path(ctx) else {
+        return map;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return map;
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some(header_line(ctx, shader_hash).as_str()) {
+        log::info!(
+            "tensor-ash: discarding stale tuning store {} (driver or shader build changed)",
+            path.display()
+        );
+        return map;
+    }
+    for line in lines {
+        let mut it = line.split_whitespace();
+        let (Some(b), Some(m), Some(n), Some(k), Some(name)) =
+            (it.next(), it.next(), it.next(), it.next(), it.next())
+        else {
+            continue;
+        };
+        let (Ok(batch), Ok(m), Ok(n), Ok(k)) = (b.parse(), m.parse(), n.parse(), k.parse()) else {
+            continue;
+        };
+        let Some(idx) = KERNEL_SPECS.iter().position(|s| s.name == name) else {
+            continue;
+        };
+        let splitk2_splits = it
+            .next()
+            .and_then(|tok| tok.strip_prefix("splitk2="))
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&s| s >= 2);
+        map.insert(
+            TuneKey { batch, m, n, k },
+            TuneEntry {
+                kernel: idx,
+                splitk2_splits,
+            },
+        );
+    }
+    map
+}
+
+/// Rewrite the whole store (it is small: one line per tuned shape).
+pub(super) fn save_tuned(ctx: &VulkanContext, shader_hash: u64, map: &HashMap<TuneKey, TuneEntry>) {
+    let Some(path) = tune_store_path(ctx) else {
+        return;
+    };
+    let write = || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = String::new();
+        out.push_str(&header_line(ctx, shader_hash));
+        out.push('\n');
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_by_key(|(key, _)| (key.batch, key.m, key.n, key.k));
+        for (key, entry) in entries {
+            out.push_str(&format!(
+                "{} {} {} {} {}",
+                key.batch, key.m, key.n, key.k, KERNEL_SPECS[entry.kernel].name
+            ));
+            if let Some(splits) = entry.splitk2_splits {
+                out.push_str(&format!(" splitk2={splits}"));
+            }
+            out.push('\n');
+        }
+        let mut f = std::fs::File::create(&path)?;
+        f.write_all(out.as_bytes())
+    };
+    if let Err(err) = write() {
+        log::warn!(
+            "tensor-ash: failed to persist tuning store {}: {err}",
+            path.display()
+        );
+    }
+}

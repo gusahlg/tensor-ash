@@ -33,6 +33,135 @@ pub struct MatmulCall<'a> {
     pub accumulate: bool,
 }
 
+/// Elementwise activation applied in the fused GEMM epilogue.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum Activation {
+    #[default]
+    None,
+    Relu,
+    /// `x * sigmoid(x)` (a.k.a. swish).
+    Silu,
+    /// tanh-approximated GELU (matches PyTorch `approximate="tanh"`).
+    Gelu,
+}
+
+impl Activation {
+    #[inline]
+    pub(crate) fn code(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Relu => 1,
+            Self::Silu => 2,
+            Self::Gelu => 3,
+        }
+    }
+}
+
+/// Optional second elementwise operand applied after the activation.
+/// `d` must have exactly C's shape (batch included); it is indexed with
+/// C's layout.
+#[derive(Copy, Clone, Default)]
+pub enum EpilogueBinary<'a> {
+    #[default]
+    None,
+    /// `out = act_result + beta * d` — residual connections.
+    AddScaled { d: &'a Tensor, beta: f32 },
+    /// `out = act_result * d` — SwiGLU-style gating
+    /// (`silu(x@W_gate) * up`).
+    Mul { d: &'a Tensor },
+}
+
+/// Fused epilogue applied while the output tile is still in registers,
+/// in order: `+bias[N]` → activation → binary op with `D`.  Avoids a
+/// full write+read+write round-trip over C for bias/activation/residual
+/// chains.
+///
+/// Requires a BDA kernel (any device with `bufferDeviceAddress`, i.e.
+/// every kernel the auto-selector picks there).  Descriptor-bound
+/// kernels reject epilogues.
+#[derive(Copy, Clone, Default)]
+pub struct Epilogue<'a> {
+    /// Length-N vector added to every output row before activation.
+    pub bias: Option<&'a Tensor>,
+    pub activation: Activation,
+    pub binary: EpilogueBinary<'a>,
+}
+
+impl Epilogue<'_> {
+    pub const NONE: Epilogue<'static> = Epilogue {
+        bias: None,
+        activation: Activation::None,
+        binary: EpilogueBinary::None,
+    };
+
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        self.bias.is_none()
+            && self.activation == Activation::None
+            && matches!(self.binary, EpilogueBinary::None)
+    }
+
+    pub(crate) fn key(&self) -> crate::pipeline::EpilogueKey {
+        crate::pipeline::EpilogueKey {
+            bias: self.bias.is_some(),
+            activation: self.activation.code(),
+            binary: match self.binary {
+                EpilogueBinary::None => 0,
+                EpilogueBinary::AddScaled { .. } => 1,
+                EpilogueBinary::Mul { .. } => 2,
+            },
+        }
+    }
+
+    /// The `D` operand tensor, if any.
+    #[inline]
+    pub(crate) fn d_tensor(&self) -> Option<&Tensor> {
+        match self.binary {
+            EpilogueBinary::None => None,
+            EpilogueBinary::AddScaled { d, .. } | EpilogueBinary::Mul { d } => Some(d),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn beta(&self) -> f32 {
+        match self.binary {
+            EpilogueBinary::AddScaled { beta, .. } => beta,
+            _ => 0.0,
+        }
+    }
+}
+
+/// A GEMM call plus its fused epilogue.  The plain `run_matmuls` /
+/// `run_matmul_graph` entry points wrap each `MatmulCall` in a
+/// `MatmulOp` with `Epilogue::NONE`.
+#[derive(Copy, Clone)]
+pub struct MatmulOp<'a> {
+    pub call: MatmulCall<'a>,
+    pub epilogue: Epilogue<'a>,
+}
+
+impl<'a> MatmulOp<'a> {
+    #[inline]
+    pub fn new(call: MatmulCall<'a>) -> Self {
+        Self {
+            call,
+            epilogue: Epilogue::NONE,
+        }
+    }
+
+    #[inline]
+    pub fn with_epilogue(call: MatmulCall<'a>, epilogue: Epilogue<'a>) -> Self {
+        Self { call, epilogue }
+    }
+}
+
+impl<'a> From<MatmulCall<'a>> for MatmulOp<'a> {
+    #[inline]
+    fn from(call: MatmulCall<'a>) -> Self {
+        Self::new(call)
+    }
+}
+
 /// Per-run statistics. `gpu_time_ns` is the on-device GPU time measured
 /// via timestamp queries, or `None` if the device does not support them.
 #[derive(Debug, Copy, Clone)]
@@ -114,14 +243,13 @@ pub(crate) enum ResolvedMatmulBatch {
 }
 
 impl ResolvedMatmulBatch {
-    pub(crate) fn from_calls(calls: &[MatmulCall<'_>]) -> Result<Self> {
-        if let [call] = calls {
-            return Ok(Self::One([ResolvedMatmul::from_call(call)?]));
+    pub(crate) fn from_ops(ops: &[MatmulOp<'_>]) -> Result<Self> {
+        if let [op] = ops {
+            return Ok(Self::One([ResolvedMatmul::from_op(op)?]));
         }
 
-        calls
-            .iter()
-            .map(ResolvedMatmul::from_call)
+        ops.iter()
+            .map(ResolvedMatmul::from_op)
             .collect::<Result<Vec<_>>>()
             .map(Self::Many)
     }
@@ -140,6 +268,34 @@ impl ResolvedMatmul {
         let b = MatrixShape::from_tensor(call.b)?;
         let c = MatrixShape::from_tensor(call.c)?;
         Self::from_matrix_shapes(a, b, c)
+    }
+
+    pub(crate) fn from_op(op: &MatmulOp<'_>) -> Result<Self> {
+        let resolved = Self::from_call(&op.call)?;
+        resolved.validate_epilogue(op)?;
+        Ok(resolved)
+    }
+
+    /// Shape checks for the fused epilogue: bias must be a length-N
+    /// vector; D must match C's shape exactly (it is indexed with C's
+    /// layout, batch stride included).
+    fn validate_epilogue(&self, op: &MatmulOp<'_>) -> Result<()> {
+        if let Some(bias) = op.epilogue.bias {
+            let numel = bias.len();
+            if numel != self.n as u64 {
+                bail!("epilogue bias has {numel} elements, expected N={}", self.n);
+            }
+        }
+        if let Some(d) = op.epilogue.d_tensor()
+            && d.shape() != op.call.c.shape()
+        {
+            bail!(
+                "epilogue D shape {:?} must equal C shape {:?}",
+                d.shape(),
+                op.call.c.shape()
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn push_constants(
@@ -162,6 +318,10 @@ impl ResolvedMatmul {
             a_ptr,
             b_ptr,
             c_ptr,
+            d_ptr: 0,
+            bias_ptr: 0,
+            beta: 0.0,
+            _pad: 0,
         }
     }
 
@@ -199,6 +359,10 @@ impl ResolvedMatmul {
             a_ptr,
             b_ptr,
             c_ptr,
+            d_ptr: 0,
+            bias_ptr: 0,
+            beta: 0.0,
+            _pad: 0,
         }
     }
 

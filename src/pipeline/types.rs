@@ -23,6 +23,13 @@ pub struct MatmulPushConstants {
     pub a_ptr: u64,
     pub b_ptr: u64,
     pub c_ptr: u64,
+    /// Epilogue residual / gate operand (same shape+layout as C), or 0.
+    pub d_ptr: u64,
+    /// Epilogue bias vector of length N, or 0.
+    pub bias_ptr: u64,
+    /// Scale for the `+= beta * D` residual epilogue.
+    pub beta: f32,
+    pub _pad: u32,
 }
 
 /// Static description of one matmul kernel: its display name, output-tile
@@ -512,6 +519,27 @@ pub struct KernelVariant {
     pub k_multiple: bool,
 }
 
+/// Specialization values for the fused-epilogue constants (IDs 4..6).
+/// The eager per-kernel pipelines are all built with the zero epilogue;
+/// non-zero combinations are compiled lazily on first use and cached in
+/// `MatmulPipeline`.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct EpilogueKey {
+    /// `constant_id = 4`: add a `[N]` bias vector before activation.
+    pub bias: bool,
+    /// `constant_id = 5`: 0=none, 1=relu, 2=silu, 3=gelu(tanh).
+    pub activation: u32,
+    /// `constant_id = 6`: 0=none, 1=`+beta*D`, 2=`*D`.
+    pub binary: u32,
+}
+
+impl EpilogueKey {
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        !self.bias && self.activation == 0 && self.binary == 0
+    }
+}
+
 impl KernelVariant {
     /// Number of distinct variants compiled per kernel.
     pub const COUNT: usize = 16;
@@ -561,6 +589,16 @@ impl MatmulKernel {
     #[inline]
     pub fn pipeline_for(&self, variant: KernelVariant) -> vk::Pipeline {
         self.variants[variant.index()]
+    }
+
+    /// Whether this kernel's shader body implements the fused-epilogue
+    /// specialization constants (IDs 4..6).  True for the BDA and
+    /// BDA_V4 bodies; false for descriptor-bound kernels (no
+    /// buffer_reference access to bias/D) and for the source-stripped
+    /// `*_aligned` bodies.
+    #[inline]
+    pub fn supports_epilogue(&self) -> bool {
+        !self.uses_descriptors && !self.name.ends_with("_aligned")
     }
 }
 

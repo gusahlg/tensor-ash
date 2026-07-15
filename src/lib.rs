@@ -44,10 +44,12 @@ pub mod testing;
 pub use buffer::{Buffer, BufferLocation};
 pub use context::{DeviceKind, DevicePreference, DeviceSummary, VulkanContext};
 pub use executor::Executor;
-pub use matmul::{MatmulCall, MatrixShape, RunStats};
+pub use matmul::{
+    Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, MatrixShape, RunStats,
+};
 pub use persistent::PersistentMatmul;
 pub use pipeline::{
-    KERNEL_SPECS, KernelSelection, KernelSpec, KernelVariant, MatmulKernel, MatmulPipeline,
-    MatmulPushConstants,
+    EpilogueKey, KERNEL_SPECS, KernelSelection, KernelSpec, KernelVariant, MatmulKernel,
+    MatmulPipeline, MatmulPushConstants,
 };
 pub use tensor::Tensor;

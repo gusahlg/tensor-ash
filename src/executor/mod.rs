@@ -25,6 +25,7 @@
 mod recording;
 mod slot;
 mod splitk;
+mod splitk2;
 mod streamk;
 
 use std::collections::VecDeque;
@@ -36,17 +37,19 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::buffer::{Buffer, BufferLocation};
 use crate::context::VulkanContext;
-use crate::matmul::{ResolvedMatmul, ResolvedMatmulBatch, total_flops};
-use crate::pipeline::MatmulPipeline;
+use crate::matmul::{MatmulOp, ResolvedMatmul, ResolvedMatmulBatch, total_flops};
+use crate::pipeline::{MatmulPipeline, TuneEntry, TuneKey};
 use crate::tensor::Tensor;
 
 use recording::{
-    record_matmul_commands, record_matmul_split_k_commands, update_matmul_descriptor_sets,
-    update_split_k_descriptor_set,
+    record_matmul_commands, record_matmul_graph_commands, record_matmul_split_k_commands,
+    record_one_matmul, update_matmul_descriptor_sets, update_split_k_descriptor_set,
 };
 use slot::Slot;
 use splitk::SplitKPipeline;
 pub use splitk::default_num_k_splits;
+use splitk2::SplitK2Pipeline;
+pub use splitk2::SplitK2ReducePushConstants;
 use streamk::StreamKPipeline;
 pub use streamk::{StreamKPushConstants, StreamKSchedule, stream_k_should_fire};
 
@@ -73,9 +76,18 @@ pub struct Executor {
     /// `run_matmuls_split_k`.  See `executor/splitk.rs` for the design
     /// rationale.
     split_k: OnceLock<SplitKPipeline>,
+    /// Two-stage split-K pipeline (scratch partials + reduce), lazily
+    /// built on first use of `run_matmuls_split_k2`.
+    split_k2: OnceLock<SplitK2Pipeline>,
     /// Experimental Stream-K pipeline, lazily built on first use of
     /// `run_matmuls_stream_k`.  See `executor/streamk.rs`.
     stream_k: OnceLock<StreamKPipeline>,
+    /// `ML_TUNE=1`: measure every eligible kernel the first time a new
+    /// shape is submitted, record the winner in the pipeline's
+    /// persistent tuning store, and use it from then on.  Off by
+    /// default — persisted winners from previous tuned runs still
+    /// apply either way.
+    tune_enabled: bool,
 }
 
 impl Executor {
@@ -99,6 +111,9 @@ impl Executor {
                 pipeline.set_layout,
             )?);
         }
+        let tune_enabled = std::env::var("ML_TUNE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         Ok(Self {
             ctx,
             pipeline,
@@ -106,7 +121,9 @@ impl Executor {
             slot_avail: Condvar::new(),
             max_calls_per_submit,
             split_k: OnceLock::new(),
+            split_k2: OnceLock::new(),
             stream_k: OnceLock::new(),
+            tune_enabled,
         })
     }
 
@@ -279,6 +296,167 @@ impl Executor {
                 None
             };
 
+            Ok(gpu_time_ns)
+        }
+    }
+
+    /// Two-stage split-K: stage 1 writes per-split partial planes to
+    /// slot-local scratch (plain stores, no atomics), stage 2 reduces
+    /// them into C.  Deterministic (bit-stable across runs, unlike the
+    /// atomic [`run_matmuls_split_k`]) and needs no
+    /// `VK_EXT_shader_atomic_float`.
+    ///
+    /// `num_k_splits == 0` picks a default from the shape; a resolved
+    /// split count of 1 falls back to the regular `run_matmuls` path.
+    /// `accumulate=true` is rejected (the reducer overwrites C).
+    ///
+    /// [`run_matmuls_split_k`]: Self::run_matmuls_split_k
+    pub fn run_matmuls_split_k2(
+        &self,
+        call: MatmulCall<'_>,
+        num_k_splits: u32,
+    ) -> Result<RunStats> {
+        if call.accumulate {
+            bail!("run_matmuls_split_k2: accumulate=true is not supported");
+        }
+        if !self.ctx.buffer_device_address_enabled {
+            bail!("run_matmuls_split_k2: bufferDeviceAddress not enabled");
+        }
+
+        let resolved = ResolvedMatmul::from_call(&call)?;
+
+        let split_k2 = self.split_k2_pipeline()?;
+        let kernel = split_k2.pick_stage1(resolved.m, resolved.n);
+        let num_k_splits = if num_k_splits == 0 {
+            default_num_k_splits(
+                resolved.batch,
+                resolved.m,
+                resolved.n,
+                resolved.k,
+                kernel.tile_m,
+                kernel.tile_n,
+            )
+        } else {
+            num_k_splits
+        };
+        if num_k_splits <= 1 {
+            return self.run_matmuls(std::slice::from_ref(&call));
+        }
+        if num_k_splits > 0xFFFF {
+            bail!("run_matmuls_split_k2: num_k_splits={num_k_splits} out of range [1, 65535]");
+        }
+
+        let mut slot = self.checkout_slot();
+        let result = self.record_and_run_split_k2(&mut slot, &call, &resolved, num_k_splits);
+        self.checkin_slot(slot);
+
+        let gpu_time_ns = result?;
+        Ok(RunStats {
+            gpu_time_ns,
+            n_calls: 1,
+            total_flops: resolved.total_flops,
+        })
+    }
+
+    /// Lazily build (or fetch) the split-K2 pipeline.
+    fn split_k2_pipeline(&self) -> Result<&SplitK2Pipeline> {
+        if let Some(s) = self.split_k2.get() {
+            return Ok(s);
+        }
+        let built = SplitK2Pipeline::new(&self.ctx)?;
+        Ok(self.split_k2.get_or_init(|| built))
+    }
+
+    /// Grow the slot-local split-K2 scratch to at least `bytes` and
+    /// return its device address.
+    fn ensure_splitk2_scratch(&self, slot: &mut Slot, bytes: u64) -> Result<u64> {
+        let needs_new = slot
+            .splitk2_scratch
+            .as_ref()
+            .is_none_or(|buffer| buffer.size < bytes);
+        if needs_new {
+            slot.splitk2_scratch = Some(Buffer::new(
+                &self.ctx,
+                bytes,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                BufferLocation::Device,
+            )?);
+        }
+        let scratch = slot
+            .splitk2_scratch
+            .as_ref()
+            .expect("split-K2 scratch initialized above");
+        Ok(self.ctx.buffer_device_address(scratch.raw))
+    }
+
+    fn record_and_run_split_k2(
+        &self,
+        slot: &mut Slot,
+        call: &MatmulCall<'_>,
+        resolved: &ResolvedMatmul,
+        num_k_splits: u32,
+    ) -> Result<Option<u64>> {
+        let split_k2 = self
+            .split_k2
+            .get()
+            .expect("split_k2 pipeline built by caller");
+        let plan = splitk2::SplitK2Dispatch::plan(&self.ctx, split_k2, resolved, num_k_splits)?;
+
+        let want_timestamps = self.ctx.timestamps_supported;
+        let query_pool = slot.query_pool;
+        let scratch_ptr = self.ensure_splitk2_scratch(slot, plan.scratch_bytes)?;
+
+        let a_ptr = self.ctx.buffer_device_address(call.a.raw_buffer());
+        let b_ptr = self.ctx.buffer_device_address(call.b.raw_buffer());
+        let c_ptr = self.ctx.buffer_device_address(call.c.raw_buffer());
+
+        unsafe {
+            self.submit_recorded(slot, |dev, cb, _slot| {
+                if want_timestamps {
+                    dev.cmd_reset_query_pool(cb, query_pool, 0, 2);
+                    dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, query_pool, 0);
+                }
+
+                splitk2::record_split_k2_commands(
+                    &self.ctx,
+                    split_k2,
+                    cb,
+                    call.alpha,
+                    resolved,
+                    &plan,
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    scratch_ptr,
+                );
+
+                if want_timestamps {
+                    dev.cmd_write_timestamp(
+                        cb,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        query_pool,
+                        1,
+                    );
+                }
+                Ok(())
+            })?;
+
+            let gpu_time_ns = if want_timestamps {
+                let mut data = [0u64; 2];
+                self.ctx
+                    .device
+                    .get_query_pool_results(
+                        query_pool,
+                        0,
+                        &mut data,
+                        vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                    )
+                    .context("get_query_pool_results (split-k2)")?;
+                let ticks = data[1].wrapping_sub(data[0]);
+                Some((ticks as f64 * self.ctx.timestamp_period_ns) as u64)
+            } else {
+                None
+            };
             Ok(gpu_time_ns)
         }
     }
@@ -708,39 +886,417 @@ impl Executor {
     /// them on the GPU for no benefit.
     ///
     /// If you need to chain calls — i.e. the second call reads a `C`
-    /// that the first call writes — split them into separate
-    /// `run_matmuls` invocations.  Each `run_matmuls` waits for the
-    /// fence, which provides a full GPU sync.
+    /// that the first call writes — use [`run_matmul_graph`], which
+    /// inserts the required barriers automatically and still submits
+    /// once.
+    ///
+    /// [`run_matmul_graph`]: Self::run_matmul_graph
     pub fn run_matmuls(&self, calls: &[MatmulCall<'_>]) -> Result<RunStats> {
-        if calls.is_empty() {
+        self.run_calls_impl(calls, false)
+    }
+
+    /// Run a *dependent* chain of matmul calls in one submission.
+    ///
+    /// Unlike [`run_matmuls`] (which records back-to-back with no
+    /// barriers and therefore requires the calls to be independent),
+    /// this entry point tracks which buffers each call reads and
+    /// writes and inserts a compute→compute barrier exactly where a
+    /// later call depends on an earlier call's output.  The whole
+    /// chain is submitted once and waits on one fence, so a
+    /// multi-layer network step costs one host round-trip instead of
+    /// one per dependency level.
+    ///
+    /// Independent calls between barriers still overlap on the GPU
+    /// exactly as they do in `run_matmuls`.
+    ///
+    /// [`run_matmuls`]: Self::run_matmuls
+    pub fn run_matmul_graph(&self, calls: &[MatmulCall<'_>]) -> Result<RunStats> {
+        self.run_calls_impl(calls, true)
+    }
+
+    /// [`run_matmuls`] for ops with fused epilogues (bias, activation,
+    /// residual add / gating mul applied in-register at store time).
+    /// No inter-op barriers — the ops must be independent.
+    ///
+    /// [`run_matmuls`]: Self::run_matmuls
+    pub fn run_ops(&self, ops: &[MatmulOp<'_>]) -> Result<RunStats> {
+        self.run_ops_impl(ops, false)
+    }
+
+    /// [`run_matmul_graph`] for ops with fused epilogues: dependent
+    /// chains in one submission, hazards (including epilogue bias / D
+    /// operands) resolved with automatic barriers.
+    ///
+    /// [`run_matmul_graph`]: Self::run_matmul_graph
+    pub fn run_op_graph(&self, ops: &[MatmulOp<'_>]) -> Result<RunStats> {
+        self.run_ops_impl(ops, true)
+    }
+
+    fn run_calls_impl(
+        &self,
+        calls: &[MatmulCall<'_>],
+        with_dependency_barriers: bool,
+    ) -> Result<RunStats> {
+        match calls {
+            [] => self.run_ops_impl(&[], with_dependency_barriers),
+            [call] => self.run_ops_impl(&[MatmulOp::new(*call)], with_dependency_barriers),
+            _ => {
+                let ops: Vec<MatmulOp<'_>> = calls.iter().copied().map(MatmulOp::new).collect();
+                self.run_ops_impl(&ops, with_dependency_barriers)
+            }
+        }
+    }
+
+    fn run_ops_impl(
+        &self,
+        ops: &[MatmulOp<'_>],
+        with_dependency_barriers: bool,
+    ) -> Result<RunStats> {
+        if ops.is_empty() {
             return Ok(RunStats {
                 gpu_time_ns: None,
                 n_calls: 0,
                 total_flops: 0,
             });
         }
-        if calls.len() > self.max_calls_per_submit as usize {
+        if ops.len() > self.max_calls_per_submit as usize {
             bail!(
-                "run_matmuls: {} calls > max_calls_per_submit {}",
-                calls.len(),
+                "run_ops: {} ops > max_calls_per_submit {}",
+                ops.len(),
                 self.max_calls_per_submit
             );
         }
 
-        let resolved = ResolvedMatmulBatch::from_calls(calls)?;
+        let resolved = ResolvedMatmulBatch::from_ops(ops)?;
         let resolved = resolved.as_slice();
         let total_flops = total_flops(resolved)?;
 
+        // Online tuning: the first time a new shape arrives as a plain
+        // single non-accumulating op, measure all candidates against
+        // it (each candidate fully overwrites C, so the caller's
+        // result stays correct) and record the winner.  Every later
+        // call — including batched, accumulating, and epilogue ops on
+        // the same shape — picks the winner up via `select_kernel`.
+        if self.tune_enabled
+            && let [op] = ops
+            && !op.call.accumulate
+            && op.epilogue.is_none()
+        {
+            let dims = &resolved[0];
+            let key = TuneKey {
+                batch: dims.batch,
+                m: dims.m,
+                n: dims.n,
+                k: dims.k,
+            };
+            if !self.pipeline.is_tuned(key)
+                && self.ctx.timestamps_supported
+                && let Err(err) = self.tune_op(op, dims)
+            {
+                log::warn!(
+                    "tensor-ash: tuning failed for B={} {}x{}x{}: {err}",
+                    dims.batch,
+                    dims.m,
+                    dims.n,
+                    dims.k
+                );
+            }
+        }
+
+        // Measured reduction routing: shapes whose tuned winner is the
+        // two-stage split-K go through it whenever the call is
+        // compatible (single, plain, non-accumulating).
+        if let [op] = ops
+            && !op.call.accumulate
+            && op.epilogue.is_none()
+        {
+            let dims = &resolved[0];
+            if let Some(splits) = self
+                .pipeline
+                .tuned_splitk2(dims.batch, dims.m, dims.n, dims.k)
+                && !with_dependency_barriers
+            {
+                return self.run_matmuls_split_k2(op.call, splits);
+            }
+        }
+
         let mut slot = self.checkout_slot();
-        let result = self.record_and_run(&mut slot, calls, resolved);
+        let result = self.record_and_run(&mut slot, ops, resolved, with_dependency_barriers);
         self.checkin_slot(slot);
 
         let gpu_time_ns = result?;
         Ok(RunStats {
             gpu_time_ns,
-            n_calls: calls.len(),
+            n_calls: ops.len(),
             total_flops,
         })
+    }
+
+    /// Explicitly tune one GEMM shape against scratch tensors (both
+    /// operands filled with 1.0).  Useful to pre-warm the persistent
+    /// tuning store for shapes an inference workload will hit, without
+    /// paying the measurement cost on the first real call.
+    pub fn tune_shape(&self, batch: u32, m: u32, n: u32, k: u32) -> Result<()> {
+        let key = TuneKey { batch, m, n, k };
+        if self.pipeline.is_tuned(key) {
+            return Ok(());
+        }
+        if !self.ctx.timestamps_supported {
+            bail!("tune_shape: device has no timestamp support");
+        }
+        let shape = |rows: u32, cols: u32| -> Vec<u32> {
+            if batch == 1 {
+                vec![rows, cols]
+            } else {
+                vec![batch, rows, cols]
+            }
+        };
+        let a = Tensor::uninit_device(&self.ctx, &shape(m, k))?;
+        let b = Tensor::uninit_device(&self.ctx, &shape(k, n))?;
+        let c = Tensor::uninit_device(&self.ctx, &shape(m, n))?;
+        // 0x3F800000 == 1.0f32: deterministic, denormal-free inputs.
+        self.fill_buffer_bits(&a, 0x3F80_0000)?;
+        self.fill_buffer_bits(&b, 0x3F80_0000)?;
+        let op = MatmulOp::new(MatmulCall {
+            a: &a,
+            b: &b,
+            c: &c,
+            alpha: 1.0,
+            accumulate: false,
+        });
+        let dims = ResolvedMatmul::from_op(&op)?;
+        self.tune_op(&op, &dims)
+    }
+
+    fn fill_buffer_bits(&self, tensor: &Tensor, bits: u32) -> Result<()> {
+        let mut slot = self.checkout_slot();
+        let res = unsafe {
+            self.submit_recorded(&mut slot, |dev, cb, _slot| {
+                dev.cmd_fill_buffer(cb, tensor.raw_buffer(), 0, vk::WHOLE_SIZE, bits);
+                Ok(())
+            })
+        };
+        self.checkin_slot(slot);
+        res
+    }
+
+    /// Measure every candidate kernel on `op`'s real shape and record
+    /// the winner in the pipeline's tuning store.
+    ///
+    /// Protocol (VkSplat-style measured selection, simplified to
+    /// benchmark-once-and-cache): one clock-warming dispatch, then one
+    /// warmup round plus `R` measured rounds over all candidates,
+    /// candidates *interleaved* per round so GPU clock drift biases no
+    /// single kernel.  Per candidate we keep the minimum GPU time.
+    /// The heuristic's pick stays unless a challenger beats it by >2%
+    /// — measured noise should not churn the store.
+    fn tune_op(&self, op: &MatmulOp<'_>, dims: &ResolvedMatmul) -> Result<()> {
+        let candidates = self.pipeline.tune_candidate_indices();
+        if candidates.is_empty() {
+            bail!("no tunable kernels on this device (bufferDeviceAddress required)");
+        }
+        let heuristic_idx = self
+            .pipeline
+            .heuristic_kernel_index(dims.batch, dims.m, dims.n, dims.k);
+
+        // Fewer rounds for expensive shapes: at ~5 TFLOPS a round of
+        // ~20 candidates on a 30 ms problem already costs ~600 ms.
+        let est_ms = dims.total_flops as f64 / 5e12 * 1e3;
+        let rounds = if est_ms > 30.0 {
+            1
+        } else if est_ms > 8.0 {
+            2
+        } else {
+            3
+        };
+
+        let mut slot = self.checkout_slot();
+        let measure = (|| -> Result<Vec<Option<u64>>> {
+            // Spin the GPU clocks up before anything is timed.
+            let _ = self.run_forced_once(&mut slot, op, dims, heuristic_idx)?;
+            let mut best: Vec<Option<u64>> = vec![None; candidates.len()];
+            for round in 0..=rounds {
+                for (ci, &kernel_idx) in candidates.iter().enumerate() {
+                    match self.run_forced_once(&mut slot, op, dims, kernel_idx) {
+                        // Round 0 is warmup (first-touch pipeline
+                        // fetch, cache state); discard its timing.
+                        Ok(Some(ns)) if round > 0 => {
+                            best[ci] = Some(best[ci].map_or(ns, |b: u64| b.min(ns)));
+                        }
+                        Ok(_) => {}
+                        // Candidate can't run this shape (e.g. dispatch
+                        // grid limits) — leave it unmeasured.
+                        Err(_) => {}
+                    }
+                }
+            }
+            Ok(best)
+        })();
+        self.checkin_slot(slot);
+        let best = measure?;
+
+        let heuristic_ns = candidates
+            .iter()
+            .position(|&idx| idx == heuristic_idx)
+            .and_then(|ci| best[ci]);
+        let challenger = candidates
+            .iter()
+            .zip(best.iter())
+            .filter_map(|(&idx, ns)| ns.map(|ns| (idx, ns)))
+            .min_by_key(|&(_, ns)| ns);
+
+        let Some((mut winner_idx, winner_ns)) = challenger else {
+            bail!("no candidate produced a measurement");
+        };
+        if let Some(heur_ns) = heuristic_ns
+            && (winner_ns as f64) >= (heur_ns as f64) * 0.98
+        {
+            winner_idx = heuristic_idx;
+        }
+
+        // Reduction-strategy pass: on deep-K low-tile shapes, probe the
+        // two-stage split-K against the DP winner.  Record its split
+        // count only when it clears the same 2% margin.
+        let splitk2_splits = self
+            .tune_splitk2(op, dims, winner_ns)
+            .inspect_err(|err| log::debug!("tensor-ash: split-K2 probe skipped: {err}"))
+            .unwrap_or(None);
+
+        let key = TuneKey {
+            batch: dims.batch,
+            m: dims.m,
+            n: dims.n,
+            k: dims.k,
+        };
+        self.pipeline.record_tuned(
+            key,
+            TuneEntry {
+                kernel: winner_idx,
+                splitk2_splits,
+            },
+        );
+        log::info!(
+            "tensor-ash: tuned B={} {}x{}x{}: {}{} ({:.3} ms) — heuristic was {} ({})",
+            dims.batch,
+            dims.m,
+            dims.n,
+            dims.k,
+            self.pipeline.kernel_at(winner_idx).name,
+            splitk2_splits
+                .map(|s| format!(" + splitk2={s}"))
+                .unwrap_or_default(),
+            winner_ns as f64 / 1e6,
+            self.pipeline.kernel_at(heuristic_idx).name,
+            heuristic_ns
+                .map(|ns| format!("{:.3} ms", ns as f64 / 1e6))
+                .unwrap_or_else(|| "unmeasured".into()),
+        );
+        Ok(())
+    }
+
+    /// Measure the two-stage split-K against the best DP time.
+    /// Returns `Some(splits)` when a split count beats `dp_best_ns` by
+    /// the tuning margin.
+    fn tune_splitk2(
+        &self,
+        op: &MatmulOp<'_>,
+        dims: &ResolvedMatmul,
+        dp_best_ns: u64,
+    ) -> Result<Option<u32>> {
+        // Deep-K, few-tiles gate: DP already saturates the device
+        // otherwise and the probe would be wasted work.
+        let tiles = dims.m.div_ceil(128) as u64 * dims.n.div_ceil(128) as u64 * dims.batch as u64;
+        if dims.k < 1024 || tiles > 48 {
+            return Ok(None);
+        }
+        let mn = dims.m as u64 * dims.n as u64 * dims.batch as u64;
+        let mut best: Option<(u64, u32)> = None;
+        for splits in [4u32, 8, 16, 32, 64] {
+            // Each split needs enough K to amortize its tile loads,
+            // and the scratch must stay modest.
+            if dims.k / splits < 128 || mn * splits as u64 * 4 > 256 << 20 {
+                continue;
+            }
+            let mut split_best: Option<u64> = None;
+            for round in 0..3 {
+                let stats = self.run_matmuls_split_k2(op.call, splits)?;
+                if round > 0
+                    && let Some(ns) = stats.gpu_time_ns
+                {
+                    split_best = Some(split_best.map_or(ns, |b| b.min(ns)));
+                }
+            }
+            if let Some(ns) = split_best
+                && best.is_none_or(|(b, _)| ns < b)
+            {
+                best = Some((ns, splits));
+            }
+        }
+        Ok(best
+            .filter(|&(ns, _)| (ns as f64) < (dp_best_ns as f64) * 0.98)
+            .map(|(_, splits)| splits))
+    }
+
+    /// Submit a single dispatch with a forced kernel and return its
+    /// GPU time.  Tuning-only path: requires a BDA kernel (no
+    /// descriptor set is written).
+    fn run_forced_once(
+        &self,
+        slot: &mut Slot,
+        op: &MatmulOp<'_>,
+        dims: &ResolvedMatmul,
+        kernel_idx: usize,
+    ) -> Result<Option<u64>> {
+        let kernel = self.pipeline.kernel_at(kernel_idx);
+        if kernel.uses_descriptors {
+            bail!("run_forced_once: descriptor-bound kernel '{}'", kernel.name);
+        }
+        let want_timestamps = self.ctx.timestamps_supported;
+        let query_pool = slot.query_pool;
+        unsafe {
+            self.submit_recorded(slot, |dev, cb, _slot| {
+                if want_timestamps {
+                    dev.cmd_reset_query_pool(cb, query_pool, 0, 2);
+                    dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, query_pool, 0);
+                }
+                let mut bound = vk::Pipeline::null();
+                record_one_matmul(
+                    &self.ctx,
+                    &self.pipeline,
+                    cb,
+                    vk::DescriptorSet::null(),
+                    op,
+                    dims,
+                    kernel,
+                    &mut bound,
+                )?;
+                if want_timestamps {
+                    dev.cmd_write_timestamp(
+                        cb,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        query_pool,
+                        1,
+                    );
+                }
+                Ok(())
+            })?;
+
+            if !want_timestamps {
+                return Ok(None);
+            }
+            let mut data = [0u64; 2];
+            self.ctx
+                .device
+                .get_query_pool_results(
+                    query_pool,
+                    0,
+                    &mut data,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )
+                .context("get_query_pool_results (tuning)")?;
+            let ticks = data[1].wrapping_sub(data[0]);
+            Ok(Some((ticks as f64 * self.ctx.timestamp_period_ns) as u64))
+        }
     }
 
     fn checkout_slot(&self) -> Slot {
@@ -837,13 +1393,62 @@ impl Executor {
     fn record_and_run(
         &self,
         slot: &mut Slot,
-        calls: &[MatmulCall<'_>],
+        ops: &[MatmulOp<'_>],
         resolved: &[ResolvedMatmul],
+        with_dependency_barriers: bool,
     ) -> Result<Option<u64>> {
-        debug_assert_eq!(calls.len(), resolved.len());
+        debug_assert_eq!(ops.len(), resolved.len());
         let want_timestamps = self.ctx.timestamps_supported;
         let query_pool = slot.query_pool;
-        let descriptor_set_count = calls.len();
+        let descriptor_set_count = ops.len();
+
+        // Graph submissions can route individual ops through the
+        // two-stage split-K when the shape's tuned winner says so
+        // (graphs already carry barriers, so split-K2's internal
+        // barrier costs nothing extra).  Plan scratch offsets up
+        // front so all routed ops share one slot-local buffer.
+        let mut graph_plans: Vec<Option<(splitk2::SplitK2Dispatch, u64)>> = Vec::new();
+        let mut graph_scratch_addr = 0u64;
+        let mut graph_sk2: Option<&SplitK2Pipeline> = None;
+        if with_dependency_barriers && self.ctx.buffer_device_address_enabled {
+            let mut offset = 0u64;
+            let mut plans = vec![None; ops.len()];
+            for (i, (op, dims)) in ops.iter().zip(resolved.iter()).enumerate() {
+                if op.call.accumulate || !op.epilogue.is_none() {
+                    continue;
+                }
+                let Some(splits) = self
+                    .pipeline
+                    .tuned_splitk2(dims.batch, dims.m, dims.n, dims.k)
+                else {
+                    continue;
+                };
+                let pipe = match graph_sk2 {
+                    Some(p) => p,
+                    None => {
+                        let p = self.split_k2_pipeline()?;
+                        graph_sk2 = Some(p);
+                        p
+                    }
+                };
+                if let Ok(plan) = splitk2::SplitK2Dispatch::plan(&self.ctx, pipe, dims, splits) {
+                    plans[i] = Some((plan, offset));
+                    offset += plan.scratch_bytes.next_multiple_of(16);
+                }
+            }
+            if offset > 0 {
+                graph_scratch_addr = self.ensure_splitk2_scratch(slot, offset)?;
+                graph_plans = plans;
+            }
+        }
+        let graph_splitk2 = match (graph_sk2, graph_plans.is_empty()) {
+            (Some(pipeline), false) => Some(recording::GraphSplitK2 {
+                pipeline,
+                scratch_addr: graph_scratch_addr,
+                plans: &graph_plans,
+            }),
+            _ => None,
+        };
 
         unsafe {
             // Point the slot's pre-allocated descriptor sets at this
@@ -857,8 +1462,8 @@ impl Executor {
             update_matmul_descriptor_sets(
                 &self.ctx,
                 &self.pipeline,
-                &slot.descriptor_sets[..calls.len()],
-                calls,
+                &slot.descriptor_sets[..ops.len()],
+                ops,
                 resolved,
             );
 
@@ -869,14 +1474,26 @@ impl Executor {
                 }
 
                 let descriptor_sets = &slot.descriptor_sets[..descriptor_set_count];
-                record_matmul_commands(
-                    &self.ctx,
-                    &self.pipeline,
-                    cb,
-                    descriptor_sets,
-                    calls,
-                    resolved,
-                )?;
+                if with_dependency_barriers {
+                    record_matmul_graph_commands(
+                        &self.ctx,
+                        &self.pipeline,
+                        cb,
+                        descriptor_sets,
+                        ops,
+                        resolved,
+                        graph_splitk2.as_ref(),
+                    )?;
+                } else {
+                    record_matmul_commands(
+                        &self.ctx,
+                        &self.pipeline,
+                        cb,
+                        descriptor_sets,
+                        ops,
+                        resolved,
+                    )?;
+                }
 
                 if want_timestamps {
                     dev.cmd_write_timestamp(

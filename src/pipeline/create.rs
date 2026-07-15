@@ -6,7 +6,68 @@ use scopeguard::ScopeGuard;
 
 use crate::context::VulkanContext;
 
-use super::types::{KernelVariant, MatmulKernel};
+use super::types::{EpilogueKey, KernelVariant, MatmulKernel};
+
+/// Build one pipeline for a (kernel, base-variant, epilogue) triple.
+/// Used by the lazy epilogue-pipeline cache in `MatmulPipeline` — the
+/// eager `create_kernel` path only builds the zero-epilogue variants.
+pub(super) fn create_epilogue_pipeline(
+    ctx: &Arc<VulkanContext>,
+    kernel: &MatmulKernel,
+    variant: KernelVariant,
+    epilogue: EpilogueKey,
+) -> Result<vk::Pipeline> {
+    unsafe {
+        let entry = std::ffi::CString::new("main").unwrap();
+        let spec_entries: Vec<vk::SpecializationMapEntry> = (0u32..7)
+            .map(|i| {
+                vk::SpecializationMapEntry::default()
+                    .constant_id(i)
+                    .offset(i * 4)
+                    .size(4)
+            })
+            .collect();
+        let spec_data: [u32; 7] = [
+            variant.accumulate as u32,
+            variant.alpha_is_one as u32,
+            variant.interior_only as u32,
+            variant.k_multiple as u32,
+            epilogue.bias as u32,
+            epilogue.activation,
+            epilogue.binary,
+        ];
+        let spec_info = vk::SpecializationInfo::default()
+            .map_entries(&spec_entries)
+            .data(bytemuck::cast_slice(&spec_data));
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(kernel.shader_module)
+            .name(&entry)
+            .specialization_info(&spec_info);
+        let create_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(kernel.pipeline_layout);
+
+        match ctx.device.create_compute_pipelines(
+            ctx.pipeline_cache,
+            std::slice::from_ref(&create_info),
+            None,
+        ) {
+            Ok(pipelines) => Ok(pipelines[0]),
+            Err((partial, err)) => {
+                for p in partial {
+                    if p != vk::Pipeline::null() {
+                        ctx.device.destroy_pipeline(p, None);
+                    }
+                }
+                Err(anyhow!(
+                    "create_compute_pipelines (epilogue {epilogue:?} on {}): {err}",
+                    kernel.name
+                ))
+            }
+        }
+    }
+}
 
 /// Destroy every Vulkan object owned by `kernel`.  Safe to call on a
 /// partially-built kernel: null handles are skipped.

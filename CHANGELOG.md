@@ -2,6 +2,102 @@
 
 ## [Unreleased]
 
+## v1.3.0 - 2026-07-15
+
+VkSplat-inspired systems release: the library stops being "a pile of
+GEMM shaders + a hand-tuned selector" and gains measured runtime
+adaptation, fused epilogues, dependent-graph submission, and a
+deterministic two-stage split-K.  Design notes: the guiding ideas are
+work-elimination before work-optimization, accumulate-locally-then-
+commit, fuse-so-intermediates-never-touch-VRAM, and measure-instead-of-
+model (per the VkSplat Eurographics'26 write-up + `IDEAS.md` items
+14/65/79/95/109/120).
+
+### Added
+
+- **Measured kernel auto-tuner with a persistent per-device store**
+  (`src/pipeline/tuning.rs`).  With `ML_TUNE=1`, the first plain
+  single-call submission of a new shape measures every BDA-family
+  kernel on the *caller's real problem* (interleaved rounds, min GPU
+  timestamp per candidate, 1 discarded warmup round, >2% margin
+  required to unseat the heuristic prior) and records the winner in
+  `$XDG_CACHE_HOME/tensor-ash/tuned_kernels_v<vendor>_<device>.txt`.
+  The store header pins driver version + an FNV hash of every embedded
+  SPIR-V, so driver updates or shader edits invalidate it wholesale.
+  Persisted winners are loaded and applied on every run (tuning off or
+  on); `ML_KERNEL=` overrides everything.  `Executor::tune_shape()`
+  pre-warms shapes explicitly.  Measured wins on the RTX 3070 showcase
+  set vs the hand heuristic: batched_2x512 +19%, batched_8x256 +19%,
+  batched_4x256 +14%, small_k_1024x1024x64 +11%, square_512 +8%,
+  non_pow2_513 +8%, attn_qkv/attn_proj +3-4% — mostly by discovering
+  that `k64_bda_v4_tm8_tn4` generalizes far beyond the shapes the
+  hand-written rules gave it.
+- **Fused GEMM epilogues** (`MatmulOp` + `Epilogue`): per-column bias,
+  ReLU / SiLU / tanh-GELU activations, and a binary second operand —
+  residual `+ beta*D` or SwiGLU-style gating `* D` — applied while the
+  output tile is still in registers.  Implemented as three new
+  specialization constants (IDs 4..6) in the BDA and BDA_V4 kernel
+  bodies; the zero-epilogue pipelines are bit-identical to before and
+  epilogue pipeline variants compile lazily on first use through the
+  persistent pipeline cache.  Push constants grew to 80 bytes
+  (`d_ptr`, `bias_ptr`, `beta`); descriptor-bound kernels reject
+  epilogues.  New entry points `Executor::run_ops` /
+  `Executor::run_op_graph`.
+- **Dependency-aware graph executor** (`Executor::run_matmul_graph` /
+  `run_op_graph`): records a dependent chain of matmuls in one command
+  buffer, tracking per-buffer read/write hazards (RAW/WAW/WAR,
+  epilogue operands included) and inserting compute→compute barriers
+  only where needed — one submit, one fence wait per chain instead of
+  one per dependency level.  Independent ops between barriers still
+  overlap exactly as in `run_matmuls`.
+- **Two-stage split-K** (`Executor::run_matmuls_split_k2` +
+  `shaders/matmul_splitk2_kernel.glsl` / `matmul_f32_splitk2_reduce.comp`):
+  stage 1 plain-stores per-split partial planes into slot-local scratch
+  (no atomics, no `VK_EXT_shader_atomic_float` requirement), stage 2
+  sums the planes into C.  Deterministic — bit-stable across runs,
+  unlike the atomic split-K.  Measured on RTX 3070: 64x64x8192 16.5x
+  over DP (0.413 → 0.025 ms), 128x128x8192 4.6x, 256x256x4096 1.8x,
+  128x128x2048 2.1x (and 30% over *atomic* split-K).  The tuner probes
+  split counts {4..64} on deep-K low-tile shapes (K >= 1024, <= 48
+  128x128-tiles) and records `splitk2=N` in the store; auto dispatch
+  routes single plain calls — and graph ops, inline with their own
+  scratch regions — through it.
+- Correctness suites for all of the above: `tests/correctness/graph.rs`
+  (chains, diamonds, accumulate-into-prior-output, bit-identical vs
+  sequential), `epilogue.rs` (10 cases across interior-vec4 and edge
+  store paths + hazard tracking of epilogue operands + shape
+  validation), `splitk2.rs` (deep-K, uneven splits, scalar reduce path,
+  batching, determinism), `tuning.rs`.
+- `examples/bench_splitk2.rs`: DP vs atomic split-K vs two-stage
+  split-K probe.
+
+### Changed
+
+- **`examples/synth_llama_layer.rs`** now compares dependency-ordered
+  split submissions against a single `run_op_graph` submission with the
+  SwiGLU (`silu(x@W_gate) * up`) fused into the gate GEMM epilogue.
+  This also fixes a latent hazard in the old example (`down` consumed
+  `up`'s output inside one barrier-less `run_matmuls`).  End-to-end at
+  M=1 on the RTX 3070: 907 → ~1235 tok/s (+36%) from tuned kernels +
+  split-K2 routing + single-submit graphs, now *including* the SwiGLU
+  that the old example never computed.
+- `MatmulPushConstants` grew from 56 to 80 bytes (three epilogue
+  fields).  The GLSL PC blocks of the BDA/BDA_V4 bodies grew to match;
+  descriptor-bound and split-K/stream-K shaders are unchanged (their
+  blocks remain prefixes of the pushed range).
+- `KERNEL_SPECS` kernels report `supports_epilogue()` (true for
+  bounds-checked BDA-family bodies).
+
+### Notes
+
+- Tuning measurements run on the caller's tensors (every candidate
+  fully overwrites C with `accumulate=false`), so the first tuned call
+  still returns correct results — it just takes a few extra
+  milliseconds.  One-shot shapes should leave `ML_TUNE` off and rely on
+  the heuristic or a pre-populated store.
+- The C ABI is unchanged; epilogues/graphs are not yet exposed through
+  `tensor-ash-capi`.
+
 ## v1.2.1 - 2026-06-14
 
 Hygiene patch on top of v1.2.0. No perf changes, no public-API changes.

@@ -1,0 +1,75 @@
+#version 460
+// =====================================================================
+//  Two-stage split-K, stage 2: sum the per-split scratch planes into C.
+//
+//  Scratch layout (written by matmul_splitk2_kernel.glsl):
+//      scratch[(batch * num_splits + split) * mn + e],  e in [0, mn)
+//  Output:
+//      c[batch * mn + e] = sum over splits
+//
+//  One invocation reduces four consecutive output elements.  When the
+//  plane size is 16-byte aligned (mn % 4 == 0) the loads and store are
+//  vec4; otherwise a scalar fallback handles plane-crossing lanes.
+//  Alpha was already applied by stage 1.
+// =====================================================================
+
+#extension GL_EXT_buffer_reference         : require
+#extension GL_EXT_buffer_reference2        : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer F32V4ReadOnly {
+    vec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict writeonly buffer F32V4WriteOnly {
+    vec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict writeonly buffer F32WriteOnly {
+    float v[];
+};
+
+layout(push_constant) uniform PC {
+    uint total;        // batch * mn output elements
+    uint mn;           // M * N (one plane)
+    uint num_splits;
+    uint _pad;
+    F32ReadOnly  scratch;
+    F32WriteOnly c;
+} pc;
+
+void main() {
+    const uint base = gl_GlobalInvocationID.x * 4u;
+    if (base >= pc.total) return;
+
+    if ((pc.mn & 3u) == 0u && base + 4u <= pc.total) {
+        // Whole vec4 lies in one plane (mn is a multiple of 4).
+        const uint b = base / pc.mn;
+        const uint e = base % pc.mn;
+        const uint src0 = b * pc.num_splits * pc.mn + e;
+        F32V4ReadOnly scratch4 = F32V4ReadOnly(uint64_t(pc.scratch));
+        vec4 acc = vec4(0.0);
+        for (uint s = 0u; s < pc.num_splits; ++s) {
+            acc += scratch4.v[(src0 + s * pc.mn) >> 2u];
+        }
+        F32V4WriteOnly c4 = F32V4WriteOnly(uint64_t(pc.c));
+        c4.v[base >> 2u] = acc;
+    } else {
+        // Scalar fallback: lanes may cross plane boundaries.
+        for (uint lane = 0u; lane < 4u; ++lane) {
+            const uint i = base + lane;
+            if (i >= pc.total) break;
+            const uint b = i / pc.mn;
+            const uint e = i % pc.mn;
+            const uint src0 = b * pc.num_splits * pc.mn + e;
+            float acc = 0.0;
+            for (uint s = 0u; s < pc.num_splits; ++s) {
+                acc += pc.scratch.v[src0 + s * pc.mn];
+            }
+            pc.c.v[i] = acc;
+        }
+    }
+}

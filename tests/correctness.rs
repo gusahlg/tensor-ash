@@ -13,6 +13,10 @@ mod common;
 
 #[path = "correctness/batch.rs"]
 mod batch;
+#[path = "correctness/epilogue.rs"]
+mod epilogue;
+#[path = "correctness/graph.rs"]
+mod graph;
 #[path = "correctness/kernels.rs"]
 mod kernels;
 #[path = "correctness/ops.rs"]
@@ -21,7 +25,11 @@ mod ops;
 mod property;
 #[path = "correctness/shapes.rs"]
 mod shapes;
+#[path = "correctness/splitk2.rs"]
+mod splitk2;
 #[path = "correctness/streamk.rs"]
 mod streamk;
 #[path = "correctness/submission.rs"]
 mod submission;
+#[path = "correctness/tuning.rs"]
+mod tuning;

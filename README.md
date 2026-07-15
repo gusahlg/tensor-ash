@@ -1,6 +1,6 @@
 # tensor-ash
 
-Version: `1.2.1`
+Version: `1.3.0`
 
 `tensor-ash` is a small Vulkan compute library for high-throughput FP32 matrix
 multiplication, written in Rust on top of [`ash`](https://crates.io/crates/ash).
@@ -8,10 +8,13 @@ It is designed to sit close to the hardware: explicit GPU buffers, explicit
 submission, GPU-timestamp measurements, and a narrow public surface that's easy
 to inspect and tune.
 
-The current scope is batched GEMM. The compute backend, kernel selector, and
-executor are built around a data-driven `KERNEL_SPECS` registry, so adding a
-new tile shape is a two-line change plus a `.comp` wrapper — the rest of the
-pipeline picks it up automatically.
+The current scope is batched GEMM plus fused GEMM epilogues (bias,
+activations, residual/gating), executed either as independent batches or as
+dependent graphs in a single submission. The compute backend, kernel
+selector, and executor are built around a data-driven `KERNEL_SPECS`
+registry, so adding a new tile shape is a two-line change plus a `.comp`
+wrapper — the rest of the pipeline (including the measured auto-tuner) picks
+it up automatically.
 
 ## Scope and API status
 
@@ -36,6 +39,20 @@ callable GEMM component; those runtimes still need their own adapter layer.
   auto-selector. The selector promotes every eligible pick to the `BDA_V4`
   family when the device supports it (with a `BDA` fallback for the TN=2
   `m64n32` tile, which has no V4 sibling).
+- **Measured auto-tuning** (`ML_TUNE=1`): first sight of a new shape
+  benchmarks every eligible kernel — and the two-stage split-K on deep-K
+  shapes — on the caller's real problem, then persists the winner per
+  device/driver/shader-build under `$XDG_CACHE_HOME/tensor-ash/`.
+  Persisted winners apply on every later run automatically.
+- **Fused epilogues** (`MatmulOp` / `Epilogue`): bias + ReLU/SiLU/GELU +
+  residual-add or SwiGLU-style gating applied in-register at store time —
+  `silu(x @ W_gate) * up` is one dispatch.
+- **Graph submission** (`run_matmul_graph` / `run_op_graph`): dependent
+  chains recorded into one command buffer with automatic hazard barriers;
+  one fence wait per chain.
+- **Two-stage split-K** (`run_matmuls_split_k2`): deterministic scratch-plane
+  partials + reduce, no atomics; up to 16x over the data-parallel path on
+  deep-K skinny shapes and auto-routed via the tuner.
 - Manual override (`ML_KERNEL=...`) over the entire registry.
 - Persistent device-qualified Vulkan pipeline cache under
   `$XDG_CACHE_HOME/tensor-ash/`.
@@ -125,6 +142,24 @@ exec.download(&c, &mut host_c)?;
 println!("{:?}", stats.tflops());
 ```
 
+Fused epilogues and dependent graphs:
+
+```rust
+use tensor_ash::{Activation, Epilogue, EpilogueBinary, MatmulOp};
+
+// One submission for a dependent chain; `gated = silu(x@Wg) * up` is a
+// single dispatch, and the hazard barriers are inserted automatically.
+exec.run_op_graph(&[
+    MatmulOp::new(MatmulCall { a: &x, b: &w_up, c: &up, alpha: 1.0, accumulate: false }),
+    MatmulOp::with_epilogue(
+        MatmulCall { a: &x, b: &w_gate, c: &gated, alpha: 1.0, accumulate: false },
+        Epilogue { bias: None, activation: Activation::Silu,
+                   binary: EpilogueBinary::Mul { d: &up } },
+    ),
+    MatmulOp::new(MatmulCall { a: &gated, b: &w_down, c: &out, alpha: 1.0, accumulate: false }),
+])?;
+```
+
 ## C ABI
 
 The C ABI lives in `tensor-ash-capi` and is declared in
@@ -149,9 +184,17 @@ Subcommands: `self-check`, `correctness`, `sweep`, `single`, `concurrent`,
 ```bash
 ML_B=4 ML_M=1024 ML_N=1024 ML_K=1024 cargo run --release --bin ml_bench -- single
 ML_KERNEL=k64_bda_v4 cargo run --release --bin ml_bench -- single
+ML_TUNE=1 ML_M=768 ML_N=768 ML_K=768 cargo run --release --bin ml_bench -- single
 ML_DEVICE=discrete cargo run --release --bin ml_bench -- self-check
 ML_OUTPUT=csv ML_SWEEP=smoke cargo run --release --bin ml_bench -- sweep
 ```
+
+`ML_TUNE=1` measures every eligible kernel (and the two-stage split-K on
+deep-K shapes) the first time a shape is seen and persists the winner under
+`$XDG_CACHE_HOME/tensor-ash/tuned_kernels_*.txt`, keyed to the driver
+version + shader build. Persisted winners are applied on **every** run —
+tuning enabled or not — whenever `ML_KERNEL` is `auto`. Delete the store (or
+update the driver / rebuild shaders) to reset it.
 
 `ML_KERNEL=auto` is the default. Concrete names span every entry in
 `KERNEL_SPECS`: descriptor-bound tiles (`large`, `small`, `m64n128`,
@@ -194,35 +237,41 @@ backend attempt, lives in `benchmarks/process.md`.
 
 ### Results
 
-Latest run: `showcase` set on an RTX 3070 (`benchmarks/latest.md`), 30 iters /
-10 warmups, FP32 throughout. Numbers are quoted as `% peak` against the RTX
-3070's 20.32 TFLOPS FP32 ceiling (`ML_PEAK_TFLOPS`, overridable for other
-GPUs).
+Latest run: `showcase` set on an RTX 3070, driver 595.80
+(`benchmarks/latest.md`), 30 iters / 10 warmups, FP32 throughout, measured
+selection pre-tuned with `ML_TUNE=1`. Numbers are quoted as `% peak` against
+the RTX 3070's 20.32 TFLOPS FP32 ceiling (`ML_PEAK_TFLOPS`, overridable for
+other GPUs).
 
-- `tensor-ash` is the fastest measured backend on **14/26** showcase cases.
-- vs the apples-to-apples **pure cuBLAS** baseline: geomean **1.146x** across
-  26 shared cases (range 0.83x-2.31x).
-- vs **PyTorch CUDA/cuBLAS**: geomean **~1.32x** when PyTorch is installed
-  (range 0.82x-3.62x in earlier runs) — the wrapper overhead alone shows up
-  as a meaningful gap.
-- vs **CuPy CUDA/cuBLAS** when installed: geomean **~2.6x**.
-- vs single-threaded **NumPy / PyTorch CPU**: ~45-48x.
-- Headline silicon-limit points: `attn_qkv_1024x3072x512` hits **51.2% peak**
-  (10.41 TFLOPS) vs pure cuBLAS at **56.1%**; `square_1024` hits **50.1%
-  peak** (10.17 TFLOPS) vs pure cuBLAS at **54.0%**.
-- New cuBLAS-beating shapes in v1.2.0: `medium_384` (1.045x) and
-  `tall_512x256x256` (essentially tied, 0.998x); `skinny_1024x128x512` and
-  `wide_128x1024x512` close from ~0.88x to ~0.93-0.98x.
-- Median synchronous host/submission overhead: ~0.022 ms per GEMM call;
-  reported TFLOPS uses GPU timestamps and excludes it.
+- `tensor-ash` is the fastest measured backend on **16/26** showcase cases
+  (was 14/26 in v1.2.x).
+- vs the apples-to-apples **pure cuBLAS** baseline: geomean **1.18x** across
+  26 shared cases (range 0.83x-2.55x; was 1.146x).
+- vs **PyTorch CUDA/cuBLAS**: geomean **1.40x** (range 0.87x-3.64x).
+- vs **CuPy CUDA/cuBLAS**: geomean **2.74x**.
+- vs single-threaded **NumPy / PyTorch CPU**: ~47-48x.
+- Headline silicon-limit points: `attn_qkv_1024x3072x512` hits **53.4% peak**
+  (10.84 TFLOPS); `square_1024` **50.1%** (10.19 TFLOPS).
+- Biggest v1.3.0 movers, all from the measured tuner discovering that the
+  `k64_bda_v4_tm8_tn4` register tile generalizes far beyond its hand-written
+  routing rules: `batched_2x512` 7.86→9.43 TFLOPS (+20%), `batched_8x256`
+  7.35→8.61 (+17%), `tiny_b16_192` 6.16→7.09 (+15%), `small_k_1024x1024x64`
+  6.69→7.37 (+10%), `square_512` 6.46→6.87 (+6%), `batched_64x128`
+  6.93→7.81 (+13%).
+- Off-showcase, the two-stage split-K transforms the deep-K band:
+  `64x64x8192` runs 16.5x faster than the data-parallel path
+  (0.413→0.025 ms), `128x128x8192` 4.6x, `256x256x4096` 1.8x — and is
+  deterministic, unlike the atomic split-K.
+- Median synchronous host/submission overhead: ~0.020 ms per GEMM call;
+  reported TFLOPS uses GPU timestamps and excludes it. Dependent chains can
+  amortize it via `run_matmul_graph` (one submission + one fence per chain).
 
 So: ahead of pure cuBLAS on geomean, decisively ahead of PyTorch CUDA, still
-trailing cuBLAS on a handful of big square / non-pow2 cases where its
-hand-tuned kernels show their edge. The BDA / BDA_V4 path is where the bulk
-of recent gains came from — every tile we measured gains ~5-15% from
-`LDG.E.128` and another ~5-15% from `LDS.E.128` — plus a +4-7% win on the
-K64-routed shape band from the `k64_bda_v4_tm8_tn4` register-tile variant
-landed in v1.2.0.
+trailing cuBLAS on a handful of big square / non-pow2 cases
+(`medium_768` 0.83x, `non_pow2_1023x1025x1027` 0.84x) where its hand-tuned
+kernels keep an in-kernel edge — the tuner confirms our best registry kernel
+is already selected there, so closing that gap needs new kernel work, not
+better selection.
 
 Selector tuning without overwriting the benchmark report:
 
@@ -247,10 +296,13 @@ reports `llvmpipe`, results are software-renderer numbers; use
 src/
   context/         Vulkan instance/device setup, BDA + atomic-float feature
                    wiring, cache paths
-  pipeline/        Data-driven KERNEL_SPECS registry, auto-selector, BDA and
-                   aligned promotion helpers
+  pipeline/        Data-driven KERNEL_SPECS registry, auto-selector, BDA
+                   promotion helpers, lazy epilogue pipelines
+    tuning.rs      Measured-selection store (persistent per-device winners)
   executor/        Thread-safe executor, submission slots, command recording
-    splitk.rs      Experimental split-K pipeline
+                   (independent batches + hazard-barriered graphs), tuner
+    splitk.rs      Experimental atomic split-K pipeline
+    splitk2.rs     Two-stage split-K (scratch partials + reduce, no atomics)
     streamk.rs     Experimental Stream-K (hybrid DP-flat + SK-tail) pipeline
   bench/           ml_bench subcommands, output formatting, case definitions
   buffer.rs        Device/staging buffer wrappers (BDA-aware)
@@ -258,8 +310,11 @@ shaders/
   matmul_kernel.glsl              Original descriptor-bound GEMM body
   matmul_bda_kernel.glsl          buffer_reference body (LDG.E.128)
   matmul_bda_v4_kernel.glsl       BDA + shared uvec4 Bs body (LDS.E.128)
+  matmul_epilogue_common.glsl     Fused-epilogue helpers (spec consts 4..6)
   matmul_bda_v4_aligned_kernel.glsl
                                   Strict no-bounds-check BDA_V4 hot path
+  matmul_splitk2_kernel.glsl      Two-stage split-K stage 1 (partial planes)
+  matmul_f32_splitk2_reduce.comp  Two-stage split-K stage 2 (plane sum)
   matmul_streamk_kernel.glsl      Stream-K SK-tail (persistent + atomicAdd)
   matmul_streamk_dp_kernel.glsl   Stream-K DP-flat bulk dispatch
   matmul_f32*.comp                Tile wrappers; *_bda / *_bda_v4 siblings

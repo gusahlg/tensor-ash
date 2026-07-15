@@ -81,7 +81,12 @@ layout(push_constant) uniform PC {
     F32ReadOnly  a_ptr;
     F32ReadOnly  b_ptr;
     F32ReadWrite c_ptr;
+    F32ReadOnly  d_ptr;
+    F32ReadOnly  bias_ptr;
+    float beta;
 } pc;
+
+#include "matmul_epilogue_common.glsl"
 
 shared float As[BM][BK + 1u];
 shared float Bs[BK][BN];
@@ -254,12 +259,10 @@ void main() {
         [[unroll]] for (uint i = 0u; i < TM; ++i) {
             const uint row_off = c_base + (row_base + i) * pc.N + col_base;
             [[unroll]] for (uint j = 0u; j < TN; ++j) {
-                const float v = ALPHA_IS_ONE ? acc[i][j] : alpha * acc[i][j];
-                if (ACCUMULATE) {
-                    c_s.v[row_off + j] = c_s.v[row_off + j] + v;
-                } else {
-                    c_s.v[row_off + j] = v;
-                }
+                float v = ALPHA_IS_ONE ? acc[i][j] : alpha * acc[i][j];
+                if (ACCUMULATE) v = c_s.v[row_off + j] + v;
+                if (EPI_ANY) v = epi_apply(v, row_off + j, col_base + j);
+                c_s.v[row_off + j] = v;
             }
         }
     } else {
@@ -271,12 +274,10 @@ void main() {
             [[unroll]] for (uint j = 0u; j < TN; ++j) {
                 const uint g_col = col_base + j;
                 if (g_col >= pc.N) continue;
-                const float v = ALPHA_IS_ONE ? acc[i][j] : alpha * acc[i][j];
-                if (ACCUMULATE) {
-                    c_s.v[row_off + g_col] = c_s.v[row_off + g_col] + v;
-                } else {
-                    c_s.v[row_off + g_col] = v;
-                }
+                float v = ALPHA_IS_ONE ? acc[i][j] : alpha * acc[i][j];
+                if (ACCUMULATE) v = c_s.v[row_off + g_col] + v;
+                if (EPI_ANY) v = epi_apply(v, row_off + g_col, g_col);
+                c_s.v[row_off + g_col] = v;
             }
         }
     }

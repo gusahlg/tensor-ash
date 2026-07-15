@@ -2,12 +2,25 @@ use anyhow::{Result, bail};
 use ash::vk;
 
 use crate::context::VulkanContext;
-use crate::matmul::ResolvedMatmul;
+use crate::matmul::{MatmulOp, ResolvedMatmul};
 use crate::pipeline::{KernelVariant, MatmulPipeline};
 use crate::tensor::Tensor;
 
 use super::MatmulCall;
 use super::splitk::SplitKKernel;
+use super::splitk2::{SplitK2Dispatch, SplitK2Pipeline, record_split_k2_commands};
+
+/// Split-K2 routing context for a graph recording: which ops route
+/// through the two-stage path, and where each op's scratch region
+/// lives inside the slot's scratch buffer.
+pub(super) struct GraphSplitK2<'a> {
+    pub(super) pipeline: &'a SplitK2Pipeline,
+    /// Device address of the slot scratch buffer (16-byte aligned).
+    pub(super) scratch_addr: u64,
+    /// Per-op `(plan, byte offset into scratch)`; `None` = regular DP
+    /// dispatch.
+    pub(super) plans: &'a [Option<(SplitK2Dispatch, u64)>],
+}
 
 /// Point the pre-allocated descriptor sets at this submission's A/B/C
 /// tensors.  `sets.len()` must equal `calls.len()`; the caller is
@@ -25,18 +38,19 @@ pub(super) fn update_matmul_descriptor_sets(
     ctx: &VulkanContext,
     pipeline: &MatmulPipeline,
     sets: &[vk::DescriptorSet],
-    calls: &[MatmulCall<'_>],
+    ops: &[MatmulOp<'_>],
     resolved: &[ResolvedMatmul],
 ) {
-    debug_assert_eq!(sets.len(), calls.len());
+    debug_assert_eq!(sets.len(), ops.len());
     debug_assert_eq!(sets.len(), resolved.len());
 
     // Build buffer-info + writes only for calls that actually need a
     // descriptor write.  Keep buffer_infos stable so the
     // &[WriteDescriptorSet] we hand to Vulkan keeps stable references.
-    let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::with_capacity(calls.len() * 3);
-    let mut needs_write: Vec<bool> = Vec::with_capacity(calls.len());
-    for (call, dims) in calls.iter().zip(resolved.iter()) {
+    let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::with_capacity(ops.len() * 3);
+    let mut needs_write: Vec<bool> = Vec::with_capacity(ops.len());
+    for (op, dims) in ops.iter().zip(resolved.iter()) {
+        let call = &op.call;
         let kernel = pipeline.select_kernel(dims.batch, dims.m, dims.n, dims.k);
         let need = kernel.uses_descriptors;
         needs_write.push(need);
@@ -121,90 +135,270 @@ pub(super) fn record_matmul_commands(
     pipeline: &MatmulPipeline,
     cb: vk::CommandBuffer,
     descriptor_sets: &[vk::DescriptorSet],
-    calls: &[MatmulCall<'_>],
+    ops: &[MatmulOp<'_>],
     resolved: &[ResolvedMatmul],
 ) -> Result<()> {
-    let max_groups = ctx.device_properties.limits.max_compute_work_group_count;
     let mut bound_pipeline = vk::Pipeline::null();
-    for ((set, call), dims) in descriptor_sets
+    for ((set, op), dims) in descriptor_sets
         .iter()
         .copied()
-        .zip(calls.iter())
+        .zip(ops.iter())
         .zip(resolved.iter())
     {
-        let (a_ptr, b_ptr, c_ptr) = if ctx.buffer_device_address_enabled {
-            (
-                ctx.buffer_device_address(call.a.raw_buffer()),
-                ctx.buffer_device_address(call.b.raw_buffer()),
-                ctx.buffer_device_address(call.c.raw_buffer()),
-            )
-        } else {
-            (0, 0, 0)
-        };
-        let pc = dims.push_constants(call.alpha, call.accumulate, a_ptr, b_ptr, c_ptr);
         let kernel = pipeline.select_kernel(dims.batch, dims.m, dims.n, dims.k);
+        record_one_matmul(
+            ctx,
+            pipeline,
+            cb,
+            set,
+            op,
+            dims,
+            kernel,
+            &mut bound_pipeline,
+        )?;
+    }
 
-        // Pick the specialization variant whose constants match this call.
-        // `interior_only` is safe whenever M and N are tile-aligned to the
-        // selected kernel's tile size — the shader then skips all
-        // m_full/n_full bounds checks.
-        let variant = KernelVariant {
-            accumulate: call.accumulate,
-            alpha_is_one: call.alpha == 1.0,
-            interior_only: dims.m.is_multiple_of(kernel.tile_m)
-                && dims.n.is_multiple_of(kernel.tile_n),
-            k_multiple: dims.k.is_multiple_of(kernel.tile_k),
-        };
-        let variant_pipeline = kernel.pipeline_for(variant);
+    Ok(())
+}
 
-        let gx = dims.n.div_ceil(kernel.tile_n);
-        let gy = dims.m.div_ceil(kernel.tile_m);
-        let gz = dims.batch;
-        if gx > max_groups[0] || gy > max_groups[1] || gz > max_groups[2] {
-            bail!(
-                "matmul dispatch ({gx}, {gy}, {gz}) for M={}, N={}, K={}, batch={} \
-                 exceeds device maxComputeWorkGroupCount ({}, {}, {})",
-                dims.m,
-                dims.n,
-                dims.k,
-                dims.batch,
-                max_groups[0],
-                max_groups[1],
-                max_groups[2],
-            );
-        }
+/// Record dependent matmuls into one command buffer, inserting
+/// compute→compute barriers only where a buffer hazard exists.
+///
+/// Hazards tracked per raw `vk::Buffer` handle:
+///   * RAW — a call reads (A, B, or C-with-accumulate) a buffer some
+///     earlier call in the batch wrote;
+///   * WAW / WAR — a call writes a C buffer an earlier call wrote or
+///     read.
+///
+/// A single global memory barrier flushes *all* prior writes, so after
+/// emitting one the tracking sets reset; back-to-back independent calls
+/// still record with zero barriers, exactly like `record_matmul_commands`.
+pub(super) fn record_matmul_graph_commands(
+    ctx: &VulkanContext,
+    pipeline: &MatmulPipeline,
+    cb: vk::CommandBuffer,
+    descriptor_sets: &[vk::DescriptorSet],
+    ops: &[MatmulOp<'_>],
+    resolved: &[ResolvedMatmul],
+    splitk2: Option<&GraphSplitK2<'_>>,
+) -> Result<()> {
+    let mut bound_pipeline = vk::Pipeline::null();
+    let mut written: Vec<vk::Buffer> = Vec::new();
+    let mut read: Vec<vk::Buffer> = Vec::new();
 
-        unsafe {
-            if bound_pipeline != variant_pipeline {
-                ctx.device
-                    .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, variant_pipeline);
-                bound_pipeline = variant_pipeline;
+    for (i, ((set, op), dims)) in descriptor_sets
+        .iter()
+        .copied()
+        .zip(ops.iter())
+        .zip(resolved.iter())
+        .enumerate()
+    {
+        let call = &op.call;
+        let a = call.a.raw_buffer();
+        let b = call.b.raw_buffer();
+        let c = call.c.raw_buffer();
+        let bias = op.epilogue.bias.map(Tensor::raw_buffer);
+        let d = op.epilogue.d_tensor().map(Tensor::raw_buffer);
+
+        // Tuned split-K2 routing: record stage1 + internal barrier +
+        // reduce inline.  The internal barrier is a global flush, so
+        // only stage-1's own reads (A, B) need a pre-barrier; C
+        // hazards are covered by the internal barrier, and every
+        // write recorded before this op is visible after it.
+        if let Some(g) = splitk2
+            && let Some((plan, offset)) = g.plans.get(i).copied().flatten()
+        {
+            if written.contains(&a) || written.contains(&b) {
+                record_compute_to_compute_barrier(ctx, cb);
             }
-            // BDA kernels carry their own push-constant-only pipeline
-            // layout and never read SSBO bindings 0/1/2 — skip the
-            // descriptor-set bind entirely.  Descriptor kernels go
-            // through the matmul pipeline's descriptor-based layout
-            // (which is what `kernel.pipeline_layout` resolves to for
-            // them).
-            if kernel.uses_descriptors {
-                ctx.device.cmd_bind_descriptor_sets(
-                    cb,
-                    vk::PipelineBindPoint::COMPUTE,
-                    kernel.pipeline_layout,
-                    0,
-                    std::slice::from_ref(&set),
-                    &[],
-                );
-            }
-            ctx.device.cmd_push_constants(
+            record_split_k2_commands(
+                ctx,
+                g.pipeline,
                 cb,
-                kernel.pipeline_layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                bytemuck::bytes_of(&pc),
+                call.alpha,
+                dims,
+                &plan,
+                ctx.buffer_device_address(a),
+                ctx.buffer_device_address(b),
+                ctx.buffer_device_address(c),
+                g.scratch_addr + offset,
             );
-            ctx.device.cmd_dispatch(cb, gx, gy, gz);
+            written.clear();
+            read.clear();
+            read.push(a);
+            read.push(b);
+            written.push(c);
+            // record_split_k2_commands bound its own pipelines.
+            bound_pipeline = vk::Pipeline::null();
+            continue;
         }
+
+        let reads_written = written.contains(&a)
+            || written.contains(&b)
+            || (call.accumulate && written.contains(&c))
+            || bias.is_some_and(|buf| written.contains(&buf))
+            || d.is_some_and(|buf| written.contains(&buf));
+        let write_hazard = written.contains(&c) || read.contains(&c);
+
+        if reads_written || write_hazard {
+            record_compute_to_compute_barrier(ctx, cb);
+            written.clear();
+            read.clear();
+        }
+
+        let kernel = pipeline.select_kernel(dims.batch, dims.m, dims.n, dims.k);
+        record_one_matmul(
+            ctx,
+            pipeline,
+            cb,
+            set,
+            op,
+            dims,
+            kernel,
+            &mut bound_pipeline,
+        )?;
+
+        read.push(a);
+        read.push(b);
+        read.extend(bias);
+        read.extend(d);
+        written.push(c);
+    }
+
+    Ok(())
+}
+
+/// Full compute→compute execution + memory barrier.  One global
+/// `vk::MemoryBarrier` (rather than per-buffer barriers) — on every
+/// driver we target, buffer-granular compute barriers offer no extra
+/// overlap for back-to-back dispatches, and the single global barrier
+/// keeps recording cost flat.
+fn record_compute_to_compute_barrier(ctx: &VulkanContext, cb: vk::CommandBuffer) {
+    let barrier = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+    unsafe {
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            std::slice::from_ref(&barrier),
+            &[],
+            &[],
+        );
+    }
+}
+
+/// Record one dispatch with an explicitly-chosen kernel.  The regular
+/// paths resolve the kernel through `MatmulPipeline::select_kernel`;
+/// the auto-tuner forces each candidate in turn.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_one_matmul(
+    ctx: &VulkanContext,
+    pipeline: &MatmulPipeline,
+    cb: vk::CommandBuffer,
+    set: vk::DescriptorSet,
+    op: &MatmulOp<'_>,
+    dims: &ResolvedMatmul,
+    kernel: &crate::pipeline::MatmulKernel,
+    bound_pipeline: &mut vk::Pipeline,
+) -> Result<()> {
+    let call = &op.call;
+    let max_groups = ctx.device_properties.limits.max_compute_work_group_count;
+    let (a_ptr, b_ptr, c_ptr) = if ctx.buffer_device_address_enabled {
+        (
+            ctx.buffer_device_address(call.a.raw_buffer()),
+            ctx.buffer_device_address(call.b.raw_buffer()),
+            ctx.buffer_device_address(call.c.raw_buffer()),
+        )
+    } else {
+        (0, 0, 0)
+    };
+    let mut pc = dims.push_constants(call.alpha, call.accumulate, a_ptr, b_ptr, c_ptr);
+
+    // Pick the specialization variant whose constants match this call.
+    // `interior_only` is safe whenever M and N are tile-aligned to the
+    // selected kernel's tile size — the shader then skips all
+    // m_full/n_full bounds checks.
+    let variant = KernelVariant {
+        accumulate: call.accumulate,
+        alpha_is_one: call.alpha == 1.0,
+        interior_only: dims.m.is_multiple_of(kernel.tile_m) && dims.n.is_multiple_of(kernel.tile_n),
+        k_multiple: dims.k.is_multiple_of(kernel.tile_k),
+    };
+
+    let epilogue = &op.epilogue;
+    let variant_pipeline = if epilogue.is_none() {
+        kernel.pipeline_for(variant)
+    } else {
+        if !ctx.buffer_device_address_enabled {
+            bail!("fused epilogues require bufferDeviceAddress, which this device lacks");
+        }
+        if !kernel.supports_epilogue() {
+            bail!(
+                "kernel '{}' does not support fused epilogues (only the BDA / BDA_V4 \
+                 kernel families do; unset ML_KERNEL or pick a *_bda / *_bda_v4 variant)",
+                kernel.name
+            );
+        }
+        if let Some(bias) = epilogue.bias {
+            pc.bias_ptr = ctx.buffer_device_address(bias.raw_buffer());
+        }
+        if let Some(d) = epilogue.d_tensor() {
+            pc.d_ptr = ctx.buffer_device_address(d.raw_buffer());
+        }
+        pc.beta = epilogue.beta();
+        pipeline.pipeline_for_epilogue(kernel, variant, epilogue.key())?
+    };
+
+    let gx = dims.n.div_ceil(kernel.tile_n);
+    let gy = dims.m.div_ceil(kernel.tile_m);
+    let gz = dims.batch;
+    if gx > max_groups[0] || gy > max_groups[1] || gz > max_groups[2] {
+        bail!(
+            "matmul dispatch ({gx}, {gy}, {gz}) for M={}, N={}, K={}, batch={} \
+             exceeds device maxComputeWorkGroupCount ({}, {}, {})",
+            dims.m,
+            dims.n,
+            dims.k,
+            dims.batch,
+            max_groups[0],
+            max_groups[1],
+            max_groups[2],
+        );
+    }
+
+    unsafe {
+        if *bound_pipeline != variant_pipeline {
+            ctx.device
+                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, variant_pipeline);
+            *bound_pipeline = variant_pipeline;
+        }
+        // BDA kernels carry their own push-constant-only pipeline
+        // layout and never read SSBO bindings 0/1/2 — skip the
+        // descriptor-set bind entirely.  Descriptor kernels go
+        // through the matmul pipeline's descriptor-based layout
+        // (which is what `kernel.pipeline_layout` resolves to for
+        // them).
+        if kernel.uses_descriptors {
+            ctx.device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                kernel.pipeline_layout,
+                0,
+                std::slice::from_ref(&set),
+                &[],
+            );
+        }
+        ctx.device.cmd_push_constants(
+            cb,
+            kernel.pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            bytemuck::bytes_of(&pc),
+        );
+        ctx.device.cmd_dispatch(cb, gx, gy, gz);
     }
 
     Ok(())

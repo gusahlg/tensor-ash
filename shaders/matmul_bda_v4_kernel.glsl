@@ -74,7 +74,12 @@ layout(push_constant) uniform PC {
     F32ReadOnly  a_ptr;
     F32ReadOnly  b_ptr;
     F32ReadWrite c_ptr;
+    F32ReadOnly  d_ptr;
+    F32ReadOnly  bias_ptr;
+    float beta;
 } pc;
+
+#include "matmul_epilogue_common.glsl"
 
 shared float As[BM][BK + 1u];
 shared uvec4 Bs[BK][BN_V4];
@@ -321,6 +326,10 @@ void main() {
                     v.y = c_s.v[c_addr + 1u] + v.y;
                     v.z = c_s.v[c_addr + 2u] + v.z;
                     v.w = c_s.v[c_addr + 3u] + v.w;
+                }
+                if (EPI_ANY)
+                    v = epi_apply4(v, c_addr >> 2u, (col_base + j4 * 4u) >> 2u);
+                if (ACCUMULATE) {
                     c_s.v[c_addr + 0u] = v.x;
                     c_s.v[c_addr + 1u] = v.y;
                     c_s.v[c_addr + 2u] = v.z;
@@ -346,6 +355,7 @@ void main() {
                     const uint c_addr = row_off + j4 * 4u + s;
                     float val = v[s];
                     if (ACCUMULATE) val = c_s.v[c_addr] + val;
+                    if (EPI_ANY) val = epi_apply(val, c_addr, col_base + j4 * 4u + s);
                     c_s.v[c_addr] = val;
                 }
             }
@@ -364,6 +374,7 @@ void main() {
                     if (g_col >= pc.N) continue;
                     float val = v[s];
                     if (ACCUMULATE) val = c_s.v[row_off + g_col] + val;
+                    if (EPI_ANY) val = epi_apply(val, row_off + g_col, g_col);
                     c_s.v[row_off + g_col] = val;
                 }
             }
