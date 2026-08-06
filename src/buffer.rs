@@ -26,10 +26,10 @@ pub enum BufferLocation {
 
 pub struct Buffer {
     ctx: Arc<VulkanContext>,
-    pub raw: vk::Buffer,
-    pub memory: vk::DeviceMemory,
-    pub size: vk::DeviceSize,
-    pub location: BufferLocation,
+    pub(crate) raw: vk::Buffer,
+    pub(crate) memory: vk::DeviceMemory,
+    pub(crate) size: vk::DeviceSize,
+    pub(crate) location: BufferLocation,
     memory_flags: vk::MemoryPropertyFlags,
     /// Persistent mapping pointer for host-visible buffers; null otherwise.
     mapped: *mut u8,
@@ -41,13 +41,43 @@ unsafe impl Send for Buffer {}
 unsafe impl Sync for Buffer {}
 
 impl Buffer {
+    pub(crate) fn belongs_to(&self, ctx: &Arc<VulkanContext>) -> bool {
+        Arc::ptr_eq(&self.ctx, ctx)
+    }
+
+    /// Raw Vulkan buffer handle for advanced interop. The `Buffer` retains
+    /// ownership; callers must not destroy the handle.
+    #[inline]
+    pub fn raw_buffer(&self) -> vk::Buffer {
+        self.raw
+    }
+
+    /// Raw Vulkan allocation backing this buffer. The `Buffer` retains
+    /// ownership; callers must not free it.
+    #[inline]
+    pub fn raw_memory(&self) -> vk::DeviceMemory {
+        self.memory
+    }
+
+    #[inline]
+    pub fn size_bytes(&self) -> vk::DeviceSize {
+        self.size
+    }
+
+    #[inline]
+    pub fn location(&self) -> BufferLocation {
+        self.location
+    }
+
     pub fn new(
         ctx: &Arc<VulkanContext>,
         size: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
         location: BufferLocation,
     ) -> Result<Self> {
-        assert!(size > 0, "Buffer::new with size=0");
+        if size == 0 {
+            bail!("Buffer::new: size must be non-zero");
+        }
         unsafe {
             // Each Vulkan handle we allocate is wrapped in a scopeguard that
             // destroys it on early return.  On the happy path we disarm the
@@ -227,7 +257,8 @@ impl Buffer {
         if !self.is_host_visible() {
             bail!("read_into_vec: buffer is not host-visible");
         }
-        let len = self.size as usize;
+        let len =
+            usize::try_from(self.size).context("buffer size does not fit host address space")?;
         let mut out = vec![0u8; len];
         self.invalidate_host_reads()?;
         unsafe {

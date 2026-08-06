@@ -16,11 +16,15 @@ use crate::context::VulkanContext;
 use crate::matmul::MatrixShape;
 
 pub struct Tensor {
-    pub shape: Vec<u32>,
-    pub buffer: Buffer,
+    shape: Vec<u32>,
+    buffer: Buffer,
 }
 
 impl Tensor {
+    pub(crate) fn belongs_to(&self, ctx: &Arc<VulkanContext>) -> bool {
+        self.buffer.belongs_to(ctx)
+    }
+
     /// Number of f32 elements implied by `shape`.
     #[inline]
     pub fn numel(shape: &[u32]) -> u64 {
@@ -101,11 +105,11 @@ impl Tensor {
 
     #[inline]
     pub fn raw_buffer(&self) -> vk::Buffer {
-        self.buffer.raw
+        self.buffer.raw_buffer()
     }
     #[inline]
     pub fn size_bytes(&self) -> vk::DeviceSize {
-        self.buffer.size
+        self.buffer.size_bytes()
     }
 }
 

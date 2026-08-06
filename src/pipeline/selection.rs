@@ -1,6 +1,6 @@
 use crate::context::DeviceKind;
 
-use super::types::{KERNEL_SPECS, KernelSelection};
+use super::catalog::{KERNEL_SPECS, KernelSelection};
 
 /// Output-tile dimensions of the large kernel.  The auto-selector
 /// thresholds are all expressed in large-kernel tiles, so we read them

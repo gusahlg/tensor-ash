@@ -3,10 +3,12 @@
 //! Descriptor *pools* live in the executor (one per command-buffer slot),
 //! so this module owns only kernel-shaped resources.
 
+mod abi;
+mod catalog;
 mod create;
+mod runtime;
 mod selection;
 mod tuning;
-mod types;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,11 +24,10 @@ use create::{create_epilogue_pipeline, create_kernel, destroy_kernel};
 use selection::{auto_min_large_tiles_for, auto_select_kernel};
 use tuning::{load_tuned, save_tuned, shader_registry_hash};
 
-pub use tuning::{TuneEntry, TuneKey};
-pub use types::{
-    EpilogueKey, KERNEL_SPECS, KernelSelection, KernelSpec, KernelVariant, MatmulKernel,
-    MatmulPushConstants,
-};
+pub use abi::{EpilogueKey, KernelVariant, MatmulPushConstants};
+pub use catalog::{KERNEL_SPECS, KernelSelection, KernelSpec};
+pub use runtime::MatmulKernel;
+pub(crate) use tuning::{TuneEntry, TuneKey};
 
 pub struct MatmulPipeline {
     ctx: Arc<VulkanContext>,
@@ -67,6 +68,10 @@ pub struct MatmulPipeline {
 }
 
 impl MatmulPipeline {
+    pub(crate) fn belongs_to(&self, ctx: &Arc<VulkanContext>) -> bool {
+        Arc::ptr_eq(&self.ctx, ctx)
+    }
+
     pub fn new(ctx: &Arc<VulkanContext>) -> Result<Self> {
         Self::new_with_kernel_selection(ctx, KernelSelection::from_env()?)
     }
@@ -147,17 +152,8 @@ impl MatmulPipeline {
                 } else {
                     pipeline_layout_bda
                 };
-                let kernel = create_kernel(
-                    ctx,
-                    layout,
-                    spec.name,
-                    spec.tile_m,
-                    spec.tile_n,
-                    spec.tile_k,
-                    spec.spv,
-                    spec.uses_descriptors,
-                )
-                .with_context(|| format!("create {} matmul kernel", spec.name))?;
+                let kernel = create_kernel(ctx, layout, spec)
+                    .with_context(|| format!("create {} matmul kernel", spec.name))?;
                 kernels_guard.push(kernel);
             }
             // Disarm the cleanup: kernels now belong to the pipeline.
@@ -204,7 +200,7 @@ impl MatmulPipeline {
     /// the two-stage split-K beat every DP kernel during tuning.  Only
     /// meaningful for single plain calls; batched / accumulate /
     /// epilogue dispatches use the DP winner instead.
-    pub fn tuned_splitk2(&self, batch: u32, m: u32, n: u32, k: u32) -> Option<u32> {
+    pub(crate) fn tuned_splitk2(&self, batch: u32, m: u32, n: u32, k: u32) -> Option<u32> {
         if !self.is_auto() {
             return None;
         }
@@ -217,7 +213,7 @@ impl MatmulPipeline {
     /// The static shape heuristic's pick, ignoring any tuned winner.
     /// Serves as the tuner's prior and as the fallback for untuned
     /// shapes.
-    pub fn heuristic_kernel_index(&self, batch: u32, m: u32, n: u32, k: u32) -> usize {
+    pub(crate) fn heuristic_kernel_index(&self, batch: u32, m: u32, n: u32, k: u32) -> usize {
         if m == 1 && self.ctx.buffer_device_address_enabled {
             return KernelSelection::RowBda
                 .index()
@@ -249,7 +245,7 @@ impl MatmulPipeline {
 
     /// Whether `shape` already has a measured winner (or tuning is
     /// moot because selection is explicit).
-    pub fn is_tuned(&self, key: TuneKey) -> bool {
+    pub(crate) fn is_tuned(&self, key: TuneKey) -> bool {
         !self.is_auto() || self.tuned.read().contains_key(&key)
     }
 
@@ -258,7 +254,7 @@ impl MatmulPipeline {
     /// only — the strict `*_aligned` variants are excluded).  Requires
     /// `bufferDeviceAddress`; on devices without it the tuner is
     /// disabled and the heuristic stands.
-    pub fn tune_candidate_indices(&self) -> Vec<usize> {
+    pub(crate) fn tune_candidate_indices(&self) -> Vec<usize> {
         if !self.ctx.buffer_device_address_enabled {
             return Vec::new();
         }
@@ -271,12 +267,12 @@ impl MatmulPipeline {
     }
 
     #[inline]
-    pub fn kernel_at(&self, idx: usize) -> &MatmulKernel {
+    pub(crate) fn kernel_at(&self, idx: usize) -> &MatmulKernel {
         &self.kernels[idx]
     }
 
     /// Record a measured winner and persist the store.
-    pub fn record_tuned(&self, key: TuneKey, entry: TuneEntry) {
+    pub(crate) fn record_tuned(&self, key: TuneKey, entry: TuneEntry) {
         let snapshot = {
             let mut tuned = self.tuned.write();
             tuned.insert(key, entry);
@@ -291,7 +287,7 @@ impl MatmulPipeline {
     /// lifetime of the pipeline.  Compilation goes through the
     /// persistent `VkPipelineCache`, so repeat processes skip the
     /// ISA compile.
-    pub fn pipeline_for_epilogue(
+    pub(crate) fn pipeline_for_epilogue(
         &self,
         kernel: &MatmulKernel,
         variant: KernelVariant,

@@ -12,9 +12,9 @@ The current scope is batched GEMM plus fused GEMM epilogues (bias,
 activations, residual/gating), executed either as independent batches or as
 dependent graphs in a single submission. The compute backend, kernel
 selector, and executor are built around a data-driven `KERNEL_SPECS`
-registry, so adding a new tile shape is a two-line change plus a `.comp`
-wrapper — the rest of the pipeline (including the measured auto-tuner) picks
-it up automatically.
+registry, so adding a new tile shape takes one catalog declaration plus a
+`.comp` wrapper — the generated selection enum, parser, stable registry order,
+pipeline builder, and measured auto-tuner all pick it up automatically.
 
 ## Scope and API status
 
@@ -113,7 +113,7 @@ don't know their workload should stick to `run_matmuls`.
 
 ```bash
 nix-shell
-cargo run --release --bin ml_bench -- self-check
+cargo run --release -p ml-bench -- self-check
 ```
 
 The flake adds the benchmark tooling, CUDA compiler/runtime, Python, and `uv`:
@@ -164,6 +164,10 @@ exec.download(&c, &mut host_c)?;
 println!("{:?}", stats.tflops());
 ```
 
+Library integrations that should not read process-wide tuning state can use
+`Executor::new_with_config` and `ExecutorConfig`; the compatibility
+`Executor::new` constructor continues to honor `ML_TUNE` for CLI workflows.
+
 Fused epilogues and dependent graphs:
 
 ```rust
@@ -204,11 +208,11 @@ Subcommands: `self-check`, `correctness`, `sweep`, `single`, `concurrent`,
 `transfer`. Useful env knobs:
 
 ```bash
-ML_B=4 ML_M=1024 ML_N=1024 ML_K=1024 cargo run --release --bin ml_bench -- single
-ML_KERNEL=k64_bda_v4 cargo run --release --bin ml_bench -- single
-ML_TUNE=1 ML_M=768 ML_N=768 ML_K=768 cargo run --release --bin ml_bench -- single
-ML_DEVICE=discrete cargo run --release --bin ml_bench -- self-check
-ML_OUTPUT=csv ML_SWEEP=smoke cargo run --release --bin ml_bench -- sweep
+ML_B=4 ML_M=1024 ML_N=1024 ML_K=1024 cargo run --release -p ml-bench -- single
+ML_KERNEL=k64_bda_v4 cargo run --release -p ml-bench -- single
+ML_TUNE=1 ML_M=768 ML_N=768 ML_K=768 cargo run --release -p ml-bench -- single
+ML_DEVICE=discrete cargo run --release -p ml-bench -- self-check
+ML_OUTPUT=csv ML_SWEEP=smoke cargo run --release -p ml-bench -- sweep
 ```
 
 `ML_TUNE=1` measures every eligible kernel (and the two-stage split-K on
@@ -219,21 +223,21 @@ tuning enabled or not — whenever `ML_KERNEL` is `auto`. Delete the store (or
 update the driver / rebuild shaders) to reset it.
 
 `ML_KERNEL=auto` is the default. Concrete names span every entry in
-`KERNEL_SPECS`: descriptor-bound tiles (`large`, `small`, `m64n128`,
-`m128n64`, `m128n64k64`, `m64n32`, `k64`, `bk16`, `v2`, `m64n128k64`,
-`m128n128_t4`, `m256n64`, `v3`), their `*_bda` / `*_bda_v4` siblings,
-and the strict-aligned `large_bda_v4_aligned` /
-`m128n64k64_bda_v4_aligned` variants for shapes divisible by their
-tile dims.
+`KERNEL_SPECS` currently contains 35 concrete choices. They include the
+descriptor-bound tiles (`large`, `small`, `m64n128`, `m128n64`,
+`m128n64k64`, `m64n32`, `k64`, `bk16`, `v2`, `m64n128k64`,
+`m128n128_t4`, `m256n64`, `v3`), BDA / BDA_V4 and register-tile variants,
+the strict-aligned kernels, and `row_bda` for batched matrix-vector work. The
+authoritative names and aliases live together in `src/pipeline/catalog.rs`.
 `ML_DEVICE` accepts `auto`, `discrete`, `integrated`, `virtual`, `cpu`,
 `index:N`, `name:TEXT`, or a bare name substring.
 
 ## Tests
 
 ```bash
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo test --release --test correctness -- --ignored --test-threads=1
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --release -p tensor-ash --test correctness -- --ignored --test-threads=1
 ```
 
 ## Cross-library benchmarks
@@ -304,7 +308,8 @@ nix develop .#benchmark --command bash -lc \
 
 ## Release notes & troubleshooting
 
-See `CHANGELOG.md` for `v1.0.0` and the unreleased post-`v1.0.0` changes.
+See `CHANGELOG.md` for the current unreleased work and the versioned release
+history.
 
 If the binary fails with `failed to load Vulkan loader: libvulkan.so.1`, the
 loader isn't visible to the dynamic linker — the Nix shell handles it,
@@ -318,16 +323,22 @@ reports `llvmpipe`, results are software-renderer numbers; use
 src/
   context/         Vulkan instance/device setup, BDA + atomic-float feature
                    wiring, cache paths
-  pipeline/        Data-driven KERNEL_SPECS registry, auto-selector, BDA
-                   promotion helpers, lazy epilogue pipelines
+  matmul.rs        Public facade over operation types and shape resolution
+  matmul/          API types, checked shape/batch resolution, unit tests
+  pipeline/        Generated KERNEL_SPECS catalog, shader ABI, pipeline
+                   creation/runtime, auto-selection, measured tuning
     tuning.rs      Measured-selection store (persistent per-device winners)
-  executor/        Thread-safe executor, submission slots, command recording
-                   (independent batches + hazard-barriered graphs), tuner
+  executor/        Thread-safe dispatch facade over validation, transfers,
+                   timed submission, recording, tuning, and reductions
+    recording/     Descriptor updates and graph hazard/barrier recording
     splitk.rs      Experimental atomic split-K pipeline
     splitk2.rs     Two-stage split-K (scratch partials + reduce, no atomics)
-    streamk.rs     Experimental Stream-K (hybrid DP-flat + SK-tail) pipeline
-  bench/           ml_bench subcommands, output formatting, case definitions
+    streamk*.rs    Experimental Stream-K pipeline, execution, and scheduling
   buffer.rs        Device/staging buffer wrappers (BDA-aware)
+  tensor.rs        Context-owned tensor abstraction
+tools/ml-bench/    Independent benchmark CLI package, reports, and cases
+tools/test-support/ Dependency-free CPU references and deterministic fixtures
+                    shared by integration tests and `ml-bench`
 shaders/
   matmul_kernel.glsl              Original descriptor-bound GEMM body
   matmul_bda_kernel.glsl          buffer_reference body (LDG.E.128)
@@ -338,11 +349,16 @@ shaders/
   matmul_splitk2_kernel.glsl      Two-stage split-K stage 1 (partial planes)
   matmul_f32_splitk2_reduce.comp  Two-stage split-K stage 2 (plane sum)
   matmul_streamk_kernel.glsl      Stream-K SK-tail (persistent + atomicAdd)
-  matmul_streamk_dp_kernel.glsl   Stream-K DP-flat bulk dispatch
+                                  (DP-flat bulk reuses the regular BDA_V4 body)
   matmul_f32*.comp                Tile wrappers; *_bda / *_bda_v4 siblings
-capi/, include/, examples/   C ABI crate, public header, smoke test
+capi/                      C ABI workspace crate; lifecycle, tensor, and
+                           matmul exports are split under capi/src/api/
+include/, examples/        Public C header, smoke test, Rust examples
 scripts/
-  bench_compare.py   Cross-library harness (cuBLAS pure row, % peak, showcase)
+  bench_compare.py   Cross-library CLI and compatibility facade
+  bench_compare_backends.py  Framework and native benchmark adapters
+  bench_compare_models.py    Cases and result data models
+  bench_compare_report.py    JSON/Markdown aggregation and reporting
   tune_kernels.py    Manual kernel-variant tuning helper
 benchmarks/
   cublas_bench/      Pure cuBLAS C++ benchmark binary + Makefile

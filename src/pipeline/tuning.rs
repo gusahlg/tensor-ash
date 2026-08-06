@@ -15,13 +15,13 @@ use std::path::PathBuf;
 
 use crate::context::VulkanContext;
 
-use super::types::KERNEL_SPECS;
+use super::catalog::KERNEL_SPECS;
 
 /// One GEMM problem shape.  `accumulate` / `alpha` / epilogues change
 /// only the store path, which never flips the kernel ranking, so they
 /// are deliberately not part of the key.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-pub struct TuneKey {
+pub(crate) struct TuneKey {
     pub batch: u32,
     pub m: u32,
     pub n: u32,
@@ -30,7 +30,7 @@ pub struct TuneKey {
 
 /// Measured winner for one shape.
 #[derive(Copy, Clone, Debug)]
-pub struct TuneEntry {
+pub(crate) struct TuneEntry {
     /// Best data-parallel kernel (index into `KERNEL_SPECS`).  Used by
     /// every dispatch of this shape, including batched submissions,
     /// accumulate, and epilogue ops.
@@ -108,7 +108,7 @@ pub(super) fn load_tuned(ctx: &VulkanContext, shader_hash: u64) -> HashMap<TuneK
             .next()
             .and_then(|tok| tok.strip_prefix("splitk2="))
             .and_then(|s| s.parse::<u32>().ok())
-            .filter(|&s| s >= 2);
+            .filter(|s| (2..=0xFFFF).contains(s));
         map.insert(
             TuneKey { batch, m, n, k },
             TuneEntry {

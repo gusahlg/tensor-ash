@@ -90,6 +90,16 @@ pub(crate) fn checked_slice_mut<'a, T>(
     Ok(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
 }
 
+pub(crate) unsafe fn destroy_handle<T>(ptr: *mut T) {
+    if ptr.is_null() {
+        return;
+    }
+    clear_error();
+    if catch_unwind(AssertUnwindSafe(|| unsafe { drop(Box::from_raw(ptr)) })).is_err() {
+        set_error(anyhow!("panic while destroying tensor-ash C ABI handle"));
+    }
+}
+
 fn clear_error() {
     LAST_ERROR.with(|slot| {
         *slot.borrow_mut() = CString::new("").unwrap();

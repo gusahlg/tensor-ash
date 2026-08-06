@@ -20,8 +20,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 BIN = REPO / "target" / "release" / "ml_bench"
 
-LD_LIBRARY_PATH = "/nix/store/00qqlzn7kc79zlc351lcjdsk4q97y8a4-system-path/lib"
-
 # (label, b, m, n, k, default_kernel_name)
 TARGET_SHAPES = [
     ("square_512", 1, 512, 512, 512, "m128n64k64_bda_v4"),
@@ -70,7 +68,6 @@ K64_ROUTED_SHAPES = [
 
 def run_once(kernel: str, b: int, m: int, n: int, k: int, iters: int, warmup: int) -> float:
     env = os.environ.copy()
-    env["LD_LIBRARY_PATH"] = LD_LIBRARY_PATH
     env.update(
         ML_KERNEL=kernel,
         ML_B=str(b),

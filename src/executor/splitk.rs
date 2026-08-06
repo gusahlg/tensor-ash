@@ -232,7 +232,12 @@ impl Drop for SplitKPipeline {
 /// the auto path and the experimental tests.
 pub fn default_num_k_splits(batch: u32, m: u32, n: u32, k: u32, tile_m: u32, tile_n: u32) -> u32 {
     const TARGET_WGS: u64 = 64;
-    let tiles = m.div_ceil(tile_m) as u64 * n.div_ceil(tile_n) as u64 * batch.max(1) as u64;
+    if tile_m == 0 || tile_n == 0 {
+        return 1;
+    }
+    let tiles = u64::from(m.div_ceil(tile_m))
+        .saturating_mul(u64::from(n.div_ceil(tile_n)))
+        .saturating_mul(u64::from(batch.max(1)));
     if tiles == 0 {
         return 1;
     }
@@ -272,5 +277,14 @@ mod tests {
         // Tiny K=64 means at most 2 splits even if we wanted more.
         let splits = default_num_k_splits(1, 64, 64, 64, 64, 64);
         assert_eq!(splits, 2);
+    }
+
+    #[test]
+    fn default_num_k_splits_handles_invalid_or_extreme_geometry() {
+        assert_eq!(default_num_k_splits(1, 128, 128, 1024, 0, 128), 1);
+        assert_eq!(
+            default_num_k_splits(u32::MAX, u32::MAX, u32::MAX, u32::MAX, 1, 1),
+            1,
+        );
     }
 }

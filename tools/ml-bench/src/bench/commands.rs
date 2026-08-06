@@ -5,10 +5,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tensor_ash::{
-    DeviceKind, Executor, MatmulCall, Tensor, VulkanContext,
-    testing::{cpu_bmm, fill_det, max_abs_err},
-};
+use tensor_ash::{DeviceKind, Executor, MatmulCall, Tensor, VulkanContext};
+use tensor_ash_test_support::{cpu_bmm, fill_det, max_abs_err};
 
 use super::cases::{BenchCase, BenchResult, host_len, sweep_cases};
 use super::env::{OutputMode, SweepMode, env_u32, env_usize};

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tensor_ash::{Executor, KernelSelection, MatmulPipeline, Tensor, VulkanContext};
 
-pub use tensor_ash::testing::{LcgRng, cpu_bmm, fill_det, max_abs_err, tolerance};
+pub use tensor_ash_test_support::{LcgRng, cpu_bmm, fill_det, max_abs_err, tolerance};
 
 /// `ML_VALIDATE=1` opts the test suite into the Vulkan validation
 /// layers.  Off by default so the suite is fast on CI machines that

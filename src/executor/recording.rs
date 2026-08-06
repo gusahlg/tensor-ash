@@ -1,134 +1,18 @@
+mod descriptors;
+mod graph;
+
 use anyhow::{Result, bail};
 use ash::vk;
 
 use crate::context::VulkanContext;
 use crate::matmul::{MatmulOp, ResolvedMatmul};
 use crate::pipeline::{KernelVariant, MatmulPipeline};
-use crate::tensor::Tensor;
 
 use super::MatmulCall;
 use super::splitk::SplitKKernel;
-use super::splitk2::{SplitK2Dispatch, SplitK2Pipeline, record_split_k2_commands};
 
-/// Split-K2 routing context for a graph recording: which ops route
-/// through the two-stage path, and where each op's scratch region
-/// lives inside the slot's scratch buffer.
-pub(super) struct GraphSplitK2<'a> {
-    pub(super) pipeline: &'a SplitK2Pipeline,
-    /// Device address of the slot scratch buffer (16-byte aligned).
-    pub(super) scratch_addr: u64,
-    /// Per-op `(plan, byte offset into scratch)`; `None` = regular DP
-    /// dispatch.
-    pub(super) plans: &'a [Option<(SplitK2Dispatch, u64)>],
-}
-
-/// Point the pre-allocated descriptor sets at this submission's A/B/C
-/// tensors.  `sets.len()` must equal `calls.len()`; the caller is
-/// responsible for guaranteeing that the GPU has fenced out of the
-/// previous use of these sets (we wait on the fence at the end of every
-/// submit, so the next submit on the same slot is safe).
-///
-/// BDA kernels read A/B/C through `buffer_reference` pointers in the
-/// push constants and never touch SSBO bindings 0/1/2.  For any call
-/// whose resolved kernel is a BDA kernel we skip the descriptor write
-/// entirely — the shader cannot observe the descriptor and the write
-/// is pure CPU-side overhead.  A pure-BDA submission therefore issues
-/// zero `vkUpdateDescriptorSets` work.
-pub(super) fn update_matmul_descriptor_sets(
-    ctx: &VulkanContext,
-    pipeline: &MatmulPipeline,
-    sets: &[vk::DescriptorSet],
-    ops: &[MatmulOp<'_>],
-    resolved: &[ResolvedMatmul],
-) {
-    debug_assert_eq!(sets.len(), ops.len());
-    debug_assert_eq!(sets.len(), resolved.len());
-
-    // Build buffer-info + writes only for calls that actually need a
-    // descriptor write.  Keep buffer_infos stable so the
-    // &[WriteDescriptorSet] we hand to Vulkan keeps stable references.
-    let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::with_capacity(ops.len() * 3);
-    let mut needs_write: Vec<bool> = Vec::with_capacity(ops.len());
-    for (op, dims) in ops.iter().zip(resolved.iter()) {
-        let call = &op.call;
-        let kernel = pipeline.select_kernel(dims.batch, dims.m, dims.n, dims.k);
-        let need = kernel.uses_descriptors;
-        needs_write.push(need);
-        if need {
-            buffer_infos.push(tensor_descriptor(call.a));
-            buffer_infos.push(tensor_descriptor(call.b));
-            buffer_infos.push(tensor_descriptor(call.c));
-        }
-    }
-
-    if buffer_infos.is_empty() {
-        // Pure-BDA submission: nothing to write.
-        return;
-    }
-
-    let mut writes: Vec<vk::WriteDescriptorSet> =
-        Vec::with_capacity(needs_write.iter().filter(|w| **w).count() * 3);
-    let mut base = 0usize;
-    for (i, set) in sets.iter().copied().enumerate() {
-        if !needs_write[i] {
-            continue;
-        }
-        for binding in 0..3u32 {
-            writes.push(
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(&buffer_infos[base + binding as usize])),
-            );
-        }
-        base += 3;
-    }
-
-    unsafe {
-        ctx.device.update_descriptor_sets(&writes, &[]);
-    }
-}
-
-/// Point a single descriptor set at `call`'s A/B/C tensors.  Used by
-/// the split-K path, whose kernels still bind the descriptor set
-/// (carried by the matmul pipeline layout that SplitKKernel was built
-/// against) even though the shader itself addresses A/B/C through
-/// BDA pointers in the push constants.  Kept as a dedicated helper so
-/// the matmul-BDA fast path doesn't have to reason about split-K's
-/// descriptor needs.
-pub(super) fn update_split_k_descriptor_set(
-    ctx: &VulkanContext,
-    set: vk::DescriptorSet,
-    call: &MatmulCall<'_>,
-) {
-    let buffer_infos = [
-        tensor_descriptor(call.a),
-        tensor_descriptor(call.b),
-        tensor_descriptor(call.c),
-    ];
-    let writes = [
-        vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_infos[0])),
-        vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_infos[1])),
-        vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(2)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_infos[2])),
-    ];
-
-    unsafe {
-        ctx.device.update_descriptor_sets(&writes, &[]);
-    }
-}
+pub(super) use descriptors::{update_matmul_descriptor_sets, update_split_k_descriptor_set};
+pub(super) use graph::{GraphSplitK2, record_matmul_graph_commands};
 
 pub(super) fn record_matmul_commands(
     ctx: &VulkanContext,
@@ -159,135 +43,6 @@ pub(super) fn record_matmul_commands(
     }
 
     Ok(())
-}
-
-/// Record dependent matmuls into one command buffer, inserting
-/// compute→compute barriers only where a buffer hazard exists.
-///
-/// Hazards tracked per raw `vk::Buffer` handle:
-///   * RAW — a call reads (A, B, or C-with-accumulate) a buffer some
-///     earlier call in the batch wrote;
-///   * WAW / WAR — a call writes a C buffer an earlier call wrote or
-///     read.
-///
-/// A single global memory barrier flushes *all* prior writes, so after
-/// emitting one the tracking sets reset; back-to-back independent calls
-/// still record with zero barriers, exactly like `record_matmul_commands`.
-pub(super) fn record_matmul_graph_commands(
-    ctx: &VulkanContext,
-    pipeline: &MatmulPipeline,
-    cb: vk::CommandBuffer,
-    descriptor_sets: &[vk::DescriptorSet],
-    ops: &[MatmulOp<'_>],
-    resolved: &[ResolvedMatmul],
-    splitk2: Option<&GraphSplitK2<'_>>,
-) -> Result<()> {
-    let mut bound_pipeline = vk::Pipeline::null();
-    let mut written: Vec<vk::Buffer> = Vec::new();
-    let mut read: Vec<vk::Buffer> = Vec::new();
-
-    for (i, ((set, op), dims)) in descriptor_sets
-        .iter()
-        .copied()
-        .zip(ops.iter())
-        .zip(resolved.iter())
-        .enumerate()
-    {
-        let call = &op.call;
-        let a = call.a.raw_buffer();
-        let b = call.b.raw_buffer();
-        let c = call.c.raw_buffer();
-        let bias = op.epilogue.bias.map(Tensor::raw_buffer);
-        let d = op.epilogue.d_tensor().map(Tensor::raw_buffer);
-
-        // Tuned split-K2 routing: record stage1 + internal barrier +
-        // reduce inline.  The internal barrier is a global flush, so
-        // only stage-1's own reads (A, B) need a pre-barrier; C
-        // hazards are covered by the internal barrier, and every
-        // write recorded before this op is visible after it.
-        if let Some(g) = splitk2
-            && let Some((plan, offset)) = g.plans.get(i).copied().flatten()
-        {
-            if written.contains(&a) || written.contains(&b) {
-                record_compute_to_compute_barrier(ctx, cb);
-            }
-            record_split_k2_commands(
-                ctx,
-                g.pipeline,
-                cb,
-                call.alpha,
-                dims,
-                &plan,
-                ctx.buffer_device_address(a),
-                ctx.buffer_device_address(b),
-                ctx.buffer_device_address(c),
-                g.scratch_addr + offset,
-            );
-            written.clear();
-            read.clear();
-            read.push(a);
-            read.push(b);
-            written.push(c);
-            // record_split_k2_commands bound its own pipelines.
-            bound_pipeline = vk::Pipeline::null();
-            continue;
-        }
-
-        let reads_written = written.contains(&a)
-            || written.contains(&b)
-            || (call.accumulate && written.contains(&c))
-            || bias.is_some_and(|buf| written.contains(&buf))
-            || d.is_some_and(|buf| written.contains(&buf));
-        let write_hazard = written.contains(&c) || read.contains(&c);
-
-        if reads_written || write_hazard {
-            record_compute_to_compute_barrier(ctx, cb);
-            written.clear();
-            read.clear();
-        }
-
-        let kernel = pipeline.select_kernel(dims.batch, dims.m, dims.n, dims.k);
-        record_one_matmul(
-            ctx,
-            pipeline,
-            cb,
-            set,
-            op,
-            dims,
-            kernel,
-            &mut bound_pipeline,
-        )?;
-
-        read.push(a);
-        read.push(b);
-        read.extend(bias);
-        read.extend(d);
-        written.push(c);
-    }
-
-    Ok(())
-}
-
-/// Full compute→compute execution + memory barrier.  One global
-/// `vk::MemoryBarrier` (rather than per-buffer barriers) — on every
-/// driver we target, buffer-granular compute barriers offer no extra
-/// overlap for back-to-back dispatches, and the single global barrier
-/// keeps recording cost flat.
-fn record_compute_to_compute_barrier(ctx: &VulkanContext, cb: vk::CommandBuffer) {
-    let barrier = vk::MemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-    unsafe {
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            std::slice::from_ref(&barrier),
-            &[],
-            &[],
-        );
-    }
 }
 
 /// Record one dispatch with an explicitly-chosen kernel.  The regular
@@ -407,13 +162,6 @@ pub(super) fn record_one_matmul(
     }
 
     Ok(())
-}
-
-fn tensor_descriptor(tensor: &Tensor) -> vk::DescriptorBufferInfo {
-    vk::DescriptorBufferInfo::default()
-        .buffer(tensor.raw_buffer())
-        .offset(0)
-        .range(tensor.size_bytes())
 }
 
 /// Record a single split-K matmul into `cb`.  Zero-fills `C` first

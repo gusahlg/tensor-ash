@@ -4,8 +4,7 @@
 //! The public surface is intentionally narrow:
 //!
 //!   * [`VulkanContext`] — instance + device + single compute queue.
-//!   * [`MatmulPipeline`] — the compiled GEMM kernel (one shader module
-//!     + descriptor layout + pipeline).
+//!   * [`MatmulPipeline`] — compiled kernel catalog, layouts, and tuning cache.
 //!   * [`Tensor`] — shape + GPU buffer (rank 2 or 3, contiguous, f32).
 //!   * [`Executor`] — submits work to the GPU; thread-safe; reports
 //!     per-run GPU time via timestamp queries.
@@ -39,11 +38,10 @@ pub mod matmul;
 pub mod persistent;
 pub mod pipeline;
 pub mod tensor;
-pub mod testing;
 
 pub use buffer::{Buffer, BufferLocation};
 pub use context::{DeviceKind, DevicePreference, DeviceSummary, VulkanContext};
-pub use executor::Executor;
+pub use executor::{Executor, ExecutorConfig};
 pub use matmul::{
     Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, MatrixShape, RunStats,
 };

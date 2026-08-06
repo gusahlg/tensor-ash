@@ -1,0 +1,5 @@
+[package]
+name = "tensor-ash-test-support"
+version.workspace = true
+edition.workspace = true
+publish = false

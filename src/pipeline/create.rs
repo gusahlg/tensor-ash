@@ -6,7 +6,7 @@ use scopeguard::ScopeGuard;
 
 use crate::context::VulkanContext;
 
-use super::types::{EpilogueKey, KernelVariant, MatmulKernel};
+use super::{EpilogueKey, KernelSpec, KernelVariant, MatmulKernel};
 
 /// Build one pipeline for a (kernel, base-variant, epilogue) triple.
 /// Used by the lazy epilogue-pipeline cache in `MatmulPipeline` — the
@@ -84,20 +84,18 @@ pub(super) unsafe fn destroy_kernel(ctx: &Arc<VulkanContext>, kernel: MatmulKern
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn create_kernel(
     ctx: &Arc<VulkanContext>,
     pipeline_layout: vk::PipelineLayout,
-    name: &'static str,
-    tile_m: u32,
-    tile_n: u32,
-    tile_k: u32,
-    spv: &[u8],
-    uses_descriptors: bool,
+    spec: &KernelSpec,
 ) -> Result<MatmulKernel> {
     unsafe {
-        assert!(spv.len().is_multiple_of(4), "SPIR-V size not 4-aligned");
-        let words: Vec<u32> = spv
+        assert!(
+            spec.spv.len().is_multiple_of(4),
+            "SPIR-V size not 4-aligned"
+        );
+        let words: Vec<u32> = spec
+            .spv
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -179,7 +177,7 @@ pub(super) fn create_kernel(
                             ctx.device.destroy_pipeline(p, None);
                         }
                     }
-                    return Err(anyhow!("create_compute_pipelines {name}: {err}"));
+                    return Err(anyhow!("create_compute_pipelines {}: {err}", spec.name));
                 }
             };
 
@@ -189,14 +187,14 @@ pub(super) fn create_kernel(
         }
 
         Ok(MatmulKernel {
-            name,
-            tile_m,
-            tile_n,
-            tile_k,
+            name: spec.name,
+            tile_m: spec.tile_m,
+            tile_n: spec.tile_n,
+            tile_k: spec.tile_k,
             shader_module: ScopeGuard::into_inner(shader_guard),
             variants,
             pipeline_layout,
-            uses_descriptors,
+            uses_descriptors: spec.uses_descriptors,
         })
     }
 }

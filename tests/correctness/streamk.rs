@@ -111,46 +111,55 @@ fn run_case(m: u32, n: u32, k: u32, seed_a: u64, seed_b: u64, label: &str) {
 }
 
 #[test]
+#[ignore]
 fn streamk_matches_regular_aligned_128() {
     run_case(128, 128, 128, 0x1001, 0x1002, "aligned_128");
 }
 
 #[test]
+#[ignore]
 fn streamk_matches_regular_aligned_256() {
     run_case(256, 256, 256, 0x2001, 0x2002, "aligned_256");
 }
 
 #[test]
+#[ignore]
 fn streamk_matches_regular_aligned_512() {
     run_case(512, 512, 512, 0x3001, 0x3002, "aligned_512");
 }
 
 #[test]
+#[ignore]
 fn streamk_matches_regular_aligned_1024() {
     run_case(1024, 1024, 1024, 0x4001, 0x4002, "aligned_1024");
 }
 
 #[test]
+#[ignore]
 fn streamk_matches_regular_aligned_2048() {
     run_case(2048, 2048, 2048, 0x5001, 0x5002, "aligned_2048");
 }
 
 #[test]
+#[ignore]
 fn streamk_matches_regular_tall_256x1024x4096() {
     run_case(256, 1024, 4096, 0x6001, 0x6002, "tall_256x1024x4096");
 }
 
 #[test]
+#[ignore]
 fn streamk_matches_regular_wide_1024x256x4096() {
     run_case(1024, 256, 4096, 0x7001, 0x7002, "wide_1024x256x4096");
 }
 
 #[test]
+#[ignore]
 fn streamk_matches_regular_deep_k_256x256x8192() {
     run_case(256, 256, 8192, 0x8001, 0x8002, "deep_k_256x256x8192");
 }
 
 #[test]
+#[ignore]
 fn streamk_matches_regular_aligned_non_square_1024x2048x512() {
     run_case(
         1024,

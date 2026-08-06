@@ -1,8 +1,5 @@
-//! Deterministic helpers shared by `tests/` and `ml_bench`.
-//!
-//! Public so the benchmark binary and the integration-test crate can pull
-//! them in without duplicating code.  Not part of the load-bearing GEMM
-//! API — if you're writing application code, you don't need this module.
+//! Dependency-free deterministic helpers shared by integration tests and
+//! the `ml-bench` workspace tool.
 
 /// Deterministic pseudo-random fill in `[-1, 1)`, seeded by `seed`.
 ///
@@ -138,14 +135,17 @@ pub fn cpu_bmm(
 }
 
 /// `(max |a-b|, index)` where `a` and `b` are interpreted positionally.
-/// NaN is treated as `(NaN-NaN).abs() = NaN`, which compares false
-/// against everything — so a NaN at position `i` does not stop a real
-/// difference at position `j` from being reported.
+/// Non-finite differences report infinite error so NaN GPU output cannot
+/// accidentally pass a correctness check.
 pub fn max_abs_err(a: &[f32], b: &[f32]) -> (f32, usize) {
+    assert_eq!(a.len(), b.len(), "max_abs_err: slice lengths differ");
     let mut m = 0.0f32;
     let mut idx = 0usize;
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         let e = (x - y).abs();
+        if !e.is_finite() {
+            return (f32::INFINITY, i);
+        }
         if e > m {
             m = e;
             idx = i;
@@ -207,6 +207,20 @@ mod tests {
         for _ in 0..16 {
             assert_eq!(rng.range_u32(42, 42), 42);
         }
+    }
+
+    #[test]
+    fn max_abs_err_rejects_non_finite_values() {
+        assert_eq!(
+            max_abs_err(&[1.0, f32::NAN], &[1.0, 2.0]),
+            (f32::INFINITY, 1)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "slice lengths differ")]
+    fn max_abs_err_rejects_different_lengths() {
+        let _ = max_abs_err(&[1.0], &[1.0, 2.0]);
     }
 
     #[test]

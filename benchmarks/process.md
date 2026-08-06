@@ -1,23 +1,29 @@
 # tensor-ash Refactor, Verification, and Benchmark Process
 
-Generated: 2026-06-10. Updated 2026-06-11 for the BDA / BDA_V4 optimization
-pass and the pure-cuBLAS comparison methodology.
+Generated: 2026-06-10. Structure and verification guidance updated
+2026-08-06 after the workspace-level architecture cleanup. Historical
+benchmark measurements remain labeled with the date and environment in which
+they were collected.
 
 ## Scope
 
-This report records the maintainability audit, post-`v1.0.0` optimization
-work, C ABI port, local verification, cross-framework GEMM benchmark, and
-Ollama backend attempt. The "Performance Changes", "GEMM Benchmark Command",
-"Apples-to-Apples cuBLAS Methodology", and "Optimization Gameplan" sections
-have been refreshed for the data-driven `KERNEL_SPECS` pipeline, the BDA /
-BDA_V4 kernel families, the showcase case set, and the pure-cuBLAS C++
-baseline.
+This report records the maintainability work, post-`v1.0.0` optimization, C
+ABI port, local verification, cross-framework GEMM benchmark, and Ollama
+backend attempt. The structure, commands, and file-size audit describe the
+current workspace; older performance numbers below are retained as historical
+measurements rather than implied results of the refactor.
 
-The project now exposes two related surfaces:
+The workspace now contains four deliberately separate packages:
 
 - `tensor-ash`: the Rust/Vulkan FP32 GEMM library.
 - `tensor-ash-capi`: a C ABI wrapper that builds `libtensor_ash.so` and
   `libtensor_ash.a`.
+- `ml-bench`: a non-published benchmark/correctness CLI. Its logging,
+  environment parsing, cases, and reporting no longer add dependencies or a
+  binary target to the core library package.
+- `tensor-ash-test-support`: a dependency-free, non-published home for
+  deterministic fixtures and CPU reference math shared by integration tests
+  and `ml-bench`; those helpers are no longer part of the runtime API.
 
 The C ABI is a callable GEMM layer. It is not yet an Ollama or ggml backend
 implementation, so Ollama cannot use it as a model runtime backend without
@@ -25,29 +31,40 @@ additional adapter work.
 
 ## Refactor Summary
 
-Earlier maintainability work split the largest Rust files into cohesive
-modules:
+The large files were decomposed along runtime ownership and change boundaries:
 
-- `src/bench/`: benchmark command parsing, cases, environment, and reporting.
-- `src/executor/`: public executor API, per-submit slots, and command
-  recording.
-- `src/pipeline/`: pipeline types, kernel selector, and Vulkan pipeline
-  creation.
-- `src/context/`: device selection, debug callback, pipeline cache paths, and
-  Vulkan context setup.
-- `tests/correctness/`: topical ignored GPU integration tests.
+- `src/executor/mod.rs` is now the slot-owning facade. Normal/graph dispatch,
+  validation, upload/download, timed queue submission, online tuning,
+  split-K execution, and Stream-K execution/scheduling live in separate
+  modules. Descriptor updates and graph barrier construction are further
+  isolated under `src/executor/recording/`.
+- `src/matmul.rs` is a compatibility facade. Public operations/statistics live
+  in `src/matmul/api.rs`, while checked shape, broadcasting, batch-stride, and
+  FLOP resolution live in `src/matmul/resolution.rs`.
+- `src/pipeline/catalog.rs` is the single source of kernel identity. One macro
+  declaration generates `KernelSelection`, parsing aliases, stable indices,
+  and `KERNEL_SPECS`; ABI specialization, Vulkan creation/runtime, selection,
+  and persistence are separate modules.
+- `src/context/` separates device discovery, debug plumbing, pipeline-cache
+  policy, and context construction/ownership.
+- `tools/ml-bench/` is its own workspace package rather than `src/bench/` plus
+  a binary in the library package.
+- `tools/test-support/` owns deterministic input generation, reference BMM,
+  error measurement, and tolerances shared by tests and the benchmark CLI.
+- `scripts/bench_compare.py` is a small CLI/compatibility facade over
+  `bench_compare_backends.py`, `bench_compare_models.py`, and
+  `bench_compare_report.py`.
+- `capi/src/api/` splits exported lifecycle, tensor-transfer, and matmul calls.
+  Shared handle validation remains in `handles.rs`; panic/error barriers remain
+  in `error.rs`; C-compatible records remain in `types.rs`.
+- `tests/correctness/` remains organized by feature, with Vulkan-dependent
+  integration tests explicitly ignored during ordinary CPU-only test runs.
 
-This pass added and split the C ABI:
-
-- `capi/src/api.rs`: exported `ta_*` functions and C ABI tests.
-- `capi/src/error.rs`: per-thread error string and panic/error barriers.
-- `capi/src/handles.rs`: opaque C handle wrappers.
-- `capi/src/types.rs`: C-compatible public structs.
-- `include/tensor_ash.h`: public C header.
-- `examples/c_smoke.c`: C smoke test.
-
-The Cargo package is now a workspace with the Rust crate as the core package
-and `tensor-ash-capi` as the C ABI wrapper crate.
+The split also tightened ownership invariants: an `Executor` rejects a
+pipeline created from another `VulkanContext`; Rust tensors and C tensor
+handles retain their originating context; C operations reject cross-context
+tensor handles; and release builds unwind at the C boundary so its
+`catch_unwind` safety barrier remains effective.
 
 ## Performance Changes
 
@@ -66,8 +83,8 @@ Layered post-`v1.0.0`:
   regressing batched cases.
 - The pipeline is now data-driven through a single `KERNEL_SPECS` table:
   pipeline construction, kernel selection, and the `ML_KERNEL=...` parser all
-  read from it, so adding a tile is a two-line registry entry plus a `.comp`
-  wrapper.
+  derive from one `kernel_catalog!` declaration, so adding a tile takes one
+  catalog entry plus a `.comp` wrapper.
 - Vulkan 1.2 `bufferDeviceAddress` is enabled end-to-end (`VulkanContext`,
   `Buffer`, `MatmulPushConstants.{a,b,c}_ptr`), enabling the
   `GL_EXT_buffer_reference` BDA kernel family (LDG.E.128 global loads) and
@@ -77,16 +94,27 @@ Layered post-`v1.0.0`:
   exposes `bufferDeviceAddress`, with a plain BDA fallback for the TN=2
   `m64n32` tile. Explicit `ML_KERNEL=...` selections are honored verbatim.
 
-`KERNEL_SPECS` currently lists 27 SPIR-V variants (7 descriptor-bound primary
-tiles, the 7 BDA siblings, 6 BDA_V4 siblings, plus exploratory entries —
-`bk16`, `v2`, `m64n128k64`, `m128n128_t4`, `m256n64`, `v3` — kept around for
-A/B tuning via `ML_KERNEL`). Multiplied by the `K_MULTIPLE` / `ACCUMULATE` /
-`ALPHA_IS_ONE` / `INTERIOR_ONLY` specialization bits, each run can create a
-few hundred specialized compute pipelines, amortized by the persistent Vulkan
-pipeline cache under `$XDG_CACHE_HOME/tensor-ash/`.
+`KERNEL_SPECS` currently lists 35 SPIR-V variants, including descriptor-bound,
+BDA, BDA_V4, register-tile, strict-aligned, exploratory, and row/GEMV entries.
+The catalog macro prevents the selection enum, parser aliases, registry order,
+and index mapping from drifting apart. Multiplied by the `K_MULTIPLE` /
+`ACCUMULATE` / `ALPHA_IS_ONE` / `INTERIOR_ONLY` specialization bits, startup
+builds 16 zero-epilogue pipelines per kernel; non-zero epilogues are created
+lazily and everything is amortized by the persistent Vulkan pipeline cache
+under `$XDG_CACHE_HOME/tensor-ash/`.
 
 ## Added Tests
 
+- The generated kernel catalog tests every selection/index mapping, every
+  case-insensitive alias, and unique registry names.
+- Matmul resolution tests require bias tensors to have actual `[N]` or
+  `[B, N]` shape rather than merely the same element count.
+- Test-support checks now treat non-finite output as an infinite error and
+  reject mismatched slice lengths.
+- Stream-K schedule tests are CPU-only; all nine Vulkan execution cases are
+  ignored during ordinary workspace tests, matching the rest of the GPU suite.
+- Python adapter tests now exercise per-case failure containment in addition to
+  model/report helpers.
 - C ABI version string is NUL-terminated.
 - C ABI null upload reports a per-thread error instead of panicking.
 - C ABI destroy functions accept null handles as no-ops.
@@ -110,32 +138,35 @@ Largest source files after the split:
 
 | file | lines | note |
 | --- | ---: | --- |
-| `scripts/bench_compare.py` | 866 | cross-framework benchmark/report CLI; next split target |
-| `src/executor/mod.rs` | 410 | cohesive executor API and submit flow |
-| `src/matmul.rs` | 375 | cohesive shape/stat API |
-| `capi/src/api.rs` | 353 | exported C ABI functions |
-| `src/bench/commands.rs` | 330 | benchmark subcommands |
+| `scripts/bench_compare_backends.py` | 467 | isolated framework/native adapters |
+| `src/pipeline/mod.rs` | 410 | pipeline ownership and caches |
+| `src/executor/splitk2.rs` | 398 | two-stage split-K pipeline and planning |
+| `src/executor/streamk_exec.rs` | 367 | Stream-K validation and GPU recording |
+| `scripts/bench_compare_report.py` | 357 | JSON/Markdown analysis |
+| `tools/ml-bench/src/bench/commands.rs` | 338 | standalone benchmark subcommands |
 | `src/context/device.rs` | 320 | device selection and tests |
-| `src/context/mod.rs` | 300 | Vulkan context setup/drop |
+| `src/executor/streamk_schedule.rs` | 309 | pure host scheduling policy and tests |
 
-`scripts/bench_compare.py` is now the largest file. It is still acceptable as a
-single script-style component for this pass, but it should be split into a
-small Python package before adding more framework backends or report formats.
+No Rust or Python source file remains above 500 lines. The remaining larger
+files each represent one cohesive subsystem; pipeline ownership and split-K2
+creation are the next candidates if either grows materially.
 
 ## Verification Commands
 
-All commands below passed unless explicitly noted.
+Run the complete current-workspace check from the repository root:
 
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo build --release -p ml-bench
 cargo build --release -p tensor-ash-capi
+python3 scripts/bench_compare_test.py
 cc -Iinclude examples/c_smoke.c -Ltarget/release -ltensor_ash \
-  -Wl,-rpath,/home/gusahlg/repos/ml_project/target/release \
+  -Wl,-rpath,"$PWD/target/release" \
   -o /tmp/tensor_ash_c_smoke
 nix-shell --run 'env LD_LIBRARY_PATH=target/release:$LD_LIBRARY_PATH /tmp/tensor_ash_c_smoke'
-nix-shell --run 'cargo test --release --test correctness -- --ignored --test-threads=1'
+nix-shell --run 'cargo test --release -p tensor-ash --test correctness -- --ignored --test-threads=1'
 ```
 
 Important runtime note:
@@ -147,6 +178,9 @@ target/release/ml_bench self-check
 fails outside the Nix shell with `failed to load Vulkan loader:
 libvulkan.so.1`. Inside `nix-shell`, the same binary selects the NVIDIA RTX
 3070 correctly.
+
+The following GPU and C outputs are retained from the earlier recorded run;
+they are not a substitute for rerunning the current verification sequence.
 
 GPU correctness result:
 
@@ -305,7 +339,7 @@ Custom backend attempt:
 ```bash
 env OLLAMA_HOST=127.0.0.1:11435 \
   OLLAMA_DEBUG=1 \
-  OLLAMA_LLM_LIBRARY=/home/gusahlg/repos/ml_project/target/release/libtensor_ash.so \
+  OLLAMA_LLM_LIBRARY="$PWD/target/release/libtensor_ash.so" \
   ollama serve
 ```
 
@@ -329,7 +363,7 @@ Second custom-server attempt:
 env OLLAMA_HOST=127.0.0.1:11435 \
   OLLAMA_DEBUG=1 \
   OLLAMA_MODELS=/var/lib/ollama/models \
-  OLLAMA_LLM_LIBRARY=/home/gusahlg/repos/ml_project/target/release/libtensor_ash.so \
+  OLLAMA_LLM_LIBRARY="$PWD/target/release/libtensor_ash.so" \
   ollama serve
 ```
 
@@ -390,7 +424,7 @@ of `cublas_bench.cu` for the exact argument mapping.
 Status legend: DONE, in progress, NEXT.
 
 1. **DONE** — Data-driven `KERNEL_SPECS` pipeline. Adding a tile shape is now
-   a two-line registry entry plus a `.comp` wrapper.
+   one `kernel_catalog!` declaration plus a `.comp` wrapper.
 2. **DONE** — Vulkan 1.2 `bufferDeviceAddress` end-to-end.
 3. **DONE** — BDA kernel family (`GL_EXT_buffer_reference` → `LDG.E.128`).
    +5-15% on every tile we measured. Variants exist for all seven primary
@@ -420,8 +454,9 @@ Status legend: DONE, in progress, NEXT.
    Ollama integration remains the priority.
 10. **NEXT** — Add a benchmark focused on C ABI call overhead and
     batched-call throughput.
-11. **NEXT** — Split `scripts/bench_compare.py` into a package if framework
-    coverage grows.
+11. **DONE** — Split `scripts/bench_compare.py` into backend adapters, data
+    models/case sets, and report generation, retaining the original module as
+    the CLI and compatibility facade.
 
 ### Dead Ends — Do Not Retry
 

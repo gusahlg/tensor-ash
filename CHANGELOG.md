@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## v1.4.0 - 2026-08-06
 
 ### Added
 
@@ -16,6 +16,47 @@
 - Batched private-network layers now approach memory-bandwidth limits on an
   RTX 3070. Across the six shapes used by town-hall at batch 10,000, measured
   GPU time improved by 2.4x to 5.8x.
+- Large implementation files were split by responsibility: executor dispatch,
+  validation, transfer, submission, tuning, reductions, Stream-K scheduling,
+  and recording are separate modules; matmul API types are separate from shape
+  resolution; pipeline identity is generated from one catalog declaration;
+  persistent execution/resource setup and C lifecycle/tensor/matmul exports are
+  likewise isolated.
+- `ml_bench` moved out of the core package into the non-published `ml-bench`
+  workspace package. Run it with `cargo run --release -p ml-bench -- ...`;
+  release builds still produce `target/release/ml_bench`.
+- Deterministic fixtures and CPU reference math moved from the public
+  `tensor_ash::testing` module to the non-published
+  `tensor-ash-test-support` workspace package shared by integration tests and
+  `ml-bench`.
+- The cross-library Python CLI is now a small compatibility facade over
+  backend adapters, data models/case sets, and report generation modules.
+- `ExecutorConfig` and `Executor::new_with_config` provide explicit slot,
+  submission-limit, and tuning policy for library callers; the existing
+  constructor remains compatible with `ML_TUNE`.
+- Raw `Buffer`/`Tensor` fields are private. Read-only Vulkan interop is exposed
+  through accessors while ownership stays with the wrapper.
+- All workspace packages now share version `1.4.0` and Rust edition `2024`.
+
+### Fixed
+
+- `Executor` construction and tensor operations reject resources owned by a
+  different `VulkanContext`, including through the C ABI, before invalid
+  cross-device handles can reach Vulkan.
+- `Buffer::new` reports a normal error for zero-sized allocations instead of
+  panicking.
+- `PersistentMatmul::bench` derives FLOP counts from the validated matmul
+  shape instead of accepting a caller-supplied value that could misreport
+  throughput.
+- Release builds use unwinding so the C ABI's `catch_unwind` boundary can
+  convert Rust panics into `ta_last_error()` instead of aborting the process.
+- All Vulkan-dependent Stream-K correctness cases are ignored during ordinary
+  CPU-only `cargo test --workspace` runs.
+
+### Removed
+
+- Unused core dependencies on `rayon` and `thiserror`; `env_logger` is now a
+  development/tool dependency rather than part of the runtime library graph.
 
 ## v1.3.0 - 2026-07-15
 
@@ -306,11 +347,11 @@ atomic, CTA swizzle, subgroupShuffle).
 Validated locally on 2026-06-14 with:
 
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release -p tensor-ash-capi
-nix-shell --run 'cargo test --release --test correctness -- --ignored --test-threads=1'
+nix-shell --run 'cargo test --release -p tensor-ash --test correctness -- --ignored --test-threads=1'
 nix-shell --run 'env LD_LIBRARY_PATH=target/release:$LD_LIBRARY_PATH /tmp/tensor_ash_c_smoke'
 nix develop .#benchmark --command bash -lc \
   '.venv-bench/bin/python scripts/bench_compare.py --case-set showcase --iters 30 --warmup 10 --torch-threads 1 --transfer-mb 64'
@@ -351,13 +392,13 @@ Initial stable release of `tensor-ash` as a Rust/Vulkan FP32 GEMM component.
 Validated on 2026-06-09 with:
 
 ```bash
-cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
-python3 -m py_compile scripts/bench_compare.py
-cargo build --release --bin ml_bench
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+python3 scripts/bench_compare_test.py
+cargo build --release -p ml-bench
 nix-shell --run 'ML_DEVICE=discrete target/release/ml_bench self-check'
-nix-shell --run 'cargo test --release --test correctness -- --ignored --test-threads=1'
+nix-shell --run 'cargo test --release -p tensor-ash --test correctness -- --ignored --test-threads=1'
 ```
 
 The release GPU correctness suite passed 23/23 ignored integration tests on an

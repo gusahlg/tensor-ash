@@ -67,9 +67,12 @@ impl Slot {
             let fence_guard = scopeguard::guard(fence, |f| ctx.device.destroy_fence(f, None));
 
             // Descriptor pool sized for `max_sets` matmul calls (3 STORAGE_BUFFER each).
+            let descriptor_count = max_sets
+                .checked_mul(3)
+                .ok_or_else(|| anyhow::anyhow!("slot descriptor count overflows u32"))?;
             let pool_size = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(max_sets * 3)];
+                .descriptor_count(descriptor_count)];
             let descriptor_pool = ctx
                 .device
                 .create_descriptor_pool(
