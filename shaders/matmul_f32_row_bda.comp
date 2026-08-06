@@ -1,0 +1,71 @@
+#version 460
+// One output row per workgroup-row, one output column per lane. This is
+// specifically efficient for very large batches of M=1 private networks,
+// while remaining correct for arbitrary M through gl_WorkGroupID.y.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const bool ACCUMULATE = false;
+layout(constant_id = 1) const bool ALPHA_IS_ONE = true;
+layout(constant_id = 2) const bool INTERIOR_ONLY = false;
+layout(constant_id = 3) const bool K_MULTIPLE = false;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer F32V4ReadOnly {
+    vec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32ReadWrite {
+    float v[];
+};
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_c;
+    uint flags;
+    float alpha;
+    F32ReadOnly a_ptr;
+    F32ReadOnly b_ptr;
+    F32ReadWrite c_ptr;
+    F32ReadOnly d_ptr;
+    F32ReadOnly bias_ptr;
+    float beta;
+    uint bias_batch_stride;
+} pc;
+
+#include "matmul_epilogue_common.glsl"
+
+void main() {
+    const uint batch = gl_WorkGroupID.z;
+    const uint row = gl_WorkGroupID.y;
+    const uint col = gl_WorkGroupID.x * 32u + gl_LocalInvocationID.x;
+    if (!INTERIOR_ONLY && col >= pc.N) return;
+
+    const uint a_base = batch * pc.batch_stride_a + row * pc.K;
+    const uint b_base = batch * pc.batch_stride_b + col;
+    float acc = 0.0;
+    for (uint inner = 0u; inner < pc.K; ++inner) {
+        acc = fma(
+            pc.a_ptr.v[a_base + inner],
+            pc.b_ptr.v[b_base + inner * pc.N],
+            acc
+        );
+    }
+
+    const uint c_index = batch * pc.batch_stride_c + row * pc.N + col;
+    float value = ALPHA_IS_ONE ? acc : pc.alpha * acc;
+    if (ACCUMULATE) value += pc.c_ptr.v[c_index];
+    if (EPI_ANY) value = epi_apply(value, c_index, col, batch);
+    pc.c_ptr.v[c_index] = value;
+}

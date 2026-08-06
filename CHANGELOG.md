@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- `row_bda`, a warp-sized row/GEMV kernel for large batches of `M=1`
+  products. The automatic selector uses it on BDA-capable devices instead of
+  dispatching mostly-empty 64x64 GEMM tiles. It retains arbitrary-M
+  correctness, batch broadcasting, alpha/accumulate behavior, and every fused
+  epilogue. Dedicated Vulkan tests cover tails, broadcasting, multiple rows,
+  batched bias, activation, and residual addition.
+
+### Changed
+
+- Batched private-network layers now approach memory-bandwidth limits on an
+  RTX 3070. Across the six shapes used by town-hall at batch 10,000, measured
+  GPU time improved by 2.4x to 5.8x.
+
 ## v1.3.0 - 2026-07-15
 
 VkSplat-inspired systems release: the library stops being "a pile of

@@ -2,7 +2,8 @@
 //  matmul_epilogue_common.glsl — fused epilogue applied at C-store time.
 //
 //  Included by the BDA kernel bodies *after* their push-constant block
-//  declaration: relies on `pc.bias_ptr`, `pc.d_ptr`, `pc.beta` and the
+//  declaration: relies on `pc.bias_ptr`, `pc.bias_batch_stride`,
+//  `pc.d_ptr`, `pc.beta` and the
 //  `F32ReadOnly` / `F32V4ReadOnly` buffer_reference types.
 //
 //  All three knobs are specialization constants, so every branch below
@@ -12,7 +13,7 @@
 //
 //  Semantics (applied after alpha-scale and ACCUMULATE):
 //      v = alpha * (A@B) [+ C_old]
-//      if EPI_BIAS:        v += bias[g_col]           (bias is a [N] vector)
+//      if EPI_BIAS:        v += bias[batch,g_col]     ([N] or [B,N])
 //      v = act(v)                                     (per EPI_ACT)
 //      if EPI_BINARY == 1: v += beta * D[c_idx]       (residual add)
 //      if EPI_BINARY == 2: v *= D[c_idx]              (SwiGLU-style gate)
@@ -37,10 +38,11 @@ float epi_activate(float x) {
     return x;
 }
 
-// Scalar path.  `c_idx` is the element index into C (D shares C's
-// layout); `g_col` is the global output column indexing the bias.
-float epi_apply(float v, uint c_idx, uint g_col) {
-    if (EPI_BIAS != 0u) v += pc.bias_ptr.v[g_col];
+// Scalar path. `bias_batch_stride == 0` broadcasts one bias row.
+float epi_apply(float v, uint c_idx, uint g_col, uint batch) {
+    if (EPI_BIAS != 0u) {
+        v += pc.bias_ptr.v[batch * pc.bias_batch_stride + g_col];
+    }
     v = epi_activate(v);
     if (EPI_BINARY == 1u) v = fma(pc.beta, pc.d_ptr.v[c_idx], v);
     else if (EPI_BINARY == 2u) v *= pc.d_ptr.v[c_idx];
@@ -49,10 +51,15 @@ float epi_apply(float v, uint c_idx, uint g_col) {
 
 // Vec4 path for the interior store: `c_idx4` = c_idx/4 and
 // `g_col4` = g_col/4, both 16-byte aligned by the interior contract.
-vec4 epi_apply4(vec4 v, uint c_idx4, uint g_col4) {
+vec4 epi_apply4(vec4 v, uint c_idx4, uint g_col4, uint batch) {
     if (EPI_BIAS != 0u) {
-        F32V4ReadOnly bias4 = F32V4ReadOnly(uint64_t(pc.bias_ptr));
-        v += bias4.v[g_col4];
+        uint base = batch * pc.bias_batch_stride + g_col4 * 4u;
+        v += vec4(
+            pc.bias_ptr.v[base],
+            pc.bias_ptr.v[base + 1u],
+            pc.bias_ptr.v[base + 2u],
+            pc.bias_ptr.v[base + 3u]
+        );
     }
     if (EPI_ACT == 1u) {
         v = max(v, vec4(0.0));

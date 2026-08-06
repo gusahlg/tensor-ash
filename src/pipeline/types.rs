@@ -25,11 +25,12 @@ pub struct MatmulPushConstants {
     pub c_ptr: u64,
     /// Epilogue residual / gate operand (same shape+layout as C), or 0.
     pub d_ptr: u64,
-    /// Epilogue bias vector of length N, or 0.
+    /// Epilogue bias data, either broadcast `[N]` or batched `[B, N]`, or 0.
     pub bias_ptr: u64,
     /// Scale for the `+= beta * D` residual epilogue.
     pub beta: f32,
-    pub _pad: u32,
+    /// Bias elements between batches; zero means broadcast one `[N]` row.
+    pub bias_batch_stride: u32,
 }
 
 /// Static description of one matmul kernel: its display name, output-tile
@@ -366,6 +367,17 @@ pub const KERNEL_SPECS: &[KernelSpec] = &[
         )),
         uses_descriptors: false,
     },
+    KernelSpec {
+        // Warp-sized row kernel for large batches of matrix-vector products.
+        // It remains correct for M>1, but auto-selection intentionally uses it
+        // only for M=1 where tiled GEMM wastes almost all row work.
+        name: "row_bda",
+        tile_m: 1,
+        tile_n: 32,
+        tile_k: 1,
+        spv: include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_row_bda.spv")),
+        uses_descriptors: false,
+    },
 ];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -405,6 +417,7 @@ pub enum KernelSelection {
     K64BdaV4Tm8Tn8,
     LargeBdaV4Aligned,
     M128N64K64BdaV4Aligned,
+    RowBda,
 }
 
 impl KernelSelection {
@@ -445,8 +458,9 @@ impl KernelSelection {
             "k64_bda_v4_tm8_tn8" => Ok(Self::K64BdaV4Tm8Tn8),
             "large_bda_v4_aligned" | "128x128_bda_v4_aligned" => Ok(Self::LargeBdaV4Aligned),
             "m128n64k64_bda_v4_aligned" => Ok(Self::M128N64K64BdaV4Aligned),
+            "row_bda" | "row" | "gemv_bda" => Ok(Self::RowBda),
             other => bail!(
-                "invalid ML_KERNEL '{other}', expected one of auto, large, small, m64n128, m128n64, m128n64k64, m64n32, k64, bk16, v2, m64n128k64, m128n128_t4, m256n64, v3, or any *_bda / *_bda_v4 variant"
+                "invalid ML_KERNEL '{other}', expected one of auto, large, small, m64n128, m128n64, m128n64k64, m64n32, k64, row_bda, bk16, v2, m64n128k64, m128n128_t4, m256n64, v3, or any *_bda / *_bda_v4 variant"
             ),
         }
     }
@@ -498,6 +512,7 @@ impl KernelSelection {
             Self::K64BdaV4Tm8Tn8 => Some(31),
             Self::LargeBdaV4Aligned => Some(32),
             Self::M128N64K64BdaV4Aligned => Some(33),
+            Self::RowBda => Some(34),
         }
     }
 }
@@ -525,7 +540,7 @@ pub struct KernelVariant {
 /// `MatmulPipeline`.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
 pub struct EpilogueKey {
-    /// `constant_id = 4`: add a `[N]` bias vector before activation.
+    /// `constant_id = 4`: add a shared `[N]` or batched `[B, N]` bias.
     pub bias: bool,
     /// `constant_id = 5`: 0=none, 1=relu, 2=silu, 3=gelu(tanh).
     pub activation: u32,
@@ -638,6 +653,10 @@ mod tests {
             KernelSelection::M64N32
         );
         assert_eq!(KernelSelection::parse("k64").unwrap(), KernelSelection::K64);
+        assert_eq!(
+            KernelSelection::parse("row").unwrap(),
+            KernelSelection::RowBda
+        );
         assert!(KernelSelection::parse("wideish").is_err());
     }
 
@@ -683,6 +702,7 @@ mod tests {
             KernelSelection::M128N64K64,
             KernelSelection::M64N32,
             KernelSelection::K64,
+            KernelSelection::RowBda,
         ] {
             let idx = selection.index().expect("non-Auto selection has an index");
             assert!(idx < KERNEL_SPECS.len(), "index {idx} out of range");

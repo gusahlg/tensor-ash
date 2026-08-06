@@ -77,6 +77,7 @@ layout(push_constant) uniform PC {
     F32ReadOnly  d_ptr;
     F32ReadOnly  bias_ptr;
     float beta;
+    uint bias_batch_stride;
 } pc;
 
 #include "matmul_epilogue_common.glsl"
@@ -328,7 +329,7 @@ void main() {
                     v.w = c_s.v[c_addr + 3u] + v.w;
                 }
                 if (EPI_ANY)
-                    v = epi_apply4(v, c_addr >> 2u, (col_base + j4 * 4u) >> 2u);
+                    v = epi_apply4(v, c_addr >> 2u, (col_base + j4 * 4u) >> 2u, batch);
                 if (ACCUMULATE) {
                     c_s.v[c_addr + 0u] = v.x;
                     c_s.v[c_addr + 1u] = v.y;
@@ -355,7 +356,7 @@ void main() {
                     const uint c_addr = row_off + j4 * 4u + s;
                     float val = v[s];
                     if (ACCUMULATE) val = c_s.v[c_addr] + val;
-                    if (EPI_ANY) val = epi_apply(val, c_addr, col_base + j4 * 4u + s);
+                    if (EPI_ANY) val = epi_apply(val, c_addr, col_base + j4 * 4u + s, batch);
                     c_s.v[c_addr] = val;
                 }
             }
@@ -374,7 +375,7 @@ void main() {
                     if (g_col >= pc.N) continue;
                     float val = v[s];
                     if (ACCUMULATE) val = c_s.v[row_off + g_col] + val;
-                    if (EPI_ANY) val = epi_apply(val, row_off + g_col, g_col);
+                    if (EPI_ANY) val = epi_apply(val, row_off + g_col, g_col, batch);
                     c_s.v[row_off + g_col] = val;
                 }
             }

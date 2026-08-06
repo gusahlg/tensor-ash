@@ -72,7 +72,8 @@ pub enum EpilogueBinary<'a> {
 }
 
 /// Fused epilogue applied while the output tile is still in registers,
-/// in order: `+bias[N]` → activation → binary op with `D`.  Avoids a
+/// in order: `+bias` → activation → binary op with `D`.  `bias` may be
+/// broadcast `[N]` or batched `[B, N]`. Avoids a
 /// full write+read+write round-trip over C for bias/activation/residual
 /// chains.
 ///
@@ -81,7 +82,7 @@ pub enum EpilogueBinary<'a> {
 /// kernels reject epilogues.
 #[derive(Copy, Clone, Default)]
 pub struct Epilogue<'a> {
-    /// Length-N vector added to every output row before activation.
+    /// A shared length-N vector or B-by-N rows added before activation.
     pub bias: Option<&'a Tensor>,
     pub activation: Activation,
     pub binary: EpilogueBinary<'a>,
@@ -276,14 +277,19 @@ impl ResolvedMatmul {
         Ok(resolved)
     }
 
-    /// Shape checks for the fused epilogue: bias must be a length-N
-    /// vector; D must match C's shape exactly (it is indexed with C's
-    /// layout, batch stride included).
+    /// Shape checks for the fused epilogue: bias must contain either N
+    /// shared elements or B*N per-batch elements; D must match C's shape
+    /// exactly (it is indexed with C's layout, batch stride included).
     fn validate_epilogue(&self, op: &MatmulOp<'_>) -> Result<()> {
         if let Some(bias) = op.epilogue.bias {
             let numel = bias.len();
-            if numel != self.n as u64 {
-                bail!("epilogue bias has {numel} elements, expected N={}", self.n);
+            let shared = self.n as u64;
+            let batched = self.batch as u64 * shared;
+            if numel != shared && numel != batched {
+                bail!(
+                    "epilogue bias has {numel} elements, expected N={} or B*N={batched}",
+                    self.n
+                );
             }
         }
         if let Some(d) = op.epilogue.d_tensor()
@@ -321,7 +327,7 @@ impl ResolvedMatmul {
             d_ptr: 0,
             bias_ptr: 0,
             beta: 0.0,
-            _pad: 0,
+            bias_batch_stride: 0,
         }
     }
 
@@ -362,7 +368,7 @@ impl ResolvedMatmul {
             d_ptr: 0,
             bias_ptr: 0,
             beta: 0.0,
-            _pad: 0,
+            bias_batch_stride: 0,
         }
     }
 

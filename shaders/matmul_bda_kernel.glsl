@@ -84,6 +84,7 @@ layout(push_constant) uniform PC {
     F32ReadOnly  d_ptr;
     F32ReadOnly  bias_ptr;
     float beta;
+    uint bias_batch_stride;
 } pc;
 
 #include "matmul_epilogue_common.glsl"
@@ -261,7 +262,7 @@ void main() {
             [[unroll]] for (uint j = 0u; j < TN; ++j) {
                 float v = ALPHA_IS_ONE ? acc[i][j] : alpha * acc[i][j];
                 if (ACCUMULATE) v = c_s.v[row_off + j] + v;
-                if (EPI_ANY) v = epi_apply(v, row_off + j, col_base + j);
+                if (EPI_ANY) v = epi_apply(v, row_off + j, col_base + j, batch);
                 c_s.v[row_off + j] = v;
             }
         }
@@ -276,7 +277,7 @@ void main() {
                 if (g_col >= pc.N) continue;
                 float v = ALPHA_IS_ONE ? acc[i][j] : alpha * acc[i][j];
                 if (ACCUMULATE) v = c_s.v[row_off + g_col] + v;
-                if (EPI_ANY) v = epi_apply(v, row_off + g_col, g_col);
+                if (EPI_ANY) v = epi_apply(v, row_off + g_col, g_col, batch);
                 c_s.v[row_off + g_col] = v;
             }
         }

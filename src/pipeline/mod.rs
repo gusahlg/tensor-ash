@@ -218,6 +218,11 @@ impl MatmulPipeline {
     /// Serves as the tuner's prior and as the fallback for untuned
     /// shapes.
     pub fn heuristic_kernel_index(&self, batch: u32, m: u32, n: u32, k: u32) -> usize {
+        if m == 1 && self.ctx.buffer_device_address_enabled {
+            return KernelSelection::RowBda
+                .index()
+                .expect("row kernel has a concrete index");
+        }
         let tile = auto_select_kernel(batch, m, n, k, self.auto_min_large_tiles);
         let selection = if self.ctx.buffer_device_address_enabled {
             maybe_to_bda(tile)

@@ -44,9 +44,9 @@ callable GEMM component; those runtimes still need their own adapter layer.
   shapes — on the caller's real problem, then persists the winner per
   device/driver/shader-build under `$XDG_CACHE_HOME/tensor-ash/`.
   Persisted winners apply on every later run automatically.
-- **Fused epilogues** (`MatmulOp` / `Epilogue`): bias + ReLU/SiLU/GELU +
-  residual-add or SwiGLU-style gating applied in-register at store time —
-  `silu(x @ W_gate) * up` is one dispatch.
+- **Fused epilogues** (`MatmulOp` / `Epilogue`): shared `[N]` or per-batch
+  `[B, N]` bias + ReLU/SiLU/GELU + residual-add or SwiGLU-style gating applied
+  in-register at store time — `silu(x @ W_gate) * up` is one dispatch.
 - **Graph submission** (`run_matmul_graph` / `run_op_graph`): dependent
   chains recorded into one command buffer with automatic hazard barriers;
   one fence wait per chain.
@@ -74,6 +74,11 @@ descriptor-bound tiles:
   Sources only emit the LDG.E.128 / LDS.E.128 / FFMA hot path and the
   STG.E.128 epilogue; the dispatcher promotes through `maybe_to_aligned`
   when the shape qualifies.
+- **Row BDA** — one warp computes one output-row tile without materializing
+  the mostly-empty 64x64 tiles used by a general GEMM. It is selected
+  automatically for `M=1`, including large batches of private neural-network
+  layers, and supports the same broadcasting, accumulation, and fused
+  epilogues as the other bounds-checked BDA kernels.
 
 On an RTX 3070, every tile we measured gains roughly +5-15% from BDA and
 another +5-15% from V4. The auto-selector promotes its picks to BDA_V4 at

@@ -344,6 +344,11 @@ pub(super) fn record_one_matmul(
         }
         if let Some(bias) = epilogue.bias {
             pc.bias_ptr = ctx.buffer_device_address(bias.raw_buffer());
+            pc.bias_batch_stride = if bias.len() == dims.n as u64 {
+                0
+            } else {
+                dims.n
+            };
         }
         if let Some(d) = epilogue.d_tensor() {
             pc.d_ptr = ctx.buffer_device_address(d.raw_buffer());

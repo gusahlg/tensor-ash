@@ -238,6 +238,67 @@ fn bias_residual_odd_shape() {
     );
 }
 
+#[test]
+#[ignore]
+fn batched_bias_uses_one_row_per_batch() {
+    let (ctx, exec) = make_setup(2, 8);
+    let (batch, m, n, k) = (3u32, 2u32, 7u32, 5u32);
+    let a = Tensor::uninit_device(&ctx, &[batch, m, k]).unwrap();
+    let b = Tensor::uninit_device(&ctx, &[batch, k, n]).unwrap();
+    let c = Tensor::uninit_device(&ctx, &[batch, m, n]).unwrap();
+    let bias = Tensor::uninit_device(&ctx, &[batch, n]).unwrap();
+
+    let mut ha = vec![0.0; (batch * m * k) as usize];
+    let mut hb = vec![0.0; (batch * k * n) as usize];
+    let mut hbias = vec![0.0; (batch * n) as usize];
+    fill_det(&mut ha, 91);
+    fill_det(&mut hb, 92);
+    for batch_index in 0..batch as usize {
+        for col in 0..n as usize {
+            hbias[batch_index * n as usize + col] = 10.0 * batch_index as f32 + col as f32;
+        }
+    }
+
+    exec.upload(&ha, &a).unwrap();
+    exec.upload(&hb, &b).unwrap();
+    exec.upload(&hbias, &bias).unwrap();
+    exec.run_ops(&[MatmulOp::with_epilogue(
+        MatmulCall {
+            a: &a,
+            b: &b,
+            c: &c,
+            alpha: 1.0,
+            accumulate: false,
+        },
+        Epilogue {
+            bias: Some(&bias),
+            activation: Activation::None,
+            binary: EpilogueBinary::None,
+        },
+    )])
+    .unwrap();
+
+    let mut got = vec![0.0; (batch * m * n) as usize];
+    exec.download(&c, &mut got).unwrap();
+    let mut expect = cpu_bmm(&ha, &hb, None, batch, m, n, k, 1.0, false);
+    for batch_index in 0..batch as usize {
+        for row in 0..m as usize {
+            for col in 0..n as usize {
+                expect[(batch_index * m as usize + row) * n as usize + col] +=
+                    hbias[batch_index * n as usize + col];
+            }
+        }
+    }
+
+    let (error, index) = max_abs_err(&got, &expect);
+    assert!(
+        error <= epi_tolerance(k),
+        "batched bias err {error:.3e} at {index} (got {}, want {})",
+        got[index],
+        expect[index]
+    );
+}
+
 // -- Epilogue tensors participate in graph hazard tracking --
 
 #[test]

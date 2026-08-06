@@ -23,6 +23,8 @@ mod kernels;
 mod ops;
 #[path = "correctness/property.rs"]
 mod property;
+#[path = "correctness/row.rs"]
+mod row;
 #[path = "correctness/shapes.rs"]
 mod shapes;
 #[path = "correctness/splitk2.rs"]
