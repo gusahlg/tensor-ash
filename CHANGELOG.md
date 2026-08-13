@@ -1,5 +1,52 @@
 # Changelog
 
+## [Unreleased]
+
+## v1.4.1 - 2026-08-13
+
+Measured-performance and correctness patch release.
+
+### Added
+
+- `ml_bench cases` benchmarks many labeled shapes in one Vulkan process,
+  avoiding repeated pipeline startup and GPU-clock perturbation. Timed results
+  retain paired wall/GPU samples and report sample counts, minimum, median,
+  nearest-rank p95, host overhead, wall throughput, and the selected
+  kernel/tile/reduction route.
+- Timed GEMMs now validate a fixed set of output elements after measurement so
+  a fast but incorrect kernel cannot be recorded as a benchmark win.
+- Cross-backend JSON schema v2 records timing scope/statistic, git state,
+  device/driver information, route metadata, and matching median distributions
+  for tensor-ash and cuBLAS. A compact regression set covers the four measured
+  worst shapes plus tile boundaries, batching, deep K, and both GEMV axes.
+- Addressing, alignment, aliasing, split-K, timestamp-wrap, and dispatch-limit
+  regression coverage, including supported strict-aligned happy paths.
+
+### Changed
+
+- Automatic kernel selection accounts for the whole batched grid and compares
+  actual padded work at tile boundaries. On an RTX 3070 this raises median
+  throughput by about 20% for batch-8 1024-cubed GEMM, 18% for batch-32
+  512-cubed GEMM, and 27% for the 4095-cubed edge case.
+- Runtime tuning filters irrelevant/invalid candidates, balances measurement
+  order, uses median samples consistently, releases its slot before probing
+  split-K2, and reports the actual selected reduction route.
+- Pure-BDA submissions skip descriptor-update allocation and selection work.
+
+### Fixed
+
+- Strict aligned kernels, including the static V3 kernel's special K=16
+  requirement, reject unsupported dimensions instead of permitting out-of-
+  bounds shader access or loop underflow.
+- Matmul resolution rejects rank-2 and batched layouts whose shader-visible
+  element offsets exceed 32-bit addressing, while accepting the exact valid
+  boundary.
+- Output tensors may no longer alias either GEMM input; split-K2 scratch and
+  split counts are range checked; one-split calls fall back before optional
+  feature/pipeline setup; Stream-K validates the actual dispatch axes.
+- Shader full-tile and K-strip predicates avoid 32-bit arithmetic overflow,
+  and timestamp deltas honor the device's valid counter width.
+
 ## v1.4.0 - 2026-08-06
 
 ### Added

@@ -120,6 +120,43 @@ fn splitk2_rejects_accumulate() {
     assert!(err.contains("accumulate"), "unexpected error: {err}");
 }
 
+#[test]
+#[ignore]
+fn splitk_one_falls_back_and_rejects_splits_past_k() {
+    let (ctx, exec) = make_setup(1, 4);
+    let a = Tensor::uninit_device(&ctx, &[16, 16]).unwrap();
+    let b = Tensor::uninit_device(&ctx, &[16, 16]).unwrap();
+    let c = Tensor::uninit_device(&ctx, &[16, 16]).unwrap();
+    let mut ha = vec![0.0; 16 * 16];
+    let mut hb = vec![0.0; 16 * 16];
+    fill_det(&mut ha, 211);
+    fill_det(&mut hb, 223);
+    exec.upload(&ha, &a).unwrap();
+    exec.upload(&hb, &b).unwrap();
+    let call = MatmulCall {
+        a: &a,
+        b: &b,
+        c: &c,
+        alpha: 1.0,
+        accumulate: false,
+    };
+    exec.run_matmuls_split_k(call, 1).unwrap();
+    let mut got = vec![0.0; 16 * 16];
+    exec.download(&c, &mut got).unwrap();
+    let expected = cpu_bmm(&ha, &hb, None, 1, 16, 16, 16, 1.0, false);
+    assert!(max_abs_err(&got, &expected).0 <= tolerance(16));
+
+    let err = exec.run_matmuls_split_k(call, 17).unwrap_err().to_string();
+    assert!(err.contains("exceeds K=16"), "unexpected error: {err}");
+
+    exec.run_matmuls_split_k2(call, 1).unwrap();
+    exec.download(&c, &mut got).unwrap();
+    assert!(max_abs_err(&got, &expected).0 <= tolerance(16));
+
+    let err = exec.run_matmuls_split_k2(call, 17).unwrap_err().to_string();
+    assert!(err.contains("exceeds K=16"), "unexpected error: {err}");
+}
+
 /// A tuned deep-K shape inside a dependent graph must route through the
 /// inline split-K2 path (when the probe recorded one) and still produce
 /// correct results for the downstream consumer.

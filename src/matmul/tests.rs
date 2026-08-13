@@ -86,14 +86,40 @@ fn rejects_batch_stride_overflow() {
 }
 
 #[test]
+fn accepts_the_largest_shader_addressable_layout() {
+    ResolvedMatmul::from_shapes(&[65_536, 65_536], &[65_536, 1], &[65_536, 1]).unwrap();
+    ResolvedMatmul::from_shapes(&[2, 32_768, 65_536], &[65_536, 1], &[2, 32_768, 1]).unwrap();
+}
+
+#[test]
+fn rejects_layouts_beyond_shader_u32_indexing() {
+    type LayoutCase<'a> = (&'a str, &'a [u32], &'a [u32], &'a [u32]);
+    let cases: [LayoutCase<'_>; 6] = [
+        ("A", &[65_537, 65_536], &[65_536, 1], &[65_537, 1]),
+        ("B", &[1, 65_537], &[65_537, 65_536], &[1, 65_536]),
+        ("C", &[65_537, 1], &[1, 65_536], &[65_537, 65_536]),
+        ("A", &[3, 32_768, 65_536], &[65_536, 1], &[3, 32_768, 1]),
+        ("B", &[3, 1, 32_768], &[3, 32_768, 65_536], &[3, 1, 65_536]),
+        ("C", &[3, 32_768, 1], &[1, 65_536], &[3, 32_768, 65_536]),
+    ];
+
+    for (label, a, b, c) in cases {
+        let err = ResolvedMatmul::from_shapes(a, b, c)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(label), "unexpected error: {err}");
+        assert!(
+            err.contains("shader u32 indexing"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
 fn rejects_flop_count_overflow() {
-    let err = ResolvedMatmul::from_shapes(
-        &[u32::MAX, u32::MAX],
-        &[u32::MAX, u32::MAX],
-        &[u32::MAX, u32::MAX],
-    )
-    .unwrap_err()
-    .to_string();
+    let err = ResolvedMatmul::from_shapes(&[1, u32::MAX], &[u32::MAX, 1], &[u32::MAX, 1, 1])
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("FLOP count overflows"));
 }
 

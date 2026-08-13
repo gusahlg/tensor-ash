@@ -59,11 +59,27 @@ STREAMK_CASES: list[Case] = [
     ("deep_k_512_8192", 1, 512, 512, 8192),
 ]
 
+# Compact guard set for the known throughput gaps and selector boundaries.
+# Keep this intentionally small: it is meant for frequent regression runs,
+# not as another exhaustive showcase.
+REGRESSION_CASES: list[Case] = [
+    ("medium_768", 1, 768, 768, 768),
+    ("non_pow2_1023x1025x1027", 1, 1023, 1025, 1027),
+    ("odd_255x257x263", 1, 255, 257, 263),
+    ("wide_128x1024x512", 1, 128, 1024, 512),
+    ("boundary_127x129x65", 1, 127, 129, 65),
+    ("batched_8x256", 8, 256, 256, 256),
+    ("deep_k_64x64x8192", 1, 64, 64, 8192),
+    ("gemv_1x4096x4096", 1, 1, 4096, 4096),
+    ("gemv_n1_4096x1x4096", 1, 4096, 1, 4096),
+]
+
 CASE_SETS: dict[str, list[Case]] = {
     "base": BASE_CASES,
     "extended": EXTENDED_CASES,
     "showcase": SHOWCASE_CASES,
     "streamk": STREAMK_CASES,
+    "regression": REGRESSION_CASES,
 }
 
 
@@ -82,6 +98,28 @@ class BenchResult:
     host_overhead_ms: float | None = None
     flops: float | None = None
     details: str = ""
+    # `best_ms` remains the compatibility alias for the minimum sample.
+    # Throughput is based on `median_ms` whenever a sample distribution is
+    # available.
+    sample_count: int | None = None
+    min_ms: float | None = None
+    median_ms: float | None = None
+    p95_ms: float | None = None
+    gpu_sample_count: int | None = None
+    wall_min_ms: float | None = None
+    wall_median_ms: float | None = None
+    wall_p95_ms: float | None = None
+    host_overhead_min_ms: float | None = None
+    host_overhead_median_ms: float | None = None
+    host_overhead_p95_ms: float | None = None
+    wall_tflops: float | None = None
+    kernel: str = ""
+    tile_m: int | None = None
+    tile_n: int | None = None
+    tile_k: int | None = None
+    strategy: str = ""
+    split_k2_splits: int | None = None
+    timing_scope: str = ""
 
 
 @dataclass
@@ -92,6 +130,13 @@ class TransferResult:
     upload_gibs: float | None = None
     download_gibs: float | None = None
     details: str = ""
+    sample_count: int | None = None
+    upload_min_ms: float | None = None
+    upload_median_ms: float | None = None
+    upload_p95_ms: float | None = None
+    download_min_ms: float | None = None
+    download_median_ms: float | None = None
+    download_p95_ms: float | None = None
 
 
 def flops_for(b: int, m: int, n: int, k: int) -> float:

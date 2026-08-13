@@ -188,8 +188,8 @@ void main() {
     const uint b_base = batch * pc.batch_stride_b;
     const uint c_base = batch * pc.batch_stride_c;
 
-    const bool m_full = ((block_row + 1u) * BM) <= pc.M;
-    const bool n_full = ((block_col + 1u) * BN) <= pc.N;
+    const bool m_full = block_row < pc.M / BM;
+    const bool n_full = block_col < pc.N / BN;
 
     const uint num_full_k = pc.K / BK;
     const bool has_k_tail = !K_MULTIPLE && ((pc.K % BK) != 0u);

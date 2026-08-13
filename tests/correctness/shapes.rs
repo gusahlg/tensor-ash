@@ -14,6 +14,14 @@ fn shape_sweep_rank2() {
         (8, 7, 5),
         (17, 19, 23),
         (31, 33, 47),
+        (65, 67, 15),
+        (65, 67, 16),
+        (65, 67, 17),
+        (65, 67, 31),
+        (65, 67, 32),
+        (65, 67, 33),
+        (65, 67, 63),
+        (65, 67, 65),
         (64, 64, 64),
         (128, 128, 128),
         (129, 130, 131),
@@ -41,6 +49,34 @@ fn shape_sweep_rank2() {
              at idx {idx}: gpu={:.6} cpu={:.6}",
             gpu[idx],
             cpu[idx],
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn strict_aligned_kernels_match_cpu_on_supported_shapes() {
+    for (selection, m, n, k) in [
+        (KernelSelection::LargeBdaV4Aligned, 128, 128, 32),
+        (KernelSelection::M128N64K64BdaV4Aligned, 128, 64, 64),
+    ] {
+        let (ctx, exec) = make_setup_with_kernel(1, 4, selection);
+        let (gpu, cpu) = run_one(
+            &ctx,
+            &exec,
+            &[m, k],
+            &[k, n],
+            &[m, n],
+            1.0,
+            false,
+            139,
+            149,
+            None,
+        );
+        let (error, index) = max_abs_err(&gpu, &cpu);
+        assert!(
+            error <= tolerance(k),
+            "aligned {selection:?} failed at {index}: {error:.3e}"
         );
     }
 }

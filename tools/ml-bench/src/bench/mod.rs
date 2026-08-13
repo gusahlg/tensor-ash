@@ -14,7 +14,8 @@ use env::{env_bool, env_string, env_usize};
 pub fn run() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let cmd = std_env::args().nth(1).unwrap_or_else(|| "all".into());
+    let mut args = std_env::args().skip(1);
+    let cmd = args.next().unwrap_or_else(|| "all".into());
     let validate = env_bool("ML_VALIDATE");
     let n_slots = env_usize("ML_SLOTS", 2);
     let device_preference = DevicePreference::parse(&env_string("ML_DEVICE", "auto"))?;
@@ -44,17 +45,16 @@ pub fn run() -> Result<()> {
         "correctness" => commands::correctness(&ctx, &exec)?,
         "sweep" => commands::sweep(&ctx, &exec)?,
         "single" => commands::single(&ctx, &exec)?,
+        "cases" => commands::cases(&ctx, &exec, args)?,
         "concurrent" => commands::concurrent(ctx.clone(), exec.clone())?,
         "transfer" => commands::transfer(&ctx, &exec)?,
         "all" => {
             commands::correctness(&ctx, &exec)?;
             commands::sweep(&ctx, &exec)?;
         }
-        _ => {
-            log::warn!("unknown subcommand '{cmd}', running default correctness+sweep");
-            commands::correctness(&ctx, &exec)?;
-            commands::sweep(&ctx, &exec)?;
-        }
+        _ => anyhow::bail!(
+            "unknown subcommand '{cmd}'; expected self-check, correctness, sweep, single, cases, concurrent, transfer, or all"
+        ),
     }
     Ok(())
 }

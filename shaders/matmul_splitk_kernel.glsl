@@ -171,8 +171,8 @@ void main() {
     const uint b_base = batch * pc.batch_stride_b;
     const uint c_base = batch * pc.batch_stride_c;
 
-    const bool m_full = ((block_row + 1u) * BM) <= pc.M;
-    const bool n_full = ((block_col + 1u) * BN) <= pc.N;
+    const bool m_full = block_row < pc.M / BM;
+    const bool n_full = block_col < pc.N / BN;
 
     // Each split owns [k_lo, k_hi) of K.  Divide K as evenly as we can:
     // the first (K % num_k_splits) splits get one extra K-element.
@@ -194,7 +194,7 @@ void main() {
     // BK boundaries on the global grid: the load functions clamp reads
     // that fall outside [k_lo, k_hi) to zero.
     const uint kt_lo = k_lo / BK;
-    const uint kt_hi = (k_hi + BK - 1u) / BK;
+    const uint kt_hi = k_hi / BK + uint((k_hi % BK) != 0u);
 
     for (uint kt = kt_lo; kt < kt_hi; ++kt) {
         const uint k_base = kt * BK;

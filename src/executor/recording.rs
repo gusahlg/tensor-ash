@@ -14,6 +14,27 @@ use super::splitk::SplitKKernel;
 pub(super) use descriptors::{update_matmul_descriptor_sets, update_split_k_descriptor_set};
 pub(super) use graph::{GraphSplitK2, record_matmul_graph_commands};
 
+fn ensure_kernel_alignment(kernel_name: &str, tile: [u32; 3], shape: [u32; 3]) -> Result<()> {
+    let required = if kernel_name == "v3_128x128_bk8_static" {
+        // V3 double-buffers exact pairs of BK=8 strips and has no edge/tail
+        // path. One pair (K=16) is the smallest safe reduction.
+        [tile[0], tile[1], 2 * tile[2]]
+    } else {
+        tile
+    };
+    let [tile_m, tile_n, tile_k] = required;
+    let [m, n, k] = shape;
+    if (kernel_name.ends_with("_aligned") || kernel_name == "v3_128x128_bk8_static")
+        && (!m.is_multiple_of(tile_m) || !n.is_multiple_of(tile_n) || !k.is_multiple_of(tile_k))
+    {
+        bail!(
+            "kernel '{kernel_name}' requires M/N/K aligned to ({tile_m}, {tile_n}, {tile_k}), \
+             got ({m}, {n}, {k})"
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn record_matmul_commands(
     ctx: &VulkanContext,
     pipeline: &MatmulPipeline,
@@ -59,6 +80,12 @@ pub(super) fn record_one_matmul(
     kernel: &crate::pipeline::MatmulKernel,
     bound_pipeline: &mut vk::Pipeline,
 ) -> Result<()> {
+    ensure_kernel_alignment(
+        kernel.name,
+        [kernel.tile_m, kernel.tile_n, kernel.tile_k],
+        [dims.m, dims.n, dims.k],
+    )?;
+
     let call = &op.call;
     let max_groups = ctx.device_properties.limits.max_compute_work_group_count;
     let (a_ptr, b_ptr, c_ptr) = if ctx.buffer_device_address_enabled {
@@ -257,4 +284,32 @@ pub(super) fn record_matmul_split_k_commands(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_kernel_alignment;
+
+    #[test]
+    fn strict_aligned_kernels_require_every_tile_multiple() {
+        let tile = [128, 128, 32];
+        assert!(ensure_kernel_alignment("large_bda_v4_aligned", tile, tile).is_ok());
+        for shape in [[127, 128, 32], [128, 127, 32], [128, 128, 31]] {
+            let err = ensure_kernel_alignment("large_bda_v4_aligned", tile, shape)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("requires M/N/K aligned"));
+        }
+        assert!(ensure_kernel_alignment("large_bda_v4", tile, [1, 1, 1]).is_ok());
+        let v3_tile = [128, 128, 8];
+        assert!(ensure_kernel_alignment("v3_128x128_bk8_static", v3_tile, [128, 128, 16]).is_ok());
+        for shape in [
+            [127, 128, 16],
+            [128, 127, 16],
+            [128, 128, 8],
+            [128, 128, 24],
+        ] {
+            assert!(ensure_kernel_alignment("v3_128x128_bk8_static", v3_tile, shape).is_err());
+        }
+    }
 }

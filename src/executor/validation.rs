@@ -18,7 +18,12 @@ impl Executor {
     pub(super) fn validate_call_context(&self, call: &MatmulCall<'_>) -> Result<()> {
         self.validate_tensor_context(call.a, "A")?;
         self.validate_tensor_context(call.b, "B")?;
-        self.validate_tensor_context(call.c, "C")
+        self.validate_tensor_context(call.c, "C")?;
+        if call.c.raw_buffer() == call.a.raw_buffer() || call.c.raw_buffer() == call.b.raw_buffer()
+        {
+            bail!("C must not alias A or B; in-place matmul is not supported");
+        }
+        Ok(())
     }
 
     pub(super) fn validate_op_context(&self, op: &MatmulOp<'_>) -> Result<()> {

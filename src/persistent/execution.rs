@@ -5,6 +5,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use ash::vk;
 
+use crate::context::timestamp_delta;
 use crate::matmul::{MatmulCall, ResolvedMatmul, RunStats};
 
 use super::{PersistentMatmul, PersistentPushConstants, TILE_K, TILE_M, TILE_N, WG_PER_SM};
@@ -33,6 +34,10 @@ impl PersistentMatmul {
             if !tensor.belongs_to(&self.ctx) {
                 bail!("persistent kernel: tensor {label} belongs to a different Vulkan context");
             }
+        }
+        if call.c.raw_buffer() == call.a.raw_buffer() || call.c.raw_buffer() == call.b.raw_buffer()
+        {
+            bail!("persistent kernel: output C must not alias input A or B");
         }
         let dims = ResolvedMatmul::from_call(call)?;
         let grid_x = dims.n.div_ceil(TILE_N);
@@ -217,17 +222,9 @@ impl PersistentMatmul {
     }
 }
 
-fn timestamp_delta(start: u64, end: u64, valid_bits: u32) -> u64 {
-    let delta = end.wrapping_sub(start);
-    match valid_bits {
-        1..64 => delta & ((1u64 << valid_bits) - 1),
-        _ => delta,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::timestamp_delta;
+    use crate::context::timestamp_delta;
 
     #[test]
     fn timestamp_delta_respects_device_counter_width() {

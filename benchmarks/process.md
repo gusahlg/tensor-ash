@@ -412,6 +412,9 @@ The `cublas_pure` row in `benchmarks/latest.md` is driven by
 4. **Reads cases from stdin as CSV** and emits CSV on stdout, so
    `scripts/bench_compare.py` can call it for every case in the showcase set
    with the same iteration / warmup counts as the Vulkan path.
+5. **Reports the same distribution as the Vulkan runner** — sample count,
+   minimum, median, and nearest-rank p95 — with headline TFLOPS based on the
+   median rather than an optimistic best sample.
 
 Row-major / column-major: `tensor-ash` uses row-major tensors and cuBLAS is
 column-major, so the cuBLAS call swaps `A` and `B` and computes `C^T = B^T A^T`.

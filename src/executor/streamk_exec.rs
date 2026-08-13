@@ -216,11 +216,24 @@ impl Executor {
             .device_properties
             .limits
             .max_compute_work_group_count;
-        if schedule.grid_total > max_groups[0] {
+        let dp_rows = if schedule.dp_tiles_total == 0 {
+            0
+        } else {
+            schedule.dp_tiles_total / schedule.n_tiles
+        };
+        if schedule.n_tiles > max_groups[0]
+            || dp_rows > max_groups[1]
+            || schedule.g_sk > max_groups[0]
+        {
             bail!(
-                "stream-K grid_total={} exceeds device maxComputeWorkGroupCount[0]={}",
-                schedule.grid_total,
-                max_groups[0]
+                "stream-K dispatch DP=({}, {}, 1) SK=({}, 1, 1) exceeds device \
+                 maxComputeWorkGroupCount ({}, {}, {})",
+                schedule.n_tiles,
+                dp_rows,
+                schedule.g_sk,
+                max_groups[0],
+                max_groups[1],
+                max_groups[2],
             );
         }
         if schedule.grid_total == 0 {
@@ -312,7 +325,6 @@ impl Executor {
                     // applies its L2-friendly swizzle just like the
                     // standalone BDA_V4 dispatch.
                     if schedule.dp_tiles_total > 0 {
-                        let dp_rows = schedule.dp_tiles_total / schedule.n_tiles;
                         dev.cmd_bind_pipeline(
                             cb,
                             vk::PipelineBindPoint::COMPUTE,

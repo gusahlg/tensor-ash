@@ -63,6 +63,9 @@ pub struct MatmulPipeline {
     /// persistent store at build time; the executor's tuner inserts new
     /// winners at runtime.
     tuned: RwLock<HashMap<TuneKey, TuneEntry>>,
+    /// Serializes tuning-store snapshots so concurrent first-use tuning cannot
+    /// persist an older map after a newer one.
+    tune_save: Mutex<()>,
     /// Hash binding persisted winners to this exact shader build.
     shader_hash: u64,
 }
@@ -170,6 +173,7 @@ impl MatmulPipeline {
                 selection,
                 auto_min_large_tiles: auto_min_large_tiles_for(ctx.device_kind()),
                 tuned: RwLock::new(load_tuned(ctx, shader_hash)),
+                tune_save: Mutex::new(()),
                 shader_hash,
             })
         }
@@ -177,6 +181,37 @@ impl MatmulPipeline {
 
     pub fn select_kernel(&self, batch: u32, m: u32, n: u32, k: u32) -> &MatmulKernel {
         &self.kernels[self.select_kernel_index(batch, m, n, k)]
+    }
+
+    /// Atomically snapshot the DP kernel and optional split-K2 route used by
+    /// a plain, non-accumulating call. Benchmark diagnostics use this so a
+    /// concurrent first-use tune cannot mix two registry states.
+    pub(crate) fn dispatch_selection(
+        &self,
+        batch: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> (&MatmulKernel, Option<u32>) {
+        match self.selection {
+            KernelSelection::Auto => {
+                let tuned = self.tuned.read();
+                if let Some(entry) = tuned.get(&TuneKey { batch, m, n, k }) {
+                    return (&self.kernels[entry.kernel], entry.splitk2_splits);
+                }
+                drop(tuned);
+                (
+                    &self.kernels[self.heuristic_kernel_index(batch, m, n, k)],
+                    None,
+                )
+            }
+            explicit => (
+                &self.kernels[explicit
+                    .index()
+                    .expect("explicit selection has a concrete kernel")],
+                None,
+            ),
+        }
     }
 
     /// Index into `KERNEL_SPECS` for this problem.  Resolution order:
@@ -254,14 +289,18 @@ impl MatmulPipeline {
     /// only — the strict `*_aligned` variants are excluded).  Requires
     /// `bufferDeviceAddress`; on devices without it the tuner is
     /// disabled and the heuristic stands.
-    pub(crate) fn tune_candidate_indices(&self) -> Vec<usize> {
+    pub(crate) fn tune_candidate_indices(&self, m: u32) -> Vec<usize> {
         if !self.ctx.buffer_device_address_enabled {
             return Vec::new();
         }
         self.kernels
             .iter()
             .enumerate()
-            .filter(|(_, kernel)| !kernel.uses_descriptors && !kernel.name.ends_with("_aligned"))
+            .filter(|(_, kernel)| {
+                !kernel.uses_descriptors
+                    && !kernel.name.ends_with("_aligned")
+                    && (m == 1 || kernel.name != "row_bda")
+            })
             .map(|(idx, _)| idx)
             .collect()
     }
@@ -273,6 +312,7 @@ impl MatmulPipeline {
 
     /// Record a measured winner and persist the store.
     pub(crate) fn record_tuned(&self, key: TuneKey, entry: TuneEntry) {
+        let _save = self.tune_save.lock();
         let snapshot = {
             let mut tuned = self.tuned.write();
             tuned.insert(key, entry);

@@ -57,6 +57,15 @@ pub use streamk_schedule::{StreamKSchedule, stream_k_should_fire};
 
 pub use crate::matmul::{MatmulCall, RunStats};
 
+/// Read-only description of the route selected for a plain matmul shape.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchInfo {
+    pub kernel: &'static str,
+    pub tile: [u32; 3],
+    pub split_k2_splits: Option<u32>,
+}
+
 /// Fallback SM count for Stream-K's persistent-grid sizing on
 /// devices where we don't have a runtime probe yet.  46 matches the
 /// RTX 3070 we develop on; the value only drives the preferred grid
@@ -112,6 +121,21 @@ pub struct Executor {
 }
 
 impl Executor {
+    /// Report the kernel and optional tuned split-K2 route a plain,
+    /// non-accumulating matmul would use. Useful for benchmark diagnostics.
+    pub fn dispatch_info(&self, batch: u32, m: u32, n: u32, k: u32) -> DispatchInfo {
+        let (kernel, split_k2_splits) = self.pipeline.dispatch_selection(batch, m, n, k);
+        let (kernel_name, tile) = split_k2_splits.map_or(
+            (kernel.name, [kernel.tile_m, kernel.tile_n, kernel.tile_k]),
+            |_| splitk2::stage1_dispatch_info(m, n),
+        );
+        DispatchInfo {
+            kernel: kernel_name,
+            tile,
+            split_k2_splits,
+        }
+    }
+
     /// `n_slots` = how many submissions can be in flight at once. 2 is
     /// the sweet spot: one being recorded by the host while the other
     /// runs on the GPU.  Higher values benefit hosts that submit

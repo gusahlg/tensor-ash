@@ -3,6 +3,8 @@
 use anyhow::{Context, Result};
 use ash::vk;
 
+use crate::context::timestamp_delta;
+
 use super::{Executor, Slot};
 
 pub(super) struct SlotLease<'a> {
@@ -94,7 +96,7 @@ impl Executor {
                     vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
                 )
                 .context(result_context)?;
-            let ticks = data[1].wrapping_sub(data[0]);
+            let ticks = timestamp_delta(data[0], data[1], self.ctx.timestamp_valid_bits);
             Ok(Some((ticks as f64 * self.ctx.timestamp_period_ns) as u64))
         }
     }
@@ -136,5 +138,19 @@ impl Executor {
             dev.reset_fences(&[slot.fence]).context("reset_fences")?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timestamp_delta;
+
+    #[test]
+    fn timestamp_delta_masks_queue_counter_width() {
+        assert_eq!(timestamp_delta(4, 7, 0), 3);
+        assert_eq!(timestamp_delta(1, 2, 1), 1);
+        assert_eq!(timestamp_delta(250, 5, 8), 11);
+        assert_eq!(timestamp_delta((1u64 << 63) - 2, 3, 63), 5);
+        assert_eq!(timestamp_delta(u64::MAX - 2, 3, 64), 6);
     }
 }

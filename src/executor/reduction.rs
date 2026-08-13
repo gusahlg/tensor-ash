@@ -37,6 +37,36 @@ impl Executor {
         if call.accumulate {
             bail!("run_matmuls_split_k: accumulate=true is not supported");
         }
+        let resolved = crate::matmul::ResolvedMatmul::from_call(&call)?;
+        if num_k_splits > 0xFFFF {
+            bail!("run_matmuls_split_k: num_k_splits={num_k_splits} out of range [1, 65535]");
+        }
+        if num_k_splits > resolved.k {
+            bail!(
+                "run_matmuls_split_k: num_k_splits={num_k_splits} exceeds K={}",
+                resolved.k
+            );
+        }
+        let (tile_m, tile_n) = if resolved.m >= 128 && resolved.n >= 128 {
+            (128, 128)
+        } else {
+            (64, 64)
+        };
+        let num_k_splits = if num_k_splits == 0 {
+            default_num_k_splits(
+                resolved.batch,
+                resolved.m,
+                resolved.n,
+                resolved.k,
+                tile_m,
+                tile_n,
+            )
+        } else {
+            num_k_splits
+        };
+        if num_k_splits == 1 {
+            return self.run_matmuls(&[call]);
+        }
         if !self.ctx.buffer_device_address_enabled {
             bail!("run_matmuls_split_k: bufferDeviceAddress not enabled");
         }
@@ -46,9 +76,6 @@ impl Executor {
                  not enabled — kernel relies on the hardware atomicAdd path"
             );
         }
-
-        let resolved = crate::matmul::ResolvedMatmul::from_call(&call)?;
-
         // Stable equivalent of `get_or_try_init`: try-init outside, then
         // race the get_or_init.  Worst case we build the pipeline twice
         // on first concurrent access but only the first init wins.
@@ -59,21 +86,6 @@ impl Executor {
             self.split_k.get_or_init(|| built)
         };
         let kernel = split_k.pick(resolved.m, resolved.n);
-        let num_k_splits = if num_k_splits == 0 {
-            default_num_k_splits(
-                resolved.batch,
-                resolved.m,
-                resolved.n,
-                resolved.k,
-                kernel.tile_m,
-                kernel.tile_n,
-            )
-        } else {
-            num_k_splits
-        };
-        if num_k_splits == 0 || num_k_splits > 0xFFFF {
-            bail!("run_matmuls_split_k: num_k_splits={num_k_splits} out of range [1, 65535]");
-        }
 
         let mut slot = self.checkout_slot();
         let result = self.record_and_run_split_k(&mut slot, &call, &resolved, kernel, num_k_splits);
@@ -173,22 +185,25 @@ impl Executor {
         if call.accumulate {
             bail!("run_matmuls_split_k2: accumulate=true is not supported");
         }
-        if !self.ctx.buffer_device_address_enabled {
-            bail!("run_matmuls_split_k2: bufferDeviceAddress not enabled");
-        }
-
         let resolved = ResolvedMatmul::from_call(&call)?;
-
-        let split_k2 = self.split_k2_pipeline()?;
-        let kernel = split_k2.pick_stage1(resolved.m, resolved.n);
+        if num_k_splits > 0xFFFF {
+            bail!("run_matmuls_split_k2: num_k_splits={num_k_splits} out of range [1, 65535]");
+        }
+        if num_k_splits > resolved.k {
+            bail!(
+                "run_matmuls_split_k2: num_k_splits={num_k_splits} exceeds K={}",
+                resolved.k
+            );
+        }
+        let (_, [tile_m, tile_n, _]) = splitk2::stage1_dispatch_info(resolved.m, resolved.n);
         let num_k_splits = if num_k_splits == 0 {
             default_num_k_splits(
                 resolved.batch,
                 resolved.m,
                 resolved.n,
                 resolved.k,
-                kernel.tile_m,
-                kernel.tile_n,
+                tile_m,
+                tile_n,
             )
         } else {
             num_k_splits
@@ -196,10 +211,11 @@ impl Executor {
         if num_k_splits <= 1 {
             return self.run_matmuls(std::slice::from_ref(&call));
         }
-        if num_k_splits > 0xFFFF {
-            bail!("run_matmuls_split_k2: num_k_splits={num_k_splits} out of range [1, 65535]");
+        if !self.ctx.buffer_device_address_enabled {
+            bail!("run_matmuls_split_k2: bufferDeviceAddress not enabled");
         }
 
+        self.split_k2_pipeline()?;
         let mut slot = self.checkout_slot();
         let result = self.record_and_run_split_k2(&mut slot, &call, &resolved, num_k_splits);
 

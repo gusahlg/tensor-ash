@@ -111,6 +111,7 @@ pub(super) fn create(
             .ok_or_else(|| anyhow!("no compute-capable queue family"))?;
         let timestamps_supported = queue_families[compute_family as usize].timestamp_valid_bits > 0
             && device_properties.limits.timestamp_period > 0.0;
+        let timestamp_valid_bits = queue_families[compute_family as usize].timestamp_valid_bits;
 
         let mut vulkan12_query = vk::PhysicalDeviceVulkan12Features::default();
         let mut atomic_float_query = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
@@ -194,6 +195,7 @@ pub(super) fn create(
             compute_family,
             queue: Mutex::new(queue),
             timestamp_period_ns: device_properties.limits.timestamp_period as f64,
+            timestamp_valid_bits,
             timestamps_supported,
             buffer_device_address_enabled: buffer_device_address_supported,
             shader_buffer_float32_atomic_add_enabled: enable_atomic_float,

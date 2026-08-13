@@ -63,14 +63,29 @@ impl Executor {
     /// Protocol (VkSplat-style measured selection, simplified to
     /// benchmark-once-and-cache): one clock-warming dispatch, then one
     /// warmup round plus `R` measured rounds over all candidates,
-    /// candidates *interleaved* per round so GPU clock drift biases no
-    /// single kernel.  Per candidate we keep the minimum GPU time.
+    /// candidates *interleaved* with a well-spaced, alternating order so GPU clock drift
+    /// biases no single kernel. Per candidate we keep the median GPU time.
     /// The heuristic's pick stays unless a challenger beats it by >2%
     /// — measured noise should not churn the store.
     pub(super) fn tune_op(&self, op: &MatmulOp<'_>, dims: &ResolvedMatmul) -> Result<()> {
-        let candidates = self.pipeline.tune_candidate_indices();
+        let max_groups = self
+            .ctx
+            .device_properties
+            .limits
+            .max_compute_work_group_count;
+        let candidates = self
+            .pipeline
+            .tune_candidate_indices(dims.m)
+            .into_iter()
+            .filter(|&idx| {
+                let kernel = self.pipeline.kernel_at(idx);
+                dims.n.div_ceil(kernel.tile_n) <= max_groups[0]
+                    && dims.m.div_ceil(kernel.tile_m) <= max_groups[1]
+                    && dims.batch <= max_groups[2]
+            })
+            .collect::<Vec<_>>();
         if candidates.is_empty() {
-            bail!("no tunable kernels on this device (bufferDeviceAddress required)");
+            bail!("no tunable kernel fits this shape and device's dispatch limits");
         }
         let heuristic_idx = self
             .pipeline
@@ -79,64 +94,69 @@ impl Executor {
         // Fewer rounds for expensive shapes: at ~5 TFLOPS a round of
         // ~20 candidates on a 30 ms problem already costs ~600 ms.
         let est_ms = dims.total_flops as f64 / 5e12 * 1e3;
-        let rounds = if est_ms > 30.0 {
-            1
-        } else if est_ms > 8.0 {
-            2
-        } else {
-            3
-        };
+        let rounds = if est_ms > 8.0 { 2 } else { 4 };
 
         let mut slot = self.checkout_slot();
-        let measure = (|| -> Result<Vec<Option<u64>>> {
+        let measure = (|| -> Result<Vec<Vec<u64>>> {
             // Spin the GPU clocks up before anything is timed.
-            let _ = self.run_forced_once(&mut slot, op, dims, heuristic_idx)?;
-            let mut best: Vec<Option<u64>> = vec![None; candidates.len()];
+            let warmup_idx = if candidates.contains(&heuristic_idx) {
+                heuristic_idx
+            } else {
+                candidates[0]
+            };
+            let _ = self.run_forced_once(&mut slot, op, dims, warmup_idx)?;
+            let mut samples = vec![Vec::with_capacity(rounds as usize); candidates.len()];
             for round in 0..=rounds {
-                for (ci, &kernel_idx) in candidates.iter().enumerate() {
+                for offset in 0..candidates.len() {
+                    let ci = candidate_at(candidates.len(), round, offset);
+                    let kernel_idx = candidates[ci];
                     match self.run_forced_once(&mut slot, op, dims, kernel_idx) {
                         // Round 0 is warmup (first-touch pipeline
                         // fetch, cache state); discard its timing.
                         Ok(Some(ns)) if round > 0 => {
-                            best[ci] = Some(best[ci].map_or(ns, |b: u64| b.min(ns)));
+                            samples[ci].push(ns);
                         }
                         Ok(_) => {}
                         // Candidate can't run this shape (e.g. dispatch
                         // grid limits) — leave it unmeasured.
-                        Err(_) => {}
+                        Err(err) => return Err(err),
                     }
                 }
             }
-            Ok(best)
+            Ok(samples)
         })();
-        let best = measure?;
+        let samples = measure?;
+        // The split-K2 probe checks out its own slot. Release the DP
+        // measurement lease first so single-slot executors cannot wait on
+        // themselves while tuning deep-K shapes.
+        drop(slot);
 
         let heuristic_ns = candidates
             .iter()
             .position(|&idx| idx == heuristic_idx)
-            .and_then(|ci| best[ci]);
+            .and_then(|ci| median(&samples[ci]));
         let challenger = candidates
             .iter()
-            .zip(best.iter())
-            .filter_map(|(&idx, ns)| ns.map(|ns| (idx, ns)))
+            .zip(samples.iter())
+            .filter_map(|(&idx, samples)| median(samples).map(|ns| (idx, ns)))
             .min_by_key(|&(_, ns)| ns);
 
-        let Some((mut winner_idx, winner_ns)) = challenger else {
+        let Some((mut winner_idx, mut winner_ns)) = challenger else {
             bail!("no candidate produced a measurement");
         };
         if let Some(heur_ns) = heuristic_ns
             && (winner_ns as f64) >= (heur_ns as f64) * 0.98
         {
             winner_idx = heuristic_idx;
+            winner_ns = heur_ns;
         }
 
         // Reduction-strategy pass: on deep-K low-tile shapes, probe the
         // two-stage split-K against the DP winner.  Record its split
         // count only when it clears the same 2% margin.
-        let splitk2_splits = self
-            .tune_splitk2(op, dims, winner_ns)
-            .inspect_err(|err| log::debug!("tensor-ash: split-K2 probe skipped: {err}"))
-            .unwrap_or(None);
+        let splitk2 = self.tune_splitk2(op, dims, winner_ns, rounds)?;
+        let splitk2_splits = splitk2.map(|(splits, _)| splits);
+        let route_ns = splitk2.map_or(winner_ns, |(_, ns)| ns);
 
         let key = TuneKey {
             batch: dims.batch,
@@ -161,7 +181,7 @@ impl Executor {
             splitk2_splits
                 .map(|s| format!(" + splitk2={s}"))
                 .unwrap_or_default(),
-            winner_ns as f64 / 1e6,
+            route_ns as f64 / 1e6,
             self.pipeline.kernel_at(heuristic_idx).name,
             heuristic_ns
                 .map(|ns| format!("{:.3} ms", ns as f64 / 1e6))
@@ -178,7 +198,8 @@ impl Executor {
         op: &MatmulOp<'_>,
         dims: &ResolvedMatmul,
         dp_best_ns: u64,
-    ) -> Result<Option<u32>> {
+        rounds: u32,
+    ) -> Result<Option<(u32, u64)>> {
         // Deep-K, few-tiles gate: DP already saturates the device
         // otherwise and the probe would be wasted work.
         let tiles = dims.m.div_ceil(128) as u64 * dims.n.div_ceil(128) as u64 * dims.batch as u64;
@@ -186,23 +207,42 @@ impl Executor {
             return Ok(None);
         }
         let mn = dims.m as u64 * dims.n as u64 * dims.batch as u64;
+        let max_groups = self
+            .ctx
+            .device_properties
+            .limits
+            .max_compute_work_group_count;
+        let (tile_m, tile_n) = if dims.m >= 128 && dims.n >= 128 {
+            (128, 128)
+        } else {
+            (64, 64)
+        };
         let mut best: Option<(u64, u32)> = None;
         for splits in [4u32, 8, 16, 32, 64] {
             // Each split needs enough K to amortize its tile loads,
             // and the scratch must stay modest.
-            if dims.k / splits < 128 || mn * splits as u64 * 4 > 256 << 20 {
+            if dims.k / splits < 128
+                || mn * splits as u64 * 4 > 256 << 20
+                || dims.n.div_ceil(tile_n) > max_groups[0]
+                || dims.m.div_ceil(tile_m) > max_groups[1]
+                || dims
+                    .batch
+                    .checked_mul(splits)
+                    .is_none_or(|z| z > max_groups[2])
+                || mn.div_ceil(4 * 256) > max_groups[0] as u64
+            {
                 continue;
             }
-            let mut split_best: Option<u64> = None;
-            for round in 0..3 {
+            let mut samples = Vec::with_capacity(rounds as usize);
+            for round in 0..=rounds {
                 let stats = self.run_matmuls_split_k2(op.call, splits)?;
                 if round > 0
                     && let Some(ns) = stats.gpu_time_ns
                 {
-                    split_best = Some(split_best.map_or(ns, |b| b.min(ns)));
+                    samples.push(ns);
                 }
             }
-            if let Some(ns) = split_best
+            if let Some(ns) = median(&samples)
                 && best.is_none_or(|(b, _)| ns < b)
             {
                 best = Some((ns, splits));
@@ -210,7 +250,7 @@ impl Executor {
         }
         Ok(best
             .filter(|&(ns, _)| (ns as f64) < (dp_best_ns as f64) * 0.98)
-            .map(|(_, splits)| splits))
+            .map(|(ns, splits)| (splits, ns)))
     }
 
     /// Submit a single dispatch with a forced kernel and return its
@@ -245,6 +285,65 @@ impl Executor {
                     )
                 },
             )
+        }
+    }
+}
+
+fn median(samples: &[u64]) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        Some(((sorted[mid - 1] as u128 + sorted[mid] as u128) / 2) as u64)
+    } else {
+        Some(sorted[mid])
+    }
+}
+
+fn candidate_at(len: usize, round: u32, offset: usize) -> usize {
+    if round == 0 {
+        return offset;
+    }
+    let pair = (round - 1) as usize / 2;
+    let start = pair * len.div_ceil(2) % len;
+    if !round.is_multiple_of(2) {
+        (start + offset) % len
+    } else {
+        (start + len - 1 - offset) % len
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{candidate_at, median};
+
+    #[test]
+    fn median_handles_empty_and_unsorted_samples() {
+        assert_eq!(median(&[]), None);
+        assert_eq!(median(&[9, 1, 5]), Some(5));
+        assert_eq!(median(&[8, 2]), Some(5));
+    }
+
+    #[test]
+    fn candidate_order_is_balanced_in_measured_pairs() {
+        for round in 0..=4 {
+            let mut order = (0..19)
+                .map(|offset| candidate_at(19, round, offset))
+                .collect::<Vec<_>>();
+            order.sort_unstable();
+            assert_eq!(order, (0..19).collect::<Vec<_>>());
+        }
+        for rounds in [2, 4] {
+            let mut rank_sums = [0; 19];
+            for round in 1..=rounds {
+                for rank in 0..19 {
+                    rank_sums[candidate_at(19, round, rank)] += rank;
+                }
+            }
+            assert!(rank_sums.iter().all(|sum| *sum == rank_sums[0]));
         }
     }
 }

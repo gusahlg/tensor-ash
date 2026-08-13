@@ -31,6 +31,17 @@ pub(in crate::executor) fn update_matmul_descriptor_sets(
     debug_assert_eq!(sets.len(), ops.len());
     debug_assert_eq!(sets.len(), resolved.len());
 
+    // BDA is the normal fast path on modern devices. Avoid two temporary
+    // allocations per submission when no selected kernel observes a
+    // descriptor set at all.
+    if resolved.iter().all(|dims| {
+        !pipeline
+            .select_kernel(dims.batch, dims.m, dims.n, dims.k)
+            .uses_descriptors
+    }) {
+        return;
+    }
+
     // Build buffer-info + writes only for calls that actually need a
     // descriptor write.  Keep buffer_infos stable so the
     // &[WriteDescriptorSet] we hand to Vulkan keeps stable references.

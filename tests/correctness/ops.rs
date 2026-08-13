@@ -4,6 +4,33 @@ use tensor_ash::{MatmulCall, Tensor};
 
 #[test]
 #[ignore]
+fn rejects_output_aliases_with_inputs() {
+    let (ctx, exec) = make_setup(1, 1);
+    let a = Tensor::uninit_device(&ctx, &[16, 16]).unwrap();
+    let b = Tensor::uninit_device(&ctx, &[16, 16]).unwrap();
+    for call in [
+        MatmulCall {
+            a: &a,
+            b: &b,
+            c: &a,
+            alpha: 1.0,
+            accumulate: false,
+        },
+        MatmulCall {
+            a: &a,
+            b: &b,
+            c: &b,
+            alpha: 1.0,
+            accumulate: false,
+        },
+    ] {
+        let err = exec.run_matmuls(&[call]).unwrap_err().to_string();
+        assert!(err.contains("must not alias"), "unexpected error: {err}");
+    }
+}
+
+#[test]
+#[ignore]
 fn alpha_and_accumulate() {
     let (ctx, exec) = make_setup(2, 8);
     let (m, n, k) = (37u32, 41u32, 29u32);

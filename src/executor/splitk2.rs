@@ -34,6 +34,14 @@ const SPIRV_STAGE1_M64N64: &[u8] =
 const SPIRV_REDUCE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_splitk2_reduce.spv"));
 
+pub(super) fn stage1_dispatch_info(m: u32, n: u32) -> (&'static str, [u32; 3]) {
+    if m >= 128 && n >= 128 {
+        ("split_k2_m128n128", [128, 128, 32])
+    } else {
+        ("split_k2_m64n64", [64, 64, 32])
+    }
+}
+
 /// Push constants for the reduce stage.  Bit-for-bit identical to the
 /// GLSL `PC` block in `matmul_f32_splitk2_reduce.comp`.
 #[repr(C)]
@@ -77,6 +85,7 @@ impl SplitK2Dispatch {
         if !(2..=0xFFFF).contains(&splits) {
             bail!("split-K2: splits={splits} out of range [2, 65535]");
         }
+        validate_scratch_geometry(resolved.batch, resolved.m, resolved.n, resolved.k, splits)?;
         let kernel = pipeline.pick_stage1(resolved.m, resolved.n);
         let max_groups = ctx.device_properties.limits.max_compute_work_group_count;
         let gx = resolved.n.div_ceil(kernel.tile_n);
@@ -101,9 +110,9 @@ impl SplitK2Dispatch {
         if total > u32::MAX as u64 {
             bail!("split-K2: batch*M*N = {total} exceeds u32 addressing");
         }
-        let scratch_bytes = total
-            .checked_mul(splits as u64)
-            .and_then(|e| e.checked_mul(4))
+        let scratch_elements = total * splits as u64;
+        let scratch_bytes = scratch_elements
+            .checked_mul(4)
             .ok_or_else(|| anyhow!("split-K2 scratch size overflows"))?;
         let reduce_groups = (total as u32).div_ceil(4 * REDUCE_WG_SIZE);
         if reduce_groups > max_groups[0] {
@@ -124,6 +133,22 @@ impl SplitK2Dispatch {
             use_m128: resolved.m >= 128 && resolved.n >= 128,
         })
     }
+}
+
+fn validate_scratch_geometry(batch: u32, m: u32, n: u32, k: u32, splits: u32) -> Result<()> {
+    if splits > k {
+        bail!("split-K2: splits={splits} exceeds K={k}");
+    }
+    let elements = [batch, m, n, splits]
+        .into_iter()
+        .try_fold(1u64, |acc, value| acc.checked_mul(value as u64))
+        .ok_or_else(|| anyhow!("split-K2 scratch size overflows"))?;
+    // Stage 1 forms `split * mn + index` in uint. The element count may be
+    // exactly 2^32 because the largest zero-based offset is u32::MAX.
+    if elements > u32::MAX as u64 + 1 {
+        bail!("split-K2: batch*M*N*splits = {elements} exceeds u32 scratch addressing");
+    }
+    Ok(())
 }
 
 /// Record both split-K2 stages (with the internal stage1→stage2
@@ -394,5 +419,23 @@ impl Drop for SplitK2Pipeline {
                 .device
                 .destroy_pipeline_layout(self.reduce_layout, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{stage1_dispatch_info, validate_scratch_geometry};
+
+    #[test]
+    fn scratch_geometry_rejects_empty_splits_and_uint_wrap() {
+        assert!(validate_scratch_geometry(1, 64, 64, 64, 65).is_err());
+        assert!(validate_scratch_geometry(1, 65_536, 65_536, 2, 2).is_err());
+        assert!(validate_scratch_geometry(1, 32_768, 65_536, 2, 2).is_ok());
+    }
+
+    #[test]
+    fn dispatch_info_matches_stage1_tile_choice() {
+        assert_eq!(stage1_dispatch_info(128, 128).1, [128, 128, 32]);
+        assert_eq!(stage1_dispatch_info(127, 128).1, [64, 64, 32]);
     }
 }

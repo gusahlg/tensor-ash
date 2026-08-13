@@ -6,6 +6,8 @@ import json
 import math
 import os
 import platform
+import statistics
+import subprocess
 import sys
 import time
 from dataclasses import asdict
@@ -36,6 +38,29 @@ class ReportArgs(Protocol):
     torch_threads: int
     skip_cpu_frameworks: bool
     skip_gpu_frameworks: bool
+
+
+def _git_metadata() -> tuple[str, bool | None]:
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        )
+        return revision, dirty
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return "", None
 
 
 def _has_throughput(result: BenchResult) -> bool:
@@ -88,8 +113,20 @@ def build_payload(
     *,
     generated_at: str | None = None,
 ) -> dict[str, Any]:
+    revision, dirty = _git_metadata()
+    timing_scopes = {
+        result.library: result.timing_scope
+        for result in results
+        if result.status == "ok" and result.timing_scope
+    }
+    timing_statistics = {
+        result.library: "median"
+        for result in results
+        if result.status == "ok" and result.median_ms is not None
+    }
     return {
         "metadata": {
+            "schema_version": 2,
             "generated_at": generated_at or time.strftime("%Y-%m-%d %H:%M:%S %z"),
             "python": sys.version.split()[0],
             "platform": platform.platform(),
@@ -100,6 +137,11 @@ def build_payload(
             "torch_threads": args.torch_threads,
             "self_check": self_check,
             "nvidia_smi": nvidia_smi,
+            "timing_statistic": "median",
+            "timing_statistic_by_backend": timing_statistics,
+            "timing_scope_by_backend": timing_scopes,
+            "git_revision": revision,
+            "git_dirty": dirty,
         },
         "transfer": None if transfer is None else asdict(transfer),
         "results": [asdict(result) for result in results],
@@ -108,6 +150,96 @@ def build_payload(
 
 def _markdown_cell(value: str) -> str:
     return value.replace("|", "/").replace("\r\n", "<br>").replace("\n", "<br>")
+
+
+def _timing_triplet(result: BenchResult) -> str:
+    minimum = result.min_ms if result.min_ms is not None else result.best_ms
+    values = (minimum, result.median_ms, result.p95_ms)
+    return "/".join("-" if value is None else f"{value:.3f}" for value in values)
+
+
+def _wall_pair(result: BenchResult) -> str:
+    median = result.wall_median_ms if result.wall_median_ms is not None else result.wall_ms
+    return "/".join(
+        "-" if value is None else f"{value:.3f}"
+        for value in (median, result.wall_p95_ms)
+    )
+
+
+def _host_pair(result: BenchResult) -> str:
+    median = (
+        result.host_overhead_median_ms
+        if result.host_overhead_median_ms is not None
+        else result.host_overhead_ms
+    )
+    return "/".join(
+        "-" if value is None else f"{value:.3f}"
+        for value in (median, result.host_overhead_p95_ms)
+    )
+
+
+def _host_share(result: BenchResult) -> float | None:
+    wall = result.wall_median_ms if result.wall_median_ms is not None else result.wall_ms
+    host = (
+        result.host_overhead_median_ms
+        if result.host_overhead_median_ms is not None
+        else result.host_overhead_ms
+    )
+    if wall is None or host is None or wall <= 0.0:
+        return None
+    return host / wall * 100.0
+
+
+def _route(result: BenchResult) -> str:
+    if not result.kernel:
+        return ""
+    tile = ""
+    if None not in (result.tile_m, result.tile_n, result.tile_k):
+        tile = f" {result.tile_m}x{result.tile_n}x{result.tile_k}"
+    strategy = result.strategy
+    if result.split_k2_splits is not None:
+        strategy = f"{strategy or 'split_k2'}({result.split_k2_splits})"
+    return f"{result.kernel}{tile}" + (f" / {strategy}" if strategy else "")
+
+
+def _ratio_note(ratio: float) -> str:
+    if ratio < 1.0:
+        return f"cuBLAS {1.0 / ratio:.2f}x faster"
+    if ratio > 1.0:
+        return f"tensor-ash {ratio:.2f}x faster"
+    return "parity"
+
+
+def _tensor_cublas_ratios(
+    results: list[BenchResult],
+) -> list[tuple[float, str, BenchResult, BenchResult]]:
+    def identity(result: BenchResult) -> tuple[str, int, int, int, int]:
+        return (result.case, result.b, result.m, result.n, result.k)
+
+    tensor = {
+        identity(result): result
+        for result in results
+        if result.library == "tensor-ash" and _has_throughput(result)
+    }
+    cublas = {
+        identity(result): result
+        for result in results
+        if result.library == "cublas_pure" and _has_throughput(result)
+    }
+    comparisons = [
+        (
+            (tensor[key].tflops or 0.0) / (cublas[key].tflops or 1.0),
+            key[0],
+            tensor[key],
+            cublas[key],
+        )
+        for key in tensor.keys() & cublas.keys()
+        if tensor[key].timing_scope == "gpu"
+        and cublas[key].timing_scope == "gpu"
+        and tensor[key].median_ms is not None
+        and cublas[key].median_ms is not None
+    ]
+    return sorted(comparisons, key=lambda item: item[0])
 
 
 def _analysis_lines(
@@ -195,15 +327,66 @@ def _analysis_lines(
             )
 
         overheads = sorted(
-            result.host_overhead_ms
+            (
+                result.host_overhead_median_ms
+                if result.host_overhead_median_ms is not None
+                else result.host_overhead_ms
+            )
             for result in ml_ok
-            if result.host_overhead_ms is not None and result.wall_ms is not None
+            if (
+                result.host_overhead_median_ms is not None
+                or result.host_overhead_ms is not None
+            )
         )
         if overheads:
-            median = overheads[len(overheads) // 2]
+            median = statistics.median(overheads)
             lines.append(
                 f"- Median `tensor-ash` host/submission overhead was {median:.3f} ms per synchronous call; "
                 "GPU timestamp TFLOPS excludes that overhead."
+            )
+
+        shares = [
+            (share, result.case)
+            for result in ml_ok
+            if (share := _host_share(result)) is not None
+        ]
+        if shares:
+            share, case = max(shares)
+            lines.append(
+                f"- Highest median host-overhead share was `{case}` at {share:.1f}% of wall time; "
+                "use `wall TFLOPS` for latency-sensitive comparisons."
+            )
+
+        variable = [
+            (result.p95_ms / result.median_ms - 1.0, result)
+            for result in ml_ok
+            if result.p95_ms is not None
+            and result.median_ms is not None
+            and result.median_ms > 0.0
+        ]
+        if variable:
+            ratio, result = max(variable, key=lambda item: item[0])
+            qualifier = (
+                " (with fewer than 20 samples, p95 is effectively the observed maximum)"
+                if (result.gpu_sample_count or result.sample_count or 0) < 20
+                else ""
+            )
+            lines.append(
+                f"- Highest `tensor-ash` GPU tail variability was `{result.case}`: "
+                f"p95 was {ratio * 100.0:.1f}% above median{qualifier}."
+            )
+
+        cublas_ratios = _tensor_cublas_ratios(results)
+        if cublas_ratios:
+            worst = cublas_ratios[: min(3, len(cublas_ratios))]
+            lines.append(
+                "- Worst `tensor-ash` / pure-cuBLAS median-throughput ratios: "
+                + ", ".join(
+                    f"`{case}` {ratio:.2f}x ({_ratio_note(ratio)})"
+                    for ratio, case, _, _ in worst
+                    if ratio > 0.0
+                )
+                + "."
             )
 
     skipped = sorted({result.library for result in results if result.status == "skipped"})
@@ -279,19 +462,28 @@ def build_markdown(
             "",
             "## Results",
             "",
-            "| case | library | status | gpu ms | wall ms | host overhead ms | TFLOPS | % peak | details |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+            "Times are `min/median/p95`; throughput uses the median of the backend's timed scope.",
+            "",
+            "| case | library | status | scope | samples | timed ms | wall med/p95 ms | host med/p95 ms | host % | TFLOPS | wall TFLOPS | route | details |",
+            "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
         ]
     )
     for result in results:
-        best_ms = "" if result.best_ms is None else f"{result.best_ms:.3f}"
-        wall_ms = "" if result.wall_ms is None else f"{result.wall_ms:.3f}"
-        overhead = "" if result.host_overhead_ms is None else f"{result.host_overhead_ms:.3f}"
+        timed_samples = (
+            result.gpu_sample_count
+            if result.timing_scope == "gpu" and result.gpu_sample_count is not None
+            else result.sample_count
+        )
+        sample_count = "" if timed_samples is None else str(timed_samples)
+        host_share = _host_share(result)
+        host_share_text = "" if host_share is None else f"{host_share:.1f}%"
         tflops = "" if result.tflops is None else f"{result.tflops:.6f}"
-        peak = "" if result.tflops is None or PEAK_TFLOPS <= 0 else f"{result.tflops / PEAK_TFLOPS * 100:.1f}%"
+        wall_tflops = "" if result.wall_tflops is None else f"{result.wall_tflops:.6f}"
         lines.append(
-            f"| {result.case} | {result.library} | {result.status} | {best_ms} | "
-            f"{wall_ms} | {overhead} | {tflops} | {peak} | {_markdown_cell(result.details)} |"
+            f"| {result.case} | {result.library} | {result.status} | {result.timing_scope} | {sample_count} | "
+            f"{_timing_triplet(result)} | {_wall_pair(result)} | {_host_pair(result)} | "
+            f"{host_share_text} | {tflops} | {wall_tflops} | {_route(result)} | "
+            f"{_markdown_cell(result.details)} |"
         )
 
     if transfer is not None:
@@ -300,17 +492,34 @@ def build_markdown(
                 "",
                 "## Transfer",
                 "",
-                "| status | bytes | iters | upload GiB/s | download GiB/s | details |",
-                "| --- | ---: | ---: | ---: | ---: | --- |",
+                "| status | bytes | samples | upload GiB/s | download GiB/s | upload ms min/med/p95 | download ms min/med/p95 | details |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
             ]
         )
         transfer_bytes = "" if transfer.bytes is None else str(transfer.bytes)
-        transfer_iters = "" if transfer.iters is None else str(transfer.iters)
+        transfer_samples = transfer.sample_count or transfer.iters
+        transfer_samples_text = "" if transfer_samples is None else str(transfer_samples)
         upload = "" if transfer.upload_gibs is None else f"{transfer.upload_gibs:.3f}"
         download = "" if transfer.download_gibs is None else f"{transfer.download_gibs:.3f}"
+        upload_ms = "/".join(
+            "-" if value is None else f"{value:.3f}"
+            for value in (
+                transfer.upload_min_ms,
+                transfer.upload_median_ms,
+                transfer.upload_p95_ms,
+            )
+        )
+        download_ms = "/".join(
+            "-" if value is None else f"{value:.3f}"
+            for value in (
+                transfer.download_min_ms,
+                transfer.download_median_ms,
+                transfer.download_p95_ms,
+            )
+        )
         lines.append(
-            f"| {transfer.status} | {transfer_bytes} | {transfer_iters} | {upload} | "
-            f"{download} | {_markdown_cell(transfer.details)} |"
+            f"| {transfer.status} | {transfer_bytes} | {transfer_samples_text} | {upload} | "
+            f"{download} | {upload_ms} | {download_ms} | {_markdown_cell(transfer.details)} |"
         )
 
     lines.extend(["", "## Analysis", "", *_analysis_lines(self_check, results, transfer)])
@@ -328,7 +537,7 @@ def build_markdown(
             [
                 "1. Keep benchmarking on this discrete-GPU baseline and tune the shape-based shader selector with larger production-like matrix sizes.",
                 "2. Use `scripts/tune_kernels.py` before accepting changes to the automatic selector.",
-                "3. Focus the next shader pass on large square GEMMs, where PyTorch CUDA still has the largest lead.",
+                "3. Focus the next shader pass on the lowest dynamically reported tensor/cuBLAS ratios and the highest-tail-variability cases.",
             ]
         )
     lines.extend(
@@ -353,5 +562,5 @@ def write_outputs(
     Path(path_json).parent.mkdir(parents=True, exist_ok=True)
     Path(path_md).parent.mkdir(parents=True, exist_ok=True)
     payload = build_payload(self_check, nvidia_smi, results, transfer, args)
-    Path(path_json).write_text(json.dumps(payload, indent=2) + "\n")
+    Path(path_json).write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
     Path(path_md).write_text(build_markdown(self_check, nvidia_smi, results, transfer, args))

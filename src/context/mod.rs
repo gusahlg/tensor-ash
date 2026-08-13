@@ -19,6 +19,14 @@ use parking_lot::Mutex;
 
 pub use device::{DeviceKind, DevicePreference, DeviceSummary};
 
+pub(crate) fn timestamp_delta(start: u64, end: u64, valid_bits: u32) -> u64 {
+    let delta = end.wrapping_sub(start);
+    match valid_bits {
+        1..64 => delta & ((1u64 << valid_bits) - 1),
+        _ => delta,
+    }
+}
+
 pub struct VulkanContext {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
@@ -32,6 +40,8 @@ pub struct VulkanContext {
     pub queue: Mutex<vk::Queue>,
     /// Nanoseconds-per-tick reported by the driver for GPU timestamps.
     pub timestamp_period_ns: f64,
+    /// Number of valid low bits in timestamps from the selected queue.
+    pub timestamp_valid_bits: u32,
     pub timestamps_supported: bool,
     /// Whether `VK_KHR_buffer_device_address` (= Vulkan 1.2
     /// `bufferDeviceAddress`) was successfully enabled.  Required for
@@ -130,7 +140,7 @@ impl VulkanContext {
 
     pub fn diagnostics(&self) -> String {
         format!(
-            "device #{}: {} ({}, Vulkan {}, vendor=0x{:04x}, device=0x{:04x}, driver={}, compute_family={}, timestamps={})",
+            "device #{}: {} ({}, Vulkan {}, vendor=0x{:04x}, device=0x{:04x}, driver={}, compute_family={}, timestamps={} ({} bits))",
             self.device_summary.index,
             self.device_summary.name,
             self.device_summary.kind.as_str(),
@@ -140,6 +150,7 @@ impl VulkanContext {
             self.device_summary.driver_version,
             self.compute_family,
             self.timestamps_supported,
+            self.timestamp_valid_bits,
         )
     }
 }

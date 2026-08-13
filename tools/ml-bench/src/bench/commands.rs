@@ -6,9 +6,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tensor_ash::{DeviceKind, Executor, MatmulCall, Tensor, VulkanContext};
-use tensor_ash_test_support::{cpu_bmm, fill_det, max_abs_err};
+use tensor_ash_test_support::{cpu_bmm, fill_det, max_abs_err, tolerance};
 
-use super::cases::{BenchCase, BenchResult, host_len, sweep_cases};
+use super::cases::{BenchCase, BenchResult, SampleSummary, host_len, sweep_cases};
 use super::env::{OutputMode, SweepMode, env_u32, env_usize};
 use super::report::{BenchReporter, csv_escape};
 
@@ -32,8 +32,8 @@ fn correctness_impl(
     let b = Tensor::uninit_device(ctx, &[B, K, N])?;
     let c = Tensor::uninit_device(ctx, &[B, M, N])?;
 
-    let mut ha = vec![0.0f32; (B * M * K) as usize];
-    let mut hb = vec![0.0f32; (B * K * N) as usize];
+    let mut ha = vec![0.0f32; host_len(&[B, M, K])?];
+    let mut hb = vec![0.0f32; host_len(&[B, K, N])?];
     fill_det(&mut ha, 1);
     fill_det(&mut hb, 2);
     exec.upload(&ha, &a)?;
@@ -47,7 +47,7 @@ fn correctness_impl(
         accumulate: false,
     }])?;
 
-    let mut hc = vec![0.0f32; (B * M * N) as usize];
+    let mut hc = vec![0.0f32; host_len(&[B, M, N])?];
     exec.download(&c, &mut hc)?;
 
     let cpu = cpu_bmm(&ha, &hb, None, B, M, N, K, 1.0, false);
@@ -87,6 +87,33 @@ pub(super) fn sweep(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn cases(
+    ctx: &Arc<VulkanContext>,
+    exec: &Executor,
+    specs: impl IntoIterator<Item = String>,
+) -> Result<()> {
+    let cases = specs
+        .into_iter()
+        .map(|spec| BenchCase::parse(&spec))
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        !cases.is_empty(),
+        "cases requires at least one label,b,m,n,k argument"
+    );
+    let iters = env_u32("ML_ITERS", 20).max(1);
+    let warmup = env_u32("ML_WARMUP", 3);
+    let peak = env::var("ML_PEAK_TFLOPS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(20.3);
+    let mut reporter = BenchReporter::new(OutputMode::from_env(), peak, ctx);
+    reporter.print_header();
+    for case in cases {
+        reporter.print_case(&run_case(ctx, exec, case, iters, warmup)?);
+    }
+    Ok(())
+}
+
 pub(super) fn run_case(
     ctx: &Arc<VulkanContext>,
     exec: &Executor,
@@ -120,8 +147,9 @@ pub(super) fn run_case(
         }])?;
     }
 
-    let mut best_gpu_ns = u64::MAX;
-    let mut best_wall_ns = u128::MAX;
+    // Keep GPU and wall measurements paired so host overhead is derived from
+    // the same submission rather than from two unrelated best-case samples.
+    let mut samples = Vec::with_capacity(iters as usize);
     for _ in 0..iters {
         let t0 = Instant::now();
         let stats = exec.run_matmuls(&[MatmulCall {
@@ -131,30 +159,89 @@ pub(super) fn run_case(
             alpha: 1.0,
             accumulate: false,
         }])?;
-        let wall_ns = t0.elapsed().as_nanos();
-        best_wall_ns = best_wall_ns.min(wall_ns);
-        if let Some(gpu_ns) = stats.gpu_time_ns {
-            best_gpu_ns = best_gpu_ns.min(gpu_ns);
-        }
+        samples.push((
+            t0.elapsed().as_secs_f64() * 1e3,
+            stats.gpu_time_ns.map(|ns| ns as f64 / 1e6),
+        ));
     }
-    let gpu_ms = if best_gpu_ns != u64::MAX {
-        best_gpu_ns as f64 / 1e6
+    validate_samples(exec, &c, &h_a, &h_b, bsz, m, n, k)?;
+    let wall_ms = SampleSummary::new(samples.iter().map(|(wall, _)| *wall))
+        .context("benchmark produced no wall-time samples")?;
+    let gpu_ms = SampleSummary::new(samples.iter().filter_map(|(_, gpu)| *gpu));
+    let host_overhead_ms = SampleSummary::new(
+        samples
+            .iter()
+            .filter_map(|(wall, gpu)| gpu.map(|gpu| (wall - gpu).max(0.0))),
+    );
+    let tflops = gpu_ms
+        .filter(|summary| summary.median > 0.0)
+        .map_or(f64::NAN, |summary| flops / summary.median * 1e-9);
+    let wall_tflops = if wall_ms.median > 0.0 {
+        flops / wall_ms.median * 1e-9
     } else {
         f64::NAN
     };
-    let wall_ms = best_wall_ns as f64 / 1e6;
-    let tflops = if best_gpu_ns != u64::MAX {
-        flops / best_gpu_ns as f64 * 1e-3
-    } else {
-        f64::NAN
-    };
+    let dispatch = exec.dispatch_info(bsz, m, n, k);
     Ok(BenchResult {
         case,
+        dispatch,
         flops,
         wall_ms,
         gpu_ms,
+        host_overhead_ms,
         tflops,
+        wall_tflops,
     })
+}
+
+/// Validate a fixed number of well-spaced outputs after timing. This catches
+/// broken kernels without turning large benchmark cases into full CPU GEMMs.
+#[allow(clippy::too_many_arguments)]
+fn validate_samples(
+    exec: &Executor,
+    c: &Tensor,
+    a: &[f32],
+    b: &[f32],
+    batch: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<()> {
+    const CHECKS: usize = 8;
+    let mut output = vec![0.0; host_len(&[batch, m, n])?];
+    exec.download(c, &mut output)?;
+    let checks = output.len().min(CHECKS);
+    let plane = m as usize * n as usize;
+    let mut max_error = 0.0f32;
+    let mut worst = 0;
+    for sample in 0..checks {
+        let index = if checks == 1 {
+            0
+        } else {
+            sample * (output.len() - 1) / (checks - 1)
+        };
+        let batch_index = index / plane;
+        let within_plane = index % plane;
+        let row = within_plane / n as usize;
+        let col = within_plane % n as usize;
+        let expected = (0..k as usize)
+            .map(|inner| {
+                a[(batch_index * m as usize + row) * k as usize + inner]
+                    * b[(batch_index * k as usize + inner) * n as usize + col]
+            })
+            .sum::<f32>();
+        let error = (output[index] - expected).abs();
+        if !error.is_finite() || error > max_error {
+            max_error = error;
+            worst = index;
+        }
+    }
+    let budget = 2.0 * tolerance(k);
+    anyhow::ensure!(
+        max_error <= budget,
+        "sampled correctness failed at output {worst}: error {max_error:.3e} > {budget:.3e}"
+    );
+    Ok(())
 }
 
 pub(super) fn single(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
@@ -264,38 +351,54 @@ pub(super) fn transfer(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> 
     exec.upload(&src, &tensor)?;
     exec.download(&tensor, &mut dst)?;
 
-    let mut best_upload = f64::INFINITY;
-    let mut best_download = f64::INFINITY;
+    let mut upload_ms = Vec::with_capacity(iters as usize);
+    let mut download_ms = Vec::with_capacity(iters as usize);
     for _ in 0..iters {
         let t0 = Instant::now();
         exec.upload(&src, &tensor)?;
-        best_upload = best_upload.min(t0.elapsed().as_secs_f64());
+        upload_ms.push(t0.elapsed().as_secs_f64() * 1e3);
 
         let t0 = Instant::now();
         exec.download(&tensor, &mut dst)?;
-        best_download = best_download.min(t0.elapsed().as_secs_f64());
+        download_ms.push(t0.elapsed().as_secs_f64() * 1e3);
     }
 
+    let upload = SampleSummary::new(upload_ms).context("no upload timing samples")?;
+    let download = SampleSummary::new(download_ms).context("no download timing samples")?;
     let gib = bytes as f64 / 1024.0 / 1024.0 / 1024.0;
-    let upload_gibs = gib / best_upload;
-    let download_gibs = gib / best_download;
+    let upload_gibs = gib / (upload.median / 1e3);
+    let download_gibs = gib / (download.median / 1e3);
     match OutputMode::from_env() {
         OutputMode::Table => {
             println!();
             println!(
-                "transfer: {mb} MiB x {iters} iters  upload={upload_gibs:.2} GiB/s  download={download_gibs:.2} GiB/s"
+                "transfer: {mb} MiB x {} samples  upload={upload_gibs:.2} GiB/s  download={download_gibs:.2} GiB/s",
+                upload.count,
+            );
+            println!(
+                "latency ms (min/median/p95): upload={:.3}/{:.3}/{:.3}  download={:.3}/{:.3}/{:.3}",
+                upload.min, upload.median, upload.p95, download.min, download.median, download.p95,
             );
         }
         OutputMode::Csv => {
-            println!("device,kind,bytes,iters,upload_gibs,download_gibs");
             println!(
-                "{},{},{},{},{:.6},{:.6}",
+                "device,kind,bytes,iters,upload_gibs,download_gibs,sample_count,upload_min_ms,upload_median_ms,upload_p95_ms,download_min_ms,download_median_ms,download_p95_ms"
+            );
+            println!(
+                "{},{},{},{},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
                 csv_escape(ctx.device_name()),
                 ctx.device_kind().as_str(),
                 bytes,
                 iters,
                 upload_gibs,
                 download_gibs,
+                upload.count,
+                upload.min,
+                upload.median,
+                upload.p95,
+                download.min,
+                download.median,
+                download.p95,
             );
         }
     }

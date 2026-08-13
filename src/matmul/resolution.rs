@@ -48,13 +48,30 @@ impl MatrixShape {
     }
 
     fn batch_stride(self, label: &'static str) -> Result<u32> {
-        if self.batch == 1 {
-            Ok(0)
+        let plane_elements = checked_product([self.rows as u64, self.cols as u64])
+            .ok_or_else(|| anyhow!("{label} matrix size overflows u64"))?;
+        let stride = if self.batch == 1 {
+            0
         } else {
-            self.rows
-                .checked_mul(self.cols)
-                .ok_or_else(|| anyhow!("{label} batch stride overflows u32"))
+            u32::try_from(plane_elements)
+                .map_err(|_| anyhow!("{label} batch stride overflows u32"))?
+        };
+
+        // Shader address expressions are `uint`. A contiguous layout is
+        // addressable when its element count is at most 2^32, because the
+        // largest zero-based offset is then exactly `u32::MAX`.
+        let addressable = checked_product([self.batch as u64, plane_elements])
+            .map(|elements| elements <= u32::MAX as u64 + 1)
+            .unwrap_or(false);
+        if !addressable {
+            bail!(
+                "{label} layout exceeds shader u32 indexing: B={} rows={} cols={}",
+                self.batch,
+                self.rows,
+                self.cols
+            );
         }
+        Ok(stride)
     }
 }
 
@@ -248,10 +265,12 @@ fn ensure_broadcastable(label: &str, input_batch: u32, output_batch: u32) -> Res
 }
 
 fn checked_flops(batch: u32, m: u32, n: u32, k: u32) -> Result<u64> {
-    [2, batch as u64, m as u64, n as u64, k as u64]
+    checked_product([2, batch as u64, m as u64, n as u64, k as u64])
+        .ok_or_else(|| anyhow!("matmul FLOP count overflows u64"))
+}
+
+fn checked_product(values: impl IntoIterator<Item = u64>) -> Option<u64> {
+    values
         .into_iter()
-        .try_fold(1u64, |acc, value| {
-            acc.checked_mul(value)
-                .ok_or_else(|| anyhow!("matmul FLOP count overflows u64"))
-        })
+        .try_fold(1u64, |acc, value| acc.checked_mul(value))
 }

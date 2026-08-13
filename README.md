@@ -1,6 +1,6 @@
 # tensor-ash
 
-Version: `1.3.0`
+Version: `1.4.1`
 
 `tensor-ash` is a small Vulkan compute library for high-throughput FP32 matrix
 multiplication, written in Rust on top of [`ash`](https://crates.io/crates/ash).
@@ -204,8 +204,8 @@ The smoke test computes a 2x3 by 3x2 GEMM and verifies the expected
 
 ## Benchmark binary (`ml_bench`)
 
-Subcommands: `self-check`, `correctness`, `sweep`, `single`, `concurrent`,
-`transfer`. Useful env knobs:
+Subcommands: `self-check`, `correctness`, `sweep`, `single`, `cases`,
+`concurrent`, `transfer`. Useful env knobs:
 
 ```bash
 ML_B=4 ML_M=1024 ML_N=1024 ML_K=1024 cargo run --release -p ml-bench -- single
@@ -213,7 +213,13 @@ ML_KERNEL=k64_bda_v4 cargo run --release -p ml-bench -- single
 ML_TUNE=1 ML_M=768 ML_N=768 ML_K=768 cargo run --release -p ml-bench -- single
 ML_DEVICE=discrete cargo run --release -p ml-bench -- self-check
 ML_OUTPUT=csv ML_SWEEP=smoke cargo run --release -p ml-bench -- sweep
+ML_OUTPUT=csv cargo run --release -p ml-bench -- cases \
+  square,1,512,512,512 edge,1,511,513,515
 ```
+
+Timed runs validate sampled outputs outside the measurement window and report
+paired wall/GPU minimum, median, and p95 values. TFLOPS uses the median; CSV
+also identifies the selected kernel, tile, and split-K route.
 
 `ML_TUNE=1` measures every eligible kernel (and the two-stage split-K on
 deep-K shapes) the first time a shape is seen and persists the winner under

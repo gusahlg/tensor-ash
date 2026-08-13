@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import math
 import os
+import statistics
 import subprocess
 import time
 from pathlib import Path
@@ -105,11 +106,38 @@ def _failed_result(library: str, case: Case, details: str) -> BenchResult:
     )
 
 
-def _timed_result(library: str, case: Case, best_ms: float, details: str) -> BenchResult:
-    if not math.isfinite(best_ms) or best_ms <= 0.0:
-        return _failed_result(library, case, f"invalid elapsed time: {best_ms!r} ms")
+def _sample_stats(samples: list[float]) -> tuple[int, float, float, float]:
+    """Return count/min/median/nearest-rank-p95 for valid timings."""
+    valid = sorted(sample for sample in samples if math.isfinite(sample) and sample >= 0.0)
+    if not valid:
+        raise ValueError("no finite, non-negative timing samples")
+    p95_index = max(0, math.ceil(len(valid) * 0.95) - 1)
+    return len(valid), valid[0], statistics.median(valid), valid[p95_index]
+
+
+def _timed_result(
+    library: str, case: Case, samples_ms: list[float], details: str
+) -> BenchResult:
+    try:
+        sample_count, min_ms, median_ms, p95_ms = _sample_stats(samples_ms)
+    except ValueError as exc:
+        return _failed_result(library, case, str(exc))
+    if median_ms <= 0.0:
+        return _failed_result(library, case, f"invalid median elapsed time: {median_ms!r} ms")
     label, b, m, n, k = case
     flops = flops_for(b, m, n, k)
+    timing_scope = "gpu" if library in {"torch_cuda", "cupy_cuda"} else "wall"
+    wall_fields = (
+        {
+            "wall_ms": median_ms,
+            "wall_min_ms": min_ms,
+            "wall_median_ms": median_ms,
+            "wall_p95_ms": p95_ms,
+            "wall_tflops": flops / median_ms * 1e-9,
+        }
+        if timing_scope == "wall"
+        else {}
+    )
     return BenchResult(
         library,
         label,
@@ -118,10 +146,16 @@ def _timed_result(library: str, case: Case, best_ms: float, details: str) -> Ben
         n,
         k,
         "ok",
-        tflops=flops / best_ms * 1e-9,
-        best_ms=best_ms,
+        tflops=flops / median_ms * 1e-9,
+        best_ms=min_ms,
         flops=flops,
         details=details,
+        sample_count=sample_count,
+        min_ms=min_ms,
+        median_ms=median_ms,
+        p95_ms=p95_ms,
+        timing_scope=timing_scope,
+        **wall_fields,
     )
 
 
@@ -154,62 +188,202 @@ def _benchmark_cases(
             run_once, measure_ms = prepare(case)
             for _ in range(warmup):
                 run_once()
-            best_ms = min(measure_ms() for _ in range(iters))
-            results.append(_timed_result(library, case, best_ms, details))
+            samples_ms = [measure_ms() for _ in range(iters)]
+            results.append(_timed_result(library, case, samples_ms, details))
         except Exception as exc:  # noqa: BLE001 - keep other cases benchmarkable
             results.append(_failed_result(library, case, f"{details}; benchmark failed: {exc}"))
     return results
 
 
-def _csv_row(output: str, header_prefix: str) -> dict[str, str]:
+def _csv_rows(output: str, header_prefix: str) -> list[dict[str, str]]:
+    """Parse complete CSV rows while ignoring log lines around/between them."""
     lines = output.splitlines()
     header_idx = next(i for i, line in enumerate(lines) if line.startswith(header_prefix))
-    return next(csv.DictReader(lines[header_idx:]))
-
-
-def bench_tensor_ash(path: str, cases: list[Case], iters: int, warmup: int) -> list[BenchResult]:
-    results = []
-    for case in cases:
-        label, b, m, n, k = case
-        env = os.environ.copy()
-        env.update(
-            {
-                "ML_B": str(b),
-                "ML_M": str(m),
-                "ML_N": str(n),
-                "ML_K": str(k),
-                "ML_ITERS": str(iters),
-                "ML_WARMUP": str(warmup),
-                "ML_OUTPUT": "csv",
-            }
-        )
-        code, output = run_cmd([path, "single"], env=env)
-        if code != 0:
-            results.append(_failed_result("tensor-ash", case, output.strip()))
+    fieldnames = next(csv.reader([lines[header_idx]]))
+    rows = []
+    for line in lines[header_idx + 1 :]:
+        if not line.strip():
             continue
         try:
-            row = _csv_row(output, "device,kind,label")
-            gpu_ms = float(row["gpu_ms"])
-            wall_ms = float(row["wall_ms"])
+            values = next(csv.reader([line]))
+        except csv.Error:
+            continue
+        if len(values) != len(fieldnames) or values == fieldnames:
+            continue
+        row = dict(zip(fieldnames, values, strict=True))
+        try:
+            for key in ("b", "m", "n", "k"):
+                if key in row:
+                    int(row[key])
+            for key in ("bytes", "iters"):
+                if key in row:
+                    int(row[key])
+        except ValueError:
+            continue
+        rows.append(row)
+    return rows
+
+
+def _csv_row(output: str, header_prefix: str) -> dict[str, str]:
+    rows = _csv_rows(output, header_prefix)
+    if not rows:
+        raise ValueError(f"no CSV data row found after header {header_prefix!r}")
+    return rows[0]
+
+
+def _unique_rows_by_label(
+    rows: list[dict[str, str]],
+) -> tuple[dict[str, dict[str, str]], set[str]]:
+    """Index emitted cases while making duplicate output an explicit error."""
+    indexed: dict[str, dict[str, str]] = {}
+    duplicates = set()
+    for row in rows:
+        label = row.get("label", "")
+        if not label:
+            continue
+        if label in indexed:
+            duplicates.add(label)
+        else:
+            indexed[label] = row
+    return indexed, duplicates
+
+
+def _optional_float(row: dict[str, str], key: str) -> float | None:
+    raw = row.get(key)
+    if raw is None or not raw.strip():
+        return None
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite {key}: {raw!r}")
+    return value
+
+
+def _optional_int(row: dict[str, str], key: str) -> int | None:
+    raw = row.get(key)
+    return None if raw is None or not raw.strip() else int(raw)
+
+
+def _tensor_ash_result(case: Case, row: dict[str, str], iters: int) -> BenchResult:
+    label, b, m, n, k = case
+    emitted_shape = tuple(int(row[key]) for key in ("b", "m", "n", "k"))
+    if emitted_shape != (b, m, n, k):
+        raise ValueError(f"shape mismatch: expected {(b, m, n, k)}, got {emitted_shape}")
+    gpu_median_ms = _optional_float(row, "gpu_median_ms")
+    if gpu_median_ms is None:
+        gpu_median_ms = _optional_float(row, "gpu_ms")
+    wall_median_ms = _optional_float(row, "wall_median_ms")
+    if wall_median_ms is None:
+        wall_median_ms = _optional_float(row, "wall_ms")
+    if gpu_median_ms is None or wall_median_ms is None:
+        raise ValueError("missing median GPU or wall timing")
+
+    gpu_min_ms = _optional_float(row, "gpu_min_ms")
+    gpu_p95_ms = _optional_float(row, "gpu_p95_ms")
+    wall_min_ms = _optional_float(row, "wall_min_ms")
+    wall_p95_ms = _optional_float(row, "wall_p95_ms")
+    gpu_min_ms = gpu_median_ms if gpu_min_ms is None else gpu_min_ms
+    gpu_p95_ms = gpu_median_ms if gpu_p95_ms is None else gpu_p95_ms
+    wall_min_ms = wall_median_ms if wall_min_ms is None else wall_min_ms
+    wall_p95_ms = wall_median_ms if wall_p95_ms is None else wall_p95_ms
+    host_median_ms = _optional_float(row, "host_overhead_median_ms")
+    if host_median_ms is None:
+        host_median_ms = max(0.0, wall_median_ms - gpu_median_ms)
+    host_min_ms = _optional_float(row, "host_overhead_min_ms")
+    host_p95_ms = _optional_float(row, "host_overhead_p95_ms")
+    host_min_ms = host_median_ms if host_min_ms is None else host_min_ms
+    host_p95_ms = host_median_ms if host_p95_ms is None else host_p95_ms
+    sample_count = _optional_int(row, "sample_count")
+    gpu_sample_count = _optional_int(row, "gpu_sample_count")
+    sample_count = iters if sample_count is None else sample_count
+    gpu_sample_count = sample_count if gpu_sample_count is None else gpu_sample_count
+    if sample_count < 1 or gpu_sample_count < 1:
+        raise ValueError("sample counts must be positive")
+    if not 0.0 <= gpu_min_ms <= gpu_median_ms <= gpu_p95_ms:
+        raise ValueError("GPU timing summary is not ordered")
+    if not 0.0 <= wall_min_ms <= wall_median_ms <= wall_p95_ms:
+        raise ValueError("wall timing summary is not ordered")
+    if not 0.0 <= host_min_ms <= host_median_ms <= host_p95_ms:
+        raise ValueError("host-overhead summary is not ordered")
+    flops = flops_for(b, m, n, k)
+    wall_tflops = _optional_float(row, "wall_tflops")
+    if wall_tflops is None:
+        wall_tflops = flops / wall_median_ms * 1e-9
+    return BenchResult(
+        "tensor-ash",
+        label,
+        b,
+        m,
+        n,
+        k,
+        "ok",
+        tflops=flops / gpu_median_ms * 1e-9,
+        best_ms=gpu_min_ms,
+        wall_ms=wall_median_ms,
+        host_overhead_ms=host_median_ms,
+        flops=flops,
+        details=f"{row['device']} ({row['kind']})",
+        sample_count=sample_count,
+        min_ms=gpu_min_ms,
+        median_ms=gpu_median_ms,
+        p95_ms=gpu_p95_ms,
+        gpu_sample_count=gpu_sample_count,
+        wall_min_ms=wall_min_ms,
+        wall_median_ms=wall_median_ms,
+        wall_p95_ms=wall_p95_ms,
+        host_overhead_min_ms=host_min_ms,
+        host_overhead_median_ms=host_median_ms,
+        host_overhead_p95_ms=host_p95_ms,
+        wall_tflops=wall_tflops,
+        kernel=row.get("kernel", ""),
+        tile_m=_optional_int(row, "tile_m"),
+        tile_n=_optional_int(row, "tile_n"),
+        tile_k=_optional_int(row, "tile_k"),
+        strategy=row.get("strategy", ""),
+        split_k2_splits=_optional_int(row, "split_k2_splits"),
+        timing_scope="gpu",
+    )
+
+
+def bench_tensor_ash(
+    path: str, cases: list[Case], iters: int, warmup: int
+) -> list[BenchResult]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "ML_ITERS": str(iters),
+            "ML_WARMUP": str(warmup),
+            "ML_OUTPUT": "csv",
+        }
+    )
+    specs = [f"{label},{b},{m},{n},{k}" for label, b, m, n, k in cases]
+    code, output = run_cmd([path, "cases", *specs], env=env)
+    try:
+        rows = _csv_rows(output, "device,kind,label")
+    except (StopIteration, csv.Error):
+        rows = []
+    if not rows:
+        details = output.strip() or f"multi-case benchmark failed with exit code {code}"
+        return [_failed_result("tensor-ash", case, details) for case in cases]
+
+    by_label, duplicates = _unique_rows_by_label(rows)
+    results = []
+    for case in cases:
+        if case[0] in duplicates:
             results.append(
-                BenchResult(
-                    "tensor-ash",
-                    label,
-                    b,
-                    m,
-                    n,
-                    k,
-                    "ok",
-                    tflops=float(row["tflops"]),
-                    best_ms=gpu_ms,
-                    wall_ms=wall_ms,
-                    host_overhead_ms=max(0.0, wall_ms - gpu_ms),
-                    flops=flops_for(b, m, n, k),
-                    details=f"{row['device']} ({row['kind']})",
+                _failed_result(
+                    "tensor-ash", case, "multi-case benchmark emitted duplicate rows"
                 )
             )
-        except Exception as exc:  # noqa: BLE001 - include malformed tool output
-            results.append(_failed_result("tensor-ash", case, f"{exc}\n{output}"))
+            continue
+        row = by_label.get(case[0])
+        if row is None:
+            details = f"multi-case benchmark did not emit row {case[0]!r} (exit code {code})"
+            results.append(_failed_result("tensor-ash", case, details))
+            continue
+        try:
+            results.append(_tensor_ash_result(case, row, iters))
+        except Exception as exc:  # noqa: BLE001 - contain malformed rows by shape
+            results.append(_failed_result("tensor-ash", case, f"invalid CSV row: {exc}"))
     return results
 
 
@@ -227,13 +401,26 @@ def bench_transfer(path: str, iters: int, mb: int) -> TransferResult:
         return TransferResult("failed", details=output.strip())
     try:
         row = _csv_row(output, "device,kind,bytes")
+        upload_gibs = _optional_float(row, "upload_gibs")
+        download_gibs = _optional_float(row, "download_gibs")
+        if upload_gibs is None or upload_gibs <= 0.0:
+            raise ValueError("missing positive upload bandwidth")
+        if download_gibs is None or download_gibs <= 0.0:
+            raise ValueError("missing positive download bandwidth")
         return TransferResult(
             "ok",
             bytes=int(row["bytes"]),
             iters=int(row["iters"]),
-            upload_gibs=float(row["upload_gibs"]),
-            download_gibs=float(row["download_gibs"]),
+            upload_gibs=upload_gibs,
+            download_gibs=download_gibs,
             details=f"{row['device']} ({row['kind']})",
+            sample_count=_optional_int(row, "sample_count"),
+            upload_min_ms=_optional_float(row, "upload_min_ms"),
+            upload_median_ms=_optional_float(row, "upload_median_ms"),
+            upload_p95_ms=_optional_float(row, "upload_p95_ms"),
+            download_min_ms=_optional_float(row, "download_min_ms"),
+            download_median_ms=_optional_float(row, "download_median_ms"),
+            download_p95_ms=_optional_float(row, "download_p95_ms"),
         )
     except Exception as exc:  # noqa: BLE001 - include malformed tool output
         return TransferResult("failed", details=f"{exc}\n{output}")
@@ -434,34 +621,66 @@ def bench_cublas_pure(
         check=False,
     )
     if proc.returncode != 0:
-        return skipped_results(
-            "cublas_pure",
-            cases,
-            f"binary failed (rc={proc.returncode}): {proc.stderr.strip()[:200]}",
-        )
+        details = f"binary failed (rc={proc.returncode}): {proc.stderr.strip()[:200]}"
+        return [_failed_result("cublas_pure", case, details) for case in cases]
 
-    lines = proc.stdout.splitlines()
-    header_idx = next(
-        (
-            idx
-            for idx, line in enumerate(lines)
-            if line.startswith("label,b,m,n,k,best_ms,mean_ms,tflops")
-        ),
-        None,
-    )
-    rows = {} if header_idx is None else {row["label"]: row for row in csv.DictReader(lines[header_idx:])}
+    try:
+        rows, duplicates = _unique_rows_by_label(
+            _csv_rows(proc.stdout, "label,b,m,n,k,")
+        )
+    except (KeyError, StopIteration, csv.Error):
+        rows, duplicates = {}, set()
     details = "pure cuBLAS, FP32 forced (CUBLAS_PEDANTIC_MATH), CUDA events"
     results = []
     for case in cases:
+        if case[0] in duplicates:
+            results.append(
+                _failed_result("cublas_pure", case, "binary emitted duplicate rows")
+            )
+            continue
         row = rows.get(case[0])
         if row is None:
             results.append(_failed_result("cublas_pure", case, "binary did not emit a row"))
             continue
         try:
-            result = _timed_result("cublas_pure", case, float(row["best_ms"]), details)
-            if result.status == "ok":
-                result.tflops = float(row["tflops"])
+            emitted_shape = tuple(int(row[key]) for key in ("b", "m", "n", "k"))
+            if emitted_shape != case[1:]:
+                raise ValueError(
+                    f"shape mismatch: expected {case[1:]}, got {emitted_shape}"
+                )
+            min_ms = _optional_float(row, "min_ms")
+            if min_ms is None:
+                min_ms = _optional_float(row, "best_ms")
+            if min_ms is None or min_ms <= 0.0:
+                raise ValueError("missing positive minimum time")
+            median_ms = _optional_float(row, "median_ms")
+            p95_ms = _optional_float(row, "p95_ms")
+            if median_ms is None or p95_ms is None:
+                raise ValueError(
+                    "legacy best-only row has no median/p95; rebuild cublas_bench"
+                )
+            sample_count = _optional_int(row, "sample_count") or iters
+            if sample_count < 1:
+                raise ValueError("sample count must be positive")
+            if not 0.0 < min_ms <= median_ms <= p95_ms:
+                raise ValueError("timing summary is not ordered")
+            flops = flops_for(case[1], case[2], case[3], case[4])
+            tflops = flops / median_ms * 1e-9
+            result = BenchResult(
+                "cublas_pure",
+                *case,
+                "ok",
+                tflops=tflops,
+                best_ms=min_ms,
+                flops=flops,
+                details=details,
+                sample_count=sample_count,
+                min_ms=min_ms,
+                median_ms=median_ms,
+                p95_ms=p95_ms,
+                timing_scope="gpu",
+            )
             results.append(result)
-        except (KeyError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError) as exc:
             results.append(_failed_result("cublas_pure", case, f"invalid binary row: {exc}"))
     return results
