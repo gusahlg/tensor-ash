@@ -88,7 +88,7 @@ fn f16_weights_match_rounded_reference_across_routes() {
                 vec![batch, rows, cols]
             }
         };
-        let (a, b, host_a, host_b) = setup_f16_case(
+        let (a, b, mut host_a, host_b) = setup_f16_case(
             &ctx,
             &exec,
             &shape(m, k),
@@ -96,6 +96,18 @@ fn f16_weights_match_rounded_reference_across_routes() {
             9000 + k as u64,
             9100 + n as u64,
         );
+        // The tensor-core route quantizes A to f16 while staging;
+        // mirror it in the reference so products stay exact.
+        if exec
+            .dispatch_info_for(batch, m, n, k, true)
+            .kernel
+            .contains("coopmat")
+        {
+            for value in &mut host_a {
+                *value = round_f32_via_f16(*value);
+            }
+            exec.upload(&host_a, &a).unwrap();
+        }
         let c = Tensor::uninit_device(&ctx, &shape(m, n)).unwrap();
         exec.run_matmuls(&[MatmulCall {
             a: &a,
@@ -124,11 +136,30 @@ fn f16_routes_pick_f16w_kernels_and_skip_splitk2() {
         eprintln!("skipping: no f16/BDA support");
         return;
     }
+    // Big aligned shapes take the tensor cores when available; the
+    // SIMT large tile handles the unaligned siblings.
     let large = exec.dispatch_info_for(1, 2048, 2048, 2048, true);
-    assert_eq!(large.kernel, "f16w_large_bda_v4", "large route: {large:?}");
-    // 1024^3 mirrors its f32 route class (m128n64k64).
+    if ctx.coopmat_enabled {
+        assert_eq!(
+            large.kernel, "f16w_coopmat_aligned",
+            "large route: {large:?}"
+        );
+    } else {
+        assert_eq!(large.kernel, "f16w_large_bda_v4", "large route: {large:?}");
+    }
+    let unaligned = exec.dispatch_info_for(1, 2048, 2040, 2048, true);
+    assert!(
+        unaligned.kernel.starts_with("f16w_") && !unaligned.kernel.contains("coopmat"),
+        "unaligned route: {unaligned:?}"
+    );
+    // 1024^3: tensor cores when available, else the f32 route class
+    // mirror (m128n64k64).
     let mid = exec.dispatch_info_for(1, 1024, 1024, 1024, true);
-    assert_eq!(mid.kernel, "f16w_m128n64k64_bda_v4", "mid route: {mid:?}");
+    if ctx.coopmat_enabled {
+        assert_eq!(mid.kernel, "f16w_coopmat_aligned", "mid route: {mid:?}");
+    } else {
+        assert_eq!(mid.kernel, "f16w_m128n64k64_bda_v4", "mid route: {mid:?}");
+    }
     let row = exec.dispatch_info_for(1, 1, 4096, 4096, true);
     assert_eq!(row.kernel, "f16w_row_bda", "row route: {row:?}");
     // Deep-K would tempt split-K2 on f32; f16 must stay data-parallel
@@ -252,4 +283,52 @@ fn f16_b_with_explicit_f32_kernel_is_rejected() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("A must be f32"), "unexpected error: {err}");
+}
+
+#[test]
+#[ignore]
+fn coopmat_routes_and_matches_dual_rounded_reference() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !f16_available(&ctx) || !ctx.coopmat_enabled {
+        eprintln!("skipping: no coopmat support");
+        return;
+    }
+    // Aligned + big => tensor cores; small or ragged stays SIMT.
+    let big = exec.dispatch_info_for(1, 1024, 1024, 1024, true);
+    assert_eq!(big.kernel, "f16w_coopmat_aligned", "{big:?}");
+    let small = exec.dispatch_info_for(1, 128, 128, 128, true);
+    assert_ne!(small.kernel, "f16w_coopmat_aligned", "{small:?}");
+    let ragged = exec.dispatch_info_for(1, 1024, 1000, 1024, true);
+    assert_ne!(ragged.kernel, "f16w_coopmat_aligned", "{ragged:?}");
+
+    // Batched + alpha + accumulate against a dual-rounded reference:
+    // f16 x f16 products are exact in f32, so tolerance(k) holds.
+    let (batch, m, n, k) = (2_u32, 256_u32, 384_u32, 256_u32);
+    let (a, b, mut host_a, host_b) =
+        setup_f16_case(&ctx, &exec, &[batch, m, k], &[batch, k, n], 9700, 9701);
+    for value in &mut host_a {
+        *value = round_f32_via_f16(*value);
+    }
+    exec.upload(&host_a, &a).unwrap();
+    let c = Tensor::uninit_device(&ctx, &[batch, m, n]).unwrap();
+    let mut host_c = vec![0.0; (batch * m * n) as usize];
+    fill_det(&mut host_c, 9702);
+    exec.upload(&host_c, &c).unwrap();
+    let alpha = 0.75;
+    exec.run_matmuls(&[MatmulCall {
+        a: &a,
+        b: &b,
+        c: &c,
+        alpha,
+        accumulate: true,
+    }])
+    .unwrap();
+    let mut gpu = vec![0.0; (batch * m * n) as usize];
+    exec.download(&c, &mut gpu).unwrap();
+    let cpu = cpu_bmm(&host_a, &host_b, Some(&host_c), batch, m, n, k, alpha, true);
+    let (error, index) = max_abs_err(&gpu, &cpu);
+    assert!(
+        error <= tolerance(k),
+        "coopmat error {error:.3e} at {index}"
+    );
 }

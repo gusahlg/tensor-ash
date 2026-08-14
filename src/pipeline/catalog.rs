@@ -192,6 +192,15 @@ kernel_catalog! {
         ["f16w_m128n64k64_bda_v4", "f16w_m128n64k64"]),
     F16wRowBda => ("f16w_row_bda", 1, 32, 1, "matmul_f16w_row_bda.spv", false,
         ["f16w_row_bda", "f16w_row"]),
+    // Tensor-core GEMM (KHR cooperative matrix): A f32 converted to
+    // f16 at staging, B f16 storage, f32 accumulate.  Strictly aligned
+    // (the suffix drives the host-side M/N/K % tile check) because
+    // coopmat ops need subgroup-uniform control flow and this device
+    // has no robust-buffer-access net for them.  Registry slot is
+    // empty unless `VulkanContext::coopmat_enabled`.
+    F16wCoopmat => ("f16w_coopmat_aligned", 128, 128, 32,
+        "matmul_f16w_coopmat_aligned.spv", false,
+        ["f16w_coopmat_aligned", "f16w_coopmat", "coopmat"]),
 }
 
 #[cfg(test)]

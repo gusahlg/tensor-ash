@@ -143,6 +143,17 @@ pub(super) fn run_case(
         for value in &mut h_b {
             *value = tensor_ash::dtype::round_f32_via_f16(*value);
         }
+        // The tensor-core route also quantizes A while staging.
+        if exec
+            .dispatch_info_for(bsz, m, n, k, true)
+            .kernel
+            .contains("coopmat")
+        {
+            for value in &mut h_a {
+                *value = tensor_ash::dtype::round_f32_via_f16(*value);
+            }
+            exec.upload(&h_a, &a)?;
+        }
     }
 
     let flops = 2.0f64 * bsz as f64 * m as f64 * n as f64 * k as f64;

@@ -58,6 +58,10 @@ pub struct VulkanContext {
     /// it f16 tensors are rejected at matmul time and the f16 kernels
     /// are not built.
     pub f16_storage_enabled: bool,
+    /// Whether `VK_KHR_cooperative_matrix` was enabled (with the
+    /// Vulkan memory model).  Required for the tensor-core `coopmat`
+    /// kernels; `ML_NO_COOPMAT=1` forces it off.
+    pub coopmat_enabled: bool,
     /// Pipeline cache, seeded from disk on init and flushed back on drop.
     /// Persisting it avoids the SPIR-V -> ISA recompile (50-200 ms on
     /// NVIDIA) on every cold start.

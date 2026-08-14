@@ -150,3 +150,36 @@ roundtrip), 45 unit tests (RNE encode/decode vectors), clippy clean.
 local-model lever works. Next: model ops (softmax/rmsnorm/rope/copy) so a
 decoder block composes end-to-end, then C ABI v2 exposing dtype + ops + prepared,
 then coopmat Phase B for the compute-bound prompt side.
+
+### 2026-08-14 — steps 3-5: internals dedup, C ABI v2, model ops
+
+**Dedup (504059a):** one shared `build_compute_pipeline` (module + spec
+constants + pipeline cache) replaced three hand-rolled builders; timestamp
+wrap/readback and single-CB submit are now single functions used by both the
+sync and prepared paths; the compute→compute barrier helper is shared by graph
+and split-K2 recording. ~180 duplicated lines removed, behavior pinned by the
+full suite.
+
+**C ABI v2 (b6795d1):** 14 → 32 exports — f16 tensors + capability queries,
+epilogue ops (`ta_run_ops`/`ta_run_op_graph`), prepared replay handles
+(`create/run/submit/wait/destroy`; the Rust lifetimes instantiate at `'static`
+with a documented outlive-the-handle C contract, and destroy fence-waits via
+`PreparedOps::Drop`), dispatch-info/tune diagnostics, `ta_executor_create_v2`
+with the tune flag. The C smoke example exercises epilogues, f16, and prepared
+replay on GPU and exits 0.
+
+**Model ops (5c96580):** `run_softmax_rows` (prefix/causal masks, exact-zero
+masked tail), `run_rms_norm` / `run_layer_norm`, `run_rope` (partial rotary,
+in-place safe), `run_copy_strided` (transpose/KV-append/head reshape) — a
+lazily-built sibling pipeline beside split-K2 reusing the shared builder and
+slot machinery. The design bet that a zero-padded KV cache composes exactly
+(masked softmax writes true zeros → padded P@V is exact) is pinned by an
+end-to-end decode-attention test against a CPU reference. Measured
+(`examples/bench_ops.rs`, RTX 3070): rmsnorm ~450 GB/s effective (memory
+bound), rope ~85% peak, softmax 0.49 ms @4096² (3-pass; possible later win:
+shared-memory exp caching), strided transpose 154 GB/s (scatter-bound;
+load-time only). Suite is now 78 GPU tests.
+
+**Direction check:** a decoder block now composes end-to-end in-library.
+Remaining: expose the five ops through the C ABI, then coopmat Phase B
+(tensor cores) for prompt-side compute.

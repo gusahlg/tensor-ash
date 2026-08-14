@@ -157,7 +157,8 @@ impl MatmulPipeline {
                 // device may not have; leave their registry slots empty
                 // instead of failing the whole pipeline. Routing and
                 // validation never select an empty slot.
-                if spec.weights_f16() && !ctx.f16_storage_enabled {
+                let coopmat_gated = spec.name.contains("coopmat") && !ctx.coopmat_enabled;
+                if (spec.weights_f16() && !ctx.f16_storage_enabled) || coopmat_gated {
                     kernels_guard.push(None);
                     continue;
                 }
@@ -284,9 +285,23 @@ impl MatmulPipeline {
         }
         let tile = auto_select_kernel(batch, m, n, k, self.auto_min_large_tiles);
         let selection = if b_f16 {
-            // f16-storage B is validated as BDA-capable upstream; map
-            // the tile class onto the nearest f16w sibling.
-            to_f16w(tile)
+            // Tensor cores first when the shape allows them: strictly
+            // aligned and big enough that the 128x128 tiles fill the
+            // device (small aligned shapes stay on the SIMT f16w
+            // kernels, which handle low occupancy better).
+            if self.ctx.coopmat_enabled
+                && m.is_multiple_of(128)
+                && n.is_multiple_of(128)
+                && k.is_multiple_of(32)
+                && m >= 256
+                && n >= 256
+            {
+                KernelSelection::F16wCoopmat
+            } else {
+                // f16-storage B is validated as BDA-capable upstream;
+                // map the tile class onto the nearest f16w sibling.
+                to_f16w(tile)
+            }
         } else if self.ctx.buffer_device_address_enabled {
             maybe_to_bda(tile)
         } else {
@@ -330,8 +345,12 @@ impl MatmulPipeline {
             .enumerate()
             .filter_map(|(idx, kernel)| kernel.as_ref().map(|kernel| (idx, kernel)))
             .filter(|(_, kernel)| {
+                let coopmat_fits = kernel.name.contains("coopmat")
+                    && m.is_multiple_of(128)
+                    && n.is_multiple_of(128)
+                    && k.is_multiple_of(32);
                 !kernel.uses_descriptors
-                    && !kernel.name.ends_with("_aligned")
+                    && (!kernel.name.ends_with("_aligned") || coopmat_fits)
                     && kernel.weights_f16() == b_f16
                     && (m == 1 || !kernel.name.ends_with("row_bda"))
                     && (n == 1 || kernel.name != "col_bda")
