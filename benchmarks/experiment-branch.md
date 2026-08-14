@@ -219,6 +219,23 @@ o_proj with fused residual → RMSNorm → SwiGLU MLP with fused gate/residual �
 matches an f64 CPU reference (observed error ~1e-5 vs 8×tolerance bound).
 Suite: 80 GPU tests.
 
+### 2026-08-14 — coopmat register-prefetch experiment: REJECTED
+
+Tried the NVIDIA-sample software pipeline (fetch tile kt+1 into registers
+while the tensor cores work on kt, then store to shared). Clean A/B with
+identical case order: **every shape lost badly** — sq4096 4.31 → 6.21 ms
+(−44%), sq2048 0.597 → 0.839, sq1024 0.106 → 0.138, prefill 0.579 → 0.736.
+Same structural cause as the v1.1 f32 source-level double-buffer dead end:
+without a `cp.async` equivalent, the 16 prefetch registers stay live across
+the entire fragment-math section, and on top of ~120 accumulator/fragment
+registers that hits a register cliff / occupancy loss that outweighs any
+load-latency hiding. Reverted; the simple single-buffered loop stays
+(baseline re-confirmed at 4.30 ms after revert). Lesson extended: the
+register-double-buffer trick that worked *inside* the f32 FFMA inner loop
+(tiny 2-deep banks) does not transfer to whole-tile prefetch around coopmat
+math. The remaining ~13% to TC peak likely needs subgroup-level tile
+re-tuning or NV_coopmat2 features, not source pipelining.
+
 **Direction check:** the mandate is delivered — FP16 in two tiers (storage
 and tensor cores), a C ABI that can drive a real decoder, verified building
 blocks for llama-class models. Remaining ideas for future legs: coopmat
