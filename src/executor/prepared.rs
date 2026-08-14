@@ -31,10 +31,10 @@ use std::marker::PhantomData;
 use anyhow::{Context, Result, bail};
 use ash::vk;
 
-use crate::context::timestamp_delta;
 use crate::matmul::{MatmulCall, MatmulOp, ResolvedMatmulBatch, RunStats, total_flops};
 
 use super::recording::{record_matmul_commands, record_matmul_graph_commands};
+use super::submission::{read_gpu_time_ns, record_timestamped, submit_one, wait_fence_spin};
 use super::{Executor, OpPlan};
 
 /// A validated, pre-recorded batch of matmul ops bound to fixed
@@ -163,36 +163,31 @@ impl Executor {
             // descriptor sets, so null handles satisfy the recorder.
             dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
                 .context("begin_command_buffer (prepared)")?;
-            if query_pool != vk::QueryPool::null() {
-                dev.cmd_reset_query_pool(cmd, query_pool, 0, 2);
-                dev.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, query_pool, 0);
-            }
             let null_sets = vec![vk::DescriptorSet::null(); ops.len()];
-            if with_dependency_barriers {
-                record_matmul_graph_commands(
-                    &self.ctx,
-                    &self.pipeline,
-                    cmd,
-                    &null_sets,
-                    ops,
-                    resolved,
-                    &plans,
-                    None,
-                )?;
-            } else {
-                record_matmul_commands(
-                    &self.ctx,
-                    &self.pipeline,
-                    cmd,
-                    &null_sets,
-                    ops,
-                    resolved,
-                    &plans,
-                )?;
-            }
-            if query_pool != vk::QueryPool::null() {
-                dev.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, query_pool, 1);
-            }
+            record_timestamped(dev, cmd, query_pool, || {
+                if with_dependency_barriers {
+                    record_matmul_graph_commands(
+                        &self.ctx,
+                        &self.pipeline,
+                        cmd,
+                        &null_sets,
+                        ops,
+                        resolved,
+                        &plans,
+                        None,
+                    )
+                } else {
+                    record_matmul_commands(
+                        &self.ctx,
+                        &self.pipeline,
+                        cmd,
+                        &null_sets,
+                        ops,
+                        resolved,
+                        &plans,
+                    )
+                }
+            })?;
             dev.end_command_buffer(cmd)
                 .context("end_command_buffer (prepared)")?;
 
@@ -243,16 +238,14 @@ impl PreparedOps<'_, '_> {
         if self.in_flight {
             bail!("PreparedOps::submit: already in flight; call wait() first");
         }
-        let command_buffers = [self.cmd];
-        let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
         unsafe {
-            let queue = self.exec.ctx.queue.lock();
-            self.exec
-                .ctx
-                .device
-                .queue_submit(*queue, &[submit], self.fence)
-                .context("queue_submit (prepared)")?;
-        }
+            submit_one(
+                &self.exec.ctx,
+                self.cmd,
+                self.fence,
+                "queue_submit (prepared)",
+            )?
+        };
         self.in_flight = true;
         Ok(())
     }
@@ -263,27 +256,21 @@ impl PreparedOps<'_, '_> {
             bail!("PreparedOps::wait: nothing submitted");
         }
         let ctx = &self.exec.ctx;
-        let gpu_time_ns = unsafe {
-            super::submission::wait_fence_spin(&ctx.device, self.fence)?;
+        wait_fence_spin(&ctx.device, self.fence)?;
+        unsafe {
             ctx.device
                 .reset_fences(&[self.fence])
                 .context("reset_fences (prepared)")?;
-            self.in_flight = false;
-            if self.query_pool == vk::QueryPool::null() {
-                None
-            } else {
-                let mut data = [0u64; 2];
-                ctx.device
-                    .get_query_pool_results(
-                        self.query_pool,
-                        0,
-                        &mut data,
-                        vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
-                    )
-                    .context("get_query_pool_results (prepared)")?;
-                let ticks = timestamp_delta(data[0], data[1], ctx.timestamp_valid_bits);
-                Some((ticks as f64 * ctx.timestamp_period_ns) as u64)
-            }
+        }
+        self.in_flight = false;
+        let gpu_time_ns = if self.query_pool == vk::QueryPool::null() {
+            None
+        } else {
+            Some(read_gpu_time_ns(
+                ctx,
+                self.query_pool,
+                "get_query_pool_results (prepared)",
+            )?)
         };
         Ok(RunStats {
             gpu_time_ns,

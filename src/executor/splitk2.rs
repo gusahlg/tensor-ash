@@ -335,18 +335,7 @@ pub(super) fn record_split_k2_commands(
         dev.cmd_dispatch(cb, plan.gx, plan.gy, plan.gz);
 
         // Scratch writes must land before the reducer reads.
-        let barrier = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-        dev.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            std::slice::from_ref(&barrier),
-            &[],
-            &[],
-        );
+        super::recording::record_compute_to_compute_barrier(ctx, cb);
 
         dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline.reduce.pipeline);
         dev.cmd_push_constants(
@@ -459,79 +448,22 @@ fn build_kernel(
     tile_n: u32,
     spv: &[u8],
 ) -> Result<SplitK2Kernel> {
-    assert!(spv.len().is_multiple_of(4), "SPIR-V size not 4-aligned");
-    let words: Vec<u32> = spv
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    unsafe {
-        let shader_module = ctx
-            .device
-            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
-            .context("create_shader_module (split-K2)")?;
-        let entry = std::ffi::CString::new("main").unwrap();
-
-        // Stage 1 reuses the standard spec-constant slots with neutral
-        // values (alpha handled dynamically: ALPHA_IS_ONE=false keeps
-        // the multiply, which folds to *1.0 anyway when alpha is 1).
-        let spec_entries = [
-            vk::SpecializationMapEntry::default()
-                .constant_id(0)
-                .offset(0)
-                .size(4),
-            vk::SpecializationMapEntry::default()
-                .constant_id(1)
-                .offset(4)
-                .size(4),
-            vk::SpecializationMapEntry::default()
-                .constant_id(2)
-                .offset(8)
-                .size(4),
-            vk::SpecializationMapEntry::default()
-                .constant_id(3)
-                .offset(12)
-                .size(4),
-        ];
-        let spec_data: [u32; 4] = [0, 0, 0, 0];
-        let spec_info = vk::SpecializationInfo::default()
-            .map_entries(&spec_entries)
-            .data(bytemuck::cast_slice(&spec_data));
-
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(shader_module)
-            .name(&entry)
-            .specialization_info(&spec_info);
-
-        let ci = [vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
-            .layout(layout)];
-
-        let pipelines = match ctx
-            .device
-            .create_compute_pipelines(ctx.pipeline_cache, &ci, None)
-        {
-            Ok(p) => p,
-            Err((partial, err)) => {
-                for p in partial {
-                    if p != vk::Pipeline::null() {
-                        ctx.device.destroy_pipeline(p, None);
-                    }
-                }
-                ctx.device.destroy_shader_module(shader_module, None);
-                return Err(anyhow!(
-                    "create_compute_pipelines split-K2 {tile_m}x{tile_n}: {err}"
-                ));
-            }
-        };
-
-        Ok(SplitK2Kernel {
-            tile_m,
-            tile_n,
-            shader_module,
-            pipeline: pipelines[0],
-        })
-    }
+    // Stage 1 reuses the standard spec-constant slots with neutral
+    // values (alpha handled dynamically: ALPHA_IS_ONE=false keeps
+    // the multiply, which folds to *1.0 anyway when alpha is 1).
+    let (shader_module, pipeline) = crate::pipeline::build_compute_pipeline(
+        ctx,
+        layout,
+        &[0, 0, 0, 0],
+        spv,
+        &format!("split-K2 {tile_m}x{tile_n}"),
+    )?;
+    Ok(SplitK2Kernel {
+        tile_m,
+        tile_n,
+        shader_module,
+        pipeline,
+    })
 }
 
 impl Drop for SplitK2Pipeline {

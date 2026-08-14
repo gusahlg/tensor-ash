@@ -10,7 +10,7 @@ use crate::tensor::Tensor;
 
 use super::super::OpPlan;
 use super::super::splitk2::{SplitK2Dispatch, SplitK2Pipeline, record_split_k2_commands};
-use super::record_one_matmul;
+use super::{record_compute_to_compute_barrier, record_one_matmul};
 
 /// Split-K2 routing context for a graph recording: which ops route
 /// through the two-stage path, and where each op's scratch region
@@ -131,26 +131,4 @@ pub(in crate::executor) fn record_matmul_graph_commands(
     }
 
     Ok(())
-}
-
-/// Full compute→compute execution + memory barrier.  One global
-/// `vk::MemoryBarrier` (rather than per-buffer barriers) — on every
-/// driver we target, buffer-granular compute barriers offer no extra
-/// overlap for back-to-back dispatches, and the single global barrier
-/// keeps recording cost flat.
-fn record_compute_to_compute_barrier(ctx: &VulkanContext, cb: vk::CommandBuffer) {
-    let barrier = vk::MemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-    unsafe {
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            std::slice::from_ref(&barrier),
-            &[],
-            &[],
-        );
-    }
 }

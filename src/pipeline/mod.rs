@@ -26,6 +26,7 @@ use tuning::{load_tuned, save_tuned, shader_registry_hash};
 
 pub use abi::{EpilogueKey, KernelVariant, MatmulPushConstants};
 pub use catalog::{KERNEL_SPECS, KernelSelection, KernelSpec};
+pub(crate) use create::build_compute_pipeline;
 pub use runtime::MatmulKernel;
 pub(crate) use tuning::{TuneEntry, TuneKey};
 

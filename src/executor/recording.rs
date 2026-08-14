@@ -13,6 +13,28 @@ use super::OpPlan;
 pub(super) use descriptors::update_matmul_descriptor_sets;
 pub(super) use graph::{GraphSplitK2, record_matmul_graph_commands};
 
+/// Full compute→compute execution + memory barrier.  One global
+/// `vk::MemoryBarrier` (rather than per-buffer barriers) — on every
+/// driver we target, buffer-granular compute barriers offer no extra
+/// overlap for back-to-back dispatches, and the single global barrier
+/// keeps recording cost flat.
+pub(super) fn record_compute_to_compute_barrier(ctx: &VulkanContext, cb: vk::CommandBuffer) {
+    let barrier = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+    unsafe {
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            std::slice::from_ref(&barrier),
+            &[],
+            &[],
+        );
+    }
+}
+
 fn ensure_kernel_alignment(kernel_name: &str, tile: [u32; 3], shape: [u32; 3]) -> Result<()> {
     let required = if kernel_name == "v3_128x128_bk8_static" {
         // V3 double-buffers exact pairs of BK=8 strips and has no edge/tail
