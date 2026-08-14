@@ -4,7 +4,8 @@
 use crate::common::*;
 
 use tensor_ash::{
-    CopyDesc, Epilogue, EpilogueBinary, ExecOp, MatmulCall, MatmulOp, RopeDesc, SoftmaxMask, Tensor,
+    BinaryOp, CopyDesc, Epilogue, EpilogueBinary, ExecOp, MatmulCall, MatmulOp, RopeDesc,
+    SoftmaxMask, Tensor,
 };
 
 fn ops_available(ctx: &std::sync::Arc<tensor_ash::VulkanContext>) -> bool {
@@ -513,4 +514,39 @@ fn exec_ops_chain_matches_per_op_path() {
     for (i, (&va, &vb)) in a.iter().zip(&b).enumerate() {
         assert_eq!(va.to_bits(), vb.to_bits(), "graph vs per-op diverge at {i}");
     }
+}
+
+#[test]
+#[ignore]
+fn binary_add_scaled_and_silu_mul_match_reference() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !ops_available(&ctx) {
+        eprintln!("skipping: no BDA");
+        return;
+    }
+    let n = 4099_u32; // odd length exercises the tail guard
+    let (a, host_a) = upload_det(&ctx, &exec, &[n], 7100);
+    let (b, host_b) = upload_det(&ctx, &exec, &[n], 7101);
+    let out = Tensor::uninit_device(&ctx, &[n]).unwrap();
+    let mut gpu = vec![0.0; n as usize];
+
+    exec.run_binary(&a, &b, &out, BinaryOp::AddScaled { beta: 0.5 })
+        .unwrap();
+    exec.download(&out, &mut gpu).unwrap();
+    let cpu: Vec<f32> = host_a
+        .iter()
+        .zip(&host_b)
+        .map(|(&x, &y)| x + 0.5 * y)
+        .collect();
+    assert_close_tol(&gpu, &cpu, 1e-6, "add_scaled");
+
+    // In-place SiluMul must match the fused-epilogue definition.
+    exec.run_binary(&a, &b, &a, BinaryOp::SiluMul).unwrap();
+    exec.download(&a, &mut gpu).unwrap();
+    let cpu: Vec<f32> = host_a
+        .iter()
+        .zip(&host_b)
+        .map(|(&x, &y)| (x / (1.0 + (-x).exp())) * y)
+        .collect();
+    assert_close_tol(&gpu, &cpu, 1e-5, "silu_mul in-place");
 }

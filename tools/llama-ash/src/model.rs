@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use tensor_ash::{
-    Activation, CopyDesc, Epilogue, EpilogueBinary, ExecOp, Executor, FlashAttentionDesc,
+    Activation, BinaryOp, CopyDesc, Epilogue, EpilogueBinary, ExecOp, Executor, FlashAttentionDesc,
     MatmulCall, MatmulOp, RopeDesc, SoftmaxMask, Tensor, VulkanContext,
 };
 
@@ -578,6 +578,12 @@ impl Model {
     }
 
     /// `mlp_block` with an explicit output (prefill ping-pongs x).
+    ///
+    /// For coopmat-eligible row counts (T >= 256) the three
+    /// residual/gated projections run as PLAIN matmuls (keeping the
+    /// tensor-core route, which cannot fuse epilogues) plus standalone
+    /// binary combines — the epilogue's saved bandwidth pass is far
+    /// cheaper than demoting the whole GEMM to the SIMT family.
     fn mlp_block_into(
         &self,
         layer: &Layer,
@@ -585,6 +591,9 @@ impl Model {
         x_in: &Tensor,
         x_out: &Tensor,
     ) -> Result<()> {
+        if s.t >= 256 {
+            return self.mlp_block_unfused(layer, s, x_in, x_out);
+        }
         let stats = self.exec.run_ops(&[MatmulOp::with_epilogue(
             MatmulCall {
                 a: &s.attn_flat,
@@ -642,6 +651,38 @@ impl Model {
             },
         )])?;
         self.note("ffn_down_mm", &stats);
+        Ok(())
+    }
+
+    fn mlp_block_unfused(
+        &self,
+        layer: &Layer,
+        s: &Scratch,
+        x_in: &Tensor,
+        x_out: &Tensor,
+    ) -> Result<()> {
+        let mm = |a, b, c| MatmulCall {
+            a,
+            b,
+            c,
+            alpha: 1.0,
+            accumulate: false,
+        };
+        self.exec
+            .run_matmuls(&[mm(&s.attn_flat, &layer.wo, &s.o)])?;
+        self.exec
+            .run_binary(&s.o, x_in, &s.o, BinaryOp::AddScaled { beta: 1.0 })?;
+        self.exec
+            .run_rms_norm(&s.o, &layer.ffn_norm, &s.on, self.cfg.rms_eps)?;
+        self.exec.run_matmuls(&[mm(&s.on, &layer.w_up, &s.up)])?;
+        self.exec
+            .run_matmuls(&[mm(&s.on, &layer.w_gate, &s.gate)])?;
+        self.exec
+            .run_binary(&s.gate, &s.up, &s.gate, BinaryOp::SiluMul)?;
+        self.exec
+            .run_matmuls(&[mm(&s.gate, &layer.w_down, x_out)])?;
+        self.exec
+            .run_binary(x_out, &s.o, x_out, BinaryOp::AddScaled { beta: 1.0 })?;
         Ok(())
     }
 

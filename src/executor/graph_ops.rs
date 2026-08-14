@@ -15,7 +15,7 @@ use crate::tensor::Tensor;
 
 use super::elementwise::ElementwiseDispatch;
 use super::recording::{record_compute_to_compute_barrier, record_one_matmul};
-use super::{CopyDesc, Executor, OpPlan, RopeDesc, SoftmaxMask};
+use super::{BinaryOp, CopyDesc, Executor, OpPlan, RopeDesc, SoftmaxMask};
 
 /// One step of a mixed-op graph.  All variants execute in submission
 /// order with a full compute barrier between consecutive steps, so a
@@ -53,6 +53,12 @@ pub enum ExecOp<'t> {
         src: &'t Tensor,
         dst: &'t Tensor,
         desc: CopyDesc,
+    },
+    Binary {
+        a: &'t Tensor,
+        b: &'t Tensor,
+        out: &'t Tensor,
+        op: BinaryOp,
     },
 }
 
@@ -143,6 +149,7 @@ impl Executor {
                     ..
                 } => Access::default().read(input).read(table).write(output),
                 ExecOp::CopyStrided { src, dst, .. } => Access::default().read(src).write(dst),
+                ExecOp::Binary { a, b, out, .. } => Access::default().read(a).read(b).write(out),
             });
             planned.push(match op {
                 ExecOp::Matmul(op) => {
@@ -213,6 +220,9 @@ impl Executor {
                 } => Planned::Elementwise(self.plan_rope(input, table, output, *desc)?),
                 ExecOp::CopyStrided { src, dst, desc } => {
                     Planned::Elementwise(self.plan_copy_strided(src, dst, *desc)?)
+                }
+                ExecOp::Binary { a, b, out, op } => {
+                    Planned::Elementwise(self.plan_binary(a, b, out, *op)?)
                 }
             });
         }

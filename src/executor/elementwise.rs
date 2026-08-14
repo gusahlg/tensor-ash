@@ -27,6 +27,7 @@ const SPIRV_SOFTMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_softma
 const SPIRV_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_rmsnorm_f32.spv"));
 const SPIRV_ROPE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_rope_f32.spv"));
 const SPIRV_COPY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_copy_strided_f32.spv"));
+const SPIRV_BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_binary_f32.spv"));
 const SPIRV_FLASH_DH64: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/op_flash_attention_dh64.spv"));
 const SPIRV_FLASH_DH128: &[u8] =
@@ -77,6 +78,18 @@ pub struct FlashAttentionDesc {
     pub pos_base: u32,
     /// `1/sqrt(dh)` for standard attention.
     pub scale: f32,
+}
+
+/// Standalone binary elementwise operator for
+/// [`Executor::run_binary`]: lets a large matmul keep its tensor-core
+/// route (which cannot fuse epilogues) and apply the combination as
+/// one cheap bandwidth pass.  In-place safe for either operand.
+#[derive(Copy, Clone, Debug)]
+pub enum BinaryOp {
+    /// `out = a + beta * b` (residual add).
+    AddScaled { beta: f32 },
+    /// `out = silu(a) * b` (SwiGLU gating).
+    SiluMul,
 }
 
 /// Strided-copy geometry for [`Executor::run_copy_strided`]: for every
@@ -147,6 +160,18 @@ struct CopyPc {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+struct BinaryPc {
+    n: u32,
+    mode: u32,
+    beta: f32,
+    _pad: u32,
+    a_ptr: u64,
+    b_ptr: u64,
+    out_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
 struct FlashPc {
     t_q: u32,
     t_max: u32,
@@ -185,6 +210,7 @@ pub(super) struct ElementwisePipeline {
     pub(super) layernorm: OpKernel,
     rope: OpKernel,
     copy: OpKernel,
+    pub(super) binary: OpKernel,
     flash_dh64: OpKernel,
     flash_dh128: OpKernel,
 }
@@ -198,7 +224,7 @@ impl ElementwisePipeline {
         let layout_guard = scopeguard::guard(layout, |l| unsafe {
             ctx.device.destroy_pipeline_layout(l, None);
         });
-        let built: Vec<OpKernel> = Vec::with_capacity(7);
+        let built: Vec<OpKernel> = Vec::with_capacity(8);
         let mut built_guard = scopeguard::guard(built, |kernels| {
             for kernel in kernels {
                 unsafe {
@@ -213,6 +239,7 @@ impl ElementwisePipeline {
             (SPIRV_NORM, &[1u32][..], "op layernorm"),
             (SPIRV_ROPE, &[][..], "op rope"),
             (SPIRV_COPY, &[][..], "op copy_strided"),
+            (SPIRV_BINARY, &[][..], "op binary"),
             (SPIRV_FLASH_DH64, &[][..], "op flash_attention dh64"),
             (SPIRV_FLASH_DH128, &[][..], "op flash_attention dh128"),
         ] {
@@ -222,7 +249,8 @@ impl ElementwisePipeline {
         }
         let built = scopeguard::ScopeGuard::into_inner(built_guard);
         let mut it = built.into_iter();
-        let (softmax, rmsnorm, layernorm, rope, copy, flash_dh64, flash_dh128) = (
+        let (softmax, rmsnorm, layernorm, rope, copy, binary, flash_dh64, flash_dh128) = (
+            it.next().unwrap(),
             it.next().unwrap(),
             it.next().unwrap(),
             it.next().unwrap(),
@@ -239,6 +267,7 @@ impl ElementwisePipeline {
             layernorm,
             rope,
             copy,
+            binary,
             flash_dh64,
             flash_dh128,
         })
@@ -255,6 +284,7 @@ impl Drop for ElementwisePipeline {
                 &self.layernorm,
                 &self.rope,
                 &self.copy,
+                &self.binary,
                 &self.flash_dh64,
                 &self.flash_dh128,
             ] {
@@ -710,6 +740,59 @@ impl Executor {
     /// KV-cache append, head reshaping, and sub-matrix extraction.
     /// `src` and `dst` must be different tensors — invocations are
     /// unordered, so overlapping in-place copies would race.
+    /// Binary elementwise combine (see [`BinaryOp`]).  Shapes must
+    /// have identical element counts; `out` may alias either input.
+    pub fn run_binary(
+        &self,
+        a: &Tensor,
+        b: &Tensor,
+        out: &Tensor,
+        op: BinaryOp,
+    ) -> Result<RunStats> {
+        let dispatch = self.plan_binary(a, b, out, op)?;
+        self.submit_one_elementwise(dispatch)
+    }
+
+    pub(super) fn plan_binary(
+        &self,
+        a: &Tensor,
+        b: &Tensor,
+        out: &Tensor,
+        op: BinaryOp,
+    ) -> Result<ElementwiseDispatch> {
+        self.ensure_f32(a, "run_binary", "a")?;
+        self.ensure_f32(b, "run_binary", "b")?;
+        self.ensure_f32(out, "run_binary", "out")?;
+        if a.len() != b.len() || a.len() != out.len() {
+            bail!(
+                "run_binary: element counts differ (a {}, b {}, out {})",
+                a.len(),
+                b.len(),
+                out.len()
+            );
+        }
+        let n = u32::try_from(a.len()).map_err(|_| anyhow::anyhow!("run_binary: too large"))?;
+        let (mode, beta) = match op {
+            BinaryOp::AddScaled { beta } => (0, beta),
+            BinaryOp::SiluMul => (1, 0.0),
+        };
+        let pipeline = self.elementwise()?.binary.pipeline;
+        self.plan_elementwise(
+            pipeline,
+            &BinaryPc {
+                n,
+                mode,
+                beta,
+                _pad: 0,
+                a_ptr: a.device_address(),
+                b_ptr: b.device_address(),
+                out_ptr: out.device_address(),
+            },
+            n.div_ceil(WG),
+            1,
+        )
+    }
+
     pub fn run_copy_strided(&self, src: &Tensor, dst: &Tensor, desc: CopyDesc) -> Result<RunStats> {
         let dispatch = self.plan_copy_strided(src, dst, desc)?;
         self.submit_one_elementwise(dispatch)
@@ -785,3 +868,5 @@ unsafe impl bytemuck::Pod for CopyPc {}
 unsafe impl bytemuck::Zeroable for CopyPc {}
 unsafe impl bytemuck::Pod for FlashPc {}
 unsafe impl bytemuck::Zeroable for FlashPc {}
+unsafe impl bytemuck::Pod for BinaryPc {}
+unsafe impl bytemuck::Zeroable for BinaryPc {}
