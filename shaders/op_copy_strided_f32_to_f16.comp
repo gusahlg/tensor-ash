@@ -1,0 +1,8 @@
+#version 460
+// Strided copy with f32 sources narrowing to an f16 destination
+// (RNE via the float16_t conversion) — the KV-cache append path when
+// caches are stored half-precision.
+
+#define DST_F16 1
+
+#include "op_copy_strided_body.glsl"

@@ -298,8 +298,22 @@ impl Model {
             let (w_down, _) = load_linear(&mut gguf, &p("ffn_down.weight"), ffn, embd)?;
             let attn_norm = load_norm(&mut gguf, &p("attn_norm.weight"))?;
             let ffn_norm = load_norm(&mut gguf, &p("ffn_norm.weight"))?;
-            let kt_cache = Tensor::uninit_device(ctx, &[kv_heads, dh, t_max])?;
-            let v_cache = Tensor::uninit_device(ctx, &[kv_heads, t_max, dh])?;
+            // f16 caches halve attention-side cache traffic and KV
+            // memory; the composed decode matmuls pick up the f16w
+            // routes automatically, and prefill uses the kv16 flash
+            // variants.  LLAMA_ASH_KV=f32 restores full precision.
+            let kv_f32 = std::env::var("LLAMA_ASH_KV").as_deref() == Ok("f32");
+            let (kt_cache, v_cache) = if kv_f32 {
+                (
+                    Tensor::uninit_device(ctx, &[kv_heads, dh, t_max])?,
+                    Tensor::uninit_device(ctx, &[kv_heads, t_max, dh])?,
+                )
+            } else {
+                (
+                    Tensor::uninit_device_f16(ctx, &[kv_heads, dh, t_max])?,
+                    Tensor::uninit_device_f16(ctx, &[kv_heads, t_max, dh])?,
+                )
+            };
             exec.upload(&zeros_kt, &kt_cache)?;
             exec.upload(&zeros_kt, &v_cache)?;
             layers.push(Layer {

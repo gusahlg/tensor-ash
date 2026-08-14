@@ -28,6 +28,12 @@ const SPIRV_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_rmsnorm_f
 const SPIRV_ROPE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_rope_f32.spv"));
 const SPIRV_COPY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_copy_strided_f32.spv"));
 const SPIRV_BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_binary_f32.spv"));
+const SPIRV_COPY_TO_F16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/op_copy_strided_f32_to_f16.spv"));
+const SPIRV_FLASH_KV16_DH64: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/op_flash_attention_kv16_dh64.spv"));
+const SPIRV_FLASH_KV16_DH128: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/op_flash_attention_kv16_dh128.spv"));
 const SPIRV_FLASH_DH64: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/op_flash_attention_dh64.spv"));
 const SPIRV_FLASH_DH128: &[u8] =
@@ -211,8 +217,11 @@ pub(super) struct ElementwisePipeline {
     rope: OpKernel,
     copy: OpKernel,
     pub(super) binary: OpKernel,
+    copy_to_f16: OpKernel,
     flash_dh64: OpKernel,
     flash_dh128: OpKernel,
+    flash_kv16_dh64: OpKernel,
+    flash_kv16_dh128: OpKernel,
 }
 
 impl ElementwisePipeline {
@@ -224,7 +233,7 @@ impl ElementwisePipeline {
         let layout_guard = scopeguard::guard(layout, |l| unsafe {
             ctx.device.destroy_pipeline_layout(l, None);
         });
-        let built: Vec<OpKernel> = Vec::with_capacity(8);
+        let built: Vec<OpKernel> = Vec::with_capacity(11);
         let mut built_guard = scopeguard::guard(built, |kernels| {
             for kernel in kernels {
                 unsafe {
@@ -240,8 +249,11 @@ impl ElementwisePipeline {
             (SPIRV_ROPE, &[][..], "op rope"),
             (SPIRV_COPY, &[][..], "op copy_strided"),
             (SPIRV_BINARY, &[][..], "op binary"),
+            (SPIRV_COPY_TO_F16, &[][..], "op copy_strided f32->f16"),
             (SPIRV_FLASH_DH64, &[][..], "op flash_attention dh64"),
             (SPIRV_FLASH_DH128, &[][..], "op flash_attention dh128"),
+            (SPIRV_FLASH_KV16_DH64, &[][..], "op flash_attention kv16 dh64"),
+            (SPIRV_FLASH_KV16_DH128, &[][..], "op flash_attention kv16 dh128"),
         ] {
             let (module, pipeline) =
                 crate::pipeline::build_compute_pipeline(ctx, layout, spec, spv, label)?;
@@ -249,15 +261,13 @@ impl ElementwisePipeline {
         }
         let built = scopeguard::ScopeGuard::into_inner(built_guard);
         let mut it = built.into_iter();
-        let (softmax, rmsnorm, layernorm, rope, copy, binary, flash_dh64, flash_dh128) = (
-            it.next().unwrap(),
-            it.next().unwrap(),
-            it.next().unwrap(),
-            it.next().unwrap(),
-            it.next().unwrap(),
-            it.next().unwrap(),
-            it.next().unwrap(),
-            it.next().unwrap(),
+        #[rustfmt::skip]
+        let (softmax, rmsnorm, layernorm, rope, copy, binary, copy_to_f16,
+            flash_dh64, flash_dh128, flash_kv16_dh64, flash_kv16_dh128) = (
+            it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
+            it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
+            it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
+            it.next().unwrap(), it.next().unwrap(),
         );
         Ok(Self {
             ctx: Arc::clone(ctx),
@@ -268,8 +278,11 @@ impl ElementwisePipeline {
             rope,
             copy,
             binary,
+            copy_to_f16,
             flash_dh64,
             flash_dh128,
+            flash_kv16_dh64,
+            flash_kv16_dh128,
         })
     }
 }
@@ -285,8 +298,11 @@ impl Drop for ElementwisePipeline {
                 &self.rope,
                 &self.copy,
                 &self.binary,
+                &self.copy_to_f16,
                 &self.flash_dh64,
                 &self.flash_dh128,
+                &self.flash_kv16_dh64,
+                &self.flash_kv16_dh128,
             ] {
                 self.ctx.device.destroy_pipeline(kernel.pipeline, None);
                 self.ctx.device.destroy_shader_module(kernel.module, None);
@@ -663,9 +679,17 @@ impl Executor {
         desc: FlashAttentionDesc,
     ) -> Result<RunStats> {
         self.ensure_f32(q, "run_flash_attention", "q")?;
-        self.ensure_f32(kt, "run_flash_attention", "kt")?;
-        self.ensure_f32(v, "run_flash_attention", "v")?;
+        self.validate_tensor_context(kt, "kt")?;
+        self.validate_tensor_context(v, "v")?;
         self.ensure_f32(out, "run_flash_attention", "out")?;
+        if kt.dtype() != v.dtype() {
+            bail!(
+                "run_flash_attention: kt ({}) and v ({}) must share a storage type",
+                kt.dtype().name(),
+                v.dtype().name()
+            );
+        }
+        let kv_f16 = kt.dtype() == DType::F16;
         let [heads, t_q, dh] = *q.shape() else {
             bail!(
                 "run_flash_attention: q must be [H, T_q, dh], got {:?}",
@@ -708,10 +732,13 @@ impl Executor {
                 desc.kv_len
             );
         }
-        let (pipeline, rows_per_wg) = match dh {
-            64 => (self.elementwise()?.flash_dh64.pipeline, 128),
-            128 => (self.elementwise()?.flash_dh128.pipeline, 128),
-            other => bail!(
+        let pipes = self.elementwise()?;
+        let (pipeline, rows_per_wg) = match (dh, kv_f16) {
+            (64, false) => (pipes.flash_dh64.pipeline, 128),
+            (128, false) => (pipes.flash_dh128.pipeline, 128),
+            (64, true) => (pipes.flash_kv16_dh64.pipeline, 128),
+            (128, true) => (pipes.flash_kv16_dh128.pipeline, 128),
+            (other, _) => bail!(
                 "run_flash_attention: head dimension {other} unsupported (compiled variants: 64, 128)"
             ),
         };
@@ -805,7 +832,9 @@ impl Executor {
         desc: CopyDesc,
     ) -> Result<ElementwiseDispatch> {
         self.ensure_f32(src, "run_copy_strided", "src")?;
-        self.ensure_f32(dst, "run_copy_strided", "dst")?;
+        self.validate_tensor_context(dst, "dst")?;
+        // f16 destinations narrow through a dedicated variant; strides
+        // and offsets are in elements either way.
         if src.raw_buffer() == dst.raw_buffer() {
             bail!("run_copy_strided: src and dst must be different tensors");
         }
@@ -838,7 +867,10 @@ impl Executor {
         }
         let total = u32::try_from(extent_product)
             .map_err(|_| anyhow::anyhow!("run_copy_strided: extent product exceeds u32"))?;
-        let pipeline = self.elementwise()?.copy.pipeline;
+        let pipeline = match dst.dtype() {
+            DType::F32 => self.elementwise()?.copy.pipeline,
+            DType::F16 => self.elementwise()?.copy_to_f16.pipeline,
+        };
         self.plan_elementwise(
             pipeline,
             &CopyPc {
