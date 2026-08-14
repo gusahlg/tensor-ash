@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [workspace]
-members = [".", "capi", "tools/ml-bench", "tools/test-support"]
+members = [".", "capi", "tools/llama-ash", "tools/ml-bench", "tools/test-support"]
 resolver = "2"
 
 [workspace.package]

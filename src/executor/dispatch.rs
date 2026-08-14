@@ -156,7 +156,9 @@ impl Executor {
                 let eligible = !op.call.accumulate
                     && op.epilogue.is_none()
                     && (with_dependency_barriers || ops.len() == 1);
-                self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, eligible)
+                let plan =
+                    self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, eligible);
+                self.demote_for_epilogue(&op.epilogue, dims, plan)
             })
             .collect();
 
