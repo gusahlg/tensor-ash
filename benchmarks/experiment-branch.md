@@ -1,5 +1,27 @@
 # Experiment branch log
 
+## Legs 6-12 — decode/prefill optimization sweep (summary)
+
+TinyLlama-1.1B f16, RTX 3070, llama.cpp CUDA (fa=1) as reference.
+Greedy generation stayed byte-identical to the CUDA reference after
+every leg; each leg's number is its own clock window (see the PR merge
+messages for full context).
+
+| leg | branch | mechanism | measured |
+|---|---|---|---|
+| 6 | `experiment/prefill-coopmat` | standalone `BinaryOp` bandwidth passes keep T>=256 projections on tensor cores (coopmat cannot fuse epilogues) | pp512 5,435 -> 7,795 t/s (+43%); decode-neutral |
+| 7 | `experiment/gemv-k16-widen` | 16-slice GEMV route widened to K>=2048 && N<=2048 (o_proj / q-projection -23%) | tg 103.9 -> 106.7 t/s (+3%) |
+| 8 | `experiment/f16-kv-cache` | f16 KV caches: RNE-narrowing appends, kv16 flash variants, cache-dtype-driven selection | speed-neutral at <=2k ctx; 44 vs 88 MB KV |
+| 9 | `experiment/decode-attention` | fused split-K decode attention (`run_attn_decode`); chunking tuned to ~32 positions/chunk within [8, 32] | attention 2,752 -> 526 µs/token; tg 107 -> 141 t/s (0.81x CUDA) |
+| 10 | `experiment/decode-fusion` | RMSNorm folded into row GEMVs (`with_normed_a`); k-RoPE + Kt append fused into one `RopeScatter` | 16 -> 13 graph ops/layer; tg 141 -> 147 t/s |
+| 11 | `experiment/replay-graph` | record-once replayable decode (`prepare_exec_ops` + `PosBuffer` indirection; fixed 32-chunk attn grid) | tg 147 -> 160 t/s (0.91x CUDA); replays bitwise |
+| 12 | `experiment/gpu-token-loop` | on-GPU argmax + embedding gather close the token loop; host writes/reads ONE u32 per token | tg 160 -> 165 t/s (tg128 162-166; 0.94x CUDA) |
+
+Standing after leg 12: decode tg128 163-166 t/s vs CUDA 175 (0.94x);
+prefill pp512 ~8.0k vs 16.7k t/s (~0.48x). The remaining decode gap is
+kernel work + residual barrier drain; the prefill gap is tensor-core
+coverage (f16 activations end-to-end, epilogue-capable coopmat).
+
 ## Leg 5 — `experiment/token-replay` (whole-token graphs + decode failure analysis)
 
 ### Decode: 82.9 → 111.8 t/s in four measured steps

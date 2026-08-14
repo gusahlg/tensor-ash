@@ -92,11 +92,7 @@ fn embed_gather_matches_cpu_f32_and_f16() {
         return;
     }
     let (vocab, embd) = (301_u32, 320_u32);
-    let mut host_table = vec![0.0_f32; (vocab * embd) as usize];
-    fill_det(&mut host_table, 7301);
-
-    let table_f32 = Tensor::uninit_device(&ctx, &[vocab, embd]).unwrap();
-    exec.upload(&host_table, &table_f32).unwrap();
+    let (table_f32, host_table) = upload_det(&ctx, &exec, &[vocab, embd], 7301);
     let table_f16 = Tensor::uninit_device_f16(&ctx, &[vocab, embd]).unwrap();
     exec.upload(&host_table, &table_f16).unwrap();
 
@@ -145,10 +141,7 @@ fn exec_chain_matmul_argmax_gather_matches_stepwise() {
     let (embd, vocab) = (256_u32, 1000_u32);
     let (x, _) = upload_det(&ctx, &exec, &[1, embd], 7401);
     let (w, _) = upload_det(&ctx, &exec, &[embd, vocab], 7402);
-    let mut host_table = vec![0.0_f32; (vocab * embd) as usize];
-    fill_det(&mut host_table, 7403);
-    let table = Tensor::uninit_device(&ctx, &[vocab, embd]).unwrap();
-    exec.upload(&host_table, &table).unwrap();
+    let (table, host_table) = upload_det(&ctx, &exec, &[vocab, embd], 7403);
 
     let logits = Tensor::uninit_device(&ctx, &[1, vocab]).unwrap();
     let next_x = Tensor::uninit_device(&ctx, &[1, embd]).unwrap();
@@ -201,10 +194,7 @@ fn prepared_argmax_gather_replays_with_fresh_inputs() {
         return;
     }
     let (vocab, embd) = (500_u32, 64_u32);
-    let mut host_table = vec![0.0_f32; (vocab * embd) as usize];
-    fill_det(&mut host_table, 7501);
-    let table = Tensor::uninit_device(&ctx, &[vocab, embd]).unwrap();
-    exec.upload(&host_table, &table).unwrap();
+    let (table, host_table) = upload_det(&ctx, &exec, &[vocab, embd], 7501);
     let logits = Tensor::uninit_device(&ctx, &[1, vocab]).unwrap();
     let out = Tensor::uninit_device(&ctx, &[1, embd]).unwrap();
     let token = exec.create_host_u32_buffer().unwrap();

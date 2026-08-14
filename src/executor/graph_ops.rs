@@ -136,12 +136,16 @@ pub enum ExecOp<'t> {
     /// A matmul (optionally with a fused epilogue).  BDA routes only —
     /// descriptor-bound kernels cannot be recorded without per-op sets.
     Matmul(MatmulOp<'t>),
+    /// RMSNorm over the last dimension (see [`Executor::run_rms_norm`]).
+    /// In-place (`input == output`) is safe.
     RmsNorm {
         input: &'t Tensor,
         weight: &'t Tensor,
         output: &'t Tensor,
         eps: f32,
     },
+    /// LayerNorm over the last dimension (see
+    /// [`Executor::run_layer_norm`]).  In-place is safe.
     LayerNorm {
         input: &'t Tensor,
         weight: &'t Tensor,
@@ -149,12 +153,16 @@ pub enum ExecOp<'t> {
         output: &'t Tensor,
         eps: f32,
     },
+    /// Masked row softmax (see [`Executor::run_softmax_rows`]).
+    /// In-place is safe.
     SoftmaxRows {
         input: &'t Tensor,
         output: &'t Tensor,
         scale: f32,
         mask: SoftmaxMask,
     },
+    /// Rotary position embedding (see [`Executor::run_rope`]).
+    /// In-place is safe.
     Rope {
         input: &'t Tensor,
         table: &'t Tensor,
@@ -171,11 +179,15 @@ pub enum ExecOp<'t> {
         desc: RopeDesc,
         scatter: RopeScatterDesc,
     },
+    /// Strided 3D copy (see [`Executor::run_copy_strided`]); `src` and
+    /// `dst` must be different tensors.
     CopyStrided {
         src: &'t Tensor,
         dst: &'t Tensor,
         desc: CopyDesc,
     },
+    /// Binary elementwise combine (see [`Executor::run_binary`]);
+    /// `out` may alias either input.
     Binary {
         a: &'t Tensor,
         b: &'t Tensor,
@@ -332,85 +344,11 @@ impl Executor {
         let mut accesses = Vec::with_capacity(ops.len() + 1);
         let mut total_flops = 0u64;
         for op in ops {
-            // Multi-dispatch ops push one (planned, access) pair per
+            // Each arm produces matching (Planned, Access) entries at
+            // the same index; multi-dispatch ops push one pair per
             // dispatch so the hazard tracker sees their internal
             // dependency.
-            if let ExecOp::AttnDecode {
-                q,
-                kt,
-                v,
-                scratch,
-                out,
-                desc,
-            } = op
-            {
-                let (stage1, combine) = self.plan_attn_decode(q, kt, v, scratch, out, *desc)?;
-                accesses.push(Access::default().read(q).read(kt).read(v).write(scratch));
-                planned.push(Planned::Elementwise(stage1));
-                accesses.push(Access::default().read(scratch).write(out));
-                planned.push(Planned::Elementwise(combine));
-                continue;
-            }
-            accesses.push(match op {
-                ExecOp::Matmul(op) => {
-                    let mut access = Access::default()
-                        .read(op.call.a)
-                        .read(op.call.b)
-                        .write(op.call.c);
-                    if op.call.accumulate {
-                        access = access.read(op.call.c);
-                    }
-                    if let Some(bias) = op.epilogue.bias {
-                        access = access.read(bias);
-                    }
-                    if let Some(d) = op.epilogue.d_tensor() {
-                        access = access.read(d);
-                    }
-                    if let Some((norm_weight, _)) = op.normed_a {
-                        access = access.read(norm_weight);
-                    }
-                    access
-                }
-                ExecOp::RmsNorm {
-                    input,
-                    weight,
-                    output,
-                    ..
-                } => Access::default().read(input).read(weight).write(output),
-                ExecOp::LayerNorm {
-                    input,
-                    weight,
-                    bias,
-                    output,
-                    ..
-                } => Access::default()
-                    .read(input)
-                    .read(weight)
-                    .read(bias)
-                    .write(output),
-                ExecOp::SoftmaxRows { input, output, .. } => {
-                    Access::default().read(input).write(output)
-                }
-                ExecOp::Rope {
-                    input,
-                    table,
-                    output,
-                    ..
-                } => Access::default().read(input).read(table).write(output),
-                ExecOp::RopeScatter {
-                    input, table, dst, ..
-                } => Access::default().read(input).read(table).write(dst),
-                ExecOp::CopyStrided { src, dst, .. } => Access::default().read(src).write(dst),
-                ExecOp::Binary { a, b, out, .. } => Access::default().read(a).read(b).write(out),
-                ExecOp::Argmax { input, result } => {
-                    Access::default().read(input).write_cell(result)
-                }
-                ExecOp::EmbedGather { token, table, out } => {
-                    Access::default().read_cell(token).read(table).write(out)
-                }
-                ExecOp::AttnDecode { .. } => unreachable!("handled above"),
-            });
-            planned.push(match op {
+            let (step, access) = match op {
                 ExecOp::Matmul(op) => {
                     self.validate_op_context(op)?;
                     let dims = ResolvedMatmul::from_op(op)?;
@@ -429,77 +367,126 @@ impl Executor {
                         );
                     }
                     total_flops = total_flops.saturating_add(dims.total_flops);
-                    Planned::Matmul { op, dims, plan }
+                    let mut access = Access::default()
+                        .read(op.call.a)
+                        .read(op.call.b)
+                        .write(op.call.c);
+                    if op.call.accumulate {
+                        access = access.read(op.call.c);
+                    }
+                    if let Some(bias) = op.epilogue.bias {
+                        access = access.read(bias);
+                    }
+                    if let Some(d) = op.epilogue.d_tensor() {
+                        access = access.read(d);
+                    }
+                    if let Some((norm_weight, _)) = op.normed_a {
+                        access = access.read(norm_weight);
+                    }
+                    (Planned::Matmul { op, dims, plan }, access)
                 }
                 ExecOp::RmsNorm {
                     input,
                     weight,
                     output,
                     eps,
-                } => {
-                    let pipeline = self
-                        .norm_common("run_rms_norm", input, weight, None, output)?
-                        .rmsnorm
-                        .pipeline;
-                    Planned::Elementwise(
-                        self.plan_norm(pipeline, input, weight, None, output, *eps)?,
-                    )
-                }
+                } => (
+                    Planned::Elementwise(self.plan_norm(
+                        "run_rms_norm",
+                        input,
+                        weight,
+                        None,
+                        output,
+                        *eps,
+                    )?),
+                    Access::default().read(input).read(weight).write(output),
+                ),
                 ExecOp::LayerNorm {
                     input,
                     weight,
                     bias,
                     output,
                     eps,
-                } => {
-                    let pipeline = self
-                        .norm_common("run_layer_norm", input, weight, Some(bias), output)?
-                        .layernorm
-                        .pipeline;
+                } => (
                     Planned::Elementwise(self.plan_norm(
-                        pipeline,
+                        "run_layer_norm",
                         input,
                         weight,
                         Some(bias),
                         output,
                         *eps,
-                    )?)
-                }
+                    )?),
+                    Access::default()
+                        .read(input)
+                        .read(weight)
+                        .read(bias)
+                        .write(output),
+                ),
                 ExecOp::SoftmaxRows {
                     input,
                     output,
                     scale,
                     mask,
-                } => Planned::Elementwise(self.plan_softmax_rows(input, output, *scale, *mask)?),
+                } => (
+                    Planned::Elementwise(self.plan_softmax_rows(input, output, *scale, *mask)?),
+                    Access::default().read(input).write(output),
+                ),
                 ExecOp::Rope {
                     input,
                     table,
                     output,
                     desc,
-                } => Planned::Elementwise(self.plan_rope(input, table, output, *desc)?),
+                } => (
+                    Planned::Elementwise(self.plan_rope(input, table, output, *desc)?),
+                    Access::default().read(input).read(table).write(output),
+                ),
                 ExecOp::RopeScatter {
                     input,
                     table,
                     dst,
                     desc,
                     scatter,
-                } => Planned::Elementwise(
-                    self.plan_rope_scatter(input, table, dst, *desc, *scatter)?,
+                } => (
+                    Planned::Elementwise(
+                        self.plan_rope_scatter(input, table, dst, *desc, *scatter)?,
+                    ),
+                    Access::default().read(input).read(table).write(dst),
                 ),
-                ExecOp::CopyStrided { src, dst, desc } => {
-                    Planned::Elementwise(self.plan_copy_strided(src, dst, *desc)?)
+                ExecOp::CopyStrided { src, dst, desc } => (
+                    Planned::Elementwise(self.plan_copy_strided(src, dst, *desc)?),
+                    Access::default().read(src).write(dst),
+                ),
+                ExecOp::Binary { a, b, out, op } => (
+                    Planned::Elementwise(self.plan_binary(a, b, out, *op)?),
+                    Access::default().read(a).read(b).write(out),
+                ),
+                ExecOp::Argmax { input, result } => (
+                    Planned::Elementwise(self.plan_argmax(input, result)?),
+                    Access::default().read(input).write_cell(result),
+                ),
+                ExecOp::EmbedGather { token, table, out } => (
+                    Planned::Elementwise(self.plan_embed_gather(token, table, out)?),
+                    Access::default().read_cell(token).read(table).write(out),
+                ),
+                ExecOp::AttnDecode {
+                    q,
+                    kt,
+                    v,
+                    scratch,
+                    out,
+                    desc,
+                } => {
+                    let (stage1, combine) = self.plan_attn_decode(q, kt, v, scratch, out, *desc)?;
+                    planned.push(Planned::Elementwise(stage1));
+                    accesses.push(Access::default().read(q).read(kt).read(v).write(scratch));
+                    (
+                        Planned::Elementwise(combine),
+                        Access::default().read(scratch).write(out),
+                    )
                 }
-                ExecOp::Binary { a, b, out, op } => {
-                    Planned::Elementwise(self.plan_binary(a, b, out, *op)?)
-                }
-                ExecOp::Argmax { input, result } => {
-                    Planned::Elementwise(self.plan_argmax(input, result)?)
-                }
-                ExecOp::EmbedGather { token, table, out } => {
-                    Planned::Elementwise(self.plan_embed_gather(token, table, out)?)
-                }
-                ExecOp::AttnDecode { .. } => unreachable!("handled above"),
-            });
+            };
+            planned.push(step);
+            accesses.push(access);
         }
         Ok((planned, accesses, total_flops))
     }
