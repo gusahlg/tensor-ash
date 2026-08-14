@@ -43,7 +43,8 @@ pub use buffer::{Buffer, BufferLocation};
 pub use context::{DeviceKind, DevicePreference, DeviceSummary, VulkanContext};
 pub use dtype::DType;
 pub use executor::{
-    CopyDesc, DispatchInfo, Executor, ExecutorConfig, PreparedOps, RopeDesc, SoftmaxMask,
+    CopyDesc, DispatchInfo, Executor, ExecutorConfig, FlashAttentionDesc, PreparedOps, RopeDesc,
+    SoftmaxMask,
 };
 pub use matmul::{
     Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, MatrixShape, RunStats,

@@ -2,7 +2,19 @@
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Fused flash-attention prefill** (`Executor::run_flash_attention`,
+  `FlashAttentionDesc`): causal `softmax(q @ K^T * scale) @ V` in one
+  dispatch with online softmax — the `[H, T_q, T_kv]` score tensor is
+  never materialized (2.1 GiB saved at H32/T4096), causal tiles above the
+  frontier are skipped, and the kernel reads the same `Kt`/`V` cache
+  layouts as the composed path. GQA via `H` a multiple of `H_kv`; head
+  dims 64 and 128 (compiled variants). Measured on RTX 3070: 1.35x over
+  the composed path at dh64/T2048, parity at dh128/T4096; the composed
+  path remains preferable for short sequences and dh128 below T4096.
+- `examples/bench_attention.rs`: per-stage composed-vs-fused attention
+  benchmark.
 
 ## [2.0.0] - 2026-08-14
 

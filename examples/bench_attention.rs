@@ -6,13 +6,17 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use tensor_ash::{Executor, MatmulCall, MatmulPipeline, SoftmaxMask, Tensor, VulkanContext};
+use tensor_ash::{
+    Executor, FlashAttentionDesc, MatmulCall, MatmulPipeline, SoftmaxMask, Tensor, VulkanContext,
+};
 
 const ITERS: usize = 20;
 
 fn median(mut samples: Vec<u64>) -> f64 {
     samples.sort_unstable();
-    samples.get(samples.len() / 2).map_or(f64::NAN, |&ns| ns as f64 / 1e6)
+    samples
+        .get(samples.len() / 2)
+        .map_or(f64::NAN, |&ns| ns as f64 / 1e6)
 }
 
 struct Case {
@@ -28,13 +32,41 @@ fn main() -> Result<()> {
     let exec = Executor::new(ctx.clone(), pipeline, 2, 16)?;
 
     let cases = [
-        Case { heads: 32, dh: 64, t: 512 },
-        Case { heads: 32, dh: 64, t: 1024 },
-        Case { heads: 32, dh: 64, t: 2048 },
-        Case { heads: 32, dh: 128, t: 512 },
-        Case { heads: 32, dh: 128, t: 1024 },
-        Case { heads: 32, dh: 128, t: 2048 },
-        Case { heads: 32, dh: 128, t: 4096 },
+        Case {
+            heads: 32,
+            dh: 64,
+            t: 512,
+        },
+        Case {
+            heads: 32,
+            dh: 64,
+            t: 1024,
+        },
+        Case {
+            heads: 32,
+            dh: 64,
+            t: 2048,
+        },
+        Case {
+            heads: 32,
+            dh: 128,
+            t: 512,
+        },
+        Case {
+            heads: 32,
+            dh: 128,
+            t: 1024,
+        },
+        Case {
+            heads: 32,
+            dh: 128,
+            t: 2048,
+        },
+        Case {
+            heads: 32,
+            dh: 128,
+            t: 4096,
+        },
     ];
 
     println!(
@@ -123,16 +155,27 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-// Filled in once `run_flash_attention` exists; keeping the seam here
-// lets the baseline run before the kernel lands.
 fn bench_flash(
-    _exec: &Executor,
-    _q: &Tensor,
-    _kt: &Tensor,
-    _v: &Tensor,
-    _out: &Tensor,
-    _case: &Case,
-    _scale: f32,
+    exec: &Executor,
+    q: &Tensor,
+    kt: &Tensor,
+    v: &Tensor,
+    out: &Tensor,
+    case: &Case,
+    scale: f32,
 ) -> Result<Option<f64>> {
-    Ok(None)
+    let desc = FlashAttentionDesc {
+        kv_len: case.t,
+        pos_base: 0,
+        scale,
+    };
+    let mut samples = Vec::new();
+    for _ in 0..ITERS {
+        let stats = exec.run_flash_attention(q, kt, v, out, desc)?;
+        samples.extend(stats.gpu_time_ns);
+    }
+    if samples.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(median(samples)))
 }
