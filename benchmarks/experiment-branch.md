@@ -1,4 +1,38 @@
-# Experiment branch log — `experiment/model-inference`
+# Experiment branch log
+
+## Leg 2 — `experiment/flash-attention` (branched from main@v2.0.0, 2026-08-14)
+
+### Design: fused causal prefill attention (flash-attention style)
+
+**Why:** the composed prefill path materializes `scores [H, T_q, T_kv]`
+and moves it through global memory three times (matmul write, softmax
+read+write, PV read). At T=4096, H=32 that is 32·4096² floats = 2 GiB of
+score traffic per layer vs the ~100 MiB of Q/K/V/O. An online-softmax
+fused kernel keeps score tiles in registers/shared and never leaves the
+chip — the classic FlashAttention result, expected to dominate at T ≥ 1k.
+
+**Design (v1, SIMT f32):**
+- One workgroup per (head, q-tile). One thread owns one query row: its
+  running max `m`, running sum `l`, and the `acc[DH]` output row in
+  registers. `DH` is a specialization constant (64/80/96/128 pipelines
+  compiled lazily per model geometry).
+- K-loop over key tiles staged in shared memory, read directly from the
+  existing cache layouts (`Kt [H, dh, T_max]`, `V [H, T_max, dh]`) so the
+  fused and composed paths interoperate on the same tensors.
+- Per tile: S-row = q·K tile (from shared), causal/prefix mask, tile max,
+  one rescale of `l`/`acc` per tile (never per element), P·V accumulate.
+  Final `out = acc / l` (all-masked rows store 0).
+- Causal semantics match `SoftmaxMask::Causal`: query row `i` attends to
+  positions `< pos_base + i + 1`, clamped by `kv_len`; causal tiles fully
+  above the diagonal are skipped, so early rows do ~half the work.
+- GQA: `kv_head = head / group_size` push constant, no K/V duplication.
+
+**Method:** baseline first (composed path measured per stage at
+T=512..4096, dh=64/128), fused kernel must beat the *sum*; correctness
+against f64 CPU reference and bit-agreement checks vs the composed path
+on shared inputs; paired A/B in one process.
+
+# Leg 1 log — `experiment/model-inference` (merged as v2.0.0, PR #1)
 
 Branched from `main@18d0f88` (v1.5.0-dev) on 2026-08-14. This file tracks every
 major shift on this branch: what was tried, why, how it was verified, and
