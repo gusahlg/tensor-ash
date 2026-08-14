@@ -53,7 +53,7 @@ pub use elementwise::{
     ATTN_DECODE_MAX_CHUNKS, AttnDecodeDesc, BinaryOp, CopyDesc, FlashAttentionDesc, RopeDesc,
     RopeScatterDesc, SoftmaxMask,
 };
-pub use graph_ops::{ExecOp, PosBuffer};
+pub use graph_ops::{ExecOp, HostU32Buffer, PosBuffer};
 pub use prepared::PreparedOps;
 
 /// Read-only description of the route selected for a plain matmul shape.

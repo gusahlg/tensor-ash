@@ -55,20 +55,77 @@ impl PosBuffer {
     }
 }
 
+/// A 4-byte u32 cell that is BOTH device-writable and host-readable —
+/// the [`PosBuffer`] machinery pointed the other way.  The GPU-argmax
+/// decode loop writes the chosen token id here
+/// ([`ExecOp::Argmax`] / [`Executor::run_argmax`]), a chained
+/// [`ExecOp::EmbedGather`] reads it back on-device for the next token's
+/// embedding, and the host [`read`]s ONE u32 after the fence instead of
+/// downloading the logits.
+///
+/// Device writes become visible to the host once the submission's fence
+/// wait returns (the fence signal is the domain operation; `read`
+/// invalidates non-coherent memory), so the usual "wait before you
+/// read" discipline — which [`super::PreparedOps::run`]'s fence already
+/// enforces — is the only requirement.
+///
+/// [`read`]: Self::read
+pub struct HostU32Buffer {
+    buffer: Buffer,
+}
+
+impl HostU32Buffer {
+    /// Read the current value (call only after the writing submission's
+    /// fence wait has returned).
+    pub fn read(&self) -> Result<u32> {
+        let mut value = [0u32];
+        self.buffer.read_pod_slice(&mut value)?;
+        Ok(value[0])
+    }
+
+    /// Host-side write, for seeding the cell before a submission that
+    /// only reads it (e.g. a standalone embed-gather).
+    pub fn set(&self, value: u32) -> Result<()> {
+        self.buffer.write_pod_slice(&[value])
+    }
+
+    /// GPU pointer for the shaders' indirection.  The buffer must
+    /// outlive every execution of any op that captured this address.
+    pub fn device_address(&self) -> u64 {
+        self.buffer.device_address()
+    }
+
+    pub(super) fn buffer(&self) -> &Buffer {
+        &self.buffer
+    }
+}
+
+fn create_u32_cell(exec: &Executor, label: &str) -> Result<Buffer> {
+    if !exec.ctx.buffer_device_address_enabled {
+        bail!("{label}: requires bufferDeviceAddress");
+    }
+    Buffer::new(
+        &exec.ctx,
+        std::mem::size_of::<u32>() as u64,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        BufferLocation::Host,
+    )
+    .context(label.to_string())
+}
+
 impl Executor {
     /// Allocate a [`PosBuffer`] on this executor's device.
     pub fn create_pos_buffer(&self) -> Result<PosBuffer> {
-        if !self.ctx.buffer_device_address_enabled {
-            bail!("create_pos_buffer: requires bufferDeviceAddress");
-        }
-        let buffer = Buffer::new(
-            &self.ctx,
-            std::mem::size_of::<u32>() as u64,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            BufferLocation::Host,
-        )
-        .context("create_pos_buffer")?;
-        Ok(PosBuffer { buffer })
+        Ok(PosBuffer {
+            buffer: create_u32_cell(self, "create_pos_buffer")?,
+        })
+    }
+
+    /// Allocate a [`HostU32Buffer`] on this executor's device.
+    pub fn create_host_u32_buffer(&self) -> Result<HostU32Buffer> {
+        Ok(HostU32Buffer {
+            buffer: create_u32_cell(self, "create_host_u32_buffer")?,
+        })
     }
 }
 
@@ -138,6 +195,23 @@ pub enum ExecOp<'t> {
         out: &'t Tensor,
         desc: AttnDecodeDesc,
     },
+    /// Greedy argmax (see [`Executor::run_argmax`]): writes the index
+    /// of `input`'s largest element into the host-readable `result`
+    /// cell (ties keep the largest index, matching Rust's
+    /// `max_by(total_cmp)`).
+    Argmax {
+        input: &'t Tensor,
+        result: &'t HostU32Buffer,
+    },
+    /// Embedding-row gather (see [`Executor::run_embed_gather`]): the
+    /// u32 `token` cell is read on-device, so chaining this after an
+    /// [`Argmax`](Self::Argmax) closes the decode loop entirely on the
+    /// GPU.
+    EmbedGather {
+        token: &'t HostU32Buffer,
+        table: &'t Tensor,
+        out: &'t Tensor,
+    },
 }
 
 enum Planned<'t, 'p> {
@@ -163,6 +237,14 @@ impl Access {
     }
     fn write(mut self, tensor: &Tensor) -> Self {
         self.writes.push(tensor.raw_buffer());
+        self
+    }
+    fn read_cell(mut self, cell: &HostU32Buffer) -> Self {
+        self.reads.push(cell.buffer().raw_buffer());
+        self
+    }
+    fn write_cell(mut self, cell: &HostU32Buffer) -> Self {
+        self.writes.push(cell.buffer().raw_buffer());
         self
     }
 }
@@ -320,6 +402,12 @@ impl Executor {
                 } => Access::default().read(input).read(table).write(dst),
                 ExecOp::CopyStrided { src, dst, .. } => Access::default().read(src).write(dst),
                 ExecOp::Binary { a, b, out, .. } => Access::default().read(a).read(b).write(out),
+                ExecOp::Argmax { input, result } => {
+                    Access::default().read(input).write_cell(result)
+                }
+                ExecOp::EmbedGather { token, table, out } => {
+                    Access::default().read_cell(token).read(table).write(out)
+                }
                 ExecOp::AttnDecode { .. } => unreachable!("handled above"),
             });
             planned.push(match op {
@@ -403,6 +491,12 @@ impl Executor {
                 }
                 ExecOp::Binary { a, b, out, op } => {
                     Planned::Elementwise(self.plan_binary(a, b, out, *op)?)
+                }
+                ExecOp::Argmax { input, result } => {
+                    Planned::Elementwise(self.plan_argmax(input, result)?)
+                }
+                ExecOp::EmbedGather { token, table, out } => {
+                    Planned::Elementwise(self.plan_embed_gather(token, table, out)?)
                 }
                 ExecOp::AttnDecode { .. } => unreachable!("handled above"),
             });

@@ -1,0 +1,49 @@
+#version 460
+// Token-embedding row gather with a device-side token id: reads the
+// u32 token from a result cell (typically the argmax kernel's output —
+// GPU-to-GPU feedback, no host round trip), then copies row `token` of
+// the [vocab, embd] embedding table into a [embd] f32 output.  The
+// table may be f16 (GGUF token_embd) or f32; f16 widens exactly.
+//
+// The token id is clamped to vocab-1 so a garbage cell cannot read out
+// of bounds; a chained argmax over vocab logits is always in range.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 2) restrict readonly buffer F16ReadOnly {
+    float16_t v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer U32ReadOnly {
+    uint v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32ReadWrite {
+    float v[];
+};
+
+layout(push_constant) uniform PC {
+    uint embd;
+    uint vocab;
+    uint table_f16;
+    uint _pad;
+    U32ReadOnly token_ptr;
+    uint64_t table_ptr;
+    F32ReadWrite out_ptr;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.embd) return;
+    const uint token = min(pc.token_ptr.v[0], pc.vocab - 1u);
+    const uint idx = token * pc.embd + i;
+    pc.out_ptr.v[i] = pc.table_f16 != 0u
+        ? float(F16ReadOnly(pc.table_ptr).v[idx])
+        : F32ReadOnly(pc.table_ptr).v[idx];
+}
