@@ -215,6 +215,12 @@ impl Executor {
         if epilogue.is_none() || self.pipeline.kernel_at(plan.kernel).supports_epilogue() {
             return plan;
         }
+        // Only auto routes demote.  An explicit ML_KERNEL selection of
+        // a non-fusing kernel keeps its documented loud failure at
+        // record time rather than being silently overridden.
+        if !self.pipeline.is_auto() {
+            return plan;
+        }
         OpPlan {
             kernel: self
                 .pipeline

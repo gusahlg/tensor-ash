@@ -307,3 +307,55 @@ fn coopmat_routes_and_matches_dual_rounded_reference() {
     let cpu = cpu_bmm(&host_a, &host_b, Some(&host_c), batch, m, n, k, alpha, true);
     assert_close(&gpu, &cpu, k, "coopmat");
 }
+
+/// Regression: TinyLlama prefill surfaced that aligned f16 shapes
+/// route to the coopmat kernel, which cannot fuse epilogues — fused
+/// ops must demote to the SIMT sibling while plain ops keep the
+/// tensor cores, and explicit selections keep their loud failure.
+#[test]
+#[ignore]
+fn f16_epilogue_on_coopmat_shape_demotes_and_matches() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !f16_available(&ctx) || !ctx.coopmat_enabled {
+        eprintln!("skipping: no coopmat support");
+        return;
+    }
+    // Plain route for this aligned shape is the tensor-core kernel.
+    let (m, n, k) = (256_u32, 384_u32, 256_u32);
+    let plain = exec.dispatch_info_for(1, m, n, k, true);
+    assert_eq!(plain.kernel, "f16w_coopmat_aligned", "{plain:?}");
+
+    // A fused bias+SiLU+gate op on the same shape must run (demoted)
+    // and match the reference computed from f16-rounded inputs.
+    let (a, b, mut host_a, host_b) = setup_f16_case(&ctx, &exec, &[m, k], &[k, n], 9800, 9801);
+    // The demoted SIMT kernel reads A as f32 (no rounding); keep the
+    // reference on the raw A.
+    let _ = &mut host_a;
+    let c = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
+    let (bias, host_bias) = upload_det(&ctx, &exec, &[n], 9802);
+    let (gate, host_gate) = upload_det(&ctx, &exec, &[m, n], 9803);
+    exec.run_ops(&[tensor_ash::MatmulOp::with_epilogue(
+        MatmulCall {
+            a: &a,
+            b: &b,
+            c: &c,
+            alpha: 1.0,
+            accumulate: false,
+        },
+        tensor_ash::Epilogue {
+            bias: Some(&bias),
+            activation: tensor_ash::Activation::Silu,
+            binary: tensor_ash::EpilogueBinary::Mul { d: &gate },
+        },
+    )])
+    .unwrap();
+    let mut gpu = vec![0.0; (m * n) as usize];
+    exec.download(&c, &mut gpu).unwrap();
+    let mut expected = cpu_bmm(&host_a, &host_b, None, 1, m, n, k, 1.0, false);
+    for (index, value) in expected.iter_mut().enumerate() {
+        let with_bias = *value + host_bias[index % n as usize];
+        let act = with_bias / (1.0 + (-with_bias).exp());
+        *value = act * host_gate[index];
+    }
+    assert_close(&gpu, &expected, k, "demoted epilogue on coopmat shape");
+}
