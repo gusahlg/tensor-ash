@@ -19,6 +19,9 @@
 //     BM, BN, BK, TM, TN, TN_RAW
 //     TN_RAW must be >= 4 for the vec4 inner read; smaller-TN tiles
 //     should use matmul_bda_kernel.glsl instead.
+//     B_F16 (optional): B is stored as IEEE half.  Loads convert to
+//     f32 while staging into Bs, so the FMA inner loop and stores are
+//     byte-identical to the f32 build; only global B traffic halves.
 // =====================================================================
 
 #extension GL_EXT_control_flow_attributes  : require
@@ -26,6 +29,9 @@
 #extension GL_EXT_buffer_reference         : require
 #extension GL_EXT_buffer_reference2        : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#ifdef B_F16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 
 layout(local_size_x = (BN / TN), local_size_y = (BM / TM), local_size_z = 1) in;
 
@@ -61,6 +67,18 @@ layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly b
 layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32ReadWrite {
     float v[];
 };
+#ifdef B_F16
+// Eight halves per element: one LDG.128 carries a full 16-byte packet.
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer H8ReadOnly {
+    uvec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 2) restrict readonly buffer F16ReadOnly {
+    float16_t v[];
+};
+const uint B_TILE_V8  = B_TILE / 8u;
+const uint B_PER_T_V8 = B_TILE_V8 / THREADS;
+const uint BN_V8 = BN / 8u;
+#endif
 
 layout(push_constant) uniform PC {
     uint  M;
@@ -103,6 +121,30 @@ void load_a_tile_v4(uint a_base, uint block_row, uint k_base, uint tid) {
     }
 }
 
+#ifdef B_F16
+void load_b_tile_v4(uint b_base, uint block_col, uint k_base, uint tid) {
+    H8ReadOnly b_v8 = H8ReadOnly(uint64_t(pc.b_ptr));
+    [[unroll]] for (uint i = 0u; i < B_PER_T_V8; ++i) {
+        const uint idx8  = tid + i * THREADS;
+        const uint row   = idx8 / BN_V8;
+        const uint col8  = idx8 % BN_V8;
+        const uint g_row = k_base + row;
+        const uint g_col_base = block_col * BN + col8 * 8u;
+        const uint addr_idx = b_base + g_row * pc.N + g_col_base;
+        const uvec4 h = b_v8.v[addr_idx >> 3u];
+        const vec2 f0 = unpackHalf2x16(h.x);
+        const vec2 f1 = unpackHalf2x16(h.y);
+        const vec2 f2 = unpackHalf2x16(h.z);
+        const vec2 f3 = unpackHalf2x16(h.w);
+        Bs[row][col8 * 2u + 0u] = uvec4(
+            floatBitsToUint(f0.x), floatBitsToUint(f0.y),
+            floatBitsToUint(f1.x), floatBitsToUint(f1.y));
+        Bs[row][col8 * 2u + 1u] = uvec4(
+            floatBitsToUint(f2.x), floatBitsToUint(f2.y),
+            floatBitsToUint(f3.x), floatBitsToUint(f3.y));
+    }
+}
+#else
 void load_b_tile_v4(uint b_base, uint block_col, uint k_base, uint tid) {
     F32V4ReadOnly b_v4 = F32V4ReadOnly(uint64_t(pc.b_ptr));
     [[unroll]] for (uint i = 0u; i < B_PER_T_V4; ++i) {
@@ -116,6 +158,7 @@ void load_b_tile_v4(uint b_base, uint block_col, uint k_base, uint tid) {
         Bs[row][col4] = floatBitsToUint(v);
     }
 }
+#endif
 
 void load_a_tile_scalar(uint a_base, uint block_row, uint k_base,
                         uint tid, bool m_full, bool k_full) {
@@ -146,7 +189,11 @@ void load_b_tile_scalar(uint b_base, uint block_col, uint k_base,
     // with `v[s]=...`) so the SPIR-V compiler observes a single
     // assignment to each `vec4` component on every path, which avoids
     // a lurking codegen issue we hit with the loop form.
+#ifdef B_F16
+    F16ReadOnly b_s = F16ReadOnly(uint64_t(pc.b_ptr));
+#else
     F32ReadOnly b_s = pc.b_ptr;
+#endif
     [[unroll]] for (uint i = 0u; i < B_PER_T_V4; ++i) {
         const uint idx4  = tid + i * THREADS;
         const uint row   = idx4 / BN_V4;
@@ -160,13 +207,13 @@ void load_b_tile_scalar(uint b_base, uint block_col, uint k_base,
         float v2 = 0.0;
         float v3 = 0.0;
         if (row_in && (n_full || (g_col_base + 0u) < pc.N))
-            v0 = b_s.v[row_off + g_col_base + 0u];
+            v0 = float(b_s.v[row_off + g_col_base + 0u]);
         if (row_in && (n_full || (g_col_base + 1u) < pc.N))
-            v1 = b_s.v[row_off + g_col_base + 1u];
+            v1 = float(b_s.v[row_off + g_col_base + 1u]);
         if (row_in && (n_full || (g_col_base + 2u) < pc.N))
-            v2 = b_s.v[row_off + g_col_base + 2u];
+            v2 = float(b_s.v[row_off + g_col_base + 2u]);
         if (row_in && (n_full || (g_col_base + 3u) < pc.N))
-            v3 = b_s.v[row_off + g_col_base + 3u];
+            v3 = float(b_s.v[row_off + g_col_base + 3u]);
         Bs[row][col4] = uvec4(
             floatBitsToUint(v0),
             floatBitsToUint(v1),
@@ -188,11 +235,19 @@ void main() {
     const uint b_base = batch * pc.batch_stride_b;
     const uint c_base = batch * pc.batch_stride_c;
 
-    const bool m_full = ((block_row + 1u) * BM) <= pc.M;
-    const bool n_full = ((block_col + 1u) * BN) <= pc.N;
+    const bool m_full = block_row < pc.M / BM;
+    const bool n_full = block_col < pc.N / BN;
 
     const uint num_full_k = pc.K / BK;
     const bool has_k_tail = !K_MULTIPLE && ((pc.K % BK) != 0u);
+
+    // Vectorized B loads need row starts aligned to one packet: four
+    // floats for f32 B, eight halves for f16 B.
+#ifdef B_F16
+    const bool b_rows_packet_aligned = (pc.N & 7u) == 0u;
+#else
+    const bool b_rows_packet_aligned = (pc.N & 3u) == 0u;
+#endif
 
     const uint a_row0    = ty * TM;
     const uint b_col0    = tx * TN;
@@ -208,6 +263,19 @@ void main() {
         if (INTERIOR_ONLY && K_MULTIPLE) {
             load_a_tile_v4(a_base, block_row, k_base, tid);
             load_b_tile_v4(b_base, block_col, k_base, tid);
+        } else if (K_MULTIPLE) {
+            // An M/N edge need not scalarize every interior workgroup. K is
+            // tile-aligned here, so A rows are 16-byte aligned; B additionally
+            // needs a four-float row stride. Keeping this behind the existing
+            // specialization flag leaves odd-K codegen identical.
+            if (m_full)
+                load_a_tile_v4(a_base, block_row, k_base, tid);
+            else
+                load_a_tile_scalar(a_base, block_row, k_base, tid, m_full, true);
+            if (n_full && b_rows_packet_aligned)
+                load_b_tile_v4(b_base, block_col, k_base, tid);
+            else
+                load_b_tile_scalar(b_base, block_col, k_base, tid, n_full, true);
         } else {
             load_a_tile_scalar(a_base, block_row, k_base, tid, m_full, true);
             load_b_tile_scalar(b_base, block_col, k_base, tid, n_full, true);

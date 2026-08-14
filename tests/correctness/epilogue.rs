@@ -65,16 +65,9 @@ fn run_epilogue_case(
     let (m, n, k) = shape;
     let (ctx, exec) = make_setup(2, 8);
 
-    let a = Tensor::uninit_device(&ctx, &[m, k]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[k, n]).unwrap();
+    let (a, ha) = upload_det(&ctx, &exec, &[m, k], 71);
+    let (b, hb) = upload_det(&ctx, &exec, &[k, n], 72);
     let c = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
-
-    let mut ha = vec![0.0f32; (m * k) as usize];
-    let mut hb = vec![0.0f32; (k * n) as usize];
-    fill_det(&mut ha, 71);
-    fill_det(&mut hb, 72);
-    exec.upload(&ha, &a).unwrap();
-    exec.upload(&hb, &b).unwrap();
 
     let mut hc0 = vec![0.0f32; (m * n) as usize];
     if accumulate {
@@ -82,31 +75,14 @@ fn run_epilogue_case(
         exec.upload(&hc0, &c).unwrap();
     }
 
-    let bias_t;
-    let mut hbias = vec![0.0f32; n as usize];
-    let bias_ref = if bias {
-        fill_det(&mut hbias, 74);
-        bias_t = Tensor::uninit_device(&ctx, &[n]).unwrap();
-        exec.upload(&hbias, &bias_t).unwrap();
-        Some(&bias_t)
-    } else {
-        None
-    };
+    let bias_pair = bias.then(|| upload_det(&ctx, &exec, &[n], 74));
+    let bias_ref = bias_pair.as_ref().map(|(bias_t, _)| bias_t);
 
-    let d_t;
-    let mut hd = vec![0.0f32; (m * n) as usize];
-    let binary_op = match binary {
-        Some((beta, is_mul)) => {
-            fill_det(&mut hd, 75);
-            d_t = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
-            exec.upload(&hd, &d_t).unwrap();
-            if is_mul {
-                EpilogueBinary::Mul { d: &d_t }
-            } else {
-                EpilogueBinary::AddScaled { d: &d_t, beta }
-            }
-        }
-        None => EpilogueBinary::None,
+    let d_pair = binary.map(|_| upload_det(&ctx, &exec, &[m, n], 75));
+    let binary_op = match (binary, &d_pair) {
+        (Some((_, true)), Some((d_t, _))) => EpilogueBinary::Mul { d: d_t },
+        (Some((beta, false)), Some((d_t, _))) => EpilogueBinary::AddScaled { d: d_t, beta },
+        _ => EpilogueBinary::None,
     };
 
     exec.run_ops(&[MatmulOp::with_epilogue(
@@ -142,18 +118,19 @@ fn run_epilogue_case(
     cpu_epilogue(
         &mut expect,
         n,
-        bias.then_some(&hbias[..]),
+        bias_pair.as_ref().map(|(_, hbias)| &hbias[..]),
         act,
-        binary.map(|(beta, is_mul)| (&hd[..], beta, is_mul)),
+        binary.map(|(beta, is_mul)| (&d_pair.as_ref().unwrap().1[..], beta, is_mul)),
     );
 
-    let (e, idx) = max_abs_err(&got, &expect);
-    assert!(
-        e <= epi_tolerance(k),
-        "epilogue case {shape:?} alpha={alpha} acc={accumulate} bias={bias} act={act:?} \
-         binary={binary:?}: err {e:.3e} at {idx} (got {}, want {})",
-        got[idx],
-        expect[idx]
+    assert_close_tol(
+        &got,
+        &expect,
+        epi_tolerance(k),
+        &format!(
+            "epilogue case {shape:?} alpha={alpha} acc={accumulate} bias={bias} act={act:?} \
+             binary={binary:?}"
+        ),
     );
 }
 
@@ -243,24 +220,17 @@ fn bias_residual_odd_shape() {
 fn batched_bias_uses_one_row_per_batch() {
     let (ctx, exec) = make_setup(2, 8);
     let (batch, m, n, k) = (3u32, 2u32, 7u32, 5u32);
-    let a = Tensor::uninit_device(&ctx, &[batch, m, k]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[batch, k, n]).unwrap();
+    let (a, ha) = upload_det(&ctx, &exec, &[batch, m, k], 91);
+    let (b, hb) = upload_det(&ctx, &exec, &[batch, k, n], 92);
     let c = Tensor::uninit_device(&ctx, &[batch, m, n]).unwrap();
     let bias = Tensor::uninit_device(&ctx, &[batch, n]).unwrap();
 
-    let mut ha = vec![0.0; (batch * m * k) as usize];
-    let mut hb = vec![0.0; (batch * k * n) as usize];
     let mut hbias = vec![0.0; (batch * n) as usize];
-    fill_det(&mut ha, 91);
-    fill_det(&mut hb, 92);
     for batch_index in 0..batch as usize {
         for col in 0..n as usize {
             hbias[batch_index * n as usize + col] = 10.0 * batch_index as f32 + col as f32;
         }
     }
-
-    exec.upload(&ha, &a).unwrap();
-    exec.upload(&hb, &b).unwrap();
     exec.upload(&hbias, &bias).unwrap();
     exec.run_ops(&[MatmulOp::with_epilogue(
         MatmulCall {
@@ -290,13 +260,7 @@ fn batched_bias_uses_one_row_per_batch() {
         }
     }
 
-    let (error, index) = max_abs_err(&got, &expect);
-    assert!(
-        error <= epi_tolerance(k),
-        "batched bias err {error:.3e} at {index} (got {}, want {})",
-        got[index],
-        expect[index]
-    );
+    assert_close_tol(&got, &expect, epi_tolerance(k), "batched bias");
 }
 
 // -- Epilogue tensors participate in graph hazard tracking --
@@ -310,21 +274,11 @@ fn graph_hazard_on_epilogue_d_operand() {
     let (ctx, exec) = make_setup(2, 8);
     let (m, h, i_) = (64u32, 128u32, 256u32);
 
-    let x = Tensor::uninit_device(&ctx, &[m, h]).unwrap();
-    let w_up = Tensor::uninit_device(&ctx, &[h, i_]).unwrap();
-    let w_gate = Tensor::uninit_device(&ctx, &[h, i_]).unwrap();
+    let (x, hx) = upload_det(&ctx, &exec, &[m, h], 81);
+    let (w_up, hup) = upload_det(&ctx, &exec, &[h, i_], 82);
+    let (w_gate, hgate) = upload_det(&ctx, &exec, &[h, i_], 83);
     let up = Tensor::uninit_device(&ctx, &[m, i_]).unwrap();
     let gated = Tensor::uninit_device(&ctx, &[m, i_]).unwrap();
-
-    let mut hx = vec![0.0f32; (m * h) as usize];
-    let mut hup = vec![0.0f32; (h * i_) as usize];
-    let mut hgate = vec![0.0f32; (h * i_) as usize];
-    fill_det(&mut hx, 81);
-    fill_det(&mut hup, 82);
-    fill_det(&mut hgate, 83);
-    exec.upload(&hx, &x).unwrap();
-    exec.upload(&hup, &w_up).unwrap();
-    exec.upload(&hgate, &w_gate).unwrap();
 
     exec.run_op_graph(&[
         MatmulOp::new(MatmulCall {
@@ -364,8 +318,7 @@ fn graph_hazard_on_epilogue_d_operand() {
         Some((&hup_out[..], 0.0, true)),
     );
 
-    let (e, _) = max_abs_err(&got, &expect);
-    assert!(e <= epi_tolerance(h), "swiglu graph err {e:.3e}");
+    assert_close_tol(&got, &expect, epi_tolerance(h), "swiglu graph");
 }
 
 /// Bias shape validation: wrong-length bias must be rejected.

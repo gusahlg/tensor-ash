@@ -37,7 +37,7 @@
 // Output (stdout, CSV with header)
 // --------------------------------
 //
-//     label,b,m,n,k,best_ms,mean_ms,tflops
+//     label,b,m,n,k,best_ms,mean_ms,tflops,sample_count,min_ms,median_ms,p95_ms
 //
 // Usage
 // -----
@@ -47,6 +47,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -87,6 +88,9 @@ struct BenchCase {
 struct BenchResult {
     double best_ms;
     double mean_ms;
+    int sample_count;
+    double median_ms;
+    double p95_ms;
     double tflops;
 };
 
@@ -146,6 +150,8 @@ static BenchResult bench_one(cublasHandle_t handle, const BenchCase& c,
 
     double best_ms = 1e18;
     double sum_ms = 0.0;
+    std::vector<double> samples_ms;
+    samples_ms.reserve(static_cast<size_t>(iters));
     for (int i = 0; i < iters; ++i) {
         CHECK_CUDA(cudaEventRecord(start));
         do_gemm();
@@ -156,8 +162,16 @@ static BenchResult bench_one(cublasHandle_t handle, const BenchCase& c,
         const double ms_d = static_cast<double>(ms);
         if (ms_d < best_ms) best_ms = ms_d;
         sum_ms += ms_d;
+        samples_ms.push_back(ms_d);
     }
     const double mean_ms = sum_ms / iters;
+    std::sort(samples_ms.begin(), samples_ms.end());
+    const size_t count = samples_ms.size();
+    const double median_ms = count % 2 == 0
+        ? (samples_ms[count / 2 - 1] + samples_ms[count / 2]) / 2.0
+        : samples_ms[count / 2];
+    const size_t p95_index = (count * 95 + 99) / 100 - 1;
+    const double p95_ms = samples_ms[p95_index];
 
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
@@ -167,8 +181,8 @@ static BenchResult bench_one(cublasHandle_t handle, const BenchCase& c,
 
     const double flops =
         2.0 * static_cast<double>(c.b) * c.m * c.n * c.k;
-    const double tflops = flops / (best_ms * 1e-3) * 1e-12;
-    return {best_ms, mean_ms, tflops};
+    const double tflops = flops / (median_ms * 1e-3) * 1e-12;
+    return {best_ms, mean_ms, static_cast<int>(count), median_ms, p95_ms, tflops};
 }
 
 static bool parse_case(const std::string& line, BenchCase& out) {
@@ -213,6 +227,10 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (iters < 1 || warmup < 0) {
+        std::fprintf(stderr, "--iters must be >= 1 and --warmup must be >= 0\n");
+        return 1;
+    }
 
     int device_id = 0;
     CHECK_CUDA(cudaSetDevice(device_id));
@@ -234,7 +252,8 @@ int main(int argc, char** argv) {
                                    allow_tf32 ? CUBLAS_DEFAULT_MATH
                                               : CUBLAS_PEDANTIC_MATH));
 
-    std::printf("label,b,m,n,k,best_ms,mean_ms,tflops\n");
+    std::printf(
+        "label,b,m,n,k,best_ms,mean_ms,tflops,sample_count,min_ms,median_ms,p95_ms\n");
     std::fflush(stdout);
 
     std::string line;
@@ -265,9 +284,10 @@ int main(int argc, char** argv) {
             continue;
         }
         const BenchResult r = bench_one(handle, c, iters, warmup);
-        std::printf("%s,%d,%d,%d,%d,%.6f,%.6f,%.6f\n",
+        std::printf("%s,%d,%d,%d,%d,%.6f,%.6f,%.6f,%d,%.6f,%.6f,%.6f\n",
                     c.label.c_str(), c.b, c.m, c.n, c.k,
-                    r.best_ms, r.mean_ms, r.tflops);
+                    r.best_ms, r.mean_ms, r.tflops, r.sample_count,
+                    r.best_ms, r.median_ms, r.p95_ms);
         std::fflush(stdout);
     }
 

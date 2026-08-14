@@ -30,9 +30,8 @@ pub struct MatmulPushConstants {
     pub bias_batch_stride: u32,
 }
 
-/// Per-call pipeline specialization. Selects one of the precompiled
-/// variants of a kernel so the shader sees these as compile-time
-/// constants and can fold out the corresponding branches.
+/// Per-call pipeline specialization. The eager fallbacks and lazily-built
+/// exact variants let the shader fold out the corresponding branches.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct KernelVariant {
     /// `C += alpha*A@B` when true, `C = alpha*A@B` when false.
@@ -48,8 +47,10 @@ pub struct KernelVariant {
 }
 
 impl KernelVariant {
-    /// Number of distinct variants compiled per kernel.
+    /// Number of logical specialization variants per kernel.
     pub const COUNT: usize = 16;
+    /// Number of correctness-safe variants built eagerly per kernel.
+    pub(crate) const FALLBACK_COUNT: usize = 4;
 
     #[inline]
     pub const fn index(self) -> usize {
@@ -68,12 +69,22 @@ impl KernelVariant {
             k_multiple: (idx & 0b1000) != 0,
         }
     }
+
+    /// Correctness-safe variant used while the aligned specialization is lazy.
+    #[inline]
+    pub(crate) const fn fallback(self) -> Self {
+        Self {
+            accumulate: self.accumulate,
+            alpha_is_one: self.alpha_is_one,
+            interior_only: false,
+            k_multiple: false,
+        }
+    }
 }
 
 /// Specialization values for the fused-epilogue constants (IDs 4..6).
-/// The eager per-kernel pipelines are all built with the zero epilogue;
-/// non-zero combinations are compiled lazily on first use and cached in
-/// `MatmulPipeline`.
+/// The eager per-kernel fallbacks use the zero epilogue; aligned and non-zero
+/// epilogue combinations are compiled lazily and cached in `MatmulPipeline`.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
 pub struct EpilogueKey {
     /// `constant_id = 4`: add a shared `[N]` or batched `[B, N]` bias.
@@ -105,5 +116,18 @@ mod tests {
             seen[variant.index()] = true;
         }
         assert!(seen.into_iter().all(|value| value));
+    }
+
+    #[test]
+    fn fallback_preserves_semantics_and_drops_alignment_assumptions() {
+        for idx in 0..KernelVariant::COUNT {
+            let variant = KernelVariant::from_index(idx);
+            let fallback = variant.fallback();
+            assert_eq!(fallback.accumulate, variant.accumulate);
+            assert_eq!(fallback.alpha_is_one, variant.alpha_is_one);
+            assert!(!fallback.interior_only);
+            assert!(!fallback.k_multiple);
+            assert!(fallback.index() < KernelVariant::FALLBACK_COUNT);
+        }
     }
 }

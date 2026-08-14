@@ -1,4 +1,4 @@
-//! Probe: DP vs atomic split-K vs two-stage split-K on deep-K shapes.
+//! Probe: DP vs two-stage split-K on deep-K shapes.
 //!
 //! Prints min GPU ms per strategy so the reduction paths can be
 //! compared on the local device.
@@ -44,8 +44,8 @@ fn main() -> Result<()> {
     ];
 
     println!(
-        "{:<20} {:>9} {:>9} {:>22} {:>22}",
-        "shape (MxNxK)", "dp_ms", "atomic_ms", "splitk2_ms(best)", "splitk2 splits"
+        "{:<20} {:>9} {:>22} {:>22}",
+        "shape (MxNxK)", "dp_ms", "splitk2_ms(best)", "splitk2 splits"
     );
     for &(m, n, k) in shapes {
         let a = Tensor::uninit_device(&ctx, &[m, k])?;
@@ -64,8 +64,6 @@ fn main() -> Result<()> {
         };
 
         let dp = min_gpu_ms(|| Ok(exec.run_matmuls(&[call()])?.gpu_time_ns))?;
-        let atomic =
-            min_gpu_ms(|| Ok(exec.run_matmuls_split_k(call(), 0)?.gpu_time_ns)).unwrap_or(None);
 
         let mut best2: Option<(f64, u32)> = None;
         for splits in [4u32, 8, 16, 32, 64] {
@@ -81,10 +79,9 @@ fn main() -> Result<()> {
         }
 
         println!(
-            "{:<20} {:>9} {:>9} {:>22} {:>22}",
+            "{:<20} {:>9} {:>22} {:>22}",
             format!("{m}x{n}x{k}"),
             dp.map_or("-".into(), |v| format!("{v:.3}")),
-            atomic.map_or("-".into(), |v| format!("{v:.3}")),
             best2.map_or("-".into(), |(v, _)| format!("{v:.3}")),
             best2.map_or("-".into(), |(_, s)| s.to_string()),
         );

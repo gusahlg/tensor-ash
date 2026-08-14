@@ -1,5 +1,181 @@
 # Changelog
 
+## [Unreleased]
+
+_Nothing yet._
+
+## [2.0.0] - 2026-08-14
+
+### Added
+
+- **C ABI inference surface** (`tensor-ash-capi`, `include/tensor_ash.h`):
+  f16 tensors (`ta_tensor_create_f16`[`_on_executor`], `ta_tensor_is_f16`;
+  `ta_upload`/`ta_download` convert to/from half automatically); fused
+  epilogues via `ta_epilogue`/`ta_matmul_op` with `ta_run_ops` and the
+  auto-barrier `ta_run_op_graph`; prepared replay
+  (`ta_prepared_create/run/submit/wait/destroy`) with a documented
+  lifetime contract (executor and tensors must outlive the handle;
+  destroy fence-waits); diagnostics `ta_dispatch_info_for` (interned
+  process-lifetime kernel-name pointers) and `ta_tune_shape`;
+  `ta_executor_create_v2` with an explicit tune flag (`ExecutorConfig`);
+  capability queries `ta_context_supports_f16`/`ta_context_supports_bda`.
+  `examples/c_smoke.c` now exercises a bias+SiLU op, prepared replay
+  (run and submit/wait), and an f16-weights matmul.
+
+- **C ABI model ops**: `ta_softmax_rows` (mask_kind
+  `TA_SOFTMAX_MASK_FULL`/`PREFIX`/`CAUSAL` with `valid_or_prefix` and
+  `rows_per_group`), `ta_rms_norm`, `ta_layer_norm`, `ta_rope`
+  (`ta_rope_desc`), and `ta_copy_strided` (`ta_copy_desc`) wrap the five
+  Rust model ops. In-place (input == output) is allowed for
+  softmax/norm/rope; `ta_copy_strided` rejects `src == dst` (unordered
+  invocations would race). All require `ta_context_supports_bda`.
+  `examples/c_smoke.c` gains RMSNorm, prefix-masked softmax, and
+  strided-copy transpose checks (plus the in-place-copy rejection).
+
+- **Model ops** (`run_softmax_rows`, `run_rms_norm`, `run_layer_norm`,
+  `run_rope`, `run_copy_strided`): the minimal non-GEMM kernel family for a
+  transformer decoder block, structured as a lazily-built sibling pipeline
+  beside split-K2. Row softmax supports prefix and causal valid-length
+  masks and stores exact zeros in the masked tail, so attention over a
+  zero-padded KV cache composes correctly with plain batched matmuls
+  (pinned by an end-to-end decode-attention test). RMSNorm runs at memory
+  bandwidth (~450 GB/s effective on RTX 3070); RoPE supports partial
+  rotary dims and in-place operation; the strided copy covers transpose,
+  KV-cache append, and head reshaping. `examples/bench_ops.rs` reports op
+  bandwidths.
+- **FP16 weight storage** (`DType::F16`, `Tensor::uninit_device_f16`): B
+  (weights) may be stored as IEEE half while A/C and accumulation stay f32.
+  Upload/download keep the `&[f32]` host API and convert with
+  round-to-nearest-even on the CPU. Six `f16w_*` kernels (large,
+  m128n64k64, k64, small BDA_V4 tiles + the K-cooperative row GEMV) share
+  the existing shader bodies via `#ifdef B_F16`, loading B as uvec4
+  packets (8 halves per LDG.128) and unpacking at shared-staging time so
+  the f32 FMA inner loop is unchanged. Measured on RTX 3070: decode GEMV
+  1x4096x4096 **1.88x** (0.158 -> 0.084 ms), llama-style down-proj
+  1x4096x11008 **1.93x**, compute-bound shapes neutral (+-1%). Routing,
+  the measured tuner (`TuneKey` gains a storage bit; store header v3),
+  split-K2 eligibility (f16 always data-parallel), and explicit-selection
+  validation are all storage-aware; `f16w_*` registry slots stay empty on
+  devices without `shaderFloat16` + `storageBuffer16BitAccess`.
+- `Executor::dispatch_info_for(batch, m, n, k, b_f16)` reports routes per
+  storage type; `dispatch_info` keeps its f32 meaning.
+- `ml-bench cases` accepts an optional `,f16w` flag per case
+  (`label,b,m,n,k,f16w`) to store B in f16.
+
+- `col_bda`, a cooperative column-GEMV kernel for `N=1`, with automatic
+  routing, tuning support, batched broadcasting, accumulation, and fused
+  epilogues.
+- `outer_bda`, a register-only `K=1` outer-product kernel (no shared memory or
+  barriers), auto-routed after the GEMV rules. On the RTX 3070 it cuts K=1
+  GPU time by 39% at 512^2 and 11-12% at 1024^2-2048^2, and roughly halves
+  odd-shape edge cases versus the tiled route.
+- `PreparedOps` (`Executor::prepare_matmuls` / `prepare_ops` /
+  `prepare_op_graph`): validate, route, and record a fixed op batch once and
+  replay it with one queue submit per call (`submit` is `unsafe` — leaking an
+  in-flight object would skip the fence wait in `Drop`). Two ping-ponged
+  prepared objects sustain 13.1 us/call at 64^3 under matched clocks, 1.26x
+  over the spin-wait synchronous path and 1.9x over the previous release's
+  blocking path.
+- `ML_SPLIT_K2=N` support in `ml_bench` for controlled split-factor sweeps,
+  and an `ml_bench prepared` subcommand comparing synchronous, replayed, and
+  pipelined submission on one shape.
+
+### Changed
+
+- The `M=1` row GEMV (`row_bda`) is now K-cooperative: eight K-slice warps
+  per workgroup share the same 32 columns with a deterministic fixed-order
+  reduce. Lone-row GEMVs run 2.4-5x faster on the RTX 3070 (1x4096x4096:
+  0.375 -> 0.158 ms, ~91% of memory bandwidth); large-batch M=1 workloads
+  are unchanged.
+- Untuned deep-K GEMMs with too few output tiles now use a conservative,
+  device-validated two-stage Split-K route. On the RTX 3070 regression case
+  `64x64x8192`, median GPU time fell from 0.365 ms to 0.022 ms.
+- Matmul pipelines eagerly build four correctness-safe variants per kernel and
+  create alignment-specialized variants on first use. Empty-cache startup fell
+  from 147 seconds to 46 seconds while warmed GEMM throughput stayed flat.
+- K-aligned V4 kernels retain 128-bit operand loads for interior workgroups at
+  M/N edges, improving isolated edge cases by about 3-4%.
+- Synchronous submissions spin briefly (bounded at 50 us) before blocking on
+  the fence, removing the scheduler-wakeup latency: per-call wall time fell
+  25-33% on small GEMMs and median host overhead dropped from ~0.020 ms to
+  ~0.010 ms.
+- Every op's dispatch route now resolves once per submission into an `OpPlan`
+  consumed by descriptor updates, recording, graph planning, and
+  `dispatch_info`, replacing repeated kernel selection and the split-K2 side
+  channel; a concurrent first-use tune can no longer split one submission
+  across two registry states.
+- Buffer device addresses are cached at creation instead of queried from the
+  driver on every recorded dispatch.
+
+### Removed
+
+- `MatmulPipeline::select_kernel_index` (superseded by the internal route
+  snapshot; `select_kernel` remains for external kernel inspection).
+- The experimental Stream-K stack (`Executor::run_matmuls_stream_k` /
+  `run_matmuls_auto_stream_k`, `executor/streamk*.rs`, the Stream-K shaders,
+  and `examples/bench_streamk.rs`): measured -6% to -75% versus the
+  data-parallel route on every probed shape on the RTX 3070.
+- The experimental persistent-threads kernel (`PersistentMatmul`,
+  `src/persistent/`, `matmul_f32_persistent_v4.comp`): the persistent-grid +
+  atomic tile-counter pattern shares Stream-K's structural cost and never
+  beat the tiled dispatch.
+- The atomic split-K path (`Executor::run_matmuls_split_k`,
+  `executor/splitk.rs`, `matmul_f32_splitk_m128n128/m64n64.comp`): measured
+  17-53% slower than the deterministic two-stage `run_matmuls_split_k2`
+  replacement on K=256-1024 low-CTA shapes, which remains the live
+  auto-routed reduction.
+
+### Fixed
+
+- Automatic Split-K routing uses checked grid/address/scratch arithmetic,
+  preserves measured data-parallel winners, and caps aggregate graph scratch;
+  over-budget graph operations safely remain data parallel.
+
+## v1.4.1 - 2026-08-13
+
+Measured-performance and correctness patch release.
+
+### Added
+
+- `ml_bench cases` benchmarks many labeled shapes in one Vulkan process,
+  avoiding repeated pipeline startup and GPU-clock perturbation. Timed results
+  retain paired wall/GPU samples and report sample counts, minimum, median,
+  nearest-rank p95, host overhead, wall throughput, and the selected
+  kernel/tile/reduction route.
+- Timed GEMMs now validate a fixed set of output elements after measurement so
+  a fast but incorrect kernel cannot be recorded as a benchmark win.
+- Cross-backend JSON schema v2 records timing scope/statistic, git state,
+  device/driver information, route metadata, and matching median distributions
+  for tensor-ash and cuBLAS. A compact regression set covers the four measured
+  worst shapes plus tile boundaries, batching, deep K, and both GEMV axes.
+- Addressing, alignment, aliasing, split-K, timestamp-wrap, and dispatch-limit
+  regression coverage, including supported strict-aligned happy paths.
+
+### Changed
+
+- Automatic kernel selection accounts for the whole batched grid and compares
+  actual padded work at tile boundaries. On an RTX 3070 this raises median
+  throughput by about 20% for batch-8 1024-cubed GEMM, 18% for batch-32
+  512-cubed GEMM, and 27% for the 4095-cubed edge case.
+- Runtime tuning filters irrelevant/invalid candidates, balances measurement
+  order, uses median samples consistently, releases its slot before probing
+  split-K2, and reports the actual selected reduction route.
+- Pure-BDA submissions skip descriptor-update allocation and selection work.
+
+### Fixed
+
+- Strict aligned kernels, including the static V3 kernel's special K=16
+  requirement, reject unsupported dimensions instead of permitting out-of-
+  bounds shader access or loop underflow.
+- Matmul resolution rejects rank-2 and batched layouts whose shader-visible
+  element offsets exceed 32-bit addressing, while accepting the exact valid
+  boundary.
+- Output tensors may no longer alias either GEMM input; split-K2 scratch and
+  split counts are range checked; one-split calls fall back before optional
+  feature/pipeline setup; Stream-K validates the actual dispatch axes.
+- Shader full-tile and K-strip predicates avoid 32-bit arithmetic overflow,
+  and timestamp deltas honor the device's valid counter width.
+
 ## v1.4.0 - 2026-08-06
 
 ### Added

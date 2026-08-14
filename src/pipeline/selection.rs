@@ -7,6 +7,8 @@ use super::catalog::{KERNEL_SPECS, KernelSelection};
 /// out of the kernel registry rather than duplicating the constants.
 const LARGE_TILE_M: u32 = KERNEL_SPECS[KernelSelection::Large.index().unwrap()].tile_m;
 const LARGE_TILE_N: u32 = KERNEL_SPECS[KernelSelection::Large.index().unwrap()].tile_n;
+const SMALL_TILE_M: u32 = KERNEL_SPECS[KernelSelection::Small.index().unwrap()].tile_m;
+const SMALL_TILE_N: u32 = KERNEL_SPECS[KernelSelection::Small.index().unwrap()].tile_n;
 
 /// Threshold (in 128x128 tiles) below which the auto selector prefers
 /// the small kernel.  Tuned per device kind so we don't underuse a beefy
@@ -30,11 +32,26 @@ pub(super) fn auto_min_large_tiles_for(kind: DeviceKind) -> u64 {
     }
 }
 
-pub(super) fn auto_selects_small_kernel(m: u32, n: u32, k: u32, min_large_tiles: u64) -> bool {
-    // Off-tile M/N shapes waste more work in the large 128x128 kernel
-    // and pay its edge-path branches. Prefer the smaller tile for these
-    // edge-heavy cases, while still allowing manual large-kernel runs.
-    if !m.is_multiple_of(LARGE_TILE_M) || !n.is_multiple_of(LARGE_TILE_N) {
+pub(super) fn auto_selects_small_kernel(
+    batch: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    min_large_tiles: u64,
+) -> bool {
+    // Prefer the small tile only when it actually removes meaningful padded
+    // work. Near a large-tile boundary (e.g. 4095²), both 64 and 128 tiles
+    // cover the same padded extent, so the large kernel keeps its arithmetic
+    // intensity advantage despite taking an edge path.
+    let large_padded = (m.div_ceil(LARGE_TILE_M) as u64)
+        .saturating_mul(LARGE_TILE_M as u64)
+        .saturating_mul(n.div_ceil(LARGE_TILE_N) as u64)
+        .saturating_mul(LARGE_TILE_N as u64);
+    let small_padded = (m.div_ceil(SMALL_TILE_M) as u64)
+        .saturating_mul(SMALL_TILE_M as u64)
+        .saturating_mul(n.div_ceil(SMALL_TILE_N) as u64)
+        .saturating_mul(SMALL_TILE_N as u64);
+    if large_padded > small_padded.saturating_mul(5).div_ceil(4) {
         return true;
     }
     // For tiny K the fixed per-workgroup load + barrier cost dominates,
@@ -50,8 +67,23 @@ pub(super) fn auto_selects_small_kernel(m: u32, n: u32, k: u32, min_large_tiles:
     //
     // On RTX 3070 (46 SMs): at 1024^3 the small kernel is faster
     // (7.8 vs 7.0 TFLOPS), at 2048^3 large wins decisively (9.8 vs 8.6).
-    let large_tiles = (m / LARGE_TILE_M) as u64 * (n / LARGE_TILE_N) as u64;
-    large_tiles < min_large_tiles
+    // Each batch plane is an independent grid in Z and contributes the
+    // same amount of occupancy. Ignoring it sent large batched GEMMs to
+    // the lower-intensity small kernel even when the aggregate grid was
+    // comfortably large enough to fill the device.
+    let large_tiles = (batch as u64)
+        .saturating_mul(m.div_ceil(LARGE_TILE_M) as u64)
+        .saturating_mul(n.div_ceil(LARGE_TILE_N) as u64);
+    let threshold = if min_large_tiles == 256 && batch > 1 && k >= 256 {
+        // Batched grids reach the large tile's throughput crossover with
+        // fewer aggregate CTAs than a single plane (measured at 128 vs 256
+        // large tiles on RTX 3070). Short-K batches retain the conservative
+        // threshold because arithmetic intensity cannot amortize the tile.
+        min_large_tiles / 2
+    } else {
+        min_large_tiles
+    };
+    large_tiles < threshold
 }
 
 pub(super) fn auto_select_kernel(
@@ -132,7 +164,7 @@ pub(super) fn auto_select_kernel(
             return KernelSelection::K64;
         }
     }
-    if auto_selects_small_kernel(m, n, k, min_large_tiles) {
+    if auto_selects_small_kernel(batch, m, n, k, min_large_tiles) {
         KernelSelection::Small
     } else {
         KernelSelection::Large
@@ -146,15 +178,30 @@ mod tests {
     #[test]
     fn auto_selector_prefers_small_for_edge_or_small_shapes() {
         let t = 256u64;
-        assert!(auto_selects_small_kernel(1023, 2048, 1024, t));
-        assert!(auto_selects_small_kernel(2048, 1025, 1024, t));
-        assert!(auto_selects_small_kernel(2048, 2048, 64, t));
-        assert!(auto_selects_small_kernel(512, 512, 512, t));
-        assert!(auto_selects_small_kernel(1024, 1024, 1024, t));
-        assert!(!auto_selects_small_kernel(2048, 2048, 128, t));
-        assert!(!auto_selects_small_kernel(2048, 2048, 2048, t));
-        assert!(!auto_selects_small_kernel(4096, 1024, 1024, t));
-        assert!(!auto_selects_small_kernel(1024, 4096, 1024, t));
+        assert!(auto_selects_small_kernel(1, 1023, 2048, 1024, t));
+        assert!(auto_selects_small_kernel(1, 2048, 1025, 1024, t));
+        assert!(!auto_selects_small_kernel(1, 2047, 2048, 2048, t));
+        assert!(!auto_selects_small_kernel(1, 4095, 4095, 4096, t));
+        assert!(auto_selects_small_kernel(1, 2048, 2048, 64, t));
+        assert!(auto_selects_small_kernel(1, 512, 512, 512, t));
+        assert!(auto_selects_small_kernel(1, 1024, 1024, 1024, t));
+        assert!(!auto_selects_small_kernel(8, 1024, 1024, 1024, t));
+        assert!(!auto_selects_small_kernel(32, 512, 512, 512, t));
+        assert!(!auto_selects_small_kernel(8, 512, 512, 512, t));
+        assert!(!auto_selects_small_kernel(2, 1024, 1024, 1024, t));
+        for (dim, expect_small) in [(63, true), (65, false), (127, false), (129, true)] {
+            assert_eq!(
+                auto_selects_small_kernel(256, dim, dim, 1024, t),
+                expect_small,
+                "unexpected padding choice for {dim}x{dim}"
+            );
+        }
+        assert!(auto_selects_small_kernel(4, 512, 512, 512, t));
+        assert!(auto_selects_small_kernel(128, 128, 128, 128, t));
+        assert!(!auto_selects_small_kernel(1, 2048, 2048, 128, t));
+        assert!(!auto_selects_small_kernel(1, 2048, 2048, 2048, t));
+        assert!(!auto_selects_small_kernel(1, 4096, 1024, 1024, t));
+        assert!(!auto_selects_small_kernel(1, 1024, 4096, 1024, t));
     }
 
     #[test]
@@ -166,8 +213,9 @@ mod tests {
         assert_eq!(auto_min_large_tiles_for(VirtualGpu), u64::MAX);
         assert_eq!(auto_min_large_tiles_for(Other), u64::MAX);
 
-        assert!(auto_selects_small_kernel(1024, 1024, 1024, 256));
-        assert!(!auto_selects_small_kernel(1024, 1024, 1024, 64));
+        assert!(auto_selects_small_kernel(1, 1024, 1024, 1024, 256));
+        assert!(!auto_selects_small_kernel(1, 1024, 1024, 1024, 64));
+        assert!(auto_selects_small_kernel(2, 512, 512, 512, 64));
     }
 
     #[test]
@@ -215,6 +263,22 @@ mod tests {
         assert_eq!(
             auto_select_kernel(2, 512, 512, 512, 256),
             KernelSelection::Small
+        );
+        assert_eq!(
+            auto_select_kernel(8, 1024, 1024, 1024, 256),
+            KernelSelection::Large
+        );
+        assert_eq!(
+            auto_select_kernel(32, 512, 512, 512, 256),
+            KernelSelection::Large
+        );
+        assert_eq!(
+            auto_select_kernel(8, 512, 512, 512, 256),
+            KernelSelection::Large
+        );
+        assert_eq!(
+            auto_select_kernel(2, 1024, 1024, 1024, 256),
+            KernelSelection::Large
         );
         assert_eq!(
             auto_select_kernel(1, 2048, 2048, 2048, 256),

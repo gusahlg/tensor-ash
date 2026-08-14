@@ -13,14 +13,24 @@ mod common;
 
 #[path = "correctness/batch.rs"]
 mod batch;
+#[path = "correctness/decoder.rs"]
+mod decoder;
+#[path = "correctness/elementwise.rs"]
+mod elementwise;
 #[path = "correctness/epilogue.rs"]
 mod epilogue;
+#[path = "correctness/f16.rs"]
+mod f16;
 #[path = "correctness/graph.rs"]
 mod graph;
 #[path = "correctness/kernels.rs"]
 mod kernels;
 #[path = "correctness/ops.rs"]
 mod ops;
+#[path = "correctness/outer.rs"]
+mod outer;
+#[path = "correctness/prepared.rs"]
+mod prepared;
 #[path = "correctness/property.rs"]
 mod property;
 #[path = "correctness/row.rs"]
@@ -29,8 +39,6 @@ mod row;
 mod shapes;
 #[path = "correctness/splitk2.rs"]
 mod splitk2;
-#[path = "correctness/streamk.rs"]
-mod streamk;
 #[path = "correctness/submission.rs"]
 mod submission;
 #[path = "correctness/tuning.rs"]

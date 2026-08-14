@@ -23,14 +23,12 @@
 //! overlap of consecutive submissions).
 
 mod dispatch;
+mod elementwise;
+mod prepared;
 mod recording;
 mod reduction;
 mod slot;
-mod splitk;
 mod splitk2;
-mod streamk;
-mod streamk_exec;
-mod streamk_schedule;
 mod submission;
 mod transfer;
 mod tuning;
@@ -43,27 +41,37 @@ use anyhow::Result;
 use ash::vk;
 use parking_lot::{Condvar, Mutex};
 
-use crate::context::VulkanContext;
+use crate::context::{DeviceKind, VulkanContext};
 use crate::pipeline::MatmulPipeline;
 
 use slot::Slot;
-use splitk::SplitKPipeline;
-pub use splitk::default_num_k_splits;
 use splitk2::SplitK2Pipeline;
-pub use splitk2::SplitK2ReducePushConstants;
-use streamk::StreamKPipeline;
-pub use streamk::StreamKPushConstants;
-pub use streamk_schedule::{StreamKSchedule, stream_k_should_fire};
 
 pub use crate::matmul::{MatmulCall, RunStats};
+pub use elementwise::{CopyDesc, RopeDesc, SoftmaxMask};
+pub use prepared::PreparedOps;
 
-/// Fallback SM count for Stream-K's persistent-grid sizing on
-/// devices where we don't have a runtime probe yet.  46 matches the
-/// RTX 3070 we develop on; the value only drives the preferred grid
-/// width `g_pref = sm_count * 2`, so being slightly off is harmless.
-/// `src/persistent.rs::FALLBACK_SM_COUNT` carries the same constant
-/// for the persistent kernel.
-const STREAMK_FALLBACK_SM_COUNT: u32 = 46;
+/// Read-only description of the route selected for a plain matmul shape.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchInfo {
+    pub kernel: &'static str,
+    pub tile: [u32; 3],
+    pub split_k2_splits: Option<u32>,
+}
+
+impl DispatchInfo {
+    /// Describe an explicit two-stage split-K dispatch. This mirrors
+    /// [`Executor::run_matmuls_split_k2`] for benchmark diagnostics.
+    pub fn split_k2(m: u32, n: u32, splits: u32) -> Self {
+        let (kernel, tile) = splitk2::stage1_dispatch_info(m, n);
+        Self {
+            kernel,
+            tile,
+            split_k2_splits: Some(splits),
+        }
+    }
+}
 
 /// Explicit executor policy. Use [`Executor::new_with_config`] when a library
 /// caller must not depend on process-wide `ML_TUNE` state.
@@ -93,16 +101,12 @@ pub struct Executor {
     /// Maximum descriptor sets we'll allocate per submission (= max
     /// matmul calls in one `run_matmuls`).
     max_calls_per_submit: u32,
-    /// Experimental split-K pipeline, lazily built on first use of
-    /// `run_matmuls_split_k`.  See `executor/splitk.rs` for the design
-    /// rationale.
-    split_k: OnceLock<SplitKPipeline>,
     /// Two-stage split-K pipeline (scratch partials + reduce), lazily
     /// built on first use of `run_matmuls_split_k2`.
     split_k2: OnceLock<SplitK2Pipeline>,
-    /// Experimental Stream-K pipeline, lazily built on first use of
-    /// `run_matmuls_stream_k`.  See `executor/streamk.rs`.
-    stream_k: OnceLock<StreamKPipeline>,
+    /// Non-GEMM model ops (softmax/norm/RoPE/copy), lazily built on
+    /// first use of any `run_*` elementwise entry point.
+    elementwise: OnceLock<elementwise::ElementwisePipeline>,
     /// `ML_TUNE=1`: measure every eligible kernel the first time a new
     /// shape is submitted, record the winner in the pipeline's
     /// persistent tuning store, and use it from then on.  Off by
@@ -111,7 +115,93 @@ pub struct Executor {
     tune_enabled: bool,
 }
 
+/// Complete validated route for one op shape, resolved once per
+/// submission and handed to every consumer (descriptor updates, command
+/// recording, diagnostics).  Snapshotting up front keeps a concurrent
+/// first-use tune from splitting one submission across two registry
+/// states.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OpPlan {
+    /// Data-parallel kernel index into `KERNEL_SPECS`; used whenever
+    /// `splitk2` is `None`.
+    pub(crate) kernel: usize,
+    /// Validated two-stage split-K route (splits >= 2).  Only set for
+    /// call forms that may take it — single plain non-accumulating
+    /// ops, or graph ops (whose barriers make the internal one free).
+    pub(crate) splitk2: Option<u32>,
+}
+
 impl Executor {
+    /// Report the kernel and optional tuned split-K2 route a plain,
+    /// non-accumulating matmul (f32 B) would use. Useful for benchmark
+    /// diagnostics.
+    pub fn dispatch_info(&self, batch: u32, m: u32, n: u32, k: u32) -> DispatchInfo {
+        self.dispatch_info_for(batch, m, n, k, false)
+    }
+
+    /// Like [`Self::dispatch_info`] with the B storage type explicit:
+    /// `b_f16 = true` reports the route for an f16-weights matmul.
+    pub fn dispatch_info_for(
+        &self,
+        batch: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+        b_f16: bool,
+    ) -> DispatchInfo {
+        let plan = self.plan_shape(batch, m, n, k, b_f16, true);
+        let (kernel_name, tile) = match plan.splitk2 {
+            Some(_) => splitk2::stage1_dispatch_info(m, n),
+            None => {
+                let kernel = self.pipeline.kernel_at(plan.kernel);
+                (kernel.name, [kernel.tile_m, kernel.tile_n, kernel.tile_k])
+            }
+        };
+        DispatchInfo {
+            kernel: kernel_name,
+            tile,
+            split_k2_splits: plan.splitk2,
+        }
+    }
+
+    /// Resolve the complete route for one shape.  `splitk2_eligible`
+    /// captures the call form (single plain non-accumulating op, or a
+    /// graph op); the measured or conservative untuned split-K2 route is
+    /// validated against device addressing, grid, and scratch limits, so
+    /// a `Some` split count here is dispatchable as-is.
+    pub(super) fn plan_shape(
+        &self,
+        batch: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+        b_f16: bool,
+        splitk2_eligible: bool,
+    ) -> OpPlan {
+        let (kernel, tuned) = self.pipeline.route(batch, m, n, k, b_f16);
+        // Split-K2's stage-1 kernels read f32 B only, so f16-weight
+        // calls always take the data-parallel route.
+        let splitk2 = (splitk2_eligible
+            && !b_f16
+            && self.pipeline.is_auto()
+            && self.ctx.buffer_device_address_enabled)
+            .then(|| {
+                let heuristic = (tuned.is_none()
+                    && self.ctx.device_kind() == DeviceKind::DiscreteGpu)
+                    .then(|| splitk2::heuristic_splits(batch, m, n, k))
+                    .flatten();
+                let splits = splitk2::resolve_auto_splits(tuned, heuristic)?;
+                let max = self
+                    .ctx
+                    .device_properties
+                    .limits
+                    .max_compute_work_group_count;
+                splitk2::auto_route_fits(max, batch, m, n, k, splits).then_some(splits)
+            })
+            .flatten();
+        OpPlan { kernel, splitk2 }
+    }
+
     /// `n_slots` = how many submissions can be in flight at once. 2 is
     /// the sweet spot: one being recorded by the host while the other
     /// runs on the GPU.  Higher values benefit hosts that submit
@@ -160,9 +250,8 @@ impl Executor {
             slots: Mutex::new(slots),
             slot_avail: Condvar::new(),
             max_calls_per_submit,
-            split_k: OnceLock::new(),
             split_k2: OnceLock::new(),
-            stream_k: OnceLock::new(),
+            elementwise: OnceLock::new(),
             tune_enabled: config.tune,
         })
     }

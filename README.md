@@ -1,6 +1,6 @@
 # tensor-ash
 
-Version: `1.3.0`
+Version: `1.4.1`
 
 `tensor-ash` is a small Vulkan compute library for high-throughput FP32 matrix
 multiplication, written in Rust on top of [`ash`](https://crates.io/crates/ash).
@@ -50,9 +50,25 @@ callable GEMM component; those runtimes still need their own adapter layer.
 - **Graph submission** (`run_matmul_graph` / `run_op_graph`): dependent
   chains recorded into one command buffer with automatic hazard barriers;
   one fence wait per chain.
+- **Prepared submission** (`prepare_matmuls` / `prepare_ops` /
+  `prepare_op_graph`): validate, route, and record a fixed batch once, then
+  replay with one `vkQueueSubmit` per call; the split `submit`/`wait` lets two
+  prepared objects ping-pong so submission overlaps GPU execution (1.26x over
+  the synchronous path on the smallest GEMMs, 1.9x versus v1.4.1).
+- **Model ops** (`run_softmax_rows` / `run_rms_norm` / `run_layer_norm` /
+  `run_rope` / `run_copy_strided`): masked row softmax (exact-zero masked
+  tail — zero-padded KV caches compose exactly), bandwidth-rate RMSNorm /
+  LayerNorm, partial-rotary RoPE, and a generic strided copy for
+  transpose / KV-append / head reshaping. Together with fused-epilogue
+  GEMM these cover a full transformer decoder block.
+- **FP16 weights** (`Tensor::uninit_device_f16`): store B as IEEE half with
+  f32 accumulation — half the weight memory and ~1.9x on bandwidth-bound
+  decode GEMV shapes, neutral on compute-bound ones. The `&[f32]` host API
+  is unchanged (CPU round-to-nearest-even conversion); the auto-router and
+  tuner pick `f16w_*` kernels per storage type.
 - **Two-stage split-K** (`run_matmuls_split_k2`): deterministic scratch-plane
   partials + reduce, no atomics; up to 16x over the data-parallel path on
-  deep-K skinny shapes and auto-routed via the tuner.
+  deep-K skinny shapes and auto-routed by a conservative heuristic or tuner.
 - Manual override (`ML_KERNEL=...`) over the entire registry.
 - Persistent device-qualified Vulkan pipeline cache under
   `$XDG_CACHE_HOME/tensor-ash/`.
@@ -72,35 +88,26 @@ descriptor-bound tiles:
 - **BDA_V4 aligned** — strict no-bounds-check siblings of the 128x128 and
   m128n64k64 tiles for shapes where `M % BM == N % BN == K % BK == 0`.
   Sources only emit the LDG.E.128 / LDS.E.128 / FFMA hot path and the
-  STG.E.128 epilogue; the dispatcher promotes through `maybe_to_aligned`
-  when the shape qualifies.
-- **Row BDA** — one warp computes one output-row tile without materializing
-  the mostly-empty 64x64 tiles used by a general GEMM. It is selected
-  automatically for `M=1`, including large batches of private neural-network
-  layers, and supports the same broadcasting, accumulation, and fused
-  epilogues as the other bounds-checked BDA kernels.
+  STG.E.128 epilogue; they remain explicit experimental selections because
+  the specialization-constant V4 path is faster on the measured device.
+- **Row BDA** — eight K-slice warps cooperate on one output-row tile
+  without materializing the mostly-empty 64x64 tiles used by a general GEMM.
+  It is selected automatically for `M=1`, saturates memory bandwidth even for
+  a lone row, scales to large batches of private neural-network layers, and
+  supports the same broadcasting, accumulation, and fused epilogues as the
+  other bounds-checked BDA kernels.
+- **Column BDA** — one warp cooperatively reduces K for two output rows. It is
+  selected automatically for `N=1`, reuses B across the two rows, and supports
+  broadcasting, accumulation, and fused epilogues.
+- **Outer BDA** — register-only rank-1 update for `K=1`, where a tiled GEMM
+  wastes ~97% of its staging and math. Each thread owns a 4-row x vec4 tile
+  with no shared memory or barriers; selected automatically for `K=1` and
+  general-shape correct under explicit selection.
 
 On an RTX 3070, every tile we measured gains roughly +5-15% from BDA and
 another +5-15% from V4. The auto-selector promotes its picks to BDA_V4 at
 runtime when the device exposes `bufferDeviceAddress`, with a BDA fallback for
 `m64n32`. Explicit `ML_KERNEL=...` picks are honored verbatim.
-
-### Stream-K (experimental)
-
-The `Executor` exposes two opt-in entry points for shapes where the regular
-data-parallel dispatch leaves a small partial wave at the end:
-
-- `run_matmuls_stream_k(call)` always routes through the hybrid Stream-K
-  pipeline (CUTLASS-style DP-flat bulk dispatch + persistent SK-tail with
-  hardware `atomicAdd` from `VK_EXT_shader_atomic_float`).
-- `run_matmuls_auto_stream_k(call, tail_fraction_max)` consults a heuristic
-  gate and falls back to `run_matmuls` when Stream-K wouldn't help.
-
-Restrictions: single matmul, batch == 1, aligned shapes
-(`M%128 == N%128 == K%32 == 0`), `accumulate == false`, and the device must
-expose `shaderBufferFloat32AtomicAdd`. The gate is intentionally
-conservative — most showcase shapes still win on plain DP, so callers that
-don't know their workload should stick to `run_matmuls`.
 
 ## Requirements
 
@@ -190,22 +197,52 @@ exec.run_op_graph(&[
 
 The C ABI lives in `tensor-ash-capi` and is declared in
 `include/tensor_ash.h`. Errors return `-1` or null and can be inspected with
-`ta_last_error()`.
+`ta_last_error()`. The surface covers real inference workloads:
+
+- Lifecycle: `ta_context_create`, `ta_executor_create` /
+  `ta_executor_create_v2` (explicit tuning policy instead of `ML_TUNE`),
+  plus capability queries `ta_context_supports_f16` /
+  `ta_context_supports_bda`.
+- Tensors: f32 (`ta_tensor_create`) and f16-storage
+  (`ta_tensor_create_f16`, `ta_tensor_is_f16`) device tensors.
+  `ta_upload` / `ta_download` always take `float` on the host and convert
+  to/from half automatically for f16 tensors.
+- Ops: `ta_matmul` / `ta_matmul_batch` for plain GEMMs; `ta_run_ops` /
+  `ta_run_op_graph` for `ta_matmul_op` batches with fused epilogues
+  (bias, relu/silu/gelu, residual add-scaled or gating mul), the graph
+  variant inserting automatic barriers between dependent ops.
+- Model ops: `ta_softmax_rows` (full / prefix / causal masks via
+  `TA_SOFTMAX_MASK_*`), `ta_rms_norm`, `ta_layer_norm`, `ta_rope`
+  (`ta_rope_desc`), and `ta_copy_strided` (`ta_copy_desc`). In-place
+  (input == output) is allowed for softmax/norm/rope; `ta_copy_strided`
+  requires `src != dst`. All require `ta_context_supports_bda`.
+- Prepared replay: `ta_prepared_create` records a fixed op batch once;
+  `ta_prepared_run` or the pipelined `ta_prepared_submit` /
+  `ta_prepared_wait` replay it with one queue submit per call;
+  `ta_prepared_destroy` fence-waits. The executor and all referenced
+  tensors must outlive the `ta_prepared` handle (documented in the
+  header).
+- Diagnostics: `ta_dispatch_info_for` reports the selected kernel, tile,
+  and split-K route for a shape; `ta_tune_shape` pre-warms the measured
+  tuner.
 
 ```bash
 cargo build --release -p tensor-ash-capi
-cc -Iinclude examples/c_smoke.c -Ltarget/release -ltensor_ash \
+cc -Iinclude examples/c_smoke.c -Ltarget/release -ltensor_ash -lm \
   -Wl,-rpath,"$PWD/target/release" -o /tmp/tensor_ash_c_smoke
 nix-shell --run 'env LD_LIBRARY_PATH=target/release:$LD_LIBRARY_PATH /tmp/tensor_ash_c_smoke'
 ```
 
 The smoke test computes a 2x3 by 3x2 GEMM and verifies the expected
-`[58, 64, 139, 154]`.
+`[58, 64, 139, 154]`, then exercises a fused bias+SiLU op, prepared
+replay (including submit/wait), an f16-weights matmul, and the model
+ops (RMSNorm, prefix-masked softmax, strided-copy transpose) when the
+device supports them.
 
 ## Benchmark binary (`ml_bench`)
 
-Subcommands: `self-check`, `correctness`, `sweep`, `single`, `concurrent`,
-`transfer`. Useful env knobs:
+Subcommands: `self-check`, `correctness`, `sweep`, `single`, `cases`,
+`concurrent`, `transfer`. Useful env knobs:
 
 ```bash
 ML_B=4 ML_M=1024 ML_N=1024 ML_K=1024 cargo run --release -p ml-bench -- single
@@ -213,7 +250,13 @@ ML_KERNEL=k64_bda_v4 cargo run --release -p ml-bench -- single
 ML_TUNE=1 ML_M=768 ML_N=768 ML_K=768 cargo run --release -p ml-bench -- single
 ML_DEVICE=discrete cargo run --release -p ml-bench -- self-check
 ML_OUTPUT=csv ML_SWEEP=smoke cargo run --release -p ml-bench -- sweep
+ML_OUTPUT=csv cargo run --release -p ml-bench -- cases \
+  square,1,512,512,512 edge,1,511,513,515
 ```
+
+Timed runs validate sampled outputs outside the measurement window and report
+paired wall/GPU minimum, median, and p95 values. TFLOPS uses the median; CSV
+also identifies the selected kernel, tile, and split-K route.
 
 `ML_TUNE=1` measures every eligible kernel (and the two-stage split-K on
 deep-K shapes) the first time a shape is seen and persists the winner under
@@ -222,13 +265,14 @@ version + shader build. Persisted winners are applied on **every** run —
 tuning enabled or not — whenever `ML_KERNEL` is `auto`. Delete the store (or
 update the driver / rebuild shaders) to reset it.
 
-`ML_KERNEL=auto` is the default. Concrete names span every entry in
-`KERNEL_SPECS` currently contains 35 concrete choices. They include the
+`ML_KERNEL=auto` is the default. `KERNEL_SPECS` currently contains 37 concrete
+choices. They include the
 descriptor-bound tiles (`large`, `small`, `m64n128`, `m128n64`,
 `m128n64k64`, `m64n32`, `k64`, `bk16`, `v2`, `m64n128k64`,
 `m128n128_t4`, `m256n64`, `v3`), BDA / BDA_V4 and register-tile variants,
-the strict-aligned kernels, and `row_bda` for batched matrix-vector work. The
-authoritative names and aliases live together in `src/pipeline/catalog.rs`.
+the strict-aligned kernels, and the shape-specialized `row_bda` (`M=1`),
+`col_bda` (`N=1`), and `outer_bda` (`K=1`) kernels. The authoritative names
+and aliases live together in `src/pipeline/catalog.rs`.
 `ML_DEVICE` accepts `auto`, `discrete`, `integrated`, `virtual`, `cpu`,
 `index:N`, `name:TEXT`, or a bare name substring.
 
@@ -288,9 +332,11 @@ other GPUs).
   `64x64x8192` runs 16.5x faster than the data-parallel path
   (0.413→0.025 ms), `128x128x8192` 4.6x, `256x256x4096` 1.8x — and is
   deterministic, unlike the atomic split-K.
-- Median synchronous host/submission overhead: ~0.020 ms per GEMM call;
-  reported TFLOPS uses GPU timestamps and excludes it. Dependent chains can
-  amortize it via `run_matmul_graph` (one submission + one fence per chain).
+- Median synchronous host/submission overhead: ~0.010 ms per GEMM call (a
+  bounded spin before the blocking fence wait removed the scheduler wakeup);
+  reported TFLOPS uses GPU timestamps and excludes it. Dependent chains
+  amortize it via `run_matmul_graph`, and repeated fixed batches drop to
+  ~0.013 ms/call end-to-end with two ping-ponged `PreparedOps`.
 
 So: ahead of pure cuBLAS on geomean, decisively ahead of PyTorch CUDA, still
 trailing cuBLAS on a handful of big square / non-pow2 cases
@@ -331,9 +377,7 @@ src/
   executor/        Thread-safe dispatch facade over validation, transfers,
                    timed submission, recording, tuning, and reductions
     recording/     Descriptor updates and graph hazard/barrier recording
-    splitk.rs      Experimental atomic split-K pipeline
     splitk2.rs     Two-stage split-K (scratch partials + reduce, no atomics)
-    streamk*.rs    Experimental Stream-K pipeline, execution, and scheduling
   buffer.rs        Device/staging buffer wrappers (BDA-aware)
   tensor.rs        Context-owned tensor abstraction
 tools/ml-bench/    Independent benchmark CLI package, reports, and cases
@@ -348,8 +392,6 @@ shaders/
                                   Strict no-bounds-check BDA_V4 hot path
   matmul_splitk2_kernel.glsl      Two-stage split-K stage 1 (partial planes)
   matmul_f32_splitk2_reduce.comp  Two-stage split-K stage 2 (plane sum)
-  matmul_streamk_kernel.glsl      Stream-K SK-tail (persistent + atomicAdd)
-                                  (DP-flat bulk reuses the regular BDA_V4 body)
   matmul_f32*.comp                Tile wrappers; *_bda / *_bda_v4 siblings
 capi/                      C ABI workspace crate; lifecycle, tensor, and
                            matmul exports are split under capi/src/api/

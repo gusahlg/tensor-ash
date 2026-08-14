@@ -8,11 +8,53 @@ use crate::context::VulkanContext;
 use crate::matmul::{MatmulOp, ResolvedMatmul};
 use crate::pipeline::{KernelVariant, MatmulPipeline};
 
-use super::MatmulCall;
-use super::splitk::SplitKKernel;
+use super::OpPlan;
 
-pub(super) use descriptors::{update_matmul_descriptor_sets, update_split_k_descriptor_set};
+pub(super) use descriptors::update_matmul_descriptor_sets;
 pub(super) use graph::{GraphSplitK2, record_matmul_graph_commands};
+
+/// Full compute→compute execution + memory barrier.  One global
+/// `vk::MemoryBarrier` (rather than per-buffer barriers) — on every
+/// driver we target, buffer-granular compute barriers offer no extra
+/// overlap for back-to-back dispatches, and the single global barrier
+/// keeps recording cost flat.
+pub(super) fn record_compute_to_compute_barrier(ctx: &VulkanContext, cb: vk::CommandBuffer) {
+    let barrier = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+    unsafe {
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            std::slice::from_ref(&barrier),
+            &[],
+            &[],
+        );
+    }
+}
+
+fn ensure_kernel_alignment(kernel_name: &str, tile: [u32; 3], shape: [u32; 3]) -> Result<()> {
+    let required = if kernel_name == "v3_128x128_bk8_static" {
+        // V3 double-buffers exact pairs of BK=8 strips and has no edge/tail
+        // path. One pair (K=16) is the smallest safe reduction.
+        [tile[0], tile[1], 2 * tile[2]]
+    } else {
+        tile
+    };
+    let [tile_m, tile_n, tile_k] = required;
+    let [m, n, k] = shape;
+    if (kernel_name.ends_with("_aligned") || kernel_name == "v3_128x128_bk8_static")
+        && (!m.is_multiple_of(tile_m) || !n.is_multiple_of(tile_n) || !k.is_multiple_of(tile_k))
+    {
+        bail!(
+            "kernel '{kernel_name}' requires M/N/K aligned to ({tile_m}, {tile_n}, {tile_k}), \
+             got ({m}, {n}, {k})"
+        );
+    }
+    Ok(())
+}
 
 pub(super) fn record_matmul_commands(
     ctx: &VulkanContext,
@@ -21,15 +63,16 @@ pub(super) fn record_matmul_commands(
     descriptor_sets: &[vk::DescriptorSet],
     ops: &[MatmulOp<'_>],
     resolved: &[ResolvedMatmul],
+    plans: &[OpPlan],
 ) -> Result<()> {
     let mut bound_pipeline = vk::Pipeline::null();
-    for ((set, op), dims) in descriptor_sets
+    for (((set, op), dims), plan) in descriptor_sets
         .iter()
         .copied()
         .zip(ops.iter())
         .zip(resolved.iter())
+        .zip(plans.iter())
     {
-        let kernel = pipeline.select_kernel(dims.batch, dims.m, dims.n, dims.k);
         record_one_matmul(
             ctx,
             pipeline,
@@ -37,7 +80,7 @@ pub(super) fn record_matmul_commands(
             set,
             op,
             dims,
-            kernel,
+            pipeline.kernel_at(plan.kernel),
             &mut bound_pipeline,
         )?;
     }
@@ -46,8 +89,8 @@ pub(super) fn record_matmul_commands(
 }
 
 /// Record one dispatch with an explicitly-chosen kernel.  The regular
-/// paths resolve the kernel through `MatmulPipeline::select_kernel`;
-/// the auto-tuner forces each candidate in turn.
+/// paths resolve the kernel from the submission's per-op plans; the
+/// auto-tuner forces each candidate in turn.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record_one_matmul(
     ctx: &VulkanContext,
@@ -59,13 +102,34 @@ pub(super) fn record_one_matmul(
     kernel: &crate::pipeline::MatmulKernel,
     bound_pipeline: &mut vk::Pipeline,
 ) -> Result<()> {
+    ensure_kernel_alignment(
+        kernel.name,
+        [kernel.tile_m, kernel.tile_n, kernel.tile_k],
+        [dims.m, dims.n, dims.k],
+    )?;
+    // Storage-type agreement: an f16w kernel would misread f32 bits
+    // and vice versa.  Auto routes always agree; this guards explicit
+    // ML_KERNEL selections.
+    if kernel.weights_f16() != dims.b_f16 {
+        bail!(
+            "kernel '{}' expects {} B storage but B is {} (pick an {} kernel or unset ML_KERNEL)",
+            kernel.name,
+            if kernel.weights_f16() { "f16" } else { "f32" },
+            if dims.b_f16 { "f16" } else { "f32" },
+            if dims.b_f16 { "f16w_*" } else { "f32" },
+        );
+    }
+    if dims.b_f16 && !ctx.buffer_device_address_enabled {
+        bail!("f16-weight matmuls require bufferDeviceAddress, which this device lacks");
+    }
+
     let call = &op.call;
     let max_groups = ctx.device_properties.limits.max_compute_work_group_count;
     let (a_ptr, b_ptr, c_ptr) = if ctx.buffer_device_address_enabled {
         (
-            ctx.buffer_device_address(call.a.raw_buffer()),
-            ctx.buffer_device_address(call.b.raw_buffer()),
-            ctx.buffer_device_address(call.c.raw_buffer()),
+            call.a.device_address(),
+            call.b.device_address(),
+            call.c.device_address(),
         )
     } else {
         (0, 0, 0)
@@ -75,18 +139,19 @@ pub(super) fn record_one_matmul(
     // Pick the specialization variant whose constants match this call.
     // `interior_only` is safe whenever M and N are tile-aligned to the
     // selected kernel's tile size — the shader then skips all
-    // m_full/n_full bounds checks.
+    // m_full/n_full bounds checks.  `tile_k == 1` divides every K and
+    // those kernels (row/col/outer) never read K_MULTIPLE; forcing the
+    // flag false lets their plain unaligned dispatches resolve to the
+    // eager fallback pipeline instead of the lazy-cache mutex.
     let variant = KernelVariant {
         accumulate: call.accumulate,
         alpha_is_one: call.alpha == 1.0,
         interior_only: dims.m.is_multiple_of(kernel.tile_m) && dims.n.is_multiple_of(kernel.tile_n),
-        k_multiple: dims.k.is_multiple_of(kernel.tile_k),
+        k_multiple: kernel.tile_k > 1 && dims.k.is_multiple_of(kernel.tile_k),
     };
 
     let epilogue = &op.epilogue;
-    let variant_pipeline = if epilogue.is_none() {
-        kernel.pipeline_for(variant)
-    } else {
+    if !epilogue.is_none() {
         if !ctx.buffer_device_address_enabled {
             bail!("fused epilogues require bufferDeviceAddress, which this device lacks");
         }
@@ -98,7 +163,7 @@ pub(super) fn record_one_matmul(
             );
         }
         if let Some(bias) = epilogue.bias {
-            pc.bias_ptr = ctx.buffer_device_address(bias.raw_buffer());
+            pc.bias_ptr = bias.device_address();
             pc.bias_batch_stride = if bias.len() == dims.n as u64 {
                 0
             } else {
@@ -106,11 +171,11 @@ pub(super) fn record_one_matmul(
             };
         }
         if let Some(d) = epilogue.d_tensor() {
-            pc.d_ptr = ctx.buffer_device_address(d.raw_buffer());
+            pc.d_ptr = d.device_address();
         }
         pc.beta = epilogue.beta();
-        pipeline.pipeline_for_epilogue(kernel, variant, epilogue.key())?
-    };
+    }
+    let variant_pipeline = pipeline.pipeline_for_epilogue(kernel, variant, epilogue.key())?;
 
     let gx = dims.n.div_ceil(kernel.tile_n);
     let gy = dims.m.div_ceil(kernel.tile_m);
@@ -164,97 +229,30 @@ pub(super) fn record_one_matmul(
     Ok(())
 }
 
-/// Record a single split-K matmul into `cb`.  Zero-fills `C` first
-/// (`vkCmdFillBuffer` with 0) so the atomic-add reduction starts from
-/// a clean slate, then issues a buffer barrier and dispatches the
-/// split-K compute pipeline.
-///
-/// The push constant block is the standard `MatmulPushConstants`; we
-/// pack `num_k_splits` into the upper 16 bits of `flags`.  The lower
-/// 16 bits stay reserved for the existing flag set (currently only the
-/// `accumulate` bit, which split-K rejects in the executor anyway).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn record_matmul_split_k_commands(
-    ctx: &VulkanContext,
-    pipeline: &MatmulPipeline,
-    kernel: &SplitKKernel,
-    cb: vk::CommandBuffer,
-    descriptor_sets: &[vk::DescriptorSet],
-    call: &MatmulCall<'_>,
-    resolved: &ResolvedMatmul,
-    num_k_splits: u32,
-    gx: u32,
-    gy: u32,
-    gz: u32,
-) -> Result<()> {
-    if descriptor_sets.is_empty() {
-        bail!("record_matmul_split_k_commands: no descriptor set");
+#[cfg(test)]
+mod tests {
+    use super::ensure_kernel_alignment;
+
+    #[test]
+    fn strict_aligned_kernels_require_every_tile_multiple() {
+        let tile = [128, 128, 32];
+        assert!(ensure_kernel_alignment("large_bda_v4_aligned", tile, tile).is_ok());
+        for shape in [[127, 128, 32], [128, 127, 32], [128, 128, 31]] {
+            let err = ensure_kernel_alignment("large_bda_v4_aligned", tile, shape)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("requires M/N/K aligned"));
+        }
+        assert!(ensure_kernel_alignment("large_bda_v4", tile, [1, 1, 1]).is_ok());
+        let v3_tile = [128, 128, 8];
+        assert!(ensure_kernel_alignment("v3_128x128_bk8_static", v3_tile, [128, 128, 16]).is_ok());
+        for shape in [
+            [127, 128, 16],
+            [128, 127, 16],
+            [128, 128, 8],
+            [128, 128, 24],
+        ] {
+            assert!(ensure_kernel_alignment("v3_128x128_bk8_static", v3_tile, shape).is_err());
+        }
     }
-    let set = descriptor_sets[0];
-
-    let (a_ptr, b_ptr, c_ptr) = if ctx.buffer_device_address_enabled {
-        (
-            ctx.buffer_device_address(call.a.raw_buffer()),
-            ctx.buffer_device_address(call.b.raw_buffer()),
-            ctx.buffer_device_address(call.c.raw_buffer()),
-        )
-    } else {
-        bail!("split-K kernel requires bufferDeviceAddress");
-    };
-
-    let pc = resolved.split_k_push_constants(call.alpha, a_ptr, b_ptr, c_ptr, num_k_splits);
-
-    unsafe {
-        // Step 1: zero-fill the entire C buffer.  The atomic-add
-        // accumulator inside the kernel expects every cell to start at
-        // 0.0 (binary all-zeros).  vkCmdFillBuffer writes the u32 0,
-        // which is bit-identical to f32 0.0.
-        ctx.device
-            .cmd_fill_buffer(cb, call.c.raw_buffer(), 0, vk::WHOLE_SIZE, 0);
-
-        // Step 2: barrier so the fill completes before the shader
-        // reads/writes C.  TRANSFER -> COMPUTE_SHADER, and on the
-        // memory side TRANSFER_WRITE -> SHADER_READ|SHADER_WRITE
-        // (the kernel atomicCompSwap reads and writes the same cell).
-        let buf_barrier = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(call.c.raw_buffer())
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier),
-            &[],
-        );
-
-        // Step 3: bind pipeline + descriptor set + push constants and
-        // dispatch (N/BN, M/BM, batch*num_k_splits).
-        ctx.device
-            .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, kernel.pipeline);
-        ctx.device.cmd_bind_descriptor_sets(
-            cb,
-            vk::PipelineBindPoint::COMPUTE,
-            pipeline.pipeline_layout,
-            0,
-            std::slice::from_ref(&set),
-            &[],
-        );
-        ctx.device.cmd_push_constants(
-            cb,
-            pipeline.pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            bytemuck::bytes_of(&pc),
-        );
-        ctx.device.cmd_dispatch(cb, gx, gy, gz);
-    }
-
-    Ok(())
 }

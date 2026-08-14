@@ -14,6 +14,14 @@ fn shape_sweep_rank2() {
         (8, 7, 5),
         (17, 19, 23),
         (31, 33, 47),
+        (65, 67, 15),
+        (65, 67, 16),
+        (65, 67, 17),
+        (65, 67, 31),
+        (65, 67, 32),
+        (65, 67, 33),
+        (65, 67, 63),
+        (65, 67, 65),
         (64, 64, 64),
         (128, 128, 128),
         (129, 130, 131),
@@ -33,15 +41,31 @@ fn shape_sweep_rank2() {
             13,
             None,
         );
-        let (e, idx) = max_abs_err(&gpu, &cpu);
-        let tol = tolerance(k);
-        assert!(
-            e <= tol,
-            "rank2 M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-             at idx {idx}: gpu={:.6} cpu={:.6}",
-            gpu[idx],
-            cpu[idx],
+        assert_close(&gpu, &cpu, k, &format!("rank2 M={m} N={n} K={k}"));
+    }
+}
+
+#[test]
+#[ignore]
+fn strict_aligned_kernels_match_cpu_on_supported_shapes() {
+    for (selection, m, n, k) in [
+        (KernelSelection::LargeBdaV4Aligned, 128, 128, 32),
+        (KernelSelection::M128N64K64BdaV4Aligned, 128, 64, 64),
+    ] {
+        let (ctx, exec) = make_setup_with_kernel(1, 4, selection);
+        let (gpu, cpu) = run_one(
+            &ctx,
+            &exec,
+            &[m, k],
+            &[k, n],
+            &[m, n],
+            1.0,
+            false,
+            139,
+            149,
+            None,
         );
+        assert_close(&gpu, &cpu, k, &format!("aligned {selection:?}"));
     }
 }
 
@@ -62,15 +86,7 @@ fn large_tile_kernel_path() {
         19,
         None,
     );
-    let (e, idx) = max_abs_err(&gpu, &cpu);
-    let tol = tolerance(k);
-    assert!(
-        e <= tol,
-        "large-tile M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-         at idx {idx}: gpu={:.6} cpu={:.6}",
-        gpu[idx],
-        cpu[idx],
-    );
+    assert_close(&gpu, &cpu, k, &format!("large-tile M={m} N={n} K={k}"));
 }
 
 #[test]
@@ -90,14 +106,11 @@ fn manual_large_kernel_handles_partial_tiles() {
         29,
         None,
     );
-    let (e, idx) = max_abs_err(&gpu, &cpu);
-    let tol = tolerance(k);
-    assert!(
-        e <= tol,
-        "manual large partial tile M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-         at idx {idx}: gpu={:.6} cpu={:.6}",
-        gpu[idx],
-        cpu[idx],
+    assert_close(
+        &gpu,
+        &cpu,
+        k,
+        &format!("manual large partial tile M={m} N={n} K={k}"),
     );
 }
 
@@ -121,15 +134,7 @@ fn manual_m64n128_kernel_handles_wide_and_partial_tiles() {
             seed_b,
             None,
         );
-        let (e, idx) = max_abs_err(&gpu, &cpu);
-        let tol = tolerance(k);
-        assert!(
-            e <= tol,
-            "m64n128 M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-             at idx {idx}: gpu={:.6} cpu={:.6}",
-            gpu[idx],
-            cpu[idx],
-        );
+        assert_close(&gpu, &cpu, k, &format!("m64n128 M={m} N={n} K={k}"));
     }
 }
 
@@ -153,15 +158,7 @@ fn manual_m128n64_kernel_handles_tall_and_partial_tiles() {
             seed_b,
             None,
         );
-        let (e, idx) = max_abs_err(&gpu, &cpu);
-        let tol = tolerance(k);
-        assert!(
-            e <= tol,
-            "m128n64 M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-             at idx {idx}: gpu={:.6} cpu={:.6}",
-            gpu[idx],
-            cpu[idx],
-        );
+        assert_close(&gpu, &cpu, k, &format!("m128n64 M={m} N={n} K={k}"));
     }
 }
 
@@ -185,15 +182,7 @@ fn manual_m128n64k64_kernel_handles_deep_k_and_tail() {
             seed_b,
             None,
         );
-        let (e, idx) = max_abs_err(&gpu, &cpu);
-        let tol = tolerance(k);
-        assert!(
-            e <= tol,
-            "m128n64k64 M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-             at idx {idx}: gpu={:.6} cpu={:.6}",
-            gpu[idx],
-            cpu[idx],
-        );
+        assert_close(&gpu, &cpu, k, &format!("m128n64k64 M={m} N={n} K={k}"));
     }
 }
 
@@ -217,15 +206,7 @@ fn manual_m64n32_kernel_handles_near_square_partial_tiles() {
             seed_b,
             None,
         );
-        let (e, idx) = max_abs_err(&gpu, &cpu);
-        let tol = tolerance(k);
-        assert!(
-            e <= tol,
-            "m64n32 M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-             at idx {idx}: gpu={:.6} cpu={:.6}",
-            gpu[idx],
-            cpu[idx],
-        );
+        assert_close(&gpu, &cpu, k, &format!("m64n32 M={m} N={n} K={k}"));
     }
 }
 
@@ -249,15 +230,7 @@ fn manual_k64_kernel_handles_small_k_and_tail() {
             seed_b,
             None,
         );
-        let (e, idx) = max_abs_err(&gpu, &cpu);
-        let tol = tolerance(k);
-        assert!(
-            e <= tol,
-            "k64 M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-             at idx {idx}: gpu={:.6} cpu={:.6}",
-            gpu[idx],
-            cpu[idx],
-        );
+        assert_close(&gpu, &cpu, k, &format!("k64 M={m} N={n} K={k}"));
     }
 }
 
@@ -317,6 +290,11 @@ fn v4_kernels_handle_n_not_multiple_of_4() {
             // Larger N with both an interior tile column and a
             // bounds-checked column.
             (tile_m * 2u32, tile_n * 2u32 + 1u32, 64u32, 131u64, 137u64),
+            // K-aligned M/N edges exercise the per-operand vec4 recovery:
+            // interior workgroups vector-load while the final tile stays
+            // bounds checked.
+            (tile_m + 1u32, tile_n, 64u32, 139u64, 149u64),
+            (tile_m, tile_n + 4u32, 64u32, 151u64, 157u64),
         ] {
             let (gpu, cpu) = run_one(
                 &ctx,
@@ -330,15 +308,7 @@ fn v4_kernels_handle_n_not_multiple_of_4() {
                 seed_b,
                 None,
             );
-            let (e, idx) = max_abs_err(&gpu, &cpu);
-            let tol = tolerance(k);
-            assert!(
-                e <= tol,
-                "{name} M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-                 at idx {idx}: gpu={:.6} cpu={:.6}",
-                gpu[idx],
-                cpu[idx],
-            );
+            assert_close(&gpu, &cpu, k, &format!("{name} M={m} N={n} K={k}"));
         }
     }
 }

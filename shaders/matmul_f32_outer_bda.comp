@@ -1,0 +1,145 @@
+#version 460
+// K=1 outer-product path. C[m,n] = alpha * A[m] * B[n] touches M + N
+// input floats to produce M*N outputs, so store bandwidth is the whole
+// cost; the tiled GEMM kernels waste ~97% of their shared-memory
+// staging and FMA work here. Each thread owns a TM x 4 register tile
+// (no shared memory, no barriers) and streams vec4 stores. The tiny
+// inner loop keeps the kernel correct for any K, but the auto-selector
+// only routes K=1 through it.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+layout(constant_id = 0) const bool ACCUMULATE = false;
+layout(constant_id = 1) const bool ALPHA_IS_ONE = true;
+layout(constant_id = 2) const bool INTERIOR_ONLY = false;
+layout(constant_id = 3) const bool K_MULTIPLE = false;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer F32V4ReadOnly {
+    vec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict buffer F32V4ReadWrite {
+    vec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32ReadWrite {
+    float v[];
+};
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_c;
+    uint flags;
+    float alpha;
+    F32ReadOnly a_ptr;
+    F32ReadOnly b_ptr;
+    F32ReadWrite c_ptr;
+    F32ReadOnly d_ptr;
+    F32ReadOnly bias_ptr;
+    float beta;
+    uint bias_batch_stride;
+} pc;
+
+#include "matmul_epilogue_common.glsl"
+
+const uint TM = 4u;
+
+void main() {
+    const uint batch = gl_WorkGroupID.z;
+    const uint row0 = gl_WorkGroupID.y * (gl_WorkGroupSize.y * TM) + gl_LocalInvocationID.y * TM;
+    const uint col0 = (gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x) * 4u;
+    const uint a_base = batch * pc.batch_stride_a;
+    const uint b_base = batch * pc.batch_stride_b;
+    const uint c_base = batch * pc.batch_stride_c;
+    const float alpha = ALPHA_IS_ONE ? 1.0 : pc.alpha;
+
+    if (INTERIOR_ONLY) {
+        // The interior contract (M % 16 == 0, N % 128 == 0) plus the
+        // element batch strides make every vec4 index 16-byte aligned.
+        F32V4ReadOnly b_v4 = F32V4ReadOnly(uint64_t(pc.b_ptr));
+        F32V4ReadWrite c_v4 = F32V4ReadWrite(uint64_t(pc.c_ptr));
+        F32ReadWrite c_s = pc.c_ptr;
+        vec4 acc[TM];
+        [[unroll]] for (uint i = 0u; i < TM; ++i) acc[i] = vec4(0.0);
+        for (uint kk = 0u; kk < pc.K; ++kk) {
+            const vec4 b4 = b_v4.v[(b_base + kk * pc.N + col0) >> 2u];
+            [[unroll]] for (uint i = 0u; i < TM; ++i)
+                acc[i] = fma(vec4(pc.a_ptr.v[a_base + (row0 + i) * pc.K + kk]), b4, acc[i]);
+        }
+        [[unroll]] for (uint i = 0u; i < TM; ++i) {
+            vec4 v = ALPHA_IS_ONE ? acc[i] : alpha * acc[i];
+            const uint c_addr = c_base + (row0 + i) * pc.N + col0;
+            if (ACCUMULATE) {
+                v.x = c_s.v[c_addr + 0u] + v.x;
+                v.y = c_s.v[c_addr + 1u] + v.y;
+                v.z = c_s.v[c_addr + 2u] + v.z;
+                v.w = c_s.v[c_addr + 3u] + v.w;
+            }
+            if (EPI_ANY) v = epi_apply4(v, c_addr >> 2u, col0 >> 2u, batch);
+            if (ACCUMULATE) {
+                c_s.v[c_addr + 0u] = v.x;
+                c_s.v[c_addr + 1u] = v.y;
+                c_s.v[c_addr + 2u] = v.z;
+                c_s.v[c_addr + 3u] = v.w;
+            } else {
+                c_v4.v[c_addr >> 2u] = v;
+            }
+        }
+    } else if (row0 + TM <= pc.M && col0 + 4u <= pc.N) {
+        // Fully in-bounds workgroup of an edge dispatch: unguarded
+        // loads and vec4 math, but scalar stores — pc.N may not be a
+        // multiple of 4, so cross-row strides break vec4 alignment.
+        vec4 acc[TM];
+        [[unroll]] for (uint i = 0u; i < TM; ++i) acc[i] = vec4(0.0);
+        for (uint kk = 0u; kk < pc.K; ++kk) {
+            const uint b_idx = b_base + kk * pc.N + col0;
+            const vec4 b4 = vec4(
+                pc.b_ptr.v[b_idx],
+                pc.b_ptr.v[b_idx + 1u],
+                pc.b_ptr.v[b_idx + 2u],
+                pc.b_ptr.v[b_idx + 3u]);
+            [[unroll]] for (uint i = 0u; i < TM; ++i)
+                acc[i] = fma(vec4(pc.a_ptr.v[a_base + (row0 + i) * pc.K + kk]), b4, acc[i]);
+        }
+        [[unroll]] for (uint i = 0u; i < TM; ++i) {
+            vec4 v = ALPHA_IS_ONE ? acc[i] : alpha * acc[i];
+            const uint c_idx = c_base + (row0 + i) * pc.N + col0;
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                float s = v[j];
+                if (ACCUMULATE) s += pc.c_ptr.v[c_idx + j];
+                if (EPI_ANY) s = epi_apply(s, c_idx + j, col0 + j, batch);
+                pc.c_ptr.v[c_idx + j] = s;
+            }
+        }
+    } else {
+        [[unroll]] for (uint i = 0u; i < TM; ++i) {
+            const uint row = row0 + i;
+            if (row >= pc.M) break;
+            for (uint j = 0u; j < 4u && col0 + j < pc.N; ++j) {
+                const uint col = col0 + j;
+                float acc = 0.0;
+                for (uint kk = 0u; kk < pc.K; ++kk)
+                    acc = fma(
+                        pc.a_ptr.v[a_base + row * pc.K + kk],
+                        pc.b_ptr.v[b_base + kk * pc.N + col],
+                        acc);
+                const uint c_idx = c_base + row * pc.N + col;
+                float v = ALPHA_IS_ONE ? acc : alpha * acc;
+                if (ACCUMULATE) v += pc.c_ptr.v[c_idx];
+                if (EPI_ANY) v = epi_apply(v, c_idx, col, batch);
+                pc.c_ptr.v[c_idx] = v;
+            }
+        }
+    }
+}

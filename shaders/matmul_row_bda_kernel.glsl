@@ -1,0 +1,105 @@
+// One output row per workgroup-row, one output column per lane, with
+// eight K-slice warps cooperating on the same 32 columns. A single-warp
+// version ran a lone 1x4096x4096 GEMV on only ~128 warps (~180 GB/s on
+// a 46-SM GA104); slicing K eight ways multiplies the resident warps
+// without changing the fully coalesced per-warp B row access. The
+// shared-memory reduce runs in a fixed order, so results stay
+// deterministic. Correct for arbitrary M through gl_WorkGroupID.y.
+//
+// Compile-time inputs (set by the .comp wrapper):
+//     B_F16 (optional): B is stored as IEEE half; loads convert to f32
+//     before the FMA, halving global B traffic (the GEMV bottleneck).
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#ifdef B_F16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(constant_id = 0) const bool ACCUMULATE = false;
+layout(constant_id = 1) const bool ALPHA_IS_ONE = true;
+layout(constant_id = 2) const bool INTERIOR_ONLY = false;
+layout(constant_id = 3) const bool K_MULTIPLE = false;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer F32V4ReadOnly {
+    vec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32ReadWrite {
+    float v[];
+};
+#ifdef B_F16
+layout(buffer_reference, std430, buffer_reference_align = 2) restrict readonly buffer F16ReadOnly {
+    float16_t v[];
+};
+#endif
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_c;
+    uint flags;
+    float alpha;
+    F32ReadOnly a_ptr;
+    F32ReadOnly b_ptr;
+    F32ReadWrite c_ptr;
+    F32ReadOnly d_ptr;
+    F32ReadOnly bias_ptr;
+    float beta;
+    uint bias_batch_stride;
+} pc;
+
+#include "matmul_epilogue_common.glsl"
+
+shared float partial[8][32];
+
+void main() {
+    const uint batch = gl_WorkGroupID.z;
+    const uint row = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint slice = gl_LocalInvocationID.y;
+    const uint col = gl_WorkGroupID.x * 32u + lane;
+    // No early return: every thread must reach the barrier. Dead lanes
+    // (column out of range) contribute a zero partial.
+    const bool live = INTERIOR_ONLY || col < pc.N;
+
+    const uint a_base = batch * pc.batch_stride_a + row * pc.K;
+    const uint b_base = batch * pc.batch_stride_b + col;
+#ifdef B_F16
+    F16ReadOnly b = F16ReadOnly(uint64_t(pc.b_ptr));
+#else
+    F32ReadOnly b = pc.b_ptr;
+#endif
+    float acc = 0.0;
+    if (live) {
+        for (uint inner = slice; inner < pc.K; inner += 8u) {
+            acc = fma(
+                pc.a_ptr.v[a_base + inner],
+                float(b.v[b_base + inner * pc.N]),
+                acc
+            );
+        }
+    }
+    partial[slice][lane] = acc;
+    barrier();
+
+    if (slice == 0u && live) {
+        float sum = partial[0][lane];
+        [[unroll]] for (uint s = 1u; s < 8u; ++s) sum += partial[s][lane];
+        const uint c_index = batch * pc.batch_stride_c + row * pc.N + col;
+        float value = ALPHA_IS_ONE ? sum : pc.alpha * sum;
+        if (ACCUMULATE) value += pc.c_ptr.v[c_index];
+        if (EPI_ANY) value = epi_apply(value, c_index, col, batch);
+        pc.c_ptr.v[c_index] = value;
+    }
+}

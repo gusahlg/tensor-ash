@@ -33,19 +33,21 @@
 
 pub mod buffer;
 pub mod context;
+pub mod dtype;
 pub mod executor;
 pub mod matmul;
-pub mod persistent;
 pub mod pipeline;
 pub mod tensor;
 
 pub use buffer::{Buffer, BufferLocation};
 pub use context::{DeviceKind, DevicePreference, DeviceSummary, VulkanContext};
-pub use executor::{Executor, ExecutorConfig};
+pub use dtype::DType;
+pub use executor::{
+    CopyDesc, DispatchInfo, Executor, ExecutorConfig, PreparedOps, RopeDesc, SoftmaxMask,
+};
 pub use matmul::{
     Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, MatrixShape, RunStats,
 };
-pub use persistent::PersistentMatmul;
 pub use pipeline::{
     EpilogueKey, KERNEL_SPECS, KernelSelection, KernelSpec, KernelVariant, MatmulKernel,
     MatmulPipeline, MatmulPushConstants,

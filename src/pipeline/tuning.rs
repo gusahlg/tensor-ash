@@ -12,10 +12,18 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::context::VulkanContext;
 
 use super::catalog::KERNEL_SPECS;
+
+const SPLITK2_SPIRV: [&[u8]; 3] = [
+    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_splitk2_m128n128.spv")),
+    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_splitk2_m64n64.spv")),
+    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_splitk2_reduce.spv")),
+];
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// One GEMM problem shape.  `accumulate` / `alpha` / epilogues change
 /// only the store path, which never flips the kernel ranking, so they
@@ -26,6 +34,10 @@ pub(crate) struct TuneKey {
     pub m: u32,
     pub n: u32,
     pub k: u32,
+    /// f16-storage B routes tune within the `f16w_*` candidate set;
+    /// the same (B,M,N,K) shape may hold a different winner per
+    /// storage type.
+    pub b_f16: bool,
 }
 
 /// Measured winner for one shape.
@@ -51,6 +63,12 @@ pub(super) fn shader_registry_hash() -> u64 {
             h = h.wrapping_mul(0x100000001b3);
         }
     }
+    for spv in SPLITK2_SPIRV {
+        for &b in spv {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
     h
 }
 
@@ -67,7 +85,7 @@ pub(super) fn tune_store_path(ctx: &VulkanContext) -> Option<PathBuf> {
 
 fn header_line(ctx: &VulkanContext, shader_hash: u64) -> String {
     format!(
-        "tensor-ash-tune-v1 driver={} shaders={shader_hash:016x}",
+        "tensor-ash-tune-v3 driver={} shaders={shader_hash:016x}",
         ctx.device_summary.driver_version
     )
 }
@@ -104,13 +122,26 @@ pub(super) fn load_tuned(ctx: &VulkanContext, shader_hash: u64) -> HashMap<TuneK
         let Some(idx) = KERNEL_SPECS.iter().position(|s| s.name == name) else {
             continue;
         };
-        let splitk2_splits = it
-            .next()
-            .and_then(|tok| tok.strip_prefix("splitk2="))
-            .and_then(|s| s.parse::<u32>().ok())
-            .filter(|s| (2..=0xFFFF).contains(s));
+        let mut splitk2_splits = None;
+        let mut b_f16 = false;
+        for tok in it {
+            if let Some(splits) = tok.strip_prefix("splitk2=") {
+                splitk2_splits = splits
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|s| (2..=0xFFFF).contains(s));
+            } else if tok == "bf16" {
+                b_f16 = true;
+            }
+        }
         map.insert(
-            TuneKey { batch, m, n, k },
+            TuneKey {
+                batch,
+                m,
+                n,
+                k,
+                b_f16,
+            },
             TuneEntry {
                 kernel: idx,
                 splitk2_splits,
@@ -133,7 +164,7 @@ pub(super) fn save_tuned(ctx: &VulkanContext, shader_hash: u64, map: &HashMap<Tu
         out.push_str(&header_line(ctx, shader_hash));
         out.push('\n');
         let mut entries: Vec<_> = map.iter().collect();
-        entries.sort_by_key(|(key, _)| (key.batch, key.m, key.n, key.k));
+        entries.sort_by_key(|(key, _)| (key.batch, key.m, key.n, key.k, key.b_f16));
         for (key, entry) in entries {
             out.push_str(&format!(
                 "{} {} {} {} {}",
@@ -142,10 +173,20 @@ pub(super) fn save_tuned(ctx: &VulkanContext, shader_hash: u64, map: &HashMap<Tu
             if let Some(splits) = entry.splitk2_splits {
                 out.push_str(&format!(" splitk2={splits}"));
             }
+            if key.b_f16 {
+                out.push_str(" bf16");
+            }
             out.push('\n');
         }
-        let mut f = std::fs::File::create(&path)?;
-        f.write_all(out.as_bytes())
+        let temporary = path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut f = std::fs::File::create(&temporary)?;
+        f.write_all(out.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(temporary, &path)
     };
     if let Err(err) = write() {
         log::warn!(

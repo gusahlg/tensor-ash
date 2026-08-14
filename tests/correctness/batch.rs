@@ -24,12 +24,7 @@ fn batched_no_broadcast() {
             23,
             None,
         );
-        let (e, _) = max_abs_err(&gpu, &cpu);
-        let tol = tolerance(k);
-        assert!(
-            e <= tol,
-            "B={bsz} M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e}"
-        );
+        assert_close(&gpu, &cpu, k, &format!("B={bsz} M={m} N={n} K={k}"));
     }
 }
 
@@ -51,8 +46,7 @@ fn batched_broadcast_a() {
         37,
         None,
     );
-    let (e, _) = max_abs_err(&gpu, &cpu);
-    assert!(e <= tolerance(k), "broadcast A err={e:.3e}");
+    assert_close(&gpu, &cpu, k, "broadcast A");
 }
 
 #[test]
@@ -73,8 +67,7 @@ fn batched_broadcast_b() {
         43,
         None,
     );
-    let (e, _) = max_abs_err(&gpu, &cpu);
-    assert!(e <= tolerance(k), "broadcast B err={e:.3e}");
+    assert_close(&gpu, &cpu, k, "broadcast B");
 }
 
 #[test]
@@ -95,6 +88,5 @@ fn batched_broadcast_both_inputs() {
         47,
         None,
     );
-    let (e, _) = max_abs_err(&gpu, &cpu);
-    assert!(e <= tolerance(k), "broadcast A+B err={e:.3e}");
+    assert_close(&gpu, &cpu, k, "broadcast A+B");
 }

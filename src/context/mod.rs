@@ -19,6 +19,14 @@ use parking_lot::Mutex;
 
 pub use device::{DeviceKind, DevicePreference, DeviceSummary};
 
+pub(crate) fn timestamp_delta(start: u64, end: u64, valid_bits: u32) -> u64 {
+    let delta = end.wrapping_sub(start);
+    match valid_bits {
+        1..64 => delta & ((1u64 << valid_bits) - 1),
+        _ => delta,
+    }
+}
+
 pub struct VulkanContext {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
@@ -32,6 +40,8 @@ pub struct VulkanContext {
     pub queue: Mutex<vk::Queue>,
     /// Nanoseconds-per-tick reported by the driver for GPU timestamps.
     pub timestamp_period_ns: f64,
+    /// Number of valid low bits in timestamps from the selected queue.
+    pub timestamp_valid_bits: u32,
     pub timestamps_supported: bool,
     /// Whether `VK_KHR_buffer_device_address` (= Vulkan 1.2
     /// `bufferDeviceAddress`) was successfully enabled.  Required for
@@ -43,6 +53,15 @@ pub struct VulkanContext {
     /// this, Stream-K pipeline creation is rejected and callers fall
     /// back to the regular DP path.
     pub shader_buffer_float32_atomic_add_enabled: bool,
+    /// Whether `shaderFloat16` + `storageBuffer16BitAccess` were both
+    /// enabled.  Required for the f16-storage kernel variants; without
+    /// it f16 tensors are rejected at matmul time and the f16 kernels
+    /// are not built.
+    pub f16_storage_enabled: bool,
+    /// Whether `VK_KHR_cooperative_matrix` was enabled (with the
+    /// Vulkan memory model).  Required for the tensor-core `coopmat`
+    /// kernels; `ML_NO_COOPMAT=1` forces it off.
+    pub coopmat_enabled: bool,
     /// Pipeline cache, seeded from disk on init and flushed back on drop.
     /// Persisting it avoids the SPIR-V -> ISA recompile (50-200 ms on
     /// NVIDIA) on every cold start.
@@ -130,7 +149,7 @@ impl VulkanContext {
 
     pub fn diagnostics(&self) -> String {
         format!(
-            "device #{}: {} ({}, Vulkan {}, vendor=0x{:04x}, device=0x{:04x}, driver={}, compute_family={}, timestamps={})",
+            "device #{}: {} ({}, Vulkan {}, vendor=0x{:04x}, device=0x{:04x}, driver={}, compute_family={}, timestamps={} ({} bits))",
             self.device_summary.index,
             self.device_summary.name,
             self.device_summary.kind.as_str(),
@@ -140,6 +159,7 @@ impl VulkanContext {
             self.device_summary.driver_version,
             self.compute_family,
             self.timestamps_supported,
+            self.timestamp_valid_bits,
         )
     }
 }

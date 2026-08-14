@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 
 use super::{MatmulCall, MatmulOp};
+use crate::dtype::DType;
 use crate::pipeline::MatmulPushConstants;
 use crate::tensor::Tensor;
 
@@ -48,13 +49,30 @@ impl MatrixShape {
     }
 
     fn batch_stride(self, label: &'static str) -> Result<u32> {
-        if self.batch == 1 {
-            Ok(0)
+        let plane_elements = checked_product([self.rows as u64, self.cols as u64])
+            .ok_or_else(|| anyhow!("{label} matrix size overflows u64"))?;
+        let stride = if self.batch == 1 {
+            0
         } else {
-            self.rows
-                .checked_mul(self.cols)
-                .ok_or_else(|| anyhow!("{label} batch stride overflows u32"))
+            u32::try_from(plane_elements)
+                .map_err(|_| anyhow!("{label} batch stride overflows u32"))?
+        };
+
+        // Shader address expressions are `uint`. A contiguous layout is
+        // addressable when its element count is at most 2^32, because the
+        // largest zero-based offset is then exactly `u32::MAX`.
+        let addressable = checked_product([self.batch as u64, plane_elements])
+            .map(|elements| elements <= u32::MAX as u64 + 1)
+            .unwrap_or(false);
+        if !addressable {
+            bail!(
+                "{label} layout exceeds shader u32 indexing: B={} rows={} cols={}",
+                self.batch,
+                self.rows,
+                self.cols
+            );
         }
+        Ok(stride)
     }
 }
 
@@ -68,6 +86,8 @@ pub(crate) struct ResolvedMatmul {
     pub batch_stride_b: u32,
     pub batch_stride_c: u32,
     pub total_flops: u64,
+    /// B is stored as f16; routes must pick an `f16w_*` kernel.
+    pub b_f16: bool,
 }
 
 pub(crate) enum ResolvedMatmulBatch {
@@ -96,11 +116,27 @@ impl ResolvedMatmulBatch {
 
 impl ResolvedMatmul {
     pub(crate) fn from_call(call: &MatmulCall<'_>) -> Result<Self> {
-        Self::from_matrix_shapes(
+        // Storage types: A and C must be f32; B may be f16 (weights).
+        // The f16 kernels convert B on load and accumulate in f32.
+        if call.a.dtype() != DType::F32 {
+            bail!(
+                "matmul A must be f32 storage (got {})",
+                call.a.dtype().name()
+            );
+        }
+        if call.c.dtype() != DType::F32 {
+            bail!(
+                "matmul C must be f32 storage (got {})",
+                call.c.dtype().name()
+            );
+        }
+        let mut resolved = Self::from_matrix_shapes(
             MatrixShape::from_tensor(call.a)?,
             MatrixShape::from_tensor(call.b)?,
             MatrixShape::from_tensor(call.c)?,
-        )
+        )?;
+        resolved.b_f16 = call.b.dtype() == DType::F16;
+        Ok(resolved)
     }
 
     pub(crate) fn from_op(op: &MatmulOp<'_>) -> Result<Self> {
@@ -112,15 +148,21 @@ impl ResolvedMatmul {
     fn validate_epilogue(&self, op: &MatmulOp<'_>) -> Result<()> {
         if let Some(bias) = op.epilogue.bias {
             self.validate_bias_shape(bias.shape())?;
+            if bias.dtype() != DType::F32 {
+                bail!("epilogue bias must be f32 storage");
+            }
         }
-        if let Some(d) = op.epilogue.d_tensor()
-            && d.shape() != op.call.c.shape()
-        {
-            bail!(
-                "epilogue D shape {:?} must equal C shape {:?}",
-                d.shape(),
-                op.call.c.shape()
-            );
+        if let Some(d) = op.epilogue.d_tensor() {
+            if d.shape() != op.call.c.shape() {
+                bail!(
+                    "epilogue D shape {:?} must equal C shape {:?}",
+                    d.shape(),
+                    op.call.c.shape()
+                );
+            }
+            if d.dtype() != DType::F32 {
+                bail!("epilogue D operand must be f32 storage");
+            }
         }
         Ok(())
     }
@@ -220,6 +262,7 @@ impl ResolvedMatmul {
             batch_stride_b: b.batch_stride("B")?,
             batch_stride_c: c.batch_stride("C")?,
             total_flops: checked_flops(c.batch, a.rows, b.cols, a.cols)?,
+            b_f16: false,
         })
     }
 }
@@ -248,10 +291,12 @@ fn ensure_broadcastable(label: &str, input_batch: u32, output_batch: u32) -> Res
 }
 
 fn checked_flops(batch: u32, m: u32, n: u32, k: u32) -> Result<u64> {
-    [2, batch as u64, m as u64, n as u64, k as u64]
+    checked_product([2, batch as u64, m as u64, n as u64, k as u64])
+        .ok_or_else(|| anyhow!("matmul FLOP count overflows u64"))
+}
+
+fn checked_product(values: impl IntoIterator<Item = u64>) -> Option<u64> {
+    values
         .into_iter()
-        .try_fold(1u64, |acc, value| {
-            acc.checked_mul(value)
-                .ok_or_else(|| anyhow!("matmul FLOP count overflows u64"))
-        })
+        .try_fold(1u64, |acc, value| acc.checked_mul(value))
 }

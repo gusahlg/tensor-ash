@@ -14,21 +14,11 @@ fn chained_two_stage() {
     let (ctx, exec) = make_setup(2, 8);
     let (m, k1, k2, n) = (128u32, 96u32, 80u32, 64u32);
 
-    let a = Tensor::uninit_device(&ctx, &[m, k1]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[k1, k2]).unwrap();
+    let (a, ha) = upload_det(&ctx, &exec, &[m, k1], 11);
+    let (b, hb) = upload_det(&ctx, &exec, &[k1, k2], 22);
     let t = Tensor::uninit_device(&ctx, &[m, k2]).unwrap();
-    let c = Tensor::uninit_device(&ctx, &[k2, n]).unwrap();
+    let (c, hc) = upload_det(&ctx, &exec, &[k2, n], 33);
     let d = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
-
-    let mut ha = vec![0.0f32; (m * k1) as usize];
-    let mut hb = vec![0.0f32; (k1 * k2) as usize];
-    let mut hc = vec![0.0f32; (k2 * n) as usize];
-    fill_det(&mut ha, 11);
-    fill_det(&mut hb, 22);
-    fill_det(&mut hc, 33);
-    exec.upload(&ha, &a).unwrap();
-    exec.upload(&hb, &b).unwrap();
-    exec.upload(&hc, &c).unwrap();
 
     exec.run_matmul_graph(&[
         MatmulCall {
@@ -53,11 +43,10 @@ fn chained_two_stage() {
 
     let ht = cpu_bmm(&ha, &hb, None, 1, m, k2, k1, 1.0, false);
     let hd = cpu_bmm(&ht, &hc, None, 1, m, n, k2, 1.0, false);
-    let (e, _) = max_abs_err(&got, &hd);
     // The second GEMM's operands are first-GEMM outputs with magnitude
     // ~sqrt(k1), so its absolute rounding error scales by that factor.
     let budget = tolerance(k1) + (k1 as f32).sqrt() * tolerance(k2);
-    assert!(e <= budget, "chained graph err {e:.3e} > {budget:.3e}");
+    assert_close_tol(&got, &hd, budget, "chained graph");
 }
 
 /// Diamond: two independent producers into one consumer.  The two
@@ -69,26 +58,13 @@ fn diamond_dependency() {
     let (ctx, exec) = make_setup(2, 8);
     let (m, k, h, n) = (64u32, 64u32, 96u32, 64u32);
 
-    let x = Tensor::uninit_device(&ctx, &[m, k]).unwrap();
-    let w1 = Tensor::uninit_device(&ctx, &[k, h]).unwrap();
-    let w2 = Tensor::uninit_device(&ctx, &[h, n]).unwrap();
+    let (x, hx) = upload_det(&ctx, &exec, &[m, k], 1);
+    let (w1, hw1) = upload_det(&ctx, &exec, &[k, h], 2);
+    let (w2, hw2) = upload_det(&ctx, &exec, &[h, n], 3);
     let u = Tensor::uninit_device(&ctx, &[m, h]).unwrap();
     let v = Tensor::uninit_device(&ctx, &[h, n]).unwrap();
     let out = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
-    let w3 = Tensor::uninit_device(&ctx, &[h, h]).unwrap();
-
-    let mut hx = vec![0.0f32; (m * k) as usize];
-    let mut hw1 = vec![0.0f32; (k * h) as usize];
-    let mut hw2 = vec![0.0f32; (h * n) as usize];
-    let mut hw3 = vec![0.0f32; (h * h) as usize];
-    fill_det(&mut hx, 1);
-    fill_det(&mut hw1, 2);
-    fill_det(&mut hw2, 3);
-    fill_det(&mut hw3, 4);
-    exec.upload(&hx, &x).unwrap();
-    exec.upload(&hw1, &w1).unwrap();
-    exec.upload(&hw2, &w2).unwrap();
-    exec.upload(&hw3, &w3).unwrap();
+    let (w3, hw3) = upload_det(&ctx, &exec, &[h, h], 4);
 
     // u = x@w1  and  v = w3@w2  are independent; out = u@v depends on both.
     exec.run_matmul_graph(&[
@@ -122,11 +98,10 @@ fn diamond_dependency() {
     let hu = cpu_bmm(&hx, &hw1, None, 1, m, h, k, 1.0, false);
     let hv = cpu_bmm(&hw3, &hw2, None, 1, h, n, h, 1.0, false);
     let hout = cpu_bmm(&hu, &hv, None, 1, m, n, h, 1.0, false);
-    let (e, _) = max_abs_err(&got, &hout);
     // Consumer operands are producer outputs with magnitude ~sqrt(k)
     // and ~sqrt(h); scale the consumer stage's error budget accordingly.
     let budget = tolerance(k) + tolerance(h) + (k.max(h) as f32).sqrt() * tolerance(h);
-    assert!(e <= budget, "diamond graph err {e:.3e} > {budget:.3e}");
+    assert_close_tol(&got, &hout, budget, "diamond graph");
 }
 
 /// Write-after-write + read-after-write on the same C: first call
@@ -137,24 +112,11 @@ fn accumulate_into_prior_output() {
     let (ctx, exec) = make_setup(2, 8);
     let (m, n, k) = (96u32, 64u32, 128u32);
 
-    let a1 = Tensor::uninit_device(&ctx, &[m, k]).unwrap();
-    let b1 = Tensor::uninit_device(&ctx, &[k, n]).unwrap();
-    let a2 = Tensor::uninit_device(&ctx, &[m, k]).unwrap();
-    let b2 = Tensor::uninit_device(&ctx, &[k, n]).unwrap();
+    let (a1, ha1) = upload_det(&ctx, &exec, &[m, k], 5);
+    let (b1, hb1) = upload_det(&ctx, &exec, &[k, n], 6);
+    let (a2, ha2) = upload_det(&ctx, &exec, &[m, k], 7);
+    let (b2, hb2) = upload_det(&ctx, &exec, &[k, n], 8);
     let c = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
-
-    let mut ha1 = vec![0.0f32; (m * k) as usize];
-    let mut hb1 = vec![0.0f32; (k * n) as usize];
-    let mut ha2 = vec![0.0f32; (m * k) as usize];
-    let mut hb2 = vec![0.0f32; (k * n) as usize];
-    fill_det(&mut ha1, 5);
-    fill_det(&mut hb1, 6);
-    fill_det(&mut ha2, 7);
-    fill_det(&mut hb2, 8);
-    exec.upload(&ha1, &a1).unwrap();
-    exec.upload(&hb1, &b1).unwrap();
-    exec.upload(&ha2, &a2).unwrap();
-    exec.upload(&hb2, &b2).unwrap();
 
     exec.run_matmul_graph(&[
         MatmulCall {
@@ -179,8 +141,7 @@ fn accumulate_into_prior_output() {
 
     let first = cpu_bmm(&ha1, &hb1, None, 1, m, n, k, 1.0, false);
     let both = cpu_bmm(&ha2, &hb2, Some(&first), 1, m, n, k, 0.5, true);
-    let (e, _) = max_abs_err(&got, &both);
-    assert!(e <= 2.0 * tolerance(k), "accumulate graph err {e:.3e}");
+    assert_close_tol(&got, &both, 2.0 * tolerance(k), "accumulate graph");
 }
 
 /// A longer llama-style chain: qkv → down-projection style shapes, all
@@ -191,23 +152,13 @@ fn graph_matches_sequential_submissions() {
     let (ctx, exec) = make_setup(2, 8);
     let (m, h, i_) = (32u32, 256u32, 512u32);
 
-    let x = Tensor::uninit_device(&ctx, &[m, h]).unwrap();
-    let w_up = Tensor::uninit_device(&ctx, &[h, i_]).unwrap();
-    let w_down = Tensor::uninit_device(&ctx, &[i_, h]).unwrap();
+    let (x, _) = upload_det(&ctx, &exec, &[m, h], 41);
+    let (w_up, _) = upload_det(&ctx, &exec, &[h, i_], 42);
+    let (w_down, _) = upload_det(&ctx, &exec, &[i_, h], 43);
     let up_g = Tensor::uninit_device(&ctx, &[m, i_]).unwrap();
     let out_g = Tensor::uninit_device(&ctx, &[m, h]).unwrap();
     let up_s = Tensor::uninit_device(&ctx, &[m, i_]).unwrap();
     let out_s = Tensor::uninit_device(&ctx, &[m, h]).unwrap();
-
-    let mut hx = vec![0.0f32; (m * h) as usize];
-    let mut hup = vec![0.0f32; (h * i_) as usize];
-    let mut hdown = vec![0.0f32; (i_ * h) as usize];
-    fill_det(&mut hx, 41);
-    fill_det(&mut hup, 42);
-    fill_det(&mut hdown, 43);
-    exec.upload(&hx, &x).unwrap();
-    exec.upload(&hup, &w_up).unwrap();
-    exec.upload(&hdown, &w_down).unwrap();
 
     exec.run_matmul_graph(&[
         MatmulCall {

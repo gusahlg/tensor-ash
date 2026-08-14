@@ -4,6 +4,33 @@ use tensor_ash::{MatmulCall, Tensor};
 
 #[test]
 #[ignore]
+fn rejects_output_aliases_with_inputs() {
+    let (ctx, exec) = make_setup(1, 1);
+    let a = Tensor::uninit_device(&ctx, &[16, 16]).unwrap();
+    let b = Tensor::uninit_device(&ctx, &[16, 16]).unwrap();
+    for call in [
+        MatmulCall {
+            a: &a,
+            b: &b,
+            c: &a,
+            alpha: 1.0,
+            accumulate: false,
+        },
+        MatmulCall {
+            a: &a,
+            b: &b,
+            c: &b,
+            alpha: 1.0,
+            accumulate: false,
+        },
+    ] {
+        let err = exec.run_matmuls(&[call]).unwrap_err().to_string();
+        assert!(err.contains("must not alias"), "unexpected error: {err}");
+    }
+}
+
+#[test]
+#[ignore]
 fn alpha_and_accumulate() {
     let (ctx, exec) = make_setup(2, 8);
     let (m, n, k) = (37u32, 41u32, 29u32);
@@ -23,14 +50,11 @@ fn alpha_and_accumulate() {
         53,
         Some(&c_init),
     );
-    let (e, idx) = max_abs_err(&gpu, &cpu);
-    let tol = tolerance(k) + alpha.abs() * 1e-5;
-    assert!(
-        e <= tol,
-        "alpha+accumulate err={e:.3e} > tol={tol:.3e} \
-         at idx {idx}: gpu={:.6} cpu={:.6}",
-        gpu[idx],
-        cpu[idx],
+    assert_close_tol(
+        &gpu,
+        &cpu,
+        tolerance(k) + alpha.abs() * 1e-5,
+        "alpha+accumulate",
     );
 }
 
@@ -43,14 +67,10 @@ fn identity_matmul() {
     for i in 0..n as usize {
         id[i * n as usize + i] = 1.0;
     }
-    let mut x = vec![0.0f32; (n * n) as usize];
-    fill_det(&mut x, 71);
-
     let a = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
-    let c = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
     exec.upload(&id, &a).unwrap();
-    exec.upload(&x, &b).unwrap();
+    let (b, x) = upload_det(&ctx, &exec, &[n, n], 71);
+    let c = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
     exec.run_matmuls(&[MatmulCall {
         a: &a,
         b: &b,
@@ -129,20 +149,9 @@ fn zero_inputs_produce_zeros() {
 fn alpha_zero_zeros_output_without_accumulate() {
     let (ctx, exec) = make_setup(1, 1);
     let n = 64u32;
-    let mut ha = vec![0.0f32; (n * n) as usize];
-    let mut hb = vec![0.0f32; (n * n) as usize];
-    fill_det(&mut ha, 31);
-    fill_det(&mut hb, 32);
-
-    let mut hc_init = vec![0.0f32; (n * n) as usize];
-    fill_det(&mut hc_init, 33);
-
-    let a = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
-    let c = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
-    exec.upload(&ha, &a).unwrap();
-    exec.upload(&hb, &b).unwrap();
-    exec.upload(&hc_init, &c).unwrap();
+    let (a, _) = upload_det(&ctx, &exec, &[n, n], 31);
+    let (b, _) = upload_det(&ctx, &exec, &[n, n], 32);
+    let (c, _) = upload_det(&ctx, &exec, &[n, n], 33);
     exec.run_matmuls(&[MatmulCall {
         a: &a,
         b: &b,
@@ -178,14 +187,7 @@ fn large_k_remains_correct() {
         78,
         None,
     );
-    let (e, idx) = max_abs_err(&gpu, &cpu);
-    let tol = tolerance(k);
-    assert!(
-        e <= tol,
-        "large K err={e:.3e} > tol={tol:.3e} at idx {idx}: gpu={:.6} cpu={:.6}",
-        gpu[idx],
-        cpu[idx],
-    );
+    assert_close(&gpu, &cpu, k, "large K");
 }
 
 #[test]

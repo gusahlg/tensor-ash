@@ -3,11 +3,11 @@
 use ash::vk;
 
 use crate::context::VulkanContext;
-use crate::matmul::{MatmulOp, ResolvedMatmul};
+use crate::matmul::MatmulOp;
 use crate::pipeline::MatmulPipeline;
 use crate::tensor::Tensor;
 
-use super::super::MatmulCall;
+use super::super::OpPlan;
 
 /// Point the pre-allocated descriptor sets at this submission's A/B/C
 /// tensors.  `sets.len()` must equal `calls.len()`; the caller is
@@ -26,38 +26,35 @@ pub(in crate::executor) fn update_matmul_descriptor_sets(
     pipeline: &MatmulPipeline,
     sets: &[vk::DescriptorSet],
     ops: &[MatmulOp<'_>],
-    resolved: &[ResolvedMatmul],
+    plans: &[OpPlan],
 ) {
     debug_assert_eq!(sets.len(), ops.len());
-    debug_assert_eq!(sets.len(), resolved.len());
+    debug_assert_eq!(sets.len(), plans.len());
+
+    // BDA is the normal fast path on modern devices. Avoid two temporary
+    // allocations per submission when no planned kernel observes a
+    // descriptor set at all.
+    let needs_write = |plan: &OpPlan| pipeline.kernel_at(plan.kernel).uses_descriptors;
+    if !plans.iter().any(needs_write) {
+        return;
+    }
 
     // Build buffer-info + writes only for calls that actually need a
     // descriptor write.  Keep buffer_infos stable so the
     // &[WriteDescriptorSet] we hand to Vulkan keeps stable references.
     let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::with_capacity(ops.len() * 3);
-    let mut needs_write: Vec<bool> = Vec::with_capacity(ops.len());
-    for (op, dims) in ops.iter().zip(resolved.iter()) {
-        let call = &op.call;
-        let kernel = pipeline.select_kernel(dims.batch, dims.m, dims.n, dims.k);
-        let need = kernel.uses_descriptors;
-        needs_write.push(need);
-        if need {
-            buffer_infos.push(tensor_descriptor(call.a));
-            buffer_infos.push(tensor_descriptor(call.b));
-            buffer_infos.push(tensor_descriptor(call.c));
+    for (op, plan) in ops.iter().zip(plans.iter()) {
+        if needs_write(plan) {
+            buffer_infos.push(tensor_descriptor(op.call.a));
+            buffer_infos.push(tensor_descriptor(op.call.b));
+            buffer_infos.push(tensor_descriptor(op.call.c));
         }
     }
 
-    if buffer_infos.is_empty() {
-        // Pure-BDA submission: nothing to write.
-        return;
-    }
-
-    let mut writes: Vec<vk::WriteDescriptorSet> =
-        Vec::with_capacity(needs_write.iter().filter(|w| **w).count() * 3);
+    let mut writes: Vec<vk::WriteDescriptorSet> = Vec::with_capacity(buffer_infos.len());
     let mut base = 0usize;
-    for (i, set) in sets.iter().copied().enumerate() {
-        if !needs_write[i] {
+    for (set, plan) in sets.iter().copied().zip(plans.iter()) {
+        if !needs_write(plan) {
             continue;
         }
         for binding in 0..3u32 {
@@ -71,46 +68,6 @@ pub(in crate::executor) fn update_matmul_descriptor_sets(
         }
         base += 3;
     }
-
-    unsafe {
-        ctx.device.update_descriptor_sets(&writes, &[]);
-    }
-}
-
-/// Point a single descriptor set at `call`'s A/B/C tensors.  Used by
-/// the split-K path, whose kernels still bind the descriptor set
-/// (carried by the matmul pipeline layout that SplitKKernel was built
-/// against) even though the shader itself addresses A/B/C through
-/// BDA pointers in the push constants.  Kept as a dedicated helper so
-/// the matmul-BDA fast path doesn't have to reason about split-K's
-/// descriptor needs.
-pub(in crate::executor) fn update_split_k_descriptor_set(
-    ctx: &VulkanContext,
-    set: vk::DescriptorSet,
-    call: &MatmulCall<'_>,
-) {
-    let buffer_infos = [
-        tensor_descriptor(call.a),
-        tensor_descriptor(call.b),
-        tensor_descriptor(call.c),
-    ];
-    let writes = [
-        vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_infos[0])),
-        vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_infos[1])),
-        vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(2)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_infos[2])),
-    ];
 
     unsafe {
         ctx.device.update_descriptor_sets(&writes, &[]);

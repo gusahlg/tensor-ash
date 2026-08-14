@@ -9,7 +9,10 @@ pub struct MatmulKernel {
     pub tile_n: u32,
     pub tile_k: u32,
     pub shader_module: vk::ShaderModule,
-    /// One pipeline per `KernelVariant`; indexed by `KernelVariant::index()`.
+    /// A correctness-safe pipeline for each `KernelVariant`, indexed by
+    /// `KernelVariant::index()`. Entries with the same accumulate/alpha flags
+    /// initially alias one bounds-checked fallback; the dispatcher lazily
+    /// builds exact interior/K specializations.
     pub variants: [vk::Pipeline; KernelVariant::COUNT],
     /// The pipeline layout the kernel's pipelines were built against,
     /// and the layout the dispatcher must pass to
@@ -36,5 +39,13 @@ impl MatmulKernel {
     #[inline]
     pub fn supports_epilogue(&self) -> bool {
         !self.uses_descriptors && !self.name.ends_with("_aligned")
+    }
+
+    /// Whether the shader reads B as f16 storage (the `f16w_*` family).
+    /// A dispatch must pair such a kernel with an f16 B tensor and any
+    /// other kernel with an f32 one; `record_one_matmul` enforces it.
+    #[inline]
+    pub fn weights_f16(&self) -> bool {
+        self.name.starts_with("f16w_")
     }
 }

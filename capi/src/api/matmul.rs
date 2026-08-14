@@ -7,7 +7,7 @@ use crate::error::{checked_ref, checked_slice, ffi_status};
 use crate::handles::{ta_executor, ta_tensor};
 use crate::types::{ta_matmul_call, ta_run_stats};
 
-fn checked_call<'a>(
+pub(crate) fn checked_call<'a>(
     exec: &ta_executor,
     raw: &ta_matmul_call,
     operation: &str,
@@ -83,7 +83,7 @@ pub unsafe extern "C" fn ta_matmul_batch(
     })
 }
 
-fn write_stats(stats: *mut ta_run_stats, run_stats: RunStats) {
+pub(crate) fn write_stats(stats: *mut ta_run_stats, run_stats: RunStats) {
     if stats.is_null() {
         return;
     }

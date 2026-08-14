@@ -1,0 +1,6 @@
+#version 460
+// K-cooperative M=1 GEMV with f16-storage B (weights); f32 accumulate.
+
+#define B_F16 1
+
+#include "matmul_row_bda_kernel.glsl"

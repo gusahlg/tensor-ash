@@ -1,10 +1,11 @@
 //! Tensor — shape + owned device buffer.
 //!
-//! Row-major, contiguous, f32 storage.  GEMM accepts rank 2 (`[M, K]`) or
-//! rank 3 (`[B, M, K]`); utility paths such as transfer benchmarks may use
-//! other non-empty shapes.  All host-side I/O goes through `Executor::upload`
-//! / `Executor::download`, so this type intentionally has no host-visible
-//! variant.
+//! Row-major, contiguous storage, f32 by default with optional f16 (see
+//! [`DType`]).  GEMM accepts rank 2 (`[M, K]`) or rank 3 (`[B, M, K]`);
+//! utility paths such as transfer benchmarks may use other non-empty
+//! shapes.  All host-side I/O goes through `Executor::upload` /
+//! `Executor::download` as `&[f32]` regardless of storage type, so this
+//! type intentionally has no host-visible variant.
 
 use std::sync::Arc;
 
@@ -13,10 +14,12 @@ use ash::vk;
 
 use crate::buffer::{Buffer, BufferLocation};
 use crate::context::VulkanContext;
+use crate::dtype::DType;
 use crate::matmul::MatrixShape;
 
 pub struct Tensor {
     shape: Vec<u32>,
+    dtype: DType,
     buffer: Buffer,
 }
 
@@ -52,8 +55,30 @@ impl Tensor {
     /// Use `Executor::upload` (or a matmul that writes the whole tensor
     /// without `accumulate`) before reading the data.
     pub fn uninit_device(ctx: &Arc<VulkanContext>, shape: &[u32]) -> Result<Self> {
+        Self::uninit_device_with(ctx, shape, DType::F32)
+    }
+
+    /// Allocate an f16-storage device tensor.  Contents are written via
+    /// the same `&[f32]` upload path (values round to the nearest f16);
+    /// kernels read it as half-precision and accumulate in f32.
+    /// Requires `shaderFloat16` + `storageBuffer16BitAccess` (checked
+    /// here so the failure is early and explicit).
+    pub fn uninit_device_f16(ctx: &Arc<VulkanContext>, shape: &[u32]) -> Result<Self> {
+        if !ctx.f16_storage_enabled {
+            bail!("device does not support f16 storage (shaderFloat16 + storageBuffer16BitAccess)");
+        }
+        Self::uninit_device_with(ctx, shape, DType::F16)
+    }
+
+    fn uninit_device_with(ctx: &Arc<VulkanContext>, shape: &[u32], dtype: DType) -> Result<Self> {
         let size = Self::numel_checked(shape)?
-            .checked_mul(std::mem::size_of::<f32>() as u64)
+            .checked_mul(dtype.size())
+            .context("tensor byte size overflows u64")?;
+        // Round f16 allocations up to 16 bytes so vectorized uvec4
+        // readers can never touch memory outside the allocation even
+        // when the element count is odd.
+        let size = size
+            .checked_next_multiple_of(16)
             .context("tensor byte size overflows u64")?;
         let buffer = Buffer::new(
             ctx,
@@ -65,8 +90,15 @@ impl Tensor {
         )?;
         Ok(Self {
             shape: shape.to_vec(),
+            dtype,
             buffer,
         })
+    }
+
+    /// Storage element type.
+    #[inline]
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
     /// Returns `(batch, m, k)` for rank-2 (`batch=1`) or rank-3 shapes.
@@ -106,6 +138,13 @@ impl Tensor {
     #[inline]
     pub fn raw_buffer(&self) -> vk::Buffer {
         self.buffer.raw_buffer()
+    }
+
+    /// Cached GPU pointer for `buffer_reference` addressing; 0 when
+    /// `bufferDeviceAddress` is disabled.
+    #[inline]
+    pub(crate) fn device_address(&self) -> u64 {
+        self.buffer.device_address()
     }
     #[inline]
     pub fn size_bytes(&self) -> vk::DeviceSize {

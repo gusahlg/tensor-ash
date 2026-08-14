@@ -11,7 +11,7 @@ use super::recording::{
     record_matmul_commands, record_matmul_graph_commands, update_matmul_descriptor_sets,
 };
 use super::splitk2::SplitK2Pipeline;
-use super::{Executor, Slot, recording, splitk2};
+use super::{Executor, OpPlan, Slot, recording, splitk2};
 
 impl Executor {
     /// Run a batch of matmul calls.  Blocks until GPU completion.
@@ -129,6 +129,7 @@ impl Executor {
                 m: dims.m,
                 n: dims.n,
                 k: dims.k,
+                b_f16: dims.b_f16,
             };
             if !self.pipeline.is_tuned(key)
                 && self.ctx.timestamps_supported
@@ -144,25 +145,33 @@ impl Executor {
             }
         }
 
-        // Measured reduction routing: shapes whose tuned winner is the
-        // two-stage split-K go through it whenever the call is
-        // compatible (single, plain, non-accumulating).
-        if let [op] = ops
-            && !op.call.accumulate
-            && op.epilogue.is_none()
+        // Resolve every op's complete route once.  The split-K2 leg is
+        // only eligible for plain non-accumulating ops that are either
+        // alone in the submission or part of a graph (where the
+        // two-stage path's internal barrier costs nothing extra).
+        let plans: Vec<OpPlan> = ops
+            .iter()
+            .zip(resolved.iter())
+            .map(|(op, dims)| {
+                let eligible = !op.call.accumulate
+                    && op.epilogue.is_none()
+                    && (with_dependency_barriers || ops.len() == 1);
+                self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, eligible)
+            })
+            .collect();
+
+        // Measured reduction routing: a lone plain op whose route says
+        // two-stage split-K goes through the dedicated entry point.
+        if !with_dependency_barriers
+            && let [plan] = plans.as_slice()
+            && let Some(splits) = plan.splitk2
         {
-            let dims = &resolved[0];
-            if let Some(splits) = self
-                .pipeline
-                .tuned_splitk2(dims.batch, dims.m, dims.n, dims.k)
-                && !with_dependency_barriers
-            {
-                return self.run_matmuls_split_k2(op.call, splits);
-            }
+            return self.run_matmuls_split_k2(ops[0].call, splits);
         }
 
         let mut slot = self.checkout_slot();
-        let result = self.record_and_run(&mut slot, ops, resolved, with_dependency_barriers);
+        let result =
+            self.record_and_run(&mut slot, ops, resolved, &plans, with_dependency_barriers);
 
         let gpu_time_ns = result?;
         Ok(RunStats {
@@ -177,30 +186,24 @@ impl Executor {
         slot: &mut Slot,
         ops: &[MatmulOp<'_>],
         resolved: &[ResolvedMatmul],
+        plans: &[OpPlan],
         with_dependency_barriers: bool,
     ) -> Result<Option<u64>> {
         debug_assert_eq!(ops.len(), resolved.len());
+        debug_assert_eq!(ops.len(), plans.len());
         let descriptor_set_count = ops.len();
 
-        // Graph submissions can route individual ops through the
-        // two-stage split-K when the shape's tuned winner says so
-        // (graphs already carry barriers, so split-K2's internal
-        // barrier costs nothing extra).  Plan scratch offsets up
+        // Graph submissions route individual ops through the two-stage
+        // split-K when their plan says so.  Plan scratch offsets up
         // front so all routed ops share one slot-local buffer.
         let mut graph_plans: Vec<Option<(splitk2::SplitK2Dispatch, u64)>> = Vec::new();
         let mut graph_scratch_addr = 0u64;
         let mut graph_sk2: Option<&SplitK2Pipeline> = None;
         if with_dependency_barriers && self.ctx.buffer_device_address_enabled {
             let mut offset = 0u64;
-            let mut plans = vec![None; ops.len()];
-            for (i, (op, dims)) in ops.iter().zip(resolved.iter()).enumerate() {
-                if op.call.accumulate || !op.epilogue.is_none() {
-                    continue;
-                }
-                let Some(splits) = self
-                    .pipeline
-                    .tuned_splitk2(dims.batch, dims.m, dims.n, dims.k)
-                else {
+            let mut sk2_plans = vec![None; ops.len()];
+            for (i, (plan, dims)) in plans.iter().zip(resolved.iter()).enumerate() {
+                let Some(splits) = plan.splitk2 else {
                     continue;
                 };
                 let pipe = match graph_sk2 {
@@ -211,14 +214,18 @@ impl Executor {
                         p
                     }
                 };
-                if let Ok(plan) = splitk2::SplitK2Dispatch::plan(&self.ctx, pipe, dims, splits) {
-                    plans[i] = Some((plan, offset));
-                    offset += plan.scratch_bytes.next_multiple_of(16);
+                if let Ok(sk2) = splitk2::SplitK2Dispatch::plan(&self.ctx, pipe, dims, splits) {
+                    let Some(end) = splitk2::checked_auto_scratch_end(offset, sk2.scratch_bytes)
+                    else {
+                        continue;
+                    };
+                    sk2_plans[i] = Some((sk2, offset));
+                    offset = end;
                 }
             }
             if offset > 0 {
                 graph_scratch_addr = self.ensure_splitk2_scratch(slot, offset)?;
-                graph_plans = plans;
+                graph_plans = sk2_plans;
             }
         }
         let graph_splitk2 = match (graph_sk2, graph_plans.is_empty()) {
@@ -244,7 +251,7 @@ impl Executor {
                 &self.pipeline,
                 &slot.descriptor_sets[..ops.len()],
                 ops,
-                resolved,
+                plans,
             );
 
             self.submit_timed(slot, "get_query_pool_results", |_dev, cb, slot| {
@@ -257,6 +264,7 @@ impl Executor {
                         descriptor_sets,
                         ops,
                         resolved,
+                        plans,
                         graph_splitk2.as_ref(),
                     )?;
                 } else {
@@ -267,6 +275,7 @@ impl Executor {
                         descriptor_sets,
                         ops,
                         resolved,
+                        plans,
                     )?;
                 }
                 Ok(())

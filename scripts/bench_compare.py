@@ -34,6 +34,7 @@ from bench_compare_models import (
     BASE_CASES,
     CASE_SETS,
     EXTENDED_CASES,
+    REGRESSION_CASES,
     SHOWCASE_CASES,
     STREAMK_CASES,
     BenchResult,

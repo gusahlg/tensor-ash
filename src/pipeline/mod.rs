@@ -13,7 +13,7 @@ mod tuning;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use ash::vk;
 use parking_lot::{Mutex, RwLock};
 use scopeguard::ScopeGuard;
@@ -26,6 +26,7 @@ use tuning::{load_tuned, save_tuned, shader_registry_hash};
 
 pub use abi::{EpilogueKey, KernelVariant, MatmulPushConstants};
 pub use catalog::{KERNEL_SPECS, KernelSelection, KernelSpec};
+pub(crate) use create::build_compute_pipeline;
 pub use runtime::MatmulKernel;
 pub(crate) use tuning::{TuneEntry, TuneKey};
 
@@ -41,15 +42,17 @@ pub struct MatmulPipeline {
     /// dispatch path skips `vkUpdateDescriptorSets` and
     /// `vkCmdBindDescriptorSets` entirely.
     pub pipeline_layout_bda: vk::PipelineLayout,
-    /// One `MatmulKernel` per entry in `KERNEL_SPECS`, in the same order.
-    /// Index with `KernelSelection::index()` (after resolving `Auto`).
-    kernels: Vec<MatmulKernel>,
-    /// Lazily-built pipelines for non-zero epilogue specializations,
-    /// keyed by (kernel name, base-variant index, epilogue key).  The
-    /// eager `variants` arrays only cover the zero epilogue; real
-    /// workloads use a handful of epilogue combos, so building them on
-    /// first use (against the persistent pipeline cache) keeps startup
-    /// flat.
+    /// One slot per entry in `KERNEL_SPECS`, in the same order. Index
+    /// with `KernelSelection::index()` (after resolving `Auto`).
+    /// `None` marks a kernel gated off by missing device features
+    /// (today: the `f16w_*` family without f16 storage support);
+    /// routing, tuning, and explicit-selection validation all skip
+    /// empty slots, so `kernel_at` on a routed index cannot fail.
+    kernels: Vec<Option<MatmulKernel>>,
+    /// Lazily-built aligned and epilogue specializations, keyed by (kernel
+    /// name, base-variant index, epilogue key). The eager `variants` arrays
+    /// hold four bounds-checked fallbacks; real workloads use a small subset
+    /// of the other combinations, so first-use creation keeps startup flat.
     epilogue_pipelines: Mutex<HashMap<(&'static str, usize, EpilogueKey), vk::Pipeline>>,
     selection: KernelSelection,
     /// Minimum number of large-kernel tiles a problem must produce
@@ -63,6 +66,9 @@ pub struct MatmulPipeline {
     /// persistent store at build time; the executor's tuner inserts new
     /// winners at runtime.
     tuned: RwLock<HashMap<TuneKey, TuneEntry>>,
+    /// Serializes tuning-store snapshots so concurrent first-use tuning cannot
+    /// persist an older map after a newer one.
+    tune_save: Mutex<()>,
     /// Hash binding persisted winners to this exact shader build.
     shader_hash: u64,
 }
@@ -140,13 +146,22 @@ impl MatmulPipeline {
             // Build every kernel in the registry.  We wrap the accumulator
             // in a scopeguard so any already-built kernels are torn down
             // if a later one fails to build.
-            let kernels_acc: Vec<MatmulKernel> = Vec::with_capacity(KERNEL_SPECS.len());
+            let kernels_acc: Vec<Option<MatmulKernel>> = Vec::with_capacity(KERNEL_SPECS.len());
             let mut kernels_guard = scopeguard::guard(kernels_acc, |built| {
-                for kernel in built {
+                for kernel in built.into_iter().flatten() {
                     destroy_kernel(ctx, kernel);
                 }
             });
             for spec in KERNEL_SPECS {
+                // f16-storage kernels declare SPIR-V capabilities the
+                // device may not have; leave their registry slots empty
+                // instead of failing the whole pipeline. Routing and
+                // validation never select an empty slot.
+                let coopmat_gated = spec.name.contains("coopmat") && !ctx.coopmat_enabled;
+                if (spec.weights_f16() && !ctx.f16_storage_enabled) || coopmat_gated {
+                    kernels_guard.push(None);
+                    continue;
+                }
                 let layout = if spec.uses_descriptors {
                     pipeline_layout
                 } else {
@@ -154,7 +169,16 @@ impl MatmulPipeline {
                 };
                 let kernel = create_kernel(ctx, layout, spec)
                     .with_context(|| format!("create {} matmul kernel", spec.name))?;
-                kernels_guard.push(kernel);
+                kernels_guard.push(Some(kernel));
+            }
+            if let Some(index) = selection.index()
+                && kernels_guard[index].is_none()
+            {
+                bail!(
+                    "ML_KERNEL selects '{}', which requires f16 storage support \
+                     (shaderFloat16 + storageBuffer16BitAccess) this device lacks",
+                    KERNEL_SPECS[index].name
+                );
             }
             // Disarm the cleanup: kernels now belong to the pipeline.
             let kernels = ScopeGuard::into_inner(kernels_guard);
@@ -170,57 +194,115 @@ impl MatmulPipeline {
                 selection,
                 auto_min_large_tiles: auto_min_large_tiles_for(ctx.device_kind()),
                 tuned: RwLock::new(load_tuned(ctx, shader_hash)),
+                tune_save: Mutex::new(()),
                 shader_hash,
             })
         }
     }
 
     pub fn select_kernel(&self, batch: u32, m: u32, n: u32, k: u32) -> &MatmulKernel {
-        &self.kernels[self.select_kernel_index(batch, m, n, k)]
+        self.kernel_at(self.route(batch, m, n, k, false).0)
     }
 
-    /// Index into `KERNEL_SPECS` for this problem.  Resolution order:
-    /// explicit `ML_KERNEL=` selection > measured tuned winner >
-    /// static shape heuristic.
-    pub fn select_kernel_index(&self, batch: u32, m: u32, n: u32, k: u32) -> usize {
+    /// Atomically snapshot the complete route for this shape in one
+    /// tuned-map read.  The kernel index resolves as: explicit
+    /// `ML_KERNEL=` selection, else measured tuned winner, else static
+    /// shape heuristic.  The second field is the tuned split-K2
+    /// verdict: `None` for an untuned shape, `Some(None)` when a
+    /// measured DP winner vetoes the split heuristic, and
+    /// `Some(Some(s))` when split-K2 measured faster than every DP
+    /// kernel.
+    pub(crate) fn route(
+        &self,
+        batch: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+        b_f16: bool,
+    ) -> (usize, Option<Option<u32>>) {
         match self.selection {
             KernelSelection::Auto => {
-                if let Some(entry) = self.tuned.read().get(&TuneKey { batch, m, n, k }) {
-                    return entry.kernel;
+                let key = TuneKey {
+                    batch,
+                    m,
+                    n,
+                    k,
+                    b_f16,
+                };
+                if let Some(entry) = self.tuned.read().get(&key) {
+                    return (entry.kernel, Some(entry.splitk2_splits));
                 }
-                self.heuristic_kernel_index(batch, m, n, k)
+                (self.heuristic_kernel_index(batch, m, n, k, b_f16), None)
             }
-            explicit => explicit
-                .index()
-                .expect("explicit selection has a concrete kernel"),
+            explicit => (
+                explicit
+                    .index()
+                    .expect("explicit selection has a concrete kernel"),
+                None,
+            ),
         }
-    }
-
-    /// Measured split-K2 routing for this shape: `Some(splits)` when
-    /// the two-stage split-K beat every DP kernel during tuning.  Only
-    /// meaningful for single plain calls; batched / accumulate /
-    /// epilogue dispatches use the DP winner instead.
-    pub(crate) fn tuned_splitk2(&self, batch: u32, m: u32, n: u32, k: u32) -> Option<u32> {
-        if !self.is_auto() {
-            return None;
-        }
-        self.tuned
-            .read()
-            .get(&TuneKey { batch, m, n, k })
-            .and_then(|entry| entry.splitk2_splits)
     }
 
     /// The static shape heuristic's pick, ignoring any tuned winner.
     /// Serves as the tuner's prior and as the fallback for untuned
     /// shapes.
-    pub(crate) fn heuristic_kernel_index(&self, batch: u32, m: u32, n: u32, k: u32) -> usize {
-        if m == 1 && self.ctx.buffer_device_address_enabled {
-            return KernelSelection::RowBda
-                .index()
-                .expect("row kernel has a concrete index");
+    pub(crate) fn heuristic_kernel_index(
+        &self,
+        batch: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+        b_f16: bool,
+    ) -> usize {
+        if self.ctx.buffer_device_address_enabled {
+            let selection = if m == 1 {
+                Some(if b_f16 {
+                    KernelSelection::F16wRowBda
+                } else {
+                    KernelSelection::RowBda
+                })
+            } else if n == 1 && !b_f16 {
+                Some(KernelSelection::ColBda)
+            } else if k == 1 && !b_f16 {
+                Some(KernelSelection::OuterBda)
+            } else {
+                None
+            };
+            if let Some(selection) = selection {
+                let spec = &KERNEL_SPECS[selection.index().expect("GEMV kernel is concrete")];
+                let max_groups = self
+                    .ctx
+                    .device_properties
+                    .limits
+                    .max_compute_work_group_count;
+                if n.div_ceil(spec.tile_n) <= max_groups[0]
+                    && m.div_ceil(spec.tile_m) <= max_groups[1]
+                    && batch <= max_groups[2]
+                {
+                    return selection.index().expect("GEMV kernel is concrete");
+                }
+            }
         }
         let tile = auto_select_kernel(batch, m, n, k, self.auto_min_large_tiles);
-        let selection = if self.ctx.buffer_device_address_enabled {
+        let selection = if b_f16 {
+            // Tensor cores first when the shape allows them: strictly
+            // aligned and big enough that the 128x128 tiles fill the
+            // device (small aligned shapes stay on the SIMT f16w
+            // kernels, which handle low occupancy better).
+            if self.ctx.coopmat_enabled
+                && m.is_multiple_of(128)
+                && n.is_multiple_of(128)
+                && k.is_multiple_of(32)
+                && m >= 256
+                && n >= 256
+            {
+                KernelSelection::F16wCoopmat
+            } else {
+                // f16-storage B is validated as BDA-capable upstream;
+                // map the tile class onto the nearest f16w sibling.
+                to_f16w(tile)
+            }
+        } else if self.ctx.buffer_device_address_enabled {
             maybe_to_bda(tile)
         } else {
             tile
@@ -254,25 +336,40 @@ impl MatmulPipeline {
     /// only — the strict `*_aligned` variants are excluded).  Requires
     /// `bufferDeviceAddress`; on devices without it the tuner is
     /// disabled and the heuristic stands.
-    pub(crate) fn tune_candidate_indices(&self) -> Vec<usize> {
+    pub(crate) fn tune_candidate_indices(&self, m: u32, n: u32, k: u32, b_f16: bool) -> Vec<usize> {
         if !self.ctx.buffer_device_address_enabled {
             return Vec::new();
         }
         self.kernels
             .iter()
             .enumerate()
-            .filter(|(_, kernel)| !kernel.uses_descriptors && !kernel.name.ends_with("_aligned"))
+            .filter_map(|(idx, kernel)| kernel.as_ref().map(|kernel| (idx, kernel)))
+            .filter(|(_, kernel)| {
+                let coopmat_fits = kernel.name.contains("coopmat")
+                    && m.is_multiple_of(128)
+                    && n.is_multiple_of(128)
+                    && k.is_multiple_of(32);
+                !kernel.uses_descriptors
+                    && (!kernel.name.ends_with("_aligned") || coopmat_fits)
+                    && kernel.weights_f16() == b_f16
+                    && (m == 1 || !kernel.name.ends_with("row_bda"))
+                    && (n == 1 || kernel.name != "col_bda")
+                    && (k == 1 || kernel.name != "outer_bda")
+            })
             .map(|(idx, _)| idx)
             .collect()
     }
 
     #[inline]
     pub(crate) fn kernel_at(&self, idx: usize) -> &MatmulKernel {
-        &self.kernels[idx]
+        self.kernels[idx]
+            .as_ref()
+            .expect("routed kernel is gated off on this device")
     }
 
     /// Record a measured winner and persist the store.
     pub(crate) fn record_tuned(&self, key: TuneKey, entry: TuneEntry) {
+        let _save = self.tune_save.lock();
         let snapshot = {
             let mut tuned = self.tuned.write();
             tuned.insert(key, entry);
@@ -281,19 +378,18 @@ impl MatmulPipeline {
         save_tuned(&self.ctx, self.shader_hash, &snapshot);
     }
 
-    /// Pipeline for a (kernel, base-variant, epilogue) triple.  The
-    /// zero epilogue resolves to the eagerly-built variant table; any
-    /// other combination is compiled on first use and cached for the
-    /// lifetime of the pipeline.  Compilation goes through the
-    /// persistent `VkPipelineCache`, so repeat processes skip the
-    /// ISA compile.
+    /// Pipeline for a (kernel, base-variant, epilogue) triple. Fully
+    /// bounds-checked zero-epilogue variants resolve to the eager fallback;
+    /// every other combination is compiled on first use and cached for the
+    /// pipeline lifetime. Creation goes through the persistent
+    /// `VkPipelineCache`, so repeat processes skip the ISA compile.
     pub(crate) fn pipeline_for_epilogue(
         &self,
         kernel: &MatmulKernel,
         variant: KernelVariant,
         epilogue: EpilogueKey,
     ) -> Result<vk::Pipeline> {
-        if epilogue.is_none() {
+        if epilogue.is_none() && variant == variant.fallback() {
             return Ok(kernel.pipeline_for(variant));
         }
         let key = (kernel.name, variant.index(), epilogue);
@@ -318,6 +414,21 @@ impl MatmulPipeline {
 /// another 5-15% on every TN>=4 tile we measured.  For the TN=2
 /// `m64n32` kernel the V4 path isn't available (LDS.128 over a 2-col
 /// stride is non-sensical), so we fall back to the plain BDA sibling.
+/// Map an auto-selected tile class onto its f16-storage-B sibling.
+/// Coarser than the f32 family on purpose: three tile classes cover
+/// the heuristic winners, and the measured tuner refines per shape
+/// within the f16w candidate set.
+fn to_f16w(tile: KernelSelection) -> KernelSelection {
+    match tile {
+        KernelSelection::Large | KernelSelection::M64N128 => KernelSelection::F16wLargeBdaV4,
+        KernelSelection::M128N64 | KernelSelection::M128N64K64 => {
+            KernelSelection::F16wM128N64K64BdaV4
+        }
+        KernelSelection::K64 => KernelSelection::F16wK64BdaV4,
+        _ => KernelSelection::F16wSmallBdaV4,
+    }
+}
+
 fn maybe_to_bda(tile: KernelSelection) -> KernelSelection {
     match tile {
         KernelSelection::Large => KernelSelection::LargeBdaV4,
@@ -348,7 +459,7 @@ impl Drop for MatmulPipeline {
                     self.ctx.device.destroy_pipeline(pipeline, None);
                 }
             }
-            for kernel in self.kernels.drain(..) {
+            for kernel in self.kernels.drain(..).flatten() {
                 destroy_kernel(&self.ctx, kernel);
             }
             self.ctx

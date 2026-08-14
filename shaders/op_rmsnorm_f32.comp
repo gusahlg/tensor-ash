@@ -1,0 +1,81 @@
+#version 460
+// Row normalization: RMSNorm by default, LayerNorm behind spec
+// constant 0.
+//
+//   RMSNorm:   out = x * w / sqrt(mean(x^2) + eps)
+//   LayerNorm: out = (x - mean(x)) * w / sqrt(var(x) + eps) + b
+//
+// One workgroup per row, 256 threads, fixed-order shared-memory
+// reductions for determinism. Bandwidth-bound: one read + one write
+// of the row plus the weight row.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const bool LAYER_NORM = false;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32ReadWrite {
+    float v[];
+};
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    float eps;
+    uint _pad;
+    F32ReadOnly in_ptr;
+    F32ReadWrite out_ptr;
+    F32ReadOnly weight_ptr;
+    F32ReadOnly bias_ptr; // LayerNorm only; 0 otherwise
+} pc;
+
+shared float red[256];
+
+float reduce_sum(float value, uint tid) {
+    red[tid] = value;
+    barrier();
+    [[unroll]] for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) red[tid] += red[tid + stride];
+        barrier();
+    }
+    const float total = red[0];
+    barrier();
+    return total;
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+    const uint base = row * pc.cols;
+    const float inv_n = 1.0 / float(pc.cols);
+
+    float mean = 0.0;
+    if (LAYER_NORM) {
+        float local = 0.0;
+        for (uint col = tid; col < pc.cols; col += 256u) {
+            local += pc.in_ptr.v[base + col];
+        }
+        mean = reduce_sum(local, tid) * inv_n;
+    }
+
+    float local_sq = 0.0;
+    for (uint col = tid; col < pc.cols; col += 256u) {
+        const float centered = pc.in_ptr.v[base + col] - mean;
+        local_sq = fma(centered, centered, local_sq);
+    }
+    const float inv_rms = inversesqrt(reduce_sum(local_sq, tid) * inv_n + pc.eps);
+
+    for (uint col = tid; col < pc.cols; col += 256u) {
+        float value = (pc.in_ptr.v[base + col] - mean) * inv_rms * pc.weight_ptr.v[col];
+        if (LAYER_NORM) value += pc.bias_ptr.v[col];
+        pc.out_ptr.v[base + col] = value;
+    }
+}

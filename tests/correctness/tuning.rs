@@ -18,15 +18,9 @@ fn tune_shape_then_compute_is_correct() {
 
     // A real matmul on the tuned shape must still be correct through
     // whatever kernel won.
-    let a = Tensor::uninit_device(&ctx, &[m, k]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[k, n]).unwrap();
+    let (a, ha) = upload_det(&ctx, &exec, &[m, k], 91);
+    let (b, hb) = upload_det(&ctx, &exec, &[k, n], 92);
     let c = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
-    let mut ha = vec![0.0f32; (m * k) as usize];
-    let mut hb = vec![0.0f32; (k * n) as usize];
-    fill_det(&mut ha, 91);
-    fill_det(&mut hb, 92);
-    exec.upload(&ha, &a).unwrap();
-    exec.upload(&hb, &b).unwrap();
 
     exec.run_matmuls(&[MatmulCall {
         a: &a,
@@ -40,8 +34,7 @@ fn tune_shape_then_compute_is_correct() {
     let mut got = vec![0.0f32; (m * n) as usize];
     exec.download(&c, &mut got).unwrap();
     let expect = cpu_bmm(&ha, &hb, None, 1, m, n, k, 1.0, false);
-    let (e, _) = max_abs_err(&got, &expect);
-    assert!(e <= tolerance(k), "tuned-path matmul err {e:.3e}");
+    assert_close(&got, &expect, k, "tuned-path matmul");
 
     // Tuning the same shape again is a no-op (already recorded).
     exec.tune_shape(1, m, n, k).expect("tune_shape (repeat)");
