@@ -9,19 +9,6 @@ fn ops_available(ctx: &std::sync::Arc<tensor_ash::VulkanContext>) -> bool {
     ctx.buffer_device_address_enabled
 }
 
-fn upload_det(
-    ctx: &std::sync::Arc<tensor_ash::VulkanContext>,
-    exec: &tensor_ash::Executor,
-    shape: &[u32],
-    seed: u64,
-) -> (Tensor, Vec<f32>) {
-    let tensor = Tensor::uninit_device(ctx, shape).unwrap();
-    let mut host = vec![0.0; Tensor::numel(shape) as usize];
-    fill_det(&mut host, seed);
-    exec.upload(&host, &tensor).unwrap();
-    (tensor, host)
-}
-
 #[test]
 #[ignore]
 fn softmax_rows_full_prefix_and_causal() {
@@ -61,8 +48,7 @@ fn softmax_rows_full_prefix_and_causal() {
     let mut gpu = vec![0.0; (rows * cols) as usize];
     exec.download(&output, &mut gpu).unwrap();
     let cpu = cpu_softmax(&|_| cols as usize);
-    let (error, index) = max_abs_err(&gpu, &cpu);
-    assert!(error <= 1e-6, "full softmax error {error:.3e} at {index}");
+    assert_close_tol(&gpu, &cpu, 1e-6, "full softmax");
     for row in 0..rows as usize {
         let sum: f32 = gpu[row * cols as usize..][..cols as usize].iter().sum();
         assert!((sum - 1.0).abs() <= 1e-5, "row {row} sums to {sum}");
@@ -81,8 +67,7 @@ fn softmax_rows_full_prefix_and_causal() {
     .unwrap();
     exec.download(&output, &mut gpu).unwrap();
     let cpu = cpu_softmax(&|_| valid);
-    let (error, index) = max_abs_err(&gpu, &cpu);
-    assert!(error <= 1e-6, "prefix softmax error {error:.3e} at {index}");
+    assert_close_tol(&gpu, &cpu, 1e-6, "prefix softmax");
     for row in 0..rows as usize {
         for col in valid..cols as usize {
             assert_eq!(gpu[row * cols as usize + col], 0.0, "masked ({row},{col})");
@@ -103,8 +88,7 @@ fn softmax_rows_full_prefix_and_causal() {
     .unwrap();
     exec.download(&output, &mut gpu).unwrap();
     let cpu = cpu_softmax(&|row| 100 + (row % 3) + 1);
-    let (error, index) = max_abs_err(&gpu, &cpu);
-    assert!(error <= 1e-6, "causal softmax error {error:.3e} at {index}");
+    assert_close_tol(&gpu, &cpu, 1e-6, "causal softmax");
 }
 
 #[test]
@@ -134,8 +118,7 @@ fn rms_and_layer_norm_match_reference() {
             cpu[row * cols as usize + col] = (data[col] as f64 * inv) as f32 * host_w[col];
         }
     }
-    let (error, index) = max_abs_err(&gpu, &cpu);
-    assert!(error <= 1e-4, "rmsnorm error {error:.3e} at {index}");
+    assert_close_tol(&gpu, &cpu, 1e-4, "rmsnorm");
 
     exec.run_layer_norm(&input, &weight, &bias, &output, eps)
         .unwrap();
@@ -150,8 +133,7 @@ fn rms_and_layer_norm_match_reference() {
                 ((data[col] as f64 - mean) * inv) as f32 * host_w[col] + host_b[col];
         }
     }
-    let (error, index) = max_abs_err(&gpu, &cpu);
-    assert!(error <= 1e-4, "layernorm error {error:.3e} at {index}");
+    assert_close_tol(&gpu, &cpu, 1e-4, "layernorm");
 }
 
 #[test]
@@ -212,8 +194,7 @@ fn rope_rotates_pairs_with_partial_dim_and_offset() {
             // Lanes past rot_dim pass through — cpu already holds them.
         }
     }
-    let (error, index) = max_abs_err(&gpu, &cpu);
-    assert!(error <= 1e-5, "rope error {error:.3e} at {index}");
+    assert_close_tol(&gpu, &cpu, 1e-5, "rope");
 
     // In-place run matches the out-of-place result.
     exec.run_rope(
@@ -230,11 +211,7 @@ fn rope_rotates_pairs_with_partial_dim_and_offset() {
     .unwrap();
     let mut inplace = vec![0.0; host_in.len()];
     exec.download(&input, &mut inplace).unwrap();
-    let (error, index) = max_abs_err(&inplace, &gpu);
-    assert!(
-        error == 0.0,
-        "in-place rope diverges {error:.3e} at {index}"
-    );
+    assert_close_tol(&inplace, &gpu, 0.0, "in-place rope diverges");
 }
 
 #[test]
@@ -426,9 +403,5 @@ fn decode_attention_step_composes() {
             cpu[head * dh as usize + lane] = acc as f32;
         }
     }
-    let (error, index) = max_abs_err(&gpu, &cpu);
-    assert!(
-        error <= 1e-4,
-        "decode attention error {error:.3e} at {index}"
-    );
+    assert_close_tol(&gpu, &cpu, 1e-4, "decode attention");
 }

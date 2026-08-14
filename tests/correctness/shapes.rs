@@ -41,15 +41,7 @@ fn shape_sweep_rank2() {
             13,
             None,
         );
-        let (e, idx) = max_abs_err(&gpu, &cpu);
-        let tol = tolerance(k);
-        assert!(
-            e <= tol,
-            "rank2 M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-             at idx {idx}: gpu={:.6} cpu={:.6}",
-            gpu[idx],
-            cpu[idx],
-        );
+        assert_close(&gpu, &cpu, k, &format!("rank2 M={m} N={n} K={k}"));
     }
 }
 
@@ -73,11 +65,7 @@ fn strict_aligned_kernels_match_cpu_on_supported_shapes() {
             149,
             None,
         );
-        let (error, index) = max_abs_err(&gpu, &cpu);
-        assert!(
-            error <= tolerance(k),
-            "aligned {selection:?} failed at {index}: {error:.3e}"
-        );
+        assert_close(&gpu, &cpu, k, &format!("aligned {selection:?}"));
     }
 }
 
@@ -98,15 +86,7 @@ fn large_tile_kernel_path() {
         19,
         None,
     );
-    let (e, idx) = max_abs_err(&gpu, &cpu);
-    let tol = tolerance(k);
-    assert!(
-        e <= tol,
-        "large-tile M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-         at idx {idx}: gpu={:.6} cpu={:.6}",
-        gpu[idx],
-        cpu[idx],
-    );
+    assert_close(&gpu, &cpu, k, &format!("large-tile M={m} N={n} K={k}"));
 }
 
 #[test]
@@ -126,14 +106,11 @@ fn manual_large_kernel_handles_partial_tiles() {
         29,
         None,
     );
-    let (e, idx) = max_abs_err(&gpu, &cpu);
-    let tol = tolerance(k);
-    assert!(
-        e <= tol,
-        "manual large partial tile M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-         at idx {idx}: gpu={:.6} cpu={:.6}",
-        gpu[idx],
-        cpu[idx],
+    assert_close(
+        &gpu,
+        &cpu,
+        k,
+        &format!("manual large partial tile M={m} N={n} K={k}"),
     );
 }
 
@@ -157,15 +134,7 @@ fn manual_m64n128_kernel_handles_wide_and_partial_tiles() {
             seed_b,
             None,
         );
-        let (e, idx) = max_abs_err(&gpu, &cpu);
-        let tol = tolerance(k);
-        assert!(
-            e <= tol,
-            "m64n128 M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-             at idx {idx}: gpu={:.6} cpu={:.6}",
-            gpu[idx],
-            cpu[idx],
-        );
+        assert_close(&gpu, &cpu, k, &format!("m64n128 M={m} N={n} K={k}"));
     }
 }
 
@@ -189,15 +158,7 @@ fn manual_m128n64_kernel_handles_tall_and_partial_tiles() {
             seed_b,
             None,
         );
-        let (e, idx) = max_abs_err(&gpu, &cpu);
-        let tol = tolerance(k);
-        assert!(
-            e <= tol,
-            "m128n64 M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-             at idx {idx}: gpu={:.6} cpu={:.6}",
-            gpu[idx],
-            cpu[idx],
-        );
+        assert_close(&gpu, &cpu, k, &format!("m128n64 M={m} N={n} K={k}"));
     }
 }
 
@@ -221,15 +182,7 @@ fn manual_m128n64k64_kernel_handles_deep_k_and_tail() {
             seed_b,
             None,
         );
-        let (e, idx) = max_abs_err(&gpu, &cpu);
-        let tol = tolerance(k);
-        assert!(
-            e <= tol,
-            "m128n64k64 M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-             at idx {idx}: gpu={:.6} cpu={:.6}",
-            gpu[idx],
-            cpu[idx],
-        );
+        assert_close(&gpu, &cpu, k, &format!("m128n64k64 M={m} N={n} K={k}"));
     }
 }
 
@@ -253,15 +206,7 @@ fn manual_m64n32_kernel_handles_near_square_partial_tiles() {
             seed_b,
             None,
         );
-        let (e, idx) = max_abs_err(&gpu, &cpu);
-        let tol = tolerance(k);
-        assert!(
-            e <= tol,
-            "m64n32 M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-             at idx {idx}: gpu={:.6} cpu={:.6}",
-            gpu[idx],
-            cpu[idx],
-        );
+        assert_close(&gpu, &cpu, k, &format!("m64n32 M={m} N={n} K={k}"));
     }
 }
 
@@ -285,15 +230,7 @@ fn manual_k64_kernel_handles_small_k_and_tail() {
             seed_b,
             None,
         );
-        let (e, idx) = max_abs_err(&gpu, &cpu);
-        let tol = tolerance(k);
-        assert!(
-            e <= tol,
-            "k64 M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-             at idx {idx}: gpu={:.6} cpu={:.6}",
-            gpu[idx],
-            cpu[idx],
-        );
+        assert_close(&gpu, &cpu, k, &format!("k64 M={m} N={n} K={k}"));
     }
 }
 
@@ -371,15 +308,7 @@ fn v4_kernels_handle_n_not_multiple_of_4() {
                 seed_b,
                 None,
             );
-            let (e, idx) = max_abs_err(&gpu, &cpu);
-            let tol = tolerance(k);
-            assert!(
-                e <= tol,
-                "{name} M={m} N={n} K={k}: err={e:.3e} > tol={tol:.3e} \
-                 at idx {idx}: gpu={:.6} cpu={:.6}",
-                gpu[idx],
-                cpu[idx],
-            );
+            assert_close(&gpu, &cpu, k, &format!("{name} M={m} N={n} K={k}"));
         }
     }
 }

@@ -9,15 +9,9 @@ use tensor_ash::{
 fn prepared_matches_reference_and_replays_fresh_uploads() {
     let (ctx, exec) = make_setup(2, 8);
     let (m, n, k) = (96_u32, 112_u32, 80_u32);
-    let a = Tensor::uninit_device(&ctx, &[m, k]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[k, n]).unwrap();
+    let (a, mut host_a) = upload_det(&ctx, &exec, &[m, k], 1201);
+    let (b, host_b) = upload_det(&ctx, &exec, &[k, n], 1202);
     let c = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
-    let mut host_a = vec![0.0; (m * k) as usize];
-    let mut host_b = vec![0.0; (k * n) as usize];
-    fill_det(&mut host_a, 1201);
-    fill_det(&mut host_b, 1202);
-    exec.upload(&host_a, &a).unwrap();
-    exec.upload(&host_b, &b).unwrap();
 
     let mut prepared = exec
         .prepare_matmuls(&[MatmulCall {
@@ -35,11 +29,7 @@ fn prepared_matches_reference_and_replays_fresh_uploads() {
     let mut gpu = vec![0.0; (m * n) as usize];
     exec.download(&c, &mut gpu).unwrap();
     let cpu = cpu_bmm(&host_a, &host_b, None, 1, m, n, k, 1.0, false);
-    let (error, index) = max_abs_err(&gpu, &cpu);
-    assert!(
-        error <= tolerance(k),
-        "prepared error {error:.3e} at {index}"
-    );
+    assert_close(&gpu, &cpu, k, "prepared");
 
     // A second replay after re-uploading A sees the new contents —
     // the recorded command buffer points at memory, not values.
@@ -48,8 +38,7 @@ fn prepared_matches_reference_and_replays_fresh_uploads() {
     prepared.run().unwrap();
     exec.download(&c, &mut gpu).unwrap();
     let cpu = cpu_bmm(&host_a, &host_b, None, 1, m, n, k, 1.0, false);
-    let (error, index) = max_abs_err(&gpu, &cpu);
-    assert!(error <= tolerance(k), "replay error {error:.3e} at {index}");
+    assert_close(&gpu, &cpu, k, "replay");
 }
 
 #[test]
@@ -57,16 +46,10 @@ fn prepared_matches_reference_and_replays_fresh_uploads() {
 fn prepared_graph_orders_dependent_chain() {
     let (ctx, exec) = make_setup(2, 8);
     let s = 64_u32;
-    let a = Tensor::uninit_device(&ctx, &[s, s]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[s, s]).unwrap();
+    let (a, host_a) = upload_det(&ctx, &exec, &[s, s], 1301);
+    let (b, host_b) = upload_det(&ctx, &exec, &[s, s], 1302);
     let c1 = Tensor::uninit_device(&ctx, &[s, s]).unwrap();
     let c2 = Tensor::uninit_device(&ctx, &[s, s]).unwrap();
-    let mut host_a = vec![0.0; (s * s) as usize];
-    let mut host_b = vec![0.0; (s * s) as usize];
-    fill_det(&mut host_a, 1301);
-    fill_det(&mut host_b, 1302);
-    exec.upload(&host_a, &a).unwrap();
-    exec.upload(&host_b, &b).unwrap();
 
     let calls = [
         MatmulCall {
@@ -97,12 +80,8 @@ fn prepared_graph_orders_dependent_chain() {
     exec.download(&c2, &mut gpu).unwrap();
     let cpu_c1 = cpu_bmm(&host_a, &host_b, None, 1, s, s, s, 1.0, false);
     let cpu_c2 = cpu_bmm(&cpu_c1, &host_b, None, 1, s, s, s, 1.0, false);
-    let (error, index) = max_abs_err(&gpu, &cpu_c2);
     // Two chained reductions accumulate two rounds of error.
-    assert!(
-        error <= 2.0 * tolerance(s),
-        "prepared graph error {error:.3e} at {index}"
-    );
+    assert_close_tol(&gpu, &cpu_c2, 2.0 * tolerance(s), "prepared graph");
 }
 
 #[test]
@@ -112,23 +91,11 @@ fn prepared_replays_batched_broadcast_epilogue_op() {
     // B is broadcast across batches; bias + ReLU + residual exercise the
     // epilogue device addresses baked into the replayed command buffer.
     let (batch, m, n, k) = (3_u32, 21_u32, 45_u32, 33_u32);
-    let a = Tensor::uninit_device(&ctx, &[batch, m, k]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[1, k, n]).unwrap();
+    let (a, host_a) = upload_det(&ctx, &exec, &[batch, m, k], 1501);
+    let (b, host_b) = upload_det(&ctx, &exec, &[1, k, n], 1502);
     let c = Tensor::uninit_device(&ctx, &[batch, m, n]).unwrap();
-    let bias = Tensor::uninit_device(&ctx, &[batch, n]).unwrap();
-    let residual = Tensor::uninit_device(&ctx, &[batch, m, n]).unwrap();
-    let mut host_a = vec![0.0; Tensor::numel(a.shape()) as usize];
-    let mut host_b = vec![0.0; Tensor::numel(b.shape()) as usize];
-    let mut host_bias = vec![0.0; Tensor::numel(bias.shape()) as usize];
-    let mut host_residual = vec![0.0; Tensor::numel(residual.shape()) as usize];
-    fill_det(&mut host_a, 1501);
-    fill_det(&mut host_b, 1502);
-    fill_det(&mut host_bias, 1503);
-    fill_det(&mut host_residual, 1504);
-    exec.upload(&host_a, &a).unwrap();
-    exec.upload(&host_b, &b).unwrap();
-    exec.upload(&host_bias, &bias).unwrap();
-    exec.upload(&host_residual, &residual).unwrap();
+    let (bias, host_bias) = upload_det(&ctx, &exec, &[batch, n], 1503);
+    let (residual, host_residual) = upload_det(&ctx, &exec, &[batch, m, n], 1504);
 
     let beta = 0.25;
     let ops = [MatmulOp::with_epilogue(
@@ -153,20 +120,8 @@ fn prepared_replays_batched_broadcast_epilogue_op() {
     let mut actual = vec![0.0; Tensor::numel(c.shape()) as usize];
     exec.download(&c, &mut actual).unwrap();
     let mut expected = cpu_bmm(&host_a, &host_b, None, batch, m, n, k, 1.0, false);
-    for batch_index in 0..batch as usize {
-        for row in 0..m as usize {
-            for col in 0..n as usize {
-                let index = (batch_index * m as usize + row) * n as usize + col;
-                let with_bias = expected[index] + host_bias[batch_index * n as usize + col];
-                expected[index] = with_bias.max(0.0) + beta * host_residual[index];
-            }
-        }
-    }
-    let (error, index) = max_abs_err(&actual, &expected);
-    assert!(
-        error <= tolerance(k),
-        "prepared epilogue error {error:.3e} at {index}"
-    );
+    cpu_bias_relu_residual(&mut expected, &host_bias, &host_residual, batch, m, n, beta);
+    assert_close(&actual, &expected, k, "prepared epilogue");
 }
 
 #[test]
@@ -199,15 +154,9 @@ fn prepared_rejects_descriptor_kernels_and_forces_dp_on_deep_k() {
     let (ctx, exec) = make_setup(2, 8);
     let (m, n, k) = (37_u32, 41_u32, 1088_u32);
     if exec.dispatch_info(1, m, n, k).split_k2_splits.is_some() {
-        let a = Tensor::uninit_device(&ctx, &[m, k]).unwrap();
-        let b = Tensor::uninit_device(&ctx, &[k, n]).unwrap();
+        let (a, host_a) = upload_det(&ctx, &exec, &[m, k], 1601);
+        let (b, host_b) = upload_det(&ctx, &exec, &[k, n], 1602);
         let c = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
-        let mut host_a = vec![0.0; (m * k) as usize];
-        let mut host_b = vec![0.0; (k * n) as usize];
-        fill_det(&mut host_a, 1601);
-        fill_det(&mut host_b, 1602);
-        exec.upload(&host_a, &a).unwrap();
-        exec.upload(&host_b, &b).unwrap();
         let mut prepared = exec
             .prepare_matmuls(&[MatmulCall {
                 a: &a,
@@ -221,11 +170,7 @@ fn prepared_rejects_descriptor_kernels_and_forces_dp_on_deep_k() {
         let mut gpu = vec![0.0; (m * n) as usize];
         exec.download(&c, &mut gpu).unwrap();
         let cpu = cpu_bmm(&host_a, &host_b, None, 1, m, n, k, 1.0, false);
-        let (error, index) = max_abs_err(&gpu, &cpu);
-        assert!(
-            error <= tolerance(k),
-            "prepared deep-K DP error {error:.3e} at {index}"
-        );
+        assert_close(&gpu, &cpu, k, "prepared deep-K DP");
     }
 }
 
@@ -234,16 +179,10 @@ fn prepared_rejects_descriptor_kernels_and_forces_dp_on_deep_k() {
 fn prepared_pingpong_overlaps_and_rejects_misuse() {
     let (ctx, exec) = make_setup(2, 8);
     let s = 48_u32;
-    let a = Tensor::uninit_device(&ctx, &[s, s]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[s, s]).unwrap();
+    let (a, host_a) = upload_det(&ctx, &exec, &[s, s], 1401);
+    let (b, host_b) = upload_det(&ctx, &exec, &[s, s], 1402);
     let c1 = Tensor::uninit_device(&ctx, &[s, s]).unwrap();
     let c2 = Tensor::uninit_device(&ctx, &[s, s]).unwrap();
-    let mut host_a = vec![0.0; (s * s) as usize];
-    let mut host_b = vec![0.0; (s * s) as usize];
-    fill_det(&mut host_a, 1401);
-    fill_det(&mut host_b, 1402);
-    exec.upload(&host_a, &a).unwrap();
-    exec.upload(&host_b, &b).unwrap();
 
     let call = |c| MatmulCall {
         a: &a,
@@ -279,10 +218,6 @@ fn prepared_pingpong_overlaps_and_rejects_misuse() {
     for c in [&c1, &c2] {
         let mut gpu = vec![0.0; (s * s) as usize];
         exec.download(c, &mut gpu).unwrap();
-        let (error, index) = max_abs_err(&gpu, &cpu);
-        assert!(
-            error <= tolerance(s),
-            "pingpong error {error:.3e} at {index}"
-        );
+        assert_close(&gpu, &cpu, s, "pingpong");
     }
 }

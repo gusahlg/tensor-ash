@@ -85,13 +85,7 @@ fn row_kernel_handles_tails_broadcasting_and_multiple_rows() {
             initial.as_deref(),
         );
         let k = *case.shape_a.last().unwrap();
-        let (error, error_index) = max_abs_err(&gpu, &cpu);
-        assert!(
-            error <= tolerance(k),
-            "row case {index} error {error:.3e} at {error_index}: got {}, expected {}",
-            gpu[error_index],
-            cpu[error_index]
-        );
+        assert_close(&gpu, &cpu, k, &format!("row case {index}"));
     }
 }
 
@@ -100,26 +94,11 @@ fn row_kernel_handles_tails_broadcasting_and_multiple_rows() {
 fn row_kernel_supports_accumulation_and_batched_fused_epilogue() {
     let (ctx, exec) = make_setup_with_kernel(2, 8, KernelSelection::RowBda);
     let (batch, m, n, k) = (3_u32, 1_u32, 35_u32, 19_u32);
-    let a = Tensor::uninit_device(&ctx, &[batch, m, k]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[batch, k, n]).unwrap();
-    let c = Tensor::uninit_device(&ctx, &[batch, m, n]).unwrap();
-    let bias = Tensor::uninit_device(&ctx, &[batch, n]).unwrap();
-    let residual = Tensor::uninit_device(&ctx, &[batch, m, n]).unwrap();
-    let mut host_a = vec![0.0; Tensor::numel(a.shape()) as usize];
-    let mut host_b = vec![0.0; Tensor::numel(b.shape()) as usize];
-    let mut host_c = vec![0.0; Tensor::numel(c.shape()) as usize];
-    let mut host_bias = vec![0.0; Tensor::numel(bias.shape()) as usize];
-    let mut host_residual = vec![0.0; Tensor::numel(residual.shape()) as usize];
-    fill_det(&mut host_a, 501);
-    fill_det(&mut host_b, 502);
-    fill_det(&mut host_c, 503);
-    fill_det(&mut host_bias, 504);
-    fill_det(&mut host_residual, 505);
-    exec.upload(&host_a, &a).unwrap();
-    exec.upload(&host_b, &b).unwrap();
-    exec.upload(&host_c, &c).unwrap();
-    exec.upload(&host_bias, &bias).unwrap();
-    exec.upload(&host_residual, &residual).unwrap();
+    let (a, host_a) = upload_det(&ctx, &exec, &[batch, m, k], 501);
+    let (b, host_b) = upload_det(&ctx, &exec, &[batch, k, n], 502);
+    let (c, host_c) = upload_det(&ctx, &exec, &[batch, m, n], 503);
+    let (bias, host_bias) = upload_det(&ctx, &exec, &[batch, n], 504);
+    let (residual, host_residual) = upload_det(&ctx, &exec, &[batch, m, n], 505);
 
     let alpha = 0.75;
     let beta = 0.25;
@@ -142,21 +121,8 @@ fn row_kernel_supports_accumulation_and_batched_fused_epilogue() {
     let mut actual = vec![0.0; host_c.len()];
     exec.download(&c, &mut actual).unwrap();
     let mut expected = cpu_bmm(&host_a, &host_b, Some(&host_c), batch, m, n, k, alpha, true);
-    for batch_index in 0..batch as usize {
-        for col in 0..n as usize {
-            let index = batch_index * n as usize + col;
-            expected[index] =
-                (expected[index] + host_bias[index]).max(0.0) + beta * host_residual[index];
-        }
-    }
-
-    let (error, index) = max_abs_err(&actual, &expected);
-    assert!(
-        error <= tolerance(k),
-        "row fused epilogue error {error:.3e} at {index}: got {}, expected {}",
-        actual[index],
-        expected[index]
-    );
+    cpu_bias_relu_residual(&mut expected, &host_bias, &host_residual, batch, m, n, beta);
+    assert_close(&actual, &expected, k, "row fused epilogue");
 }
 
 #[test]
@@ -231,13 +197,7 @@ fn col_kernel_handles_k_boundaries_rows_and_broadcasting() {
             initial.as_deref(),
         );
         let k = *case.shape_a.last().unwrap();
-        let (error, error_index) = max_abs_err(&gpu, &cpu);
-        assert!(
-            error <= tolerance(k),
-            "col case {index} error {error:.3e} at {error_index}: got {}, expected {}",
-            gpu[error_index],
-            cpu[error_index]
-        );
+        assert_close(&gpu, &cpu, k, &format!("col case {index}"));
     }
 }
 
@@ -246,26 +206,11 @@ fn col_kernel_handles_k_boundaries_rows_and_broadcasting() {
 fn col_kernel_supports_batched_fused_epilogue() {
     let (ctx, exec) = make_setup_with_kernel(2, 8, KernelSelection::ColBda);
     let (batch, m, n, k) = (3_u32, 5_u32, 1_u32, 33_u32);
-    let a = Tensor::uninit_device(&ctx, &[batch, m, k]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[batch, k, n]).unwrap();
-    let c = Tensor::uninit_device(&ctx, &[batch, m, n]).unwrap();
-    let bias = Tensor::uninit_device(&ctx, &[batch, n]).unwrap();
-    let residual = Tensor::uninit_device(&ctx, &[batch, m, n]).unwrap();
-    let mut host_a = vec![0.0; Tensor::numel(a.shape()) as usize];
-    let mut host_b = vec![0.0; Tensor::numel(b.shape()) as usize];
-    let mut host_c = vec![0.0; Tensor::numel(c.shape()) as usize];
-    let mut host_bias = vec![0.0; Tensor::numel(bias.shape()) as usize];
-    let mut host_residual = vec![0.0; Tensor::numel(residual.shape()) as usize];
-    fill_det(&mut host_a, 801);
-    fill_det(&mut host_b, 802);
-    fill_det(&mut host_c, 803);
-    fill_det(&mut host_bias, 804);
-    fill_det(&mut host_residual, 805);
-    exec.upload(&host_a, &a).unwrap();
-    exec.upload(&host_b, &b).unwrap();
-    exec.upload(&host_c, &c).unwrap();
-    exec.upload(&host_bias, &bias).unwrap();
-    exec.upload(&host_residual, &residual).unwrap();
+    let (a, host_a) = upload_det(&ctx, &exec, &[batch, m, k], 801);
+    let (b, host_b) = upload_det(&ctx, &exec, &[batch, k, n], 802);
+    let (c, host_c) = upload_det(&ctx, &exec, &[batch, m, n], 803);
+    let (bias, host_bias) = upload_det(&ctx, &exec, &[batch, n], 804);
+    let (residual, host_residual) = upload_det(&ctx, &exec, &[batch, m, n], 805);
 
     let alpha = 0.75;
     let beta = 0.25;
@@ -288,18 +233,6 @@ fn col_kernel_supports_batched_fused_epilogue() {
     let mut actual = vec![0.0; host_c.len()];
     exec.download(&c, &mut actual).unwrap();
     let mut expected = cpu_bmm(&host_a, &host_b, Some(&host_c), batch, m, n, k, alpha, true);
-    for (batch_index, expected_batch) in expected.chunks_exact_mut(m as usize).enumerate() {
-        for (row, value) in expected_batch.iter_mut().enumerate() {
-            let index = batch_index * m as usize + row;
-            *value = (*value + host_bias[batch_index]).max(0.0) + beta * host_residual[index];
-        }
-    }
-
-    let (error, index) = max_abs_err(&actual, &expected);
-    assert!(
-        error <= tolerance(k),
-        "col fused epilogue error {error:.3e} at {index}: got {}, expected {}",
-        actual[index],
-        expected[index]
-    );
+    cpu_bias_relu_residual(&mut expected, &host_bias, &host_residual, batch, m, n, beta);
+    assert_close(&actual, &expected, k, "col fused epilogue");
 }

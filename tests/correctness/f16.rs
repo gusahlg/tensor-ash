@@ -25,13 +25,10 @@ fn setup_f16_case(
     seed_a: u64,
     seed_b: u64,
 ) -> (Tensor, Tensor, Vec<f32>, Vec<f32>) {
-    let a = Tensor::uninit_device(ctx, a_shape).unwrap();
+    let (a, host_a) = upload_det(ctx, exec, a_shape, seed_a);
     let b = Tensor::uninit_device_f16(ctx, b_shape).unwrap();
-    let mut host_a = vec![0.0; Tensor::numel(a_shape) as usize];
     let mut host_b = vec![0.0; Tensor::numel(b_shape) as usize];
-    fill_det(&mut host_a, seed_a);
     fill_det(&mut host_b, seed_b);
-    exec.upload(&host_a, &a).unwrap();
     exec.upload(&host_b, &b).unwrap();
     for value in &mut host_b {
         *value = round_f32_via_f16(*value);
@@ -120,11 +117,7 @@ fn f16_weights_match_rounded_reference_across_routes() {
         let mut gpu = vec![0.0; Tensor::numel(&shape(m, n)) as usize];
         exec.download(&c, &mut gpu).unwrap();
         let cpu = cpu_bmm(&host_a, &host_b, None, batch, m, n, k, 1.0, false);
-        let (error, index) = max_abs_err(&gpu, &cpu);
-        assert!(
-            error <= tolerance(k),
-            "B={batch} {m}x{n}x{k}: f16w error {error:.3e} at {index}"
-        );
+        assert_close(&gpu, &cpu, k, &format!("B={batch} {m}x{n}x{k} f16w"));
     }
 }
 
@@ -195,8 +188,7 @@ fn f16_row_gemv_and_batched_epilogue() {
     let mut gpu = vec![0.0; (m * n) as usize];
     exec.download(&c, &mut gpu).unwrap();
     let cpu = cpu_bmm(&host_a, &host_b, None, 1, m, n, k, 1.0, false);
-    let (error, index) = max_abs_err(&gpu, &cpu);
-    assert!(error <= tolerance(k), "gemv error {error:.3e} at {index}");
+    assert_close(&gpu, &cpu, k, "gemv");
 
     // Batched broadcast-B with bias + SiLU + scaled residual: the
     // epilogue operands stay f32 while B is f16.
@@ -204,14 +196,8 @@ fn f16_row_gemv_and_batched_epilogue() {
     let (a, b, host_a, host_b) =
         setup_f16_case(&ctx, &exec, &[batch, m, k], &[1, k, n], 9600, 9601);
     let c = Tensor::uninit_device(&ctx, &[batch, m, n]).unwrap();
-    let bias = Tensor::uninit_device(&ctx, &[n]).unwrap();
-    let residual = Tensor::uninit_device(&ctx, &[batch, m, n]).unwrap();
-    let mut host_bias = vec![0.0; n as usize];
-    let mut host_residual = vec![0.0; (batch * m * n) as usize];
-    fill_det(&mut host_bias, 9602);
-    fill_det(&mut host_residual, 9603);
-    exec.upload(&host_bias, &bias).unwrap();
-    exec.upload(&host_residual, &residual).unwrap();
+    let (bias, host_bias) = upload_det(&ctx, &exec, &[n], 9602);
+    let (residual, host_residual) = upload_det(&ctx, &exec, &[batch, m, n], 9603);
     let beta = 0.5;
     exec.run_ops(&[MatmulOp::with_epilogue(
         MatmulCall {
@@ -237,11 +223,7 @@ fn f16_row_gemv_and_batched_epilogue() {
         let act = with_bias / (1.0 + (-with_bias).exp());
         *value = act + beta * host_residual[index];
     }
-    let (error, index) = max_abs_err(&gpu, &expected);
-    assert!(
-        error <= tolerance(k),
-        "f16w epilogue error {error:.3e} at {index}"
-    );
+    assert_close(&gpu, &expected, k, "f16w epilogue");
 }
 
 #[test]
@@ -310,10 +292,7 @@ fn coopmat_routes_and_matches_dual_rounded_reference() {
         *value = round_f32_via_f16(*value);
     }
     exec.upload(&host_a, &a).unwrap();
-    let c = Tensor::uninit_device(&ctx, &[batch, m, n]).unwrap();
-    let mut host_c = vec![0.0; (batch * m * n) as usize];
-    fill_det(&mut host_c, 9702);
-    exec.upload(&host_c, &c).unwrap();
+    let (c, host_c) = upload_det(&ctx, &exec, &[batch, m, n], 9702);
     let alpha = 0.75;
     exec.run_matmuls(&[MatmulCall {
         a: &a,
@@ -326,9 +305,5 @@ fn coopmat_routes_and_matches_dual_rounded_reference() {
     let mut gpu = vec![0.0; (batch * m * n) as usize];
     exec.download(&c, &mut gpu).unwrap();
     let cpu = cpu_bmm(&host_a, &host_b, Some(&host_c), batch, m, n, k, alpha, true);
-    let (error, index) = max_abs_err(&gpu, &cpu);
-    assert!(
-        error <= tolerance(k),
-        "coopmat error {error:.3e} at {index}"
-    );
+    assert_close(&gpu, &cpu, k, "coopmat");
 }

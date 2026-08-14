@@ -28,6 +28,61 @@ fn executor_config(n_slots: usize, max_calls: u32) -> ExecutorConfig {
     }
 }
 
+/// Assert `gpu` matches `cpu` within `tol`, panicking with the worst
+/// element's index and both values.
+pub fn assert_close_tol(gpu: &[f32], cpu: &[f32], tol: f32, label: &str) {
+    let (e, idx) = max_abs_err(gpu, cpu);
+    assert!(
+        e <= tol,
+        "{label}: err={e:.3e} > tol={tol:.3e} at idx {idx}: gpu={:.6} cpu={:.6}",
+        gpu[idx],
+        cpu[idx],
+    );
+}
+
+/// `assert_close_tol` with the standard K-scaled GEMM `tolerance(k)`.
+pub fn assert_close(gpu: &[f32], cpu: &[f32], k: u32, label: &str) {
+    assert_close_tol(gpu, cpu, tolerance(k), label);
+}
+
+/// Create a device tensor of `shape`, fill it deterministically from
+/// `seed`, upload, and return the tensor plus the host copy.
+pub fn upload_det(
+    ctx: &Arc<VulkanContext>,
+    exec: &Executor,
+    shape: &[u32],
+    seed: u64,
+) -> (Tensor, Vec<f32>) {
+    let tensor = Tensor::uninit_device(ctx, shape).unwrap();
+    let mut host = vec![0.0; Tensor::numel(shape) as usize];
+    fill_det(&mut host, seed);
+    exec.upload(&host, &tensor).unwrap();
+    (tensor, host)
+}
+
+/// CPU reference for the fused batched epilogue used across kernels:
+/// `c[b,r,col] = max(c[b,r,col] + bias[b,col], 0) + beta * d[b,r,col]`
+/// (per-batch bias row, ReLU, scaled residual add).
+pub fn cpu_bias_relu_residual(
+    c: &mut [f32],
+    bias: &[f32],
+    residual: &[f32],
+    batch: u32,
+    m: u32,
+    n: u32,
+    beta: f32,
+) {
+    for batch_index in 0..batch as usize {
+        for row in 0..m as usize {
+            for col in 0..n as usize {
+                let index = (batch_index * m as usize + row) * n as usize + col;
+                let with_bias = c[index] + bias[batch_index * n as usize + col];
+                c[index] = with_bias.max(0.0) + beta * residual[index];
+            }
+        }
+    }
+}
+
 pub fn make_setup(n_slots: usize, max_calls: u32) -> (Arc<VulkanContext>, Executor) {
     let ctx = VulkanContext::new(validate_from_env()).expect("Vulkan init");
     let pipe = Arc::new(MatmulPipeline::new(&ctx).expect("pipeline"));

@@ -14,15 +14,9 @@ fn many_calls_one_submit() {
     let mut tensors = Vec::new();
     let mut hosts = Vec::new();
     for s in 0..n_calls {
-        let a = Tensor::uninit_device(&ctx, &[m, k]).unwrap();
-        let b = Tensor::uninit_device(&ctx, &[k, nn]).unwrap();
+        let (a, ha) = upload_det(&ctx, &exec, &[m, k], 1000 + s as u64);
+        let (b, hb) = upload_det(&ctx, &exec, &[k, nn], 2000 + s as u64);
         let c = Tensor::uninit_device(&ctx, &[m, nn]).unwrap();
-        let mut ha = vec![0.0f32; (m * k) as usize];
-        let mut hb = vec![0.0f32; (k * nn) as usize];
-        fill_det(&mut ha, 1000 + s as u64);
-        fill_det(&mut hb, 2000 + s as u64);
-        exec.upload(&ha, &a).unwrap();
-        exec.upload(&hb, &b).unwrap();
         tensors.push((a, b, c));
         hosts.push((ha, hb));
     }
@@ -42,8 +36,7 @@ fn many_calls_one_submit() {
         let mut got = vec![0.0f32; (m * nn) as usize];
         exec.download(c, &mut got).unwrap();
         let cpu = cpu_bmm(&hosts[i].0, &hosts[i].1, None, 1, m, nn, k, 1.0, false);
-        let (e, _) = max_abs_err(&got, &cpu);
-        assert!(e <= tolerance(k), "call {i}: err {e:.3e}");
+        assert_close(&got, &cpu, k, &format!("call {i}"));
     }
 }
 
@@ -59,15 +52,9 @@ fn concurrent_submitters() {
         let exec = exec.clone();
         let ctx = ctx.clone();
         threads.push(std::thread::spawn(move || {
-            let a = Tensor::uninit_device(&ctx, &[m, k]).unwrap();
-            let b = Tensor::uninit_device(&ctx, &[k, n]).unwrap();
+            let (a, ha) = upload_det(&ctx, &exec, &[m, k], 10_000 + t as u64);
+            let (b, hb) = upload_det(&ctx, &exec, &[k, n], 20_000 + t as u64);
             let c = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
-            let mut ha = vec![0.0f32; (m * k) as usize];
-            let mut hb = vec![0.0f32; (k * n) as usize];
-            fill_det(&mut ha, 10_000 + t as u64);
-            fill_det(&mut hb, 20_000 + t as u64);
-            exec.upload(&ha, &a).unwrap();
-            exec.upload(&hb, &b).unwrap();
             exec.run_matmuls(&[MatmulCall {
                 a: &a,
                 b: &b,
@@ -79,8 +66,7 @@ fn concurrent_submitters() {
             let mut got = vec![0.0f32; (m * n) as usize];
             exec.download(&c, &mut got).unwrap();
             let cpu = cpu_bmm(&ha, &hb, None, 1, m, n, k, 1.0, false);
-            let (e, _) = max_abs_err(&got, &cpu);
-            assert!(e <= tolerance(k), "thread {t}: err {e:.3e}");
+            assert_close(&got, &cpu, k, &format!("thread {t}"));
         }));
     }
     for th in threads {
@@ -102,20 +88,12 @@ fn empty_submit() {
 fn chained_run_matmuls_observe_dependencies() {
     let (ctx, exec) = make_setup(2, 4);
     let n = 64u32;
-    let mut ha = vec![0.0f32; (n * n) as usize];
-    let mut hb = vec![0.0f32; (n * n) as usize];
-    fill_det(&mut ha, 111);
-    fill_det(&mut hb, 222);
-
-    let a = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
+    let (a, _) = upload_det(&ctx, &exec, &[n, n], 111);
+    let (b, _) = upload_det(&ctx, &exec, &[n, n], 222);
     let t1 = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
     let t2 = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
     let bb = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
     let abb = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
-
-    exec.upload(&ha, &a).unwrap();
-    exec.upload(&hb, &b).unwrap();
 
     exec.run_matmuls(&[MatmulCall {
         a: &a,
@@ -172,15 +150,9 @@ fn chained_run_matmuls_observe_dependencies() {
 fn many_consecutive_submits() {
     let (ctx, exec) = make_setup(2, 4);
     let n = 64u32;
-    let mut ha = vec![0.0f32; (n * n) as usize];
-    let mut hb = vec![0.0f32; (n * n) as usize];
-    fill_det(&mut ha, 91);
-    fill_det(&mut hb, 92);
-    let a = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
+    let (a, ha) = upload_det(&ctx, &exec, &[n, n], 91);
+    let (b, hb) = upload_det(&ctx, &exec, &[n, n], 92);
     let c = Tensor::uninit_device(&ctx, &[n, n]).unwrap();
-    exec.upload(&ha, &a).unwrap();
-    exec.upload(&hb, &b).unwrap();
 
     for _ in 0..200 {
         exec.run_matmuls(&[MatmulCall {
@@ -196,8 +168,7 @@ fn many_consecutive_submits() {
     let mut got = vec![0.0f32; (n * n) as usize];
     exec.download(&c, &mut got).unwrap();
     let cpu = cpu_bmm(&ha, &hb, None, 1, n, n, n, 1.0, false);
-    let (e, _) = max_abs_err(&got, &cpu);
-    assert!(e <= tolerance(n), "200-iter drift err={e:.3e}");
+    assert_close(&got, &cpu, n, "200-iter drift");
 }
 
 #[test]
@@ -212,15 +183,9 @@ fn concurrent_heavy_load() {
         let exec = exec.clone();
         let ctx = ctx.clone();
         threads.push(std::thread::spawn(move || {
-            let a = Tensor::uninit_device(&ctx, &[m, k]).unwrap();
-            let b = Tensor::uninit_device(&ctx, &[k, n]).unwrap();
+            let (a, ha) = upload_det(&ctx, &exec, &[m, k], 50_000 + t as u64);
+            let (b, hb) = upload_det(&ctx, &exec, &[k, n], 60_000 + t as u64);
             let c = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
-            let mut ha = vec![0.0f32; (m * k) as usize];
-            let mut hb = vec![0.0f32; (k * n) as usize];
-            fill_det(&mut ha, 50_000 + t as u64);
-            fill_det(&mut hb, 60_000 + t as u64);
-            exec.upload(&ha, &a).unwrap();
-            exec.upload(&hb, &b).unwrap();
 
             for _ in 0..50 {
                 exec.run_matmuls(&[MatmulCall {
@@ -235,8 +200,7 @@ fn concurrent_heavy_load() {
             let mut got = vec![0.0f32; (m * n) as usize];
             exec.download(&c, &mut got).unwrap();
             let cpu = cpu_bmm(&ha, &hb, None, 1, m, n, k, 1.0, false);
-            let (e, _) = max_abs_err(&got, &cpu);
-            assert!(e <= tolerance(k), "thread {t}: err {e:.3e}");
+            assert_close(&got, &cpu, k, &format!("thread {t}"));
         }));
     }
     for th in threads {
@@ -251,15 +215,9 @@ fn run_stats_reports_correct_counts() {
     let m = 32u32;
     let n = 48u32;
     let k = 16u32;
-    let a = Tensor::uninit_device(&ctx, &[m, k]).unwrap();
-    let b = Tensor::uninit_device(&ctx, &[k, n]).unwrap();
+    let (a, _) = upload_det(&ctx, &exec, &[m, k], 1);
+    let (b, _) = upload_det(&ctx, &exec, &[k, n], 2);
     let c = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
-    let mut ha = vec![0.0f32; (m * k) as usize];
-    let mut hb = vec![0.0f32; (k * n) as usize];
-    fill_det(&mut ha, 1);
-    fill_det(&mut hb, 2);
-    exec.upload(&ha, &a).unwrap();
-    exec.upload(&hb, &b).unwrap();
 
     let calls = [MatmulCall {
         a: &a,
