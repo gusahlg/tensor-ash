@@ -1,5 +1,56 @@
 # Experiment branch log
 
+## Leg 5 — `experiment/token-replay` (whole-token graphs + decode failure analysis)
+
+### Decode: 82.9 → 111.8 t/s in four measured steps
+
+| step | tg128 t/s | mechanism |
+|---|---|---|
+| baseline (per-op) | 82.9 | ~350 submit+wait per token |
+| whole-token graph (`run_exec_ops`) | 87.7 | one submission; bitwise-identical results |
+| hazard-aware barriers | 96.4 | fence only real RAW/WAW/WAR; QKV/RoPE/KV-append overlap |
+| free reshapes (`Tensor::alias_with_shape`) | 107.1 | GQA views alias q/attn memory; −44 dispatches+barriers |
+| 16-slice deep-K GEMV (`f16w_row_bda_k16`) | 111.8 | ffn_down 78→61 µs; deep-K/narrow-N routes |
+
+**Failure analysis that drove it** (LLAMA_ASH_BREAKDOWN per-op GPU timing):
+kernels 7.26 ms vs whole-CB 9.97 ms exposed ~2.7 ms of full-barrier drain
+(~7.7 µs each); kernel table showed FFN GEMVs at 58-72% of bandwidth
+(deep-K serial chains, narrow-N occupancy starvation) while attention was
+only 12% of the token. The naive "submission overhead dominates" theory
+was half-wrong: one submission alone bought +6%; the rest came from
+barrier elimination and kernel work.
+
+### Comparison matrix (TinyLlama-1.1B f16, RTX 3070, llama.cpp CUDA fa=1)
+
+| test | tensor-ash | llama.cpp CUDA | ratio |
+|---|---|---|---|
+| pp128 | 3,807 t/s | 10,114 t/s | 0.38x |
+| pp512 | 5,435 t/s | 16,718 t/s | 0.33x |
+| pp1024 | 5,649 t/s | 16,679 t/s | 0.34x |
+| pp2032 | 4,261 t/s | 16,393 t/s (pp2048) | 0.26x |
+| tg128 | **112.3 t/s** | 175.1 t/s | **0.64x** (was 0.48x) |
+
+Generation remains byte-identical to the CUDA reference (24/24) after
+every step. 85/85 GPU tests.
+
+### Remaining path to the goal (tensor-ash > CUDA), ranked
+
+Decode budget now ≈ 8.9 ms: ~6.9 ms kernels + ~1.6 ms barrier drain +
+~0.5 ms host. Target 5.7 ms (175 t/s), stretch below.
+1. **Op fusion to cut barrier count**: RoPE-into-cache (write the cache
+   from the rope kernel; −44 ops), norm+matmul pairs; a decode-attention
+   kernel collapsing scores/softmax/PV (−44 ops).
+2. **GEMV last 15%**: o_proj at 58% is the worst remaining; qkv batching.
+3. **Replayable token graph**: position values via host-visible buffer so
+   the command buffer records once (−~0.5 ms host, enables N-token
+   pipelining).
+4. **Prefill (the wide gap, 0.33x)**: standalone binary elementwise op so
+   the big projections keep the coopmat route instead of demoting for
+   fused epilogues; then f16 activations end-to-end; then NV_coopmat2
+   flash. llama.cpp's pp advantage is pure tensor-core coverage.
+
+
+
 ## Leg 4 — `experiment/llama-runner` (real-model E2E vs CUDA)
 
 ### TinyLlama-1.1B f16 on tensor-ash, compared against llama.cpp CUDA

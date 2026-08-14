@@ -4,6 +4,18 @@
 
 ### Added
 
+- **Mixed-op single-submission graphs** (`ExecOp`, `Executor::run_exec_ops`):
+  record a dependent chain of matmuls and model ops into one command
+  buffer with hazard-aware barriers (fence only on real RAW/WAW/WAR;
+  independent neighbours overlap). Bitwise-identical to the per-op path.
+- `Tensor::alias_with_shape`: zero-copy reshape of contiguous memory via
+  shared buffers; hazard tracking treats aliases as one buffer.
+- `f16w_row_bda_k16`: sixteen K-slice GEMV variant, auto-routed for
+  deep-K (>= 4096) or narrow-N (<= 512) f16-weight matvecs.
+- llama-ash: graph decode (whole token in one submission; default),
+  `LLAMA_ASH_BREAKDOWN=1` per-op-class GPU-time table. TinyLlama decode
+  82.9 -> 112.3 t/s (llama.cpp CUDA: 175); generation byte-identical.
+
 - `Executor::upload_f16`: stage raw binary16 host data directly into an
   f16 tensor, skipping `upload`'s `&[f32]` widen-and-renarrow round-trip
   for callers that already store half-precision parameters.
