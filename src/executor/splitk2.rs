@@ -1,8 +1,8 @@
 //! Two-stage split-K pipeline: partials to scratch + reduction kernel.
 //!
-//! The atomic split-K in `splitk.rs` pays `RED.E.ADD.F32` contention on
-//! every output cell (measured 17-53% losses on K=256-1024 low-CTA
-//! shapes).  This variant removes the atomics entirely:
+//! An earlier atomic split-K variant (removed) paid `RED.E.ADD.F32`
+//! contention on every output cell (measured 17-53% losses on
+//! K=256-1024 low-CTA shapes).  This variant has no atomics at all:
 //!
 //!   * **Stage 1** (`matmul_splitk2_kernel.glsl`): one workgroup per
 //!     (tile, batch, k_split) computes a partial C tile over its K
@@ -13,8 +13,8 @@
 //!
 //! Costs one extra dispatch + `splits * M*N` scratch traffic; wins
 //! when K is deep, M*N is small (so scratch is tiny and the DP grid
-//! can't fill the device), and determinism matters — unlike the atomic
-//! path, results are bit-stable across runs.
+//! can't fill the device), and determinism matters — results are
+//! bit-stable across runs.
 //!
 //! Neither stage touches descriptor sets: both address buffers through
 //! `buffer_reference` pointers in push constants.
@@ -81,6 +81,45 @@ pub(super) fn heuristic_splits(batch: u32, m: u32, n: u32, k: u32) -> Option<u32
     [64, 32, 16, 8, 4]
         .into_iter()
         .find(|&splits| u64::from(splits) <= wanted && splits <= max_splits)
+}
+
+/// Default number of K splits for a given (M, N, K) shape.  Aimed at
+/// roughly saturating an RTX 3070's 46 SMs (target ~64 active WGs to
+/// give the scheduler some queueing slack).  When the natural
+/// `(M/BM)*(N/BN)*batch` already yields that many WGs, no split is
+/// needed.  When it yields very few, pick a large split.
+///
+/// The user can override this through the explicit `num_k_splits`
+/// argument to `Executor::run_matmuls_split_k2`; this helper exists
+/// for the auto path and the experimental tests.
+pub(super) fn default_num_k_splits(
+    batch: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    tile_m: u32,
+    tile_n: u32,
+) -> u32 {
+    const TARGET_WGS: u64 = 64;
+    if tile_m == 0 || tile_n == 0 {
+        return 1;
+    }
+    let tiles = u64::from(m.div_ceil(tile_m))
+        .saturating_mul(u64::from(n.div_ceil(tile_n)))
+        .saturating_mul(u64::from(batch.max(1)));
+    if tiles == 0 {
+        return 1;
+    }
+    // Want tiles * num_k_splits >= TARGET_WGS, and num_k_splits | K.
+    // Round up the raw split count, then bound it to K so that each
+    // split has at least one K-element to consume.
+    let raw = TARGET_WGS.div_ceil(tiles).max(1);
+    // Cap so a single split still has a useful amount of K.  Below
+    // BK=32 elements per split the inner FMA loop has too little work
+    // to amortize the reduction epilogue.
+    let max_splits = (k as u64 / 32).max(1);
+    let splits = raw.min(max_splits);
+    splits.min(u32::MAX as u64) as u32
 }
 
 /// Push constants for the reduce stage.  Bit-for-bit identical to the
@@ -522,9 +561,40 @@ impl Drop for SplitK2Pipeline {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTO_SCRATCH_CAP_BYTES, auto_route_fits, checked_auto_scratch_end, heuristic_splits,
-        resolve_auto_splits, stage1_dispatch_info, validate_scratch_geometry,
+        AUTO_SCRATCH_CAP_BYTES, auto_route_fits, checked_auto_scratch_end, default_num_k_splits,
+        heuristic_splits, resolve_auto_splits, stage1_dispatch_info, validate_scratch_geometry,
     };
+
+    #[test]
+    fn default_num_k_splits_picks_enough_for_few_tiles() {
+        // 256x256x4096 with 128x128 tile: 4 tiles, want >= 64 WGs ->
+        // 16 splits, each handling 256 K-elements.
+        let splits = default_num_k_splits(1, 256, 256, 4096, 128, 128);
+        assert_eq!(splits, 16);
+        // 64x64x8192 with 64x64 tile: 1 tile, want >= 64 WGs -> 64
+        // splits, each 128 K-elements.
+        let splits = default_num_k_splits(1, 64, 64, 8192, 64, 64);
+        assert_eq!(splits, 64);
+        // 512x512 with 128x128 tile: 16 tiles already, no split.
+        let splits = default_num_k_splits(1, 512, 512, 4096, 128, 128);
+        assert_eq!(splits, 4);
+    }
+
+    #[test]
+    fn default_num_k_splits_caps_at_min_chunk_size() {
+        // Tiny K=64 means at most 2 splits even if we wanted more.
+        let splits = default_num_k_splits(1, 64, 64, 64, 64, 64);
+        assert_eq!(splits, 2);
+    }
+
+    #[test]
+    fn default_num_k_splits_handles_invalid_or_extreme_geometry() {
+        assert_eq!(default_num_k_splits(1, 128, 128, 1024, 0, 128), 1);
+        assert_eq!(
+            default_num_k_splits(u32::MAX, u32::MAX, u32::MAX, u32::MAX, 1, 1),
+            1,
+        );
+    }
 
     #[test]
     fn scratch_geometry_rejects_empty_splits_and_uint_wrap() {

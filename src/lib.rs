@@ -35,7 +35,6 @@ pub mod buffer;
 pub mod context;
 pub mod executor;
 pub mod matmul;
-pub mod persistent;
 pub mod pipeline;
 pub mod tensor;
 
@@ -45,7 +44,6 @@ pub use executor::{DispatchInfo, Executor, ExecutorConfig, PreparedOps};
 pub use matmul::{
     Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, MatrixShape, RunStats,
 };
-pub use persistent::PersistentMatmul;
 pub use pipeline::{
     EpilogueKey, KERNEL_SPECS, KernelSelection, KernelSpec, KernelVariant, MatmulKernel,
     MatmulPipeline, MatmulPushConstants,

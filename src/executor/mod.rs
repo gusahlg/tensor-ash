@@ -27,11 +27,7 @@ mod prepared;
 mod recording;
 mod reduction;
 mod slot;
-mod splitk;
 mod splitk2;
-mod streamk;
-mod streamk_exec;
-mod streamk_schedule;
 mod submission;
 mod transfer;
 mod tuning;
@@ -48,13 +44,7 @@ use crate::context::{DeviceKind, VulkanContext};
 use crate::pipeline::MatmulPipeline;
 
 use slot::Slot;
-use splitk::SplitKPipeline;
-pub use splitk::default_num_k_splits;
 use splitk2::SplitK2Pipeline;
-pub use splitk2::SplitK2ReducePushConstants;
-use streamk::StreamKPipeline;
-pub use streamk::StreamKPushConstants;
-pub use streamk_schedule::{StreamKSchedule, stream_k_should_fire};
 
 pub use crate::matmul::{MatmulCall, RunStats};
 pub use prepared::PreparedOps;
@@ -80,14 +70,6 @@ impl DispatchInfo {
         }
     }
 }
-
-/// Fallback SM count for Stream-K's persistent-grid sizing on
-/// devices where we don't have a runtime probe yet.  46 matches the
-/// RTX 3070 we develop on; the value only drives the preferred grid
-/// width `g_pref = sm_count * 2`, so being slightly off is harmless.
-/// `src/persistent.rs::FALLBACK_SM_COUNT` carries the same constant
-/// for the persistent kernel.
-const STREAMK_FALLBACK_SM_COUNT: u32 = 46;
 
 /// Explicit executor policy. Use [`Executor::new_with_config`] when a library
 /// caller must not depend on process-wide `ML_TUNE` state.
@@ -117,16 +99,9 @@ pub struct Executor {
     /// Maximum descriptor sets we'll allocate per submission (= max
     /// matmul calls in one `run_matmuls`).
     max_calls_per_submit: u32,
-    /// Experimental split-K pipeline, lazily built on first use of
-    /// `run_matmuls_split_k`.  See `executor/splitk.rs` for the design
-    /// rationale.
-    split_k: OnceLock<SplitKPipeline>,
     /// Two-stage split-K pipeline (scratch partials + reduce), lazily
     /// built on first use of `run_matmuls_split_k2`.
     split_k2: OnceLock<SplitK2Pipeline>,
-    /// Experimental Stream-K pipeline, lazily built on first use of
-    /// `run_matmuls_stream_k`.  See `executor/streamk.rs`.
-    stream_k: OnceLock<StreamKPipeline>,
     /// `ML_TUNE=1`: measure every eligible kernel the first time a new
     /// shape is submitted, record the winner in the pipeline's
     /// persistent tuning store, and use it from then on.  Off by
@@ -251,9 +226,7 @@ impl Executor {
             slots: Mutex::new(slots),
             slot_avail: Condvar::new(),
             max_calls_per_submit,
-            split_k: OnceLock::new(),
             split_k2: OnceLock::new(),
-            stream_k: OnceLock::new(),
             tune_enabled: config.tune,
         })
     }

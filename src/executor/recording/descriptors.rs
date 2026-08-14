@@ -7,7 +7,7 @@ use crate::matmul::MatmulOp;
 use crate::pipeline::MatmulPipeline;
 use crate::tensor::Tensor;
 
-use super::super::{MatmulCall, OpPlan};
+use super::super::OpPlan;
 
 /// Point the pre-allocated descriptor sets at this submission's A/B/C
 /// tensors.  `sets.len()` must equal `calls.len()`; the caller is
@@ -68,46 +68,6 @@ pub(in crate::executor) fn update_matmul_descriptor_sets(
         }
         base += 3;
     }
-
-    unsafe {
-        ctx.device.update_descriptor_sets(&writes, &[]);
-    }
-}
-
-/// Point a single descriptor set at `call`'s A/B/C tensors.  Used by
-/// the split-K path, whose kernels still bind the descriptor set
-/// (carried by the matmul pipeline layout that SplitKKernel was built
-/// against) even though the shader itself addresses A/B/C through
-/// BDA pointers in the push constants.  Kept as a dedicated helper so
-/// the matmul-BDA fast path doesn't have to reason about split-K's
-/// descriptor needs.
-pub(in crate::executor) fn update_split_k_descriptor_set(
-    ctx: &VulkanContext,
-    set: vk::DescriptorSet,
-    call: &MatmulCall<'_>,
-) {
-    let buffer_infos = [
-        tensor_descriptor(call.a),
-        tensor_descriptor(call.b),
-        tensor_descriptor(call.c),
-    ];
-    let writes = [
-        vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_infos[0])),
-        vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_infos[1])),
-        vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(2)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_infos[2])),
-    ];
 
     unsafe {
         ctx.device.update_descriptor_sets(&writes, &[]);

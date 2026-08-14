@@ -33,8 +33,6 @@ mod row;
 mod shapes;
 #[path = "correctness/splitk2.rs"]
 mod splitk2;
-#[path = "correctness/streamk.rs"]
-mod streamk;
 #[path = "correctness/submission.rs"]
 mod submission;
 #[path = "correctness/tuning.rs"]

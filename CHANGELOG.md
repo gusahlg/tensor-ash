@@ -53,6 +53,19 @@
 
 - `MatmulPipeline::select_kernel_index` (superseded by the internal route
   snapshot; `select_kernel` remains for external kernel inspection).
+- The experimental Stream-K stack (`Executor::run_matmuls_stream_k` /
+  `run_matmuls_auto_stream_k`, `executor/streamk*.rs`, the Stream-K shaders,
+  and `examples/bench_streamk.rs`): measured -6% to -75% versus the
+  data-parallel route on every probed shape on the RTX 3070.
+- The experimental persistent-threads kernel (`PersistentMatmul`,
+  `src/persistent/`, `matmul_f32_persistent_v4.comp`): the persistent-grid +
+  atomic tile-counter pattern shares Stream-K's structural cost and never
+  beat the tiled dispatch.
+- The atomic split-K path (`Executor::run_matmuls_split_k`,
+  `executor/splitk.rs`, `matmul_f32_splitk_m128n128/m64n64.comp`): measured
+  17-53% slower than the deterministic two-stage `run_matmuls_split_k2`
+  replacement on K=256-1024 low-CTA shapes, which remains the live
+  auto-routed reduction.
 
 ### Fixed
 

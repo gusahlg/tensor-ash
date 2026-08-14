@@ -98,23 +98,6 @@ another +5-15% from V4. The auto-selector promotes its picks to BDA_V4 at
 runtime when the device exposes `bufferDeviceAddress`, with a BDA fallback for
 `m64n32`. Explicit `ML_KERNEL=...` picks are honored verbatim.
 
-### Stream-K (experimental)
-
-The `Executor` exposes two opt-in entry points for shapes where the regular
-data-parallel dispatch leaves a small partial wave at the end:
-
-- `run_matmuls_stream_k(call)` always routes through the hybrid Stream-K
-  pipeline (CUTLASS-style DP-flat bulk dispatch + persistent SK-tail with
-  hardware `atomicAdd` from `VK_EXT_shader_atomic_float`).
-- `run_matmuls_auto_stream_k(call, tail_fraction_max)` consults a heuristic
-  gate and falls back to `run_matmuls` when Stream-K wouldn't help.
-
-Restrictions: single matmul, batch == 1, aligned shapes
-(`M%128 == N%128 == K%32 == 0`), `accumulate == false`, and the device must
-expose `shaderBufferFloat32AtomicAdd`. The gate is intentionally
-conservative — most showcase shapes still win on plain DP, so callers that
-don't know their workload should stick to `run_matmuls`.
-
 ## Requirements
 
 - Vulkan 1.2 runtime/driver and loader (`libvulkan.so.1` on Linux).
@@ -353,9 +336,7 @@ src/
   executor/        Thread-safe dispatch facade over validation, transfers,
                    timed submission, recording, tuning, and reductions
     recording/     Descriptor updates and graph hazard/barrier recording
-    splitk.rs      Experimental atomic split-K pipeline
     splitk2.rs     Two-stage split-K (scratch partials + reduce, no atomics)
-    streamk*.rs    Experimental Stream-K pipeline, execution, and scheduling
   buffer.rs        Device/staging buffer wrappers (BDA-aware)
   tensor.rs        Context-owned tensor abstraction
 tools/ml-bench/    Independent benchmark CLI package, reports, and cases
@@ -370,8 +351,6 @@ shaders/
                                   Strict no-bounds-check BDA_V4 hot path
   matmul_splitk2_kernel.glsl      Two-stage split-K stage 1 (partial planes)
   matmul_f32_splitk2_reduce.comp  Two-stage split-K stage 2 (plane sum)
-  matmul_streamk_kernel.glsl      Stream-K SK-tail (persistent + atomicAdd)
-                                  (DP-flat bulk reuses the regular BDA_V4 body)
   matmul_f32*.comp                Tile wrappers; *_bda / *_bda_v4 siblings
 capi/                      C ABI workspace crate; lifecycle, tensor, and
                            matmul exports are split under capi/src/api/
