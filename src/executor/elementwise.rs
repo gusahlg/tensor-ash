@@ -162,17 +162,27 @@ struct FlashPc {
     out_ptr: u64,
 }
 
-struct OpKernel {
-    module: vk::ShaderModule,
+/// A fully planned elementwise dispatch: pipeline, push constants,
+/// and grid — ready to record into any command buffer.
+pub(super) struct ElementwiseDispatch {
     pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    push: [u8; 64],
+    push_len: usize,
+    groups: (u32, u32),
+}
+
+pub(super) struct OpKernel {
+    module: vk::ShaderModule,
+    pub(super) pipeline: vk::Pipeline,
 }
 
 pub(super) struct ElementwisePipeline {
     ctx: Arc<VulkanContext>,
     layout: vk::PipelineLayout,
     softmax: OpKernel,
-    rmsnorm: OpKernel,
-    layernorm: OpKernel,
+    pub(super) rmsnorm: OpKernel,
+    pub(super) layernorm: OpKernel,
     rope: OpKernel,
     copy: OpKernel,
     flash_dh64: OpKernel,
@@ -288,22 +298,13 @@ impl Executor {
     }
 
     /// Dispatch one elementwise op: bind, push, dispatch, spin-wait.
-    fn run_elementwise<T: bytemuck::Pod>(
-        &self,
-        pipeline: vk::Pipeline,
-        pc: &T,
-        groups_x: u32,
-    ) -> Result<RunStats> {
-        self.run_elementwise_2d(pipeline, pc, groups_x, 1)
-    }
-
-    fn run_elementwise_2d<T: bytemuck::Pod>(
+    fn plan_elementwise<T: bytemuck::Pod>(
         &self,
         pipeline: vk::Pipeline,
         pc: &T,
         groups_x: u32,
         groups_y: u32,
-    ) -> Result<RunStats> {
+    ) -> Result<ElementwiseDispatch> {
         let max = self
             .ctx
             .device_properties
@@ -316,22 +317,42 @@ impl Executor {
                 max[1]
             );
         }
-        let layout = self.elementwise()?.layout;
+        let bytes = bytemuck::bytes_of(pc);
+        let mut push = [0u8; 64];
+        push[..bytes.len()].copy_from_slice(bytes);
+        Ok(ElementwiseDispatch {
+            pipeline,
+            layout: self.elementwise()?.layout,
+            push,
+            push_len: bytes.len(),
+            groups: (groups_x, groups_y),
+        })
+    }
+
+    /// Record one planned elementwise dispatch into `cb` (no barriers).
+    pub(super) fn record_elementwise(&self, cb: vk::CommandBuffer, dispatch: &ElementwiseDispatch) {
+        let dev = &self.ctx.device;
+        unsafe {
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, dispatch.pipeline);
+            dev.cmd_push_constants(
+                cb,
+                dispatch.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                &dispatch.push[..dispatch.push_len],
+            );
+            dev.cmd_dispatch(cb, dispatch.groups.0, dispatch.groups.1, 1);
+        }
+    }
+
+    fn submit_one_elementwise(&self, dispatch: ElementwiseDispatch) -> Result<RunStats> {
         let mut slot = self.checkout_slot();
         let gpu_time_ns = unsafe {
             self.submit_timed(
                 &mut slot,
                 "get_query_pool_results (elementwise)",
-                |dev, cb, _slot| {
-                    dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
-                    dev.cmd_push_constants(
-                        cb,
-                        layout,
-                        vk::ShaderStageFlags::COMPUTE,
-                        0,
-                        bytemuck::bytes_of(pc),
-                    );
-                    dev.cmd_dispatch(cb, groups_x, groups_y, 1);
+                |_dev, cb, _slot| {
+                    self.record_elementwise(cb, &dispatch);
                     Ok(())
                 },
             )
@@ -341,6 +362,17 @@ impl Executor {
             n_calls: 1,
             total_flops: 0,
         })
+    }
+
+    fn run_elementwise_2d<T: bytemuck::Pod>(
+        &self,
+        pipeline: vk::Pipeline,
+        pc: &T,
+        groups_x: u32,
+        groups_y: u32,
+    ) -> Result<RunStats> {
+        let dispatch = self.plan_elementwise(pipeline, pc, groups_x, groups_y)?;
+        self.submit_one_elementwise(dispatch)
     }
 
     /// Numerically stable softmax over the last dimension, with
@@ -355,6 +387,17 @@ impl Executor {
         scale: f32,
         mask: SoftmaxMask,
     ) -> Result<RunStats> {
+        let dispatch = self.plan_softmax_rows(input, output, scale, mask)?;
+        self.submit_one_elementwise(dispatch)
+    }
+
+    pub(super) fn plan_softmax_rows(
+        &self,
+        input: &Tensor,
+        output: &Tensor,
+        scale: f32,
+        mask: SoftmaxMask,
+    ) -> Result<ElementwiseDispatch> {
         self.ensure_f32(input, "run_softmax_rows", "input")?;
         self.ensure_f32(output, "run_softmax_rows", "output")?;
         if input.shape() != output.shape() {
@@ -381,7 +424,7 @@ impl Executor {
             }
         };
         let pipeline = self.elementwise()?.softmax.pipeline;
-        self.run_elementwise(
+        self.plan_elementwise(
             pipeline,
             &SoftmaxPc {
                 rows,
@@ -394,6 +437,7 @@ impl Executor {
                 out_ptr: output.device_address(),
             },
             rows,
+            1,
         )
     }
 
@@ -410,7 +454,8 @@ impl Executor {
             .norm_common("run_rms_norm", input, weight, None, output)?
             .rmsnorm
             .pipeline;
-        self.run_norm(pipeline, input, weight, None, output, eps)
+        let dispatch = self.plan_norm(pipeline, input, weight, None, output, eps)?;
+        self.submit_one_elementwise(dispatch)
     }
 
     /// LayerNorm over the last dimension: `out = (x - mean) * w /
@@ -427,10 +472,11 @@ impl Executor {
             .norm_common("run_layer_norm", input, weight, Some(bias), output)?
             .layernorm
             .pipeline;
-        self.run_norm(pipeline, input, weight, Some(bias), output, eps)
+        let dispatch = self.plan_norm(pipeline, input, weight, Some(bias), output, eps)?;
+        self.submit_one_elementwise(dispatch)
     }
 
-    fn norm_common(
+    pub(super) fn norm_common(
         &self,
         op: &str,
         input: &Tensor,
@@ -463,7 +509,7 @@ impl Executor {
         self.elementwise()
     }
 
-    fn run_norm(
+    pub(super) fn plan_norm(
         &self,
         pipeline: vk::Pipeline,
         input: &Tensor,
@@ -471,9 +517,9 @@ impl Executor {
         bias: Option<&Tensor>,
         output: &Tensor,
         eps: f32,
-    ) -> Result<RunStats> {
+    ) -> Result<ElementwiseDispatch> {
         let (rows, cols) = rows_cols(input, "norm")?;
-        self.run_elementwise(
+        self.plan_elementwise(
             pipeline,
             &NormPc {
                 rows,
@@ -486,6 +532,7 @@ impl Executor {
                 bias_ptr: bias.map_or(0, |b| b.device_address()),
             },
             rows,
+            1,
         )
     }
 
@@ -500,6 +547,17 @@ impl Executor {
         output: &Tensor,
         desc: RopeDesc,
     ) -> Result<RunStats> {
+        let dispatch = self.plan_rope(input, table, output, desc)?;
+        self.submit_one_elementwise(dispatch)
+    }
+
+    pub(super) fn plan_rope(
+        &self,
+        input: &Tensor,
+        table: &Tensor,
+        output: &Tensor,
+        desc: RopeDesc,
+    ) -> Result<ElementwiseDispatch> {
         self.ensure_f32(input, "run_rope", "input")?;
         self.ensure_f32(table, "run_rope", "table")?;
         self.ensure_f32(output, "run_rope", "output")?;
@@ -540,7 +598,7 @@ impl Executor {
         }
         let pairs = tokens * desc.heads * (desc.rot_dim / 2);
         let pipeline = self.elementwise()?.rope.pipeline;
-        self.run_elementwise(
+        self.plan_elementwise(
             pipeline,
             &RopePc {
                 tokens,
@@ -554,6 +612,7 @@ impl Executor {
                 table_ptr: table.device_address(),
             },
             pairs.div_ceil(WG),
+            1,
         )
     }
 
@@ -652,6 +711,16 @@ impl Executor {
     /// `src` and `dst` must be different tensors — invocations are
     /// unordered, so overlapping in-place copies would race.
     pub fn run_copy_strided(&self, src: &Tensor, dst: &Tensor, desc: CopyDesc) -> Result<RunStats> {
+        let dispatch = self.plan_copy_strided(src, dst, desc)?;
+        self.submit_one_elementwise(dispatch)
+    }
+
+    pub(super) fn plan_copy_strided(
+        &self,
+        src: &Tensor,
+        dst: &Tensor,
+        desc: CopyDesc,
+    ) -> Result<ElementwiseDispatch> {
         self.ensure_f32(src, "run_copy_strided", "src")?;
         self.ensure_f32(dst, "run_copy_strided", "dst")?;
         if src.raw_buffer() == dst.raw_buffer() {
@@ -687,7 +756,7 @@ impl Executor {
         let total = u32::try_from(extent_product)
             .map_err(|_| anyhow::anyhow!("run_copy_strided: extent product exceeds u32"))?;
         let pipeline = self.elementwise()?.copy.pipeline;
-        self.run_elementwise(
+        self.plan_elementwise(
             pipeline,
             &CopyPc {
                 extent: desc.extent,
@@ -700,6 +769,7 @@ impl Executor {
                 dst_ptr: dst.device_address(),
             },
             total.div_ceil(WG),
+            1,
         )
     }
 }

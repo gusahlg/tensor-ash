@@ -33,6 +33,25 @@ impl Executor {
         }
     }
 
+    /// Synchronous host->device upload of raw IEEE-754 binary16 bits into an
+    /// f16 tensor. Callers that already hold half-precision data stage it
+    /// byte-for-byte instead of paying `upload`'s f32 round-trip.
+    pub fn upload_f16(&self, src: &[u16], dst: &Tensor) -> Result<()> {
+        self.validate_tensor_context(dst, "upload destination")?;
+        if src.is_empty() {
+            return Ok(());
+        }
+        if dst.dtype() != DType::F16 {
+            bail!(
+                "upload_f16 requires an f16 destination tensor, got {}",
+                dst.dtype().name()
+            );
+        }
+        let size = checked_transfer_size("upload", size_of_slice(src)?, dst)?;
+        let mut slot = self.checkout_slot();
+        self.upload_with_slot(&mut slot, src, dst, size)
+    }
+
     /// Synchronous device->host download via the slot-local staging buffer.
     /// f16 tensors are widened to f32 during staging.
     pub fn download(&self, src: &Tensor, dst: &mut [f32]) -> Result<()> {

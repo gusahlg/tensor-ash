@@ -20,7 +20,7 @@ use crate::matmul::MatrixShape;
 pub struct Tensor {
     shape: Vec<u32>,
     dtype: DType,
-    buffer: Buffer,
+    buffer: Arc<Buffer>,
 }
 
 impl Tensor {
@@ -91,7 +91,28 @@ impl Tensor {
         Ok(Self {
             shape: shape.to_vec(),
             dtype,
-            buffer,
+            buffer: Arc::new(buffer),
+        })
+    }
+
+    /// A tensor sharing this tensor's device memory under a different
+    /// shape — a free reshape of the same contiguous elements (no copy,
+    /// no new allocation).  The element count must match exactly.
+    /// Writes through either tensor are visible through both; the
+    /// executor's hazard tracking treats them as the same buffer.
+    pub fn alias_with_shape(&self, shape: &[u32]) -> Result<Self> {
+        let numel = Self::numel_checked(shape)?;
+        if numel != self.len() {
+            bail!(
+                "alias_with_shape: {numel} elements for shape {shape:?} != {} in {:?}",
+                self.len(),
+                self.shape
+            );
+        }
+        Ok(Self {
+            shape: shape.to_vec(),
+            dtype: self.dtype,
+            buffer: Arc::clone(&self.buffer),
         })
     }
 

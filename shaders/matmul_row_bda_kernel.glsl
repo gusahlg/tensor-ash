@@ -19,7 +19,12 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
 
-layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+#ifndef KSLICES
+#define KSLICES 8
+#endif
+const uint KSLICES_U = uint(KSLICES);
+
+layout(local_size_x = 32, local_size_y = KSLICES, local_size_z = 1) in;
 
 layout(constant_id = 0) const bool ACCUMULATE = false;
 layout(constant_id = 1) const bool ALPHA_IS_ONE = true;
@@ -61,7 +66,7 @@ layout(push_constant) uniform PC {
 
 #include "matmul_epilogue_common.glsl"
 
-shared float partial[8][32];
+shared float partial[KSLICES][32];
 
 void main() {
     const uint batch = gl_WorkGroupID.z;
@@ -82,7 +87,7 @@ void main() {
 #endif
     float acc = 0.0;
     if (live) {
-        for (uint inner = slice; inner < pc.K; inner += 8u) {
+        for (uint inner = slice; inner < pc.K; inner += KSLICES_U) {
             acc = fma(
                 pc.a_ptr.v[a_base + inner],
                 float(b.v[b_base + inner * pc.N]),
@@ -95,7 +100,7 @@ void main() {
 
     if (slice == 0u && live) {
         float sum = partial[0][lane];
-        [[unroll]] for (uint s = 1u; s < 8u; ++s) sum += partial[s][lane];
+        [[unroll]] for (uint s = 1u; s < KSLICES_U; ++s) sum += partial[s][lane];
         const uint c_index = batch * pc.batch_stride_c + row * pc.N + col;
         float value = ALPHA_IS_ONE ? sum : pc.alpha * sum;
         if (ACCUMULATE) value += pc.c_ptr.v[c_index];

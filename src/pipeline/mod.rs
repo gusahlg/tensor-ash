@@ -257,7 +257,13 @@ impl MatmulPipeline {
         if self.ctx.buffer_device_address_enabled {
             let selection = if m == 1 {
                 Some(if b_f16 {
-                    KernelSelection::F16wRowBda
+                    // Deep K or narrow N: sixteen K-slice warps keep
+                    // the device occupied where eight leave it idle.
+                    if k >= 4096 || n <= 512 {
+                        KernelSelection::F16wRowBdaK16
+                    } else {
+                        KernelSelection::F16wRowBda
+                    }
                 } else {
                     KernelSelection::RowBda
                 })
