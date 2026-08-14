@@ -46,6 +46,31 @@ pub struct ta_matmul_op {
     pub epilogue: ta_epilogue,
 }
 
+/// Rotary-embedding geometry for `ta_rope`. `rot_dim` is the rotated
+/// lane count per head vector (even, `>= 2`, `<= head_dim`); lanes
+/// past it pass through (partial rotary). `pos_base` is the absolute
+/// position of the first token in the input.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ta_rope_desc {
+    pub heads: u32,
+    pub head_dim: u32,
+    pub rot_dim: u32,
+    pub pos_base: u32,
+}
+
+/// Strided-copy geometry for `ta_copy_strided`. Strides and offsets
+/// are in elements (f32 lanes), not bytes.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ta_copy_desc {
+    pub extent: [u32; 3],
+    pub src_offset: u32,
+    pub src_strides: [u32; 3],
+    pub dst_offset: u32,
+    pub dst_strides: [u32; 3],
+}
+
 /// Route description for one matmul shape. `kernel` points to an
 /// interned NUL-terminated name valid for the process lifetime.
 #[repr(C)]

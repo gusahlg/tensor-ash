@@ -18,6 +18,16 @@
   `examples/c_smoke.c` now exercises a bias+SiLU op, prepared replay
   (run and submit/wait), and an f16-weights matmul.
 
+- **C ABI model ops**: `ta_softmax_rows` (mask_kind
+  `TA_SOFTMAX_MASK_FULL`/`PREFIX`/`CAUSAL` with `valid_or_prefix` and
+  `rows_per_group`), `ta_rms_norm`, `ta_layer_norm`, `ta_rope`
+  (`ta_rope_desc`), and `ta_copy_strided` (`ta_copy_desc`) wrap the five
+  Rust model ops. In-place (input == output) is allowed for
+  softmax/norm/rope; `ta_copy_strided` rejects `src == dst` (unordered
+  invocations would race). All require `ta_context_supports_bda`.
+  `examples/c_smoke.c` gains RMSNorm, prefix-masked softmax, and
+  strided-copy transpose checks (plus the in-place-copy rejection).
+
 - **Model ops** (`run_softmax_rows`, `run_rms_norm`, `run_layer_norm`,
   `run_rope`, `run_copy_strided`): the minimal non-GEMM kernel family for a
   transformer decoder block, structured as a lazily-built sibling pipeline

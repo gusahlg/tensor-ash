@@ -64,6 +64,36 @@ typedef struct ta_matmul_op {
   ta_epilogue epilogue;
 } ta_matmul_op;
 
+/* Values for ta_softmax_rows mask_kind. */
+enum {
+  TA_SOFTMAX_MASK_FULL = 0,   /* every column participates */
+  TA_SOFTMAX_MASK_PREFIX = 1, /* columns >= valid_or_prefix are masked */
+  TA_SOFTMAX_MASK_CAUSAL = 2  /* row i of each rows_per_group block sees
+                               * valid_or_prefix + (i % rows_per_group) + 1
+                               * columns */
+};
+
+/* Rotary-embedding geometry for ta_rope. rot_dim is the rotated lane
+ * count per head vector (even, >= 2, <= head_dim); lanes past it pass
+ * through (partial rotary). pos_base is the absolute position of the
+ * first token in the input. */
+typedef struct ta_rope_desc {
+  uint32_t heads;
+  uint32_t head_dim;
+  uint32_t rot_dim;
+  uint32_t pos_base;
+} ta_rope_desc;
+
+/* Strided-copy geometry for ta_copy_strided. Strides and offsets are
+ * in elements (f32 lanes), not bytes. */
+typedef struct ta_copy_desc {
+  uint32_t extent[3];
+  uint32_t src_offset;
+  uint32_t src_strides[3];
+  uint32_t dst_offset;
+  uint32_t dst_strides[3];
+} ta_copy_desc;
+
 /* Route description for one matmul shape. kernel points to an interned
  * NUL-terminated name valid for the process lifetime. */
 typedef struct ta_dispatch_info {
@@ -134,6 +164,49 @@ int ta_run_ops(const ta_executor *exec, const ta_matmul_op *ops, size_t n_ops,
  * op N may read outputs of earlier ops in the same submission. */
 int ta_run_op_graph(const ta_executor *exec, const ta_matmul_op *ops,
                     size_t n_ops, ta_run_stats *stats);
+
+/* Non-GEMM model ops. All operands must be f32-storage tensors and the
+ * device must support bufferDeviceAddress (see
+ * ta_context_supports_bda). In-place operation (input == output) is
+ * allowed for ta_softmax_rows, ta_rms_norm, ta_layer_norm, and
+ * ta_rope; ta_copy_strided requires src != dst (unordered invocations
+ * would race) and fails with -1 otherwise. stats may be null. */
+
+/* Numerically stable softmax over the last dimension. scale multiplies
+ * inputs before the max/exp passes (pass 1.0, or 1/sqrt(dh) to fold in
+ * attention scaling). mask_kind is TA_SOFTMAX_MASK_*; masked columns
+ * store exactly 0.0. valid_or_prefix is the prefix valid length
+ * (TA_SOFTMAX_MASK_PREFIX) or the already-cached position count
+ * (TA_SOFTMAX_MASK_CAUSAL); rows_per_group is used only by the causal
+ * mask and must divide the row count. */
+int ta_softmax_rows(const ta_executor *exec, const ta_tensor *input,
+                    const ta_tensor *output, float scale, uint32_t mask_kind,
+                    uint32_t valid_or_prefix, uint32_t rows_per_group,
+                    ta_run_stats *stats);
+/* RMSNorm over the last dimension: out = x * w / sqrt(mean(x^2) +
+ * eps). weight has the row length. */
+int ta_rms_norm(const ta_executor *exec, const ta_tensor *input,
+                const ta_tensor *weight, const ta_tensor *output, float eps,
+                ta_run_stats *stats);
+/* LayerNorm over the last dimension: out = (x - mean) * w / sqrt(var +
+ * eps) + b. weight and bias have the row length. */
+int ta_layer_norm(const ta_executor *exec, const ta_tensor *input,
+                  const ta_tensor *weight, const ta_tensor *bias,
+                  const ta_tensor *output, float eps, ta_run_stats *stats);
+/* Rotary position embedding over [T, heads, head_dim] activations (any
+ * tensor whose element count is T * heads * head_dim). table is the
+ * precomputed [T_max, rot_dim/2, 2] (cos, sin) tensor. */
+int ta_rope(const ta_executor *exec, const ta_tensor *input,
+            const ta_tensor *table, const ta_tensor *output,
+            const ta_rope_desc *desc, ta_run_stats *stats);
+/* Strided 3D copy: for every (x, y, z) in desc->extent, element
+ * src_offset + x*src_strides[0] + y*src_strides[1] + z*src_strides[2]
+ * of src is copied to the equivalent destination index. Covers
+ * transpose/permute, KV-cache append, head reshaping, and sub-matrix
+ * extraction. */
+int ta_copy_strided(const ta_executor *exec, const ta_tensor *src,
+                    const ta_tensor *dst, const ta_copy_desc *desc,
+                    ta_run_stats *stats);
 
 /* Prepared replay: validate, route, and record a fixed op batch once,
  * then replay it with one queue submit per call. as_graph != 0 records

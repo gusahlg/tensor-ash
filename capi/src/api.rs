@@ -1,4 +1,5 @@
 mod diagnostics;
+mod elementwise;
 mod lifecycle;
 mod matmul;
 mod ops;
@@ -11,6 +12,9 @@ mod tests {
     use std::ptr;
 
     use super::diagnostics::{ta_dispatch_info_for, ta_tune_shape};
+    use super::elementwise::{
+        ta_copy_strided, ta_layer_norm, ta_rms_norm, ta_rope, ta_softmax_rows,
+    };
     use super::lifecycle::{
         ta_context_destroy, ta_context_supports_bda, ta_context_supports_f16, ta_executor_destroy,
         ta_last_error, ta_version,
@@ -80,6 +84,78 @@ mod tests {
             assert!(last_error().contains("ta_prepared_submit: prepared is null"));
             assert_eq!(ta_prepared_wait(ptr::null_mut(), ptr::null_mut()), -1);
             assert!(last_error().contains("ta_prepared_wait: prepared is null"));
+        }
+    }
+
+    #[test]
+    fn null_elementwise_entry_points_report_errors() {
+        unsafe {
+            assert_eq!(
+                ta_softmax_rows(
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    1.0,
+                    0,
+                    0,
+                    0,
+                    ptr::null_mut()
+                ),
+                -1
+            );
+            assert!(last_error().contains("ta_softmax_rows: exec is null"));
+
+            assert_eq!(
+                ta_rms_norm(
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    1e-5,
+                    ptr::null_mut()
+                ),
+                -1
+            );
+            assert!(last_error().contains("ta_rms_norm: exec is null"));
+
+            assert_eq!(
+                ta_layer_norm(
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    1e-5,
+                    ptr::null_mut()
+                ),
+                -1
+            );
+            assert!(last_error().contains("ta_layer_norm: exec is null"));
+
+            assert_eq!(
+                ta_rope(
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null_mut()
+                ),
+                -1
+            );
+            assert!(last_error().contains("ta_rope: exec is null"));
+
+            assert_eq!(
+                ta_copy_strided(
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null_mut()
+                ),
+                -1
+            );
+            assert!(last_error().contains("ta_copy_strided: exec is null"));
         }
     }
 

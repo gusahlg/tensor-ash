@@ -154,6 +154,85 @@ int main(void) {
     printf("skipping f16 check (no f16 storage support)\n");
   }
 
+  if (supports_bda) {
+    /* 5. Model ops: rms_norm, prefix-masked softmax, strided copy.
+     * A still holds {1,2,3,4,5,6} as a 2x3 matrix. */
+    ta_tensor *w = ta_tensor_create(ctx, a_shape + 1, 1); /* [3] */
+    ta_tensor *out23 = ta_tensor_create(ctx, a_shape, 2); /* [2,3] */
+    ta_tensor *out32 = ta_tensor_create(ctx, b_shape, 2); /* [3,2] */
+    if (!w || !out23 || !out32)
+      die("ta_tensor_create model-op operands");
+    const float host_w[3] = {1.0f, 0.5f, 2.0f};
+    if (ta_upload(exec, w, host_w, 3) != 0)
+      die("ta_upload weight");
+
+    /* rms_norm: out = x * w / sqrt(mean(x^2) + eps), per row. */
+    const float eps = 1e-5f;
+    if (ta_rms_norm(exec, a, w, out23, eps, &stats) != 0)
+      die("ta_rms_norm");
+    float host_out[6];
+    if (ta_download(exec, out23, host_out, 6) != 0)
+      die("ta_download rms_norm");
+    for (size_t r = 0; r < 2; ++r) {
+      float ss = 0.0f;
+      for (size_t j = 0; j < 3; ++j)
+        ss += host_a[3 * r + j] * host_a[3 * r + j];
+      const float inv_rms = 1.0f / sqrtf(ss / 3.0f + eps);
+      for (size_t j = 0; j < 3; ++j)
+        check_close("rms_norm", host_out[3 * r + j],
+                    host_a[3 * r + j] * host_w[j] * inv_rms, 1e-4f);
+    }
+    printf("rms_norm OK: row0 = %.6f %.6f %.6f\n", host_out[0], host_out[1],
+           host_out[2]);
+
+    /* softmax with a prefix mask: columns >= 2 store exactly 0.0. */
+    if (ta_softmax_rows(exec, a, out23, 1.0f, TA_SOFTMAX_MASK_PREFIX, 2, 0,
+                        &stats) != 0)
+      die("ta_softmax_rows");
+    if (ta_download(exec, out23, host_out, 6) != 0)
+      die("ta_download softmax");
+    for (size_t r = 0; r < 2; ++r) {
+      const float m = fmaxf(host_a[3 * r], host_a[3 * r + 1]);
+      const float e0 = expf(host_a[3 * r] - m);
+      const float e1 = expf(host_a[3 * r + 1] - m);
+      check_close("softmax col0", host_out[3 * r], e0 / (e0 + e1), 1e-5f);
+      check_close("softmax col1", host_out[3 * r + 1], e1 / (e0 + e1), 1e-5f);
+      check_close("softmax masked col2", host_out[3 * r + 2], 0.0f, 0.0f);
+    }
+    printf("softmax(prefix=2) OK: row0 = %.6f %.6f %.6f\n", host_out[0],
+           host_out[1], host_out[2]);
+
+    /* copy_strided: transpose the 2x3 A into a 3x2 tensor. */
+    ta_copy_desc transpose = {0};
+    transpose.extent[0] = 3;
+    transpose.extent[1] = 2;
+    transpose.extent[2] = 1;
+    transpose.src_strides[0] = 1; /* walk columns of A */
+    transpose.src_strides[1] = 3; /* then rows */
+    transpose.dst_strides[0] = 2; /* which are rows of A^T */
+    transpose.dst_strides[1] = 1; /* and columns */
+    if (ta_copy_strided(exec, a, out32, &transpose, &stats) != 0)
+      die("ta_copy_strided");
+    if (ta_download(exec, out32, host_out, 6) != 0)
+      die("ta_download copy_strided");
+    const float expected_t[6] = {1.0f, 4.0f, 2.0f, 5.0f, 3.0f, 6.0f};
+    for (size_t i = 0; i < 6; ++i)
+      check_close("copy_strided transpose", host_out[i], expected_t[i], 0.0f);
+    /* In-place copy must be rejected (unordered invocations race). */
+    if (ta_copy_strided(exec, a, a, &transpose, NULL) == 0) {
+      fprintf(stderr, "ta_copy_strided accepted src == dst\n");
+      return 2;
+    }
+    printf("copy_strided transpose OK (in-place rejected: %s)\n",
+           ta_last_error());
+
+    ta_tensor_destroy(out32);
+    ta_tensor_destroy(out23);
+    ta_tensor_destroy(w);
+  } else {
+    printf("skipping model-op checks (no bufferDeviceAddress)\n");
+  }
+
   printf("tensor-ash C smoke OK\n");
 
   ta_tensor_destroy(c);

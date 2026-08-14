@@ -211,6 +211,11 @@ The C ABI lives in `tensor-ash-capi` and is declared in
   `ta_run_op_graph` for `ta_matmul_op` batches with fused epilogues
   (bias, relu/silu/gelu, residual add-scaled or gating mul), the graph
   variant inserting automatic barriers between dependent ops.
+- Model ops: `ta_softmax_rows` (full / prefix / causal masks via
+  `TA_SOFTMAX_MASK_*`), `ta_rms_norm`, `ta_layer_norm`, `ta_rope`
+  (`ta_rope_desc`), and `ta_copy_strided` (`ta_copy_desc`). In-place
+  (input == output) is allowed for softmax/norm/rope; `ta_copy_strided`
+  requires `src != dst`. All require `ta_context_supports_bda`.
 - Prepared replay: `ta_prepared_create` records a fixed op batch once;
   `ta_prepared_run` or the pipelined `ta_prepared_submit` /
   `ta_prepared_wait` replay it with one queue submit per call;
@@ -230,7 +235,8 @@ nix-shell --run 'env LD_LIBRARY_PATH=target/release:$LD_LIBRARY_PATH /tmp/tensor
 
 The smoke test computes a 2x3 by 3x2 GEMM and verifies the expected
 `[58, 64, 139, 154]`, then exercises a fused bias+SiLU op, prepared
-replay (including submit/wait), and an f16-weights matmul when the
+replay (including submit/wait), an f16-weights matmul, and the model
+ops (RMSNorm, prefix-masked softmax, strided-copy transpose) when the
 device supports them.
 
 ## Benchmark binary (`ml_bench`)
