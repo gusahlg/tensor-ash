@@ -110,10 +110,31 @@ fn bench(args: &Args) -> Result<()> {
     let (next, _) = model.prefill(&prompt)?;
     let prefill_s = t0.elapsed().as_secs_f64();
 
+    model.breakdown.borrow_mut().clear();
     let t1 = Instant::now();
     let generated = model.decode_many(next, args.tg)?;
     let decode_s = t1.elapsed().as_secs_f64();
     let next = generated.last().copied().unwrap_or(next);
+
+    // GPU-timestamped decode time vs wall time: the difference is the
+    // per-token host overhead (embed/upload/logits plus, in graph
+    // mode, the ~0.5 ms re-record + validate).  Single-submission
+    // modes only — perop's per-dispatch entries would double-count.
+    let gpu_ns: u64 = model
+        .breakdown
+        .borrow()
+        .iter()
+        .filter(|(class, _)| matches!(*class, "graph_total" | "prepared_total"))
+        .map(|(_, ns)| ns)
+        .sum();
+    if gpu_ns > 0 {
+        log::info!(
+            "decode timing: {:.3} ms/token GPU vs {:.3} ms/token wall ({:.3} ms host)",
+            gpu_ns as f64 / 1e6 / args.tg as f64,
+            decode_s * 1e3 / args.tg as f64,
+            decode_s * 1e3 / args.tg as f64 - gpu_ns as f64 / 1e6 / args.tg as f64,
+        );
+    }
 
     // Per-op-class GPU-time breakdown of one decode step (perop mode
     // records per-dispatch GPU timestamps; graph mode cannot split
