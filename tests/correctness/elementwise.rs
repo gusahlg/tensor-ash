@@ -3,7 +3,9 @@
 
 use crate::common::*;
 
-use tensor_ash::{CopyDesc, MatmulCall, RopeDesc, SoftmaxMask, Tensor};
+use tensor_ash::{
+    CopyDesc, Epilogue, EpilogueBinary, ExecOp, MatmulCall, MatmulOp, RopeDesc, SoftmaxMask, Tensor,
+};
 
 fn ops_available(ctx: &std::sync::Arc<tensor_ash::VulkanContext>) -> bool {
     ctx.buffer_device_address_enabled
@@ -404,4 +406,111 @@ fn decode_attention_step_composes() {
         }
     }
     assert_close_tol(&gpu, &cpu, 1e-4, "decode attention");
+}
+
+/// A mixed decode-style chain through `run_exec_ops` must match the
+/// same ops submitted one by one — same kernels, same order, so the
+/// results are bitwise identical; only the submission count differs.
+#[test]
+#[ignore]
+fn exec_ops_chain_matches_per_op_path() {
+    let (ctx, exec) = make_setup(2, 64);
+    if !ops_available(&ctx) {
+        eprintln!("skipping: no BDA");
+        return;
+    }
+    let (rows, hidden, ffn) = (4_u32, 256_u32, 512_u32);
+    let (x, _) = upload_det(&ctx, &exec, &[rows, hidden], 6100);
+    let (norm_w, _) = upload_det(&ctx, &exec, &[hidden], 6101);
+    let w_up = Tensor::uninit_device_f16(&ctx, &[hidden, ffn]).unwrap();
+    let w_gate = Tensor::uninit_device_f16(&ctx, &[hidden, ffn]).unwrap();
+    let mut host_w = vec![0.0; (hidden * ffn) as usize];
+    fill_det(&mut host_w, 6102);
+    exec.upload(&host_w, &w_up).unwrap();
+    fill_det(&mut host_w, 6103);
+    exec.upload(&host_w, &w_gate).unwrap();
+
+    let run = |xn: &Tensor, up: &Tensor, gated: &Tensor, graph: bool| {
+        let ops = [
+            ExecOp::RmsNorm {
+                input: &x,
+                weight: &norm_w,
+                output: xn,
+                eps: 1e-5,
+            },
+            ExecOp::Matmul(MatmulOp::new(MatmulCall {
+                a: xn,
+                b: &w_up,
+                c: up,
+                alpha: 1.0,
+                accumulate: false,
+            })),
+            ExecOp::Matmul(MatmulOp::with_epilogue(
+                MatmulCall {
+                    a: xn,
+                    b: &w_gate,
+                    c: gated,
+                    alpha: 1.0,
+                    accumulate: false,
+                },
+                Epilogue {
+                    bias: None,
+                    activation: tensor_ash::Activation::Silu,
+                    binary: EpilogueBinary::Mul { d: up },
+                },
+            )),
+            ExecOp::SoftmaxRows {
+                input: gated,
+                output: gated,
+                scale: 1.0,
+                mask: SoftmaxMask::Full,
+            },
+        ];
+        if graph {
+            let stats = exec.run_exec_ops(&ops).unwrap();
+            assert_eq!(stats.n_calls, ops.len());
+        } else {
+            for op in ops {
+                match op {
+                    ExecOp::RmsNorm {
+                        input,
+                        weight,
+                        output,
+                        eps,
+                    } => {
+                        exec.run_rms_norm(input, weight, output, eps).unwrap();
+                    }
+                    ExecOp::Matmul(op) => {
+                        exec.run_ops(std::slice::from_ref(&op)).unwrap();
+                    }
+                    ExecOp::SoftmaxRows {
+                        input,
+                        output,
+                        scale,
+                        mask,
+                    } => {
+                        exec.run_softmax_rows(input, output, scale, mask).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    };
+
+    let xn_a = Tensor::uninit_device(&ctx, &[rows, hidden]).unwrap();
+    let up_a = Tensor::uninit_device(&ctx, &[rows, ffn]).unwrap();
+    let out_a = Tensor::uninit_device(&ctx, &[rows, ffn]).unwrap();
+    run(&xn_a, &up_a, &out_a, true);
+    let xn_b = Tensor::uninit_device(&ctx, &[rows, hidden]).unwrap();
+    let up_b = Tensor::uninit_device(&ctx, &[rows, ffn]).unwrap();
+    let out_b = Tensor::uninit_device(&ctx, &[rows, ffn]).unwrap();
+    run(&xn_b, &up_b, &out_b, false);
+
+    let mut a = vec![0.0; (rows * ffn) as usize];
+    let mut b = vec![0.0; (rows * ffn) as usize];
+    exec.download(&out_a, &mut a).unwrap();
+    exec.download(&out_b, &mut b).unwrap();
+    for (i, (&va, &vb)) in a.iter().zip(&b).enumerate() {
+        assert_eq!(va.to_bits(), vb.to_bits(), "graph vs per-op diverge at {i}");
+    }
 }

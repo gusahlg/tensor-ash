@@ -24,6 +24,7 @@
 
 mod dispatch;
 mod elementwise;
+mod graph_ops;
 mod prepared;
 mod recording;
 mod reduction;
@@ -49,6 +50,7 @@ use splitk2::SplitK2Pipeline;
 
 pub use crate::matmul::{MatmulCall, RunStats};
 pub use elementwise::{CopyDesc, FlashAttentionDesc, RopeDesc, SoftmaxMask};
+pub use graph_ops::ExecOp;
 pub use prepared::PreparedOps;
 
 /// Read-only description of the route selected for a plain matmul shape.
