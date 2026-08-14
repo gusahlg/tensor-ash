@@ -122,6 +122,7 @@ impl Executor {
             && let [op] = ops
             && !op.call.accumulate
             && op.epilogue.is_none()
+            && op.normed_a.is_none()
         {
             let dims = &resolved[0];
             let key = TuneKey {
@@ -155,10 +156,11 @@ impl Executor {
             .map(|(op, dims)| {
                 let eligible = !op.call.accumulate
                     && op.epilogue.is_none()
+                    && op.normed_a.is_none()
                     && (with_dependency_barriers || ops.len() == 1);
                 let plan =
                     self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, eligible);
-                self.demote_for_epilogue(&op.epilogue, dims, plan)
+                self.demote_for_op(op, dims, plan)
             })
             .collect();
 

@@ -62,6 +62,8 @@ pub(crate) fn checked_op<'a>(
             activation,
             binary,
         },
+        // Not exposed through the C ABI yet.
+        normed_a: None,
     })
 }
 

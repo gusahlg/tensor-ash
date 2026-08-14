@@ -65,6 +65,7 @@ pub(in crate::executor) fn record_matmul_graph_commands(
         let c = call.c.raw_buffer();
         let bias = op.epilogue.bias.map(Tensor::raw_buffer);
         let d = op.epilogue.d_tensor().map(Tensor::raw_buffer);
+        let norm_weight = op.normed_a.map(|(weight, _)| weight.raw_buffer());
 
         // Tuned split-K2 routing: record stage1 + internal barrier +
         // reduce inline.  The internal barrier is a global flush, so
@@ -103,7 +104,8 @@ pub(in crate::executor) fn record_matmul_graph_commands(
             || written.contains(&b)
             || (call.accumulate && written.contains(&c))
             || bias.is_some_and(|buf| written.contains(&buf))
-            || d.is_some_and(|buf| written.contains(&buf));
+            || d.is_some_and(|buf| written.contains(&buf))
+            || norm_weight.is_some_and(|buf| written.contains(&buf));
         let write_hazard = written.contains(&c) || read.contains(&c);
 
         if reads_written || write_hazard {
@@ -127,6 +129,7 @@ pub(in crate::executor) fn record_matmul_graph_commands(
         read.push(b);
         read.extend(bias);
         read.extend(d);
+        read.extend(norm_weight);
         written.push(c);
     }
 

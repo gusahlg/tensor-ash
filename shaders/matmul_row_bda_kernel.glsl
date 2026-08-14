@@ -9,6 +9,15 @@
 // Compile-time inputs (set by the .comp wrapper):
 //     B_F16 (optional): B is stored as IEEE half; loads convert to f32
 //     before the FMA, halving global B traffic (the GEMV bottleneck).
+//
+// NORM_A (push-constant flags bit 1): fold an RMSNorm of the A row
+// into the GEMV.  Each workgroup first cooperatively computes
+// inv_rms = inversesqrt(mean(a^2) + eps) over its K-length A row, then
+// every A element is read as `a[k] * inv_rms * norm_w[k]`.  The norm
+// weight rides the (otherwise unused) bias_ptr slot and eps rides
+// beta, so NORM_A excludes the bias epilogue and the AddScaled binary
+// (the host validates).  Redundant across the column workgroups of one
+// row, but K extra reads per workgroup are trivia next to B.
 
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_GOOGLE_include_directive : require
@@ -85,14 +94,49 @@ void main() {
 #else
     F32ReadOnly b = pc.b_ptr;
 #endif
+    // Fused RMSNorm preamble (see header).  The flag is a push
+    // constant, so the branch (and its barriers) is workgroup-uniform.
+    const bool norm_a = (pc.flags & 2u) != 0u;
+    float a_scale = 1.0;
+    if (norm_a) {
+        const uint tid = slice * 32u + lane;
+        const uint wg = KSLICES_U * 32u;
+        float sumsq = 0.0;
+        for (uint k = tid; k < pc.K; k += wg) {
+            const float a = pc.a_ptr.v[a_base + k];
+            sumsq = fma(a, a, sumsq);
+        }
+        partial[slice][lane] = sumsq;
+        barrier();
+        [[unroll]] for (uint step = wg >> 1u; step > 0u; step >>= 1u) {
+            if (tid < step) {
+                const uint other = tid + step;
+                partial[slice][lane] += partial[other >> 5u][other & 31u];
+            }
+            barrier();
+        }
+        a_scale = inversesqrt(partial[0][0] / float(pc.K) + pc.beta);
+        // Every thread has read partial[0][0]; safe to reuse below.
+        barrier();
+    }
     float acc = 0.0;
     if (live) {
-        for (uint inner = slice; inner < pc.K; inner += KSLICES_U) {
-            acc = fma(
-                pc.a_ptr.v[a_base + inner],
-                float(b.v[b_base + inner * pc.N]),
-                acc
-            );
+        if (norm_a) {
+            for (uint inner = slice; inner < pc.K; inner += KSLICES_U) {
+                acc = fma(
+                    pc.a_ptr.v[a_base + inner] * a_scale * pc.bias_ptr.v[inner],
+                    float(b.v[b_base + inner * pc.N]),
+                    acc
+                );
+            }
+        } else {
+            for (uint inner = slice; inner < pc.K; inner += KSLICES_U) {
+                acc = fma(
+                    pc.a_ptr.v[a_base + inner],
+                    float(b.v[b_base + inner * pc.N]),
+                    acc
+                );
+            }
         }
     }
     partial[slice][lane] = acc;

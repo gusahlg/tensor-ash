@@ -15,7 +15,9 @@ use crate::tensor::Tensor;
 
 use super::elementwise::ElementwiseDispatch;
 use super::recording::{record_compute_to_compute_barrier, record_one_matmul};
-use super::{AttnDecodeDesc, BinaryOp, CopyDesc, Executor, OpPlan, RopeDesc, SoftmaxMask};
+use super::{
+    AttnDecodeDesc, BinaryOp, CopyDesc, Executor, OpPlan, RopeDesc, RopeScatterDesc, SoftmaxMask,
+};
 
 /// One step of a mixed-op graph.  All variants execute in submission
 /// order with a full compute barrier between consecutive steps, so a
@@ -48,6 +50,16 @@ pub enum ExecOp<'t> {
         table: &'t Tensor,
         output: &'t Tensor,
         desc: RopeDesc,
+    },
+    /// Fused RoPE + strided scatter (see
+    /// [`Executor::run_rope_scatter`]): rotate and write straight into
+    /// a strided destination (KV-cache append) in one dispatch.
+    RopeScatter {
+        input: &'t Tensor,
+        table: &'t Tensor,
+        dst: &'t Tensor,
+        desc: RopeDesc,
+        scatter: RopeScatterDesc,
     },
     CopyStrided {
         src: &'t Tensor,
@@ -152,6 +164,9 @@ impl Executor {
                     if let Some(d) = op.epilogue.d_tensor() {
                         access = access.read(d);
                     }
+                    if let Some((norm_weight, _)) = op.normed_a {
+                        access = access.read(norm_weight);
+                    }
                     access
                 }
                 ExecOp::RmsNorm {
@@ -180,6 +195,9 @@ impl Executor {
                     output,
                     ..
                 } => Access::default().read(input).read(table).write(output),
+                ExecOp::RopeScatter {
+                    input, table, dst, ..
+                } => Access::default().read(input).read(table).write(dst),
                 ExecOp::CopyStrided { src, dst, .. } => Access::default().read(src).write(dst),
                 ExecOp::Binary { a, b, out, .. } => Access::default().read(a).read(b).write(out),
                 ExecOp::AttnDecode { .. } => unreachable!("handled above"),
@@ -188,8 +206,8 @@ impl Executor {
                 ExecOp::Matmul(op) => {
                     self.validate_op_context(op)?;
                     let dims = ResolvedMatmul::from_op(op)?;
-                    let plan = self.demote_for_epilogue(
-                        &op.epilogue,
+                    let plan = self.demote_for_op(
+                        op,
                         &dims,
                         self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, false),
                     );
@@ -251,6 +269,15 @@ impl Executor {
                     output,
                     desc,
                 } => Planned::Elementwise(self.plan_rope(input, table, output, *desc)?),
+                ExecOp::RopeScatter {
+                    input,
+                    table,
+                    dst,
+                    desc,
+                    scatter,
+                } => Planned::Elementwise(
+                    self.plan_rope_scatter(input, table, dst, *desc, *scatter)?,
+                ),
                 ExecOp::CopyStrided { src, dst, desc } => {
                     Planned::Elementwise(self.plan_copy_strided(src, dst, *desc)?)
                 }

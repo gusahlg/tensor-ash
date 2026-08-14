@@ -175,6 +175,23 @@ pub(super) fn record_one_matmul(
         }
         pc.beta = epilogue.beta();
     }
+    if let Some((norm_weight, eps)) = op.normed_a {
+        // Only the row-GEMV bodies implement the fused RMSNorm-of-A
+        // preamble; every other route must fail loudly rather than
+        // silently skip the normalization.
+        if !kernel.supports_normed_a() {
+            bail!(
+                "kernel '{}' does not implement the fused normed-A GEMV \
+                 (row_bda-family kernels only; normed-A requires an M=1 \
+                 row-kernel route, got M={})",
+                kernel.name,
+                dims.m
+            );
+        }
+        pc.flags |= crate::pipeline::MATMUL_FLAG_NORM_A;
+        pc.bias_ptr = norm_weight.device_address();
+        pc.beta = eps;
+    }
     let variant_pipeline = pipeline.pipeline_for_epilogue(kernel, variant, epilogue.key())?;
 
     let gx = dims.n.div_ceil(kernel.tile_n);

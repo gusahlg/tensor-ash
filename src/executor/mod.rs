@@ -51,7 +51,7 @@ use splitk2::SplitK2Pipeline;
 pub use crate::matmul::{MatmulCall, RunStats};
 pub use elementwise::{
     ATTN_DECODE_MAX_CHUNKS, AttnDecodeDesc, BinaryOp, CopyDesc, FlashAttentionDesc, RopeDesc,
-    SoftmaxMask,
+    RopeScatterDesc, SoftmaxMask,
 };
 pub use graph_ops::ExecOp;
 pub use prepared::PreparedOps;
@@ -207,31 +207,51 @@ impl Executor {
         OpPlan { kernel, splitk2 }
     }
 
-    /// Reroute a fused-epilogue op whose planned kernel cannot fuse
+    /// Reroute an op whose planned kernel cannot honor its fusions:
+    /// fused-epilogue ops off kernels without the epilogue constants
     /// (heuristic coopmat, or a tuned winner measured for the plain
-    /// shape) onto the epilogue-capable SIMT sibling.  No-op for plain
-    /// ops and for routes that already fuse.
-    pub(super) fn demote_for_epilogue(
+    /// shape) onto the epilogue-capable SIMT sibling, and normed-A ops
+    /// off any non-row route (e.g. a tuned M=1 winner) back onto the
+    /// row-GEMV heuristic pick.  No-op for plain ops and for routes
+    /// that already fuse.
+    pub(super) fn demote_for_op(
         &self,
-        epilogue: &crate::matmul::Epilogue<'_>,
+        op: &crate::matmul::MatmulOp<'_>,
         dims: &crate::matmul::ResolvedMatmul,
         plan: OpPlan,
     ) -> OpPlan {
-        if epilogue.is_none() || self.pipeline.kernel_at(plan.kernel).supports_epilogue() {
-            return plan;
-        }
         // Only auto routes demote.  An explicit ML_KERNEL selection of
         // a non-fusing kernel keeps its documented loud failure at
         // record time rather than being silently overridden.
-        if !self.pipeline.is_auto() {
-            return plan;
+        let mut plan = plan;
+        if !op.epilogue.is_none()
+            && !self.pipeline.kernel_at(plan.kernel).supports_epilogue()
+            && self.pipeline.is_auto()
+        {
+            plan = OpPlan {
+                kernel: self
+                    .pipeline
+                    .epilogue_fallback_index(dims.batch, dims.m, dims.n, dims.k, dims.b_f16),
+                splitk2: None,
+            };
         }
-        OpPlan {
-            kernel: self
+        if op.normed_a.is_some()
+            && !self.pipeline.kernel_at(plan.kernel).supports_normed_a()
+            && self.pipeline.is_auto()
+        {
+            // For M=1 the heuristic always picks a row kernel; other
+            // shapes keep their plan and fail loudly at record time.
+            let index = self
                 .pipeline
-                .epilogue_fallback_index(dims.batch, dims.m, dims.n, dims.k, dims.b_f16),
-            splitk2: None,
+                .heuristic_kernel_index(dims.batch, dims.m, dims.n, dims.k, dims.b_f16);
+            if self.pipeline.kernel_at(index).supports_normed_a() {
+                plan = OpPlan {
+                    kernel: index,
+                    splitk2: None,
+                };
+            }
         }
+        plan
     }
 
     /// `n_slots` = how many submissions can be in flight at once. 2 is

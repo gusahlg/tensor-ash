@@ -34,6 +34,9 @@ impl Executor {
         if let Some(d) = op.epilogue.d_tensor() {
             self.validate_tensor_context(d, "D")?;
         }
+        if let Some((norm_weight, _)) = op.normed_a {
+            self.validate_tensor_context(norm_weight, "normed-A weight")?;
+        }
         Ok(())
     }
 }

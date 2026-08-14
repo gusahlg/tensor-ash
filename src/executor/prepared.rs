@@ -106,7 +106,7 @@ impl Executor {
             .zip(resolved.iter())
             .map(|(op, dims)| {
                 let plan = self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, false);
-                self.demote_for_epilogue(&op.epilogue, dims, plan)
+                self.demote_for_op(op, dims, plan)
             })
             .collect();
         if let Some(plan) = plans
