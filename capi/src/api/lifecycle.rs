@@ -1,7 +1,9 @@
 use std::ffi::c_char;
 use std::sync::Arc;
 
-use tensor_ash_core::{DevicePreference, Executor, KernelSelection, MatmulPipeline, VulkanContext};
+use tensor_ash_core::{
+    DevicePreference, Executor, ExecutorConfig, KernelSelection, MatmulPipeline, VulkanContext,
+};
 
 use crate::error::{checked_ref, destroy_handle, ffi_create, last_error_ptr, parse_optional_cstr};
 use crate::handles::{ta_context, ta_executor};
@@ -83,12 +85,87 @@ pub unsafe extern "C" fn ta_executor_create(
     })
 }
 
-/// Destroy an executor returned by `ta_executor_create`.
+/// `ta_executor_create` with an explicit tuning policy instead of the
+/// process-wide `ML_TUNE` environment variable. `tune != 0` measures
+/// every eligible kernel the first time a new shape is submitted and
+/// persists the winner; persisted winners from earlier tuned runs apply
+/// either way.
 ///
 /// # Safety
 ///
-/// `exec` may be null. Otherwise it must be a pointer returned by
-/// `ta_executor_create` that has not already been destroyed.
+/// Same contract as `ta_executor_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ta_executor_create_v2(
+    ctx: *const ta_context,
+    n_slots: usize,
+    max_calls_per_submit: u32,
+    kernel_selection: *const c_char,
+    tune: u32,
+) -> *mut ta_executor {
+    ffi_create(|| {
+        let ctx = checked_ref(ctx, "ta_executor_create_v2: ctx is null")?;
+        let selection = parse_optional_cstr(kernel_selection, "auto")?;
+        let selection = KernelSelection::parse(&selection)?;
+        let pipeline = Arc::new(MatmulPipeline::new_with_kernel_selection(
+            &ctx.ctx, selection,
+        )?);
+        let exec = Executor::new_with_config(
+            Arc::clone(&ctx.ctx),
+            Arc::clone(&pipeline),
+            ExecutorConfig {
+                n_slots,
+                max_calls_per_submit,
+                tune: tune != 0,
+            },
+        )?;
+        Ok(Box::into_raw(Box::new(ta_executor {
+            ctx: Arc::clone(&ctx.ctx),
+            _pipeline: pipeline,
+            exec,
+        })))
+    })
+}
+
+/// Return 1 if the device supports f16 tensor storage
+/// (`shaderFloat16` + `storageBuffer16BitAccess`), 0 otherwise or for
+/// null.
+///
+/// # Safety
+///
+/// `ctx` may be null. Otherwise it must point to a live context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ta_context_supports_f16(ctx: *const ta_context) -> u32 {
+    if ctx.is_null() {
+        return 0;
+    }
+    let ctx = unsafe { &*ctx };
+    ctx.ctx.f16_storage_enabled as u32
+}
+
+/// Return 1 if the device supports `bufferDeviceAddress` (required for
+/// the BDA kernels, fused epilogues, and prepared replay), 0 otherwise
+/// or for null.
+///
+/// # Safety
+///
+/// `ctx` may be null. Otherwise it must point to a live context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ta_context_supports_bda(ctx: *const ta_context) -> u32 {
+    if ctx.is_null() {
+        return 0;
+    }
+    let ctx = unsafe { &*ctx };
+    ctx.ctx.buffer_device_address_enabled as u32
+}
+
+/// Destroy an executor returned by `ta_executor_create` or
+/// `ta_executor_create_v2`.
+///
+/// # Safety
+///
+/// `exec` may be null. Otherwise it must be a pointer returned by an
+/// executor creation function that has not already been destroyed, with
+/// no live `ta_prepared` handles still referencing it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ta_executor_destroy(exec: *mut ta_executor) {
     unsafe { destroy_handle(exec) }

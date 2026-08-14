@@ -1,7 +1,7 @@
 use std::ffi::c_int;
 use std::sync::Arc;
 
-use tensor_ash_core::Tensor;
+use tensor_ash_core::{DType, Tensor};
 
 use crate::error::{
     checked_ref, checked_slice, checked_slice_mut, destroy_handle, ffi_create, ffi_status,
@@ -54,6 +54,75 @@ pub unsafe extern "C" fn ta_tensor_create_on_executor(
     })
 }
 
+/// Allocate a device-local f16-storage tensor from a context.
+///
+/// Fails when the device lacks f16 storage support (check
+/// `ta_context_supports_f16`). Kernels read the tensor as half
+/// precision and accumulate in f32; `ta_upload`/`ta_download` keep the
+/// `float` host API and convert automatically (round-to-nearest half on
+/// upload, widen on download).
+///
+/// # Safety
+///
+/// `ctx` must be a live context. If `rank > 0`, `shape` must point to at
+/// least `rank` `uint32_t` dimensions for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ta_tensor_create_f16(
+    ctx: *const ta_context,
+    shape: *const u32,
+    rank: usize,
+) -> *mut ta_tensor {
+    ffi_create(|| {
+        let ctx = checked_ref(ctx, "ta_tensor_create_f16: ctx is null")?;
+        let shape = checked_slice(shape, rank, "ta_tensor_create_f16: shape is null")?;
+        let tensor = Tensor::uninit_device_f16(&ctx.ctx, shape)?;
+        Ok(Box::into_raw(Box::new(ta_tensor {
+            ctx: Arc::clone(&ctx.ctx),
+            tensor,
+        })))
+    })
+}
+
+/// `ta_tensor_create_f16` using the context held by an executor.
+///
+/// # Safety
+///
+/// `exec` must be a live executor. If `rank > 0`, `shape` must point to
+/// at least `rank` `uint32_t` dimensions for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ta_tensor_create_f16_on_executor(
+    exec: *const ta_executor,
+    shape: *const u32,
+    rank: usize,
+) -> *mut ta_tensor {
+    ffi_create(|| {
+        let exec = checked_ref(exec, "ta_tensor_create_f16_on_executor: exec is null")?;
+        let shape = checked_slice(
+            shape,
+            rank,
+            "ta_tensor_create_f16_on_executor: shape is null",
+        )?;
+        let tensor = Tensor::uninit_device_f16(&exec.ctx, shape)?;
+        Ok(Box::into_raw(Box::new(ta_tensor {
+            ctx: Arc::clone(&exec.ctx),
+            tensor,
+        })))
+    })
+}
+
+/// Return 1 if the tensor stores f16 elements, 0 for f32 or null.
+///
+/// # Safety
+///
+/// `tensor` may be null. Otherwise it must point to a live tensor.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ta_tensor_is_f16(tensor: *const ta_tensor) -> u32 {
+    if tensor.is_null() {
+        return 0;
+    }
+    (unsafe { (*tensor).tensor.dtype() } == DType::F16) as u32
+}
+
 /// Destroy a tensor returned by a tensor creation function.
 ///
 /// # Safety
@@ -93,6 +162,9 @@ pub unsafe extern "C" fn ta_tensor_size_bytes(tensor: *const ta_tensor) -> u64 {
 
 /// Upload `len` f32 values into a tensor.
 ///
+/// The host side is always `float`; values headed for an f16 tensor are
+/// rounded to the nearest half automatically during staging.
+///
 /// # Safety
 ///
 /// `exec` and `dst` must be live handles. If `len > 0`, `src` must point to at
@@ -113,6 +185,9 @@ pub unsafe extern "C" fn ta_upload(
 }
 
 /// Download `len` f32 values from a tensor.
+///
+/// The host side is always `float`; f16 tensors are widened to f32
+/// automatically during staging.
 ///
 /// # Safety
 ///

@@ -191,17 +191,41 @@ exec.run_op_graph(&[
 
 The C ABI lives in `tensor-ash-capi` and is declared in
 `include/tensor_ash.h`. Errors return `-1` or null and can be inspected with
-`ta_last_error()`.
+`ta_last_error()`. The surface covers real inference workloads:
+
+- Lifecycle: `ta_context_create`, `ta_executor_create` /
+  `ta_executor_create_v2` (explicit tuning policy instead of `ML_TUNE`),
+  plus capability queries `ta_context_supports_f16` /
+  `ta_context_supports_bda`.
+- Tensors: f32 (`ta_tensor_create`) and f16-storage
+  (`ta_tensor_create_f16`, `ta_tensor_is_f16`) device tensors.
+  `ta_upload` / `ta_download` always take `float` on the host and convert
+  to/from half automatically for f16 tensors.
+- Ops: `ta_matmul` / `ta_matmul_batch` for plain GEMMs; `ta_run_ops` /
+  `ta_run_op_graph` for `ta_matmul_op` batches with fused epilogues
+  (bias, relu/silu/gelu, residual add-scaled or gating mul), the graph
+  variant inserting automatic barriers between dependent ops.
+- Prepared replay: `ta_prepared_create` records a fixed op batch once;
+  `ta_prepared_run` or the pipelined `ta_prepared_submit` /
+  `ta_prepared_wait` replay it with one queue submit per call;
+  `ta_prepared_destroy` fence-waits. The executor and all referenced
+  tensors must outlive the `ta_prepared` handle (documented in the
+  header).
+- Diagnostics: `ta_dispatch_info_for` reports the selected kernel, tile,
+  and split-K route for a shape; `ta_tune_shape` pre-warms the measured
+  tuner.
 
 ```bash
 cargo build --release -p tensor-ash-capi
-cc -Iinclude examples/c_smoke.c -Ltarget/release -ltensor_ash \
+cc -Iinclude examples/c_smoke.c -Ltarget/release -ltensor_ash -lm \
   -Wl,-rpath,"$PWD/target/release" -o /tmp/tensor_ash_c_smoke
 nix-shell --run 'env LD_LIBRARY_PATH=target/release:$LD_LIBRARY_PATH /tmp/tensor_ash_c_smoke'
 ```
 
 The smoke test computes a 2x3 by 3x2 GEMM and verifies the expected
-`[58, 64, 139, 154]`.
+`[58, 64, 139, 154]`, then exercises a fused bias+SiLU op, prepared
+replay (including submit/wait), and an f16-weights matmul when the
+device supports them.
 
 ## Benchmark binary (`ml_bench`)
 

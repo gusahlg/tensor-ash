@@ -4,6 +4,20 @@
 
 ### Added
 
+- **C ABI inference surface** (`tensor-ash-capi`, `include/tensor_ash.h`):
+  f16 tensors (`ta_tensor_create_f16`[`_on_executor`], `ta_tensor_is_f16`;
+  `ta_upload`/`ta_download` convert to/from half automatically); fused
+  epilogues via `ta_epilogue`/`ta_matmul_op` with `ta_run_ops` and the
+  auto-barrier `ta_run_op_graph`; prepared replay
+  (`ta_prepared_create/run/submit/wait/destroy`) with a documented
+  lifetime contract (executor and tensors must outlive the handle;
+  destroy fence-waits); diagnostics `ta_dispatch_info_for` (interned
+  process-lifetime kernel-name pointers) and `ta_tune_shape`;
+  `ta_executor_create_v2` with an explicit tune flag (`ExecutorConfig`);
+  capability queries `ta_context_supports_f16`/`ta_context_supports_bda`.
+  `examples/c_smoke.c` now exercises a bias+SiLU op, prepared replay
+  (run and submit/wait), and an f16-weights matmul.
+
 - **FP16 weight storage** (`DType::F16`, `Tensor::uninit_device_f16`): B
   (weights) may be stored as IEEE half while A/C and accumulation stay f32.
   Upload/download keep the `&[f32]` host API and convert with
