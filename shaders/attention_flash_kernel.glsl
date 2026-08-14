@@ -21,6 +21,9 @@
 // DH/SPLIT accumulator lanes and score dots are completed with one
 // subgroupShuffleXor per key.
 
+#ifdef KV_F16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_buffer_reference : require
@@ -46,6 +49,14 @@ layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly b
 layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32ReadWrite {
     float v[];
 };
+#ifdef KV_F16
+layout(buffer_reference, std430, buffer_reference_align = 2) restrict readonly buffer F16ReadOnly {
+    float16_t v[];
+};
+#define KV_READER F16ReadOnly
+#else
+#define KV_READER F32ReadOnly
+#endif
 
 layout(push_constant) uniform PC {
     uint t_q;
@@ -100,13 +111,15 @@ void main() {
             const uint d = i / BK;
             const uint j = i % BK;
             const uint k_pos = k0 + j;
-            Ksh[i] = k_pos < pc.t_max ? pc.kt_ptr.v[kt_base + d * pc.t_max + k_pos] : 0.0;
+            KV_READER kt = KV_READER(uint64_t(pc.kt_ptr));
+            Ksh[i] = k_pos < pc.t_max ? float(kt.v[kt_base + d * pc.t_max + k_pos]) : 0.0;
         }
         for (uint i = tid; i < BK * DH; i += THREADS) {
             const uint j = i / DH;
             const uint d = i % DH;
             const uint k_pos = k0 + j;
-            Vsh[i] = k_pos < pc.t_max ? pc.v_ptr.v[v_base + k_pos * DH + d] : 0.0;
+            KV_READER vv = KV_READER(uint64_t(pc.v_ptr));
+            Vsh[i] = k_pos < pc.t_max ? float(vv.v[v_base + k_pos * DH + d]) : 0.0;
         }
         barrier();
 
