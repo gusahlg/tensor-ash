@@ -12,8 +12,8 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail, ensure};
 use tensor_ash::{
     ATTN_DECODE_MAX_CHUNKS, Activation, AttnDecodeDesc, BinaryOp, CopyDesc, Epilogue,
-    EpilogueBinary, ExecOp, Executor, FlashAttentionDesc, MatmulCall, MatmulOp, PosBuffer,
-    RopeDesc, RopeScatterDesc, SoftmaxMask, Tensor, VulkanContext,
+    EpilogueBinary, ExecOp, Executor, FlashAttentionDesc, HostU32Buffer, MatmulCall, MatmulOp,
+    PosBuffer, RopeDesc, RopeScatterDesc, SoftmaxMask, Tensor, VulkanContext,
 };
 
 use crate::gguf::{GGML_TYPE_F32, GgufFile};
@@ -156,8 +156,12 @@ pub struct Model {
     exec: Arc<Executor>,
     pub cfg: Config,
     layers: Vec<Layer>,
-    /// Token embeddings on the CPU, row-major [vocab][embd] f32.
+    /// Token embeddings on the CPU, row-major [vocab][embd] f32
+    /// (prefill embeds T rows host-side).
     embd_cpu: Vec<f32>,
+    /// The same table on the DEVICE ([vocab, embd], in the GGUF's
+    /// storage precision) for the decode loop's on-GPU row gather.
+    embd_gpu: Tensor,
     output_norm: Tensor,
     lm_head: Tensor,
     rope_table: Tensor,
@@ -168,6 +172,10 @@ pub struct Model {
     /// The 4-byte device-readable position cell the prepared decode
     /// graph reads; the host bumps it between replays.
     pos_buf: PosBuffer,
+    /// The 4-byte host-readable token cell the prepared graph's GPU
+    /// argmax writes; per token the host reads this ONE u32 instead of
+    /// downloading the 32000-float logits.
+    token_buf: HostU32Buffer,
     /// Decode strategy.  `LLAMA_ASH_DECODE=prepared|graph|perop|flash`
     /// overrides the default (prepared: record the token's command
     /// buffer once, replay it per token via the position buffer).
@@ -378,6 +386,16 @@ impl Model {
         }
 
         let embd_cpu = gguf.read_f32("token_embd.weight")?;
+        // Device copy of the embedding table for the decode loop's
+        // on-GPU row gather, in the GGUF's own storage precision so the
+        // gathered row is bit-identical to the CPU embed (an f16 GGUF
+        // round-trips f16 -> f32 -> f16 exactly; an f32 GGUF stays f32).
+        let embd_gpu = if embd_info.ggml_type == GGML_TYPE_F32 {
+            Tensor::uninit_device(ctx, &[vocab, embd])?
+        } else {
+            Tensor::uninit_device_f16(ctx, &[vocab, embd])?
+        };
+        exec.upload(&embd_cpu, &embd_gpu)?;
         let output_norm = load_norm(&mut gguf, "output_norm.weight")?;
         // Some GGUFs tie the LM head to the embeddings.
         let lm_head = if gguf.tensors.contains_key("output.weight") {
@@ -406,6 +424,7 @@ impl Model {
 
         let decode_scratch = Scratch::new(ctx, &cfg, 1)?;
         let pos_buf = exec.create_pos_buffer()?;
+        let token_buf = exec.create_host_u32_buffer()?;
         log::info!("model loaded in {:.2}s", start.elapsed().as_secs_f64());
         Ok(Self {
             ctx: ctx.clone(),
@@ -413,6 +432,7 @@ impl Model {
             cfg,
             layers,
             embd_cpu,
+            embd_gpu,
             output_norm,
             lm_head,
             rope_table,
@@ -420,6 +440,7 @@ impl Model {
             decode_scratch,
             prefill_scratch: None,
             pos_buf,
+            token_buf,
             breakdown: std::cell::RefCell::new(Vec::new()),
             decode_mode: match std::env::var("LLAMA_ASH_DECODE").as_deref() {
                 Ok("flash") => DecodeMode::Flash,
@@ -915,22 +936,34 @@ impl Model {
         {
             let s = &self.decode_scratch;
             // Pos-relative descs + the position buffer: one recording
-            // serves every token position.
-            let ops = self.decode_ops(s, 0, self.pos_buf.device_address());
+            // serves every token position.  The graph tail closes the
+            // token loop on the GPU: argmax writes the next token id to
+            // the host-readable cell, and the embedding gather writes
+            // that token's row into `x_a` — the very tensor the graph
+            // reads first — so the next replay feeds itself.
+            let mut ops = self.decode_ops(s, 0, self.pos_buf.device_address());
+            ops.push(ExecOp::Argmax {
+                input: &s.logits,
+                result: &self.token_buf,
+            });
+            ops.push(ExecOp::EmbedGather {
+                token: &self.token_buf,
+                table: &self.embd_gpu,
+                out: &s.x_a,
+            });
             let mut prepared = self.exec.prepare_exec_ops(&ops, Some(&self.pos_buf))?;
-            let mut logits = vec![0.0_f32; self.cfg.vocab as usize];
+            // Seed the first replay with the prefill's (CPU-argmaxed)
+            // token; from then on the graph's own gather refills x_a.
+            let host_x = self.embed(&[token])?;
+            self.exec.upload(&host_x, &s.x_a)?;
             for i in 0..n {
-                let host_x = self.embed(&[token])?;
-                // The upload is its own submission on the same queue,
-                // so it is ordered before the replay; the position
-                // write is host-visible and becomes visible to the
-                // device at submit.
-                self.exec.upload(&host_x, &s.x_a)?;
+                // The position write is host-visible and becomes
+                // visible to the device at submit; run()'s fence wait
+                // orders the token-cell read after the GPU argmax.
                 self.pos_buf.set(start_pos + i)?;
                 let stats = prepared.run()?;
                 self.note("prepared_total", &stats);
-                self.exec.download(&s.logits, &mut logits)?;
-                token = argmax(&logits)?;
+                token = self.token_buf.read()?;
                 generated.push(token);
             }
         }
