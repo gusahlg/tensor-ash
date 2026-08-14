@@ -257,9 +257,12 @@ impl MatmulPipeline {
         if self.ctx.buffer_device_address_enabled {
             let selection = if m == 1 {
                 Some(if b_f16 {
-                    // Deep K or narrow N: sixteen K-slice warps keep
-                    // the device occupied where eight leave it idle.
-                    if k >= 4096 || n <= 512 {
+                    // Sixteen K-slice warps win when K is deep, N is
+                    // narrow, or the shape is square-ish (measured:
+                    // 2048^2 -23%, K=5632/N=2048 -22%, N=256 helps;
+                    // wide-N moderate-K like N=5632/K=2048 regresses
+                    // -8% and stays on eight).
+                    if k >= 4096 || n <= 512 || (k >= 2048 && n <= 2048) {
                         KernelSelection::F16wRowBdaK16
                     } else {
                         KernelSelection::F16wRowBda
