@@ -117,9 +117,12 @@ pub const ATTN_DECODE_MAX_CHUNKS: u32 = 32;
 /// Sequence chunks for one decode-attention dispatch: enough
 /// workgroups to fill the device (grid = num_chunks * kv_heads)
 /// without shrinking chunks below the merge overhead.  Measured on
-/// GA104 (see experiment/decode-attention).
+/// GA104 at kv_heads=4 (TinyLlama, kv_len ~640): 8 chunks 715 us/22
+/// layers, 16 -> 565, 20 -> 526, 32 -> 523; short contexts favor the
+/// floor of 8 and deep ones the cap of 32, so target ~32 positions
+/// per chunk inside [8, 32].
 fn attn_decode_num_chunks(kv_len: u32) -> u32 {
-    kv_len.div_ceil(64).clamp(8, ATTN_DECODE_MAX_CHUNKS)
+    kv_len.div_ceil(32).clamp(8, ATTN_DECODE_MAX_CHUNKS)
 }
 
 /// Standalone binary elementwise operator for
