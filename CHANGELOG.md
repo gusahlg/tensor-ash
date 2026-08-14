@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [2.0.0] - 2026-08-14
+
 ### Added
 
 - **C ABI inference surface** (`tensor-ash-capi`, `include/tensor_ash.h`):
