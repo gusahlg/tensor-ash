@@ -125,7 +125,11 @@ fn run_case(kv_len: u32, f16_kv: bool, via_graph: bool) {
     let out = Tensor::uninit_device(&ctx, &[KV_HEADS, GROUP, DH]).unwrap();
 
     let scale = 1.0 / (DH as f32).sqrt();
-    let desc = AttnDecodeDesc { kv_len, scale };
+    let desc = AttnDecodeDesc {
+        kv_len,
+        scale,
+        ..Default::default()
+    };
     if via_graph {
         exec.run_exec_ops(&[ExecOp::AttnDecode {
             q: &q,
@@ -231,7 +235,11 @@ fn attn_decode_matches_composed_path() {
         &v,
         &scratch,
         &fused,
-        AttnDecodeDesc { kv_len, scale },
+        AttnDecodeDesc {
+            kv_len,
+            scale,
+            ..Default::default()
+        },
     )
     .unwrap();
 
@@ -280,6 +288,7 @@ fn attn_decode_rejects_bad_geometry() {
     let desc = AttnDecodeDesc {
         kv_len: 16,
         scale: 1.0,
+        ..Default::default()
     };
 
     // dh 128 has no compiled stage-1 variant.
@@ -308,6 +317,7 @@ fn attn_decode_rejects_bad_geometry() {
             AttnDecodeDesc {
                 kv_len: 65,
                 scale: 1.0,
+                ..Default::default()
             },
         )
         .unwrap_err()

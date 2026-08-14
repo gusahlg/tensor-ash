@@ -28,6 +28,15 @@
 // dimension) and optionally KV_F16 (f16 K/V caches, read via
 // float()).  Positions >= kv_len are never read, so cache-tail
 // garbage (even f16 inf) cannot leak in.
+//
+// Position indirection (replayable command buffers): when
+// `pos_ptr != 0` it points at one u32 position `p` and the effective
+// kv_len becomes `pc.kv_len + p` (record with kv_len = 1 so the
+// effective length is `p + 1`).  The recorded grid then covers a
+// FIXED chunk count; chunks whose start lies at or past the effective
+// kv_len run an empty position loop and write the online-softmax
+// identity (m ~ -inf, l = 0, acc = 0), which stage 2 merges as an
+// exact no-op.
 
 #ifdef KV_F16
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -57,6 +66,9 @@ layout(buffer_reference, std430, buffer_reference_align = 2) restrict readonly b
 #else
 #define KV_READER F32ReadOnly
 #endif
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer U32ReadOnly {
+    uint v[];
+};
 
 layout(push_constant) uniform PC {
     uint kv_len;
@@ -69,6 +81,7 @@ layout(push_constant) uniform PC {
     F32ReadOnly kt_ptr;
     F32ReadOnly v_ptr;
     F32ReadWrite scratch_ptr;
+    U32ReadOnly pos_ptr; // optional indirect position (0 = unused)
 } pc;
 
 shared float Qsh[ROWS * DH];
@@ -87,9 +100,11 @@ void main() {
     }
     barrier();
 
-    const uint chunk_size = (pc.kv_len + pc.num_chunks - 1u) / pc.num_chunks;
+    const uint kv_len =
+        pc.kv_len + (uint64_t(pc.pos_ptr) != 0ul ? pc.pos_ptr.v[0] : 0u);
+    const uint chunk_size = (kv_len + pc.num_chunks - 1u) / pc.num_chunks;
     const uint p0 = chunk * chunk_size;
-    const uint p1 = min(p0 + chunk_size, pc.kv_len);
+    const uint p1 = min(p0 + chunk_size, kv_len);
     const uint kt_base = kv_head * DH * pc.t_max;
     const uint v_base = kv_head * pc.t_max * DH;
 

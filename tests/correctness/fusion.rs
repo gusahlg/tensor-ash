@@ -87,17 +87,15 @@ fn normed_a_gemv_matches_f64_rms_reference() {
         let (a, b, w, host_a, host_b, host_w) =
             setup_normed_case(&ctx, &exec, k, n, b_f16, 11_000 + k as u64);
         let c = Tensor::uninit_device(&ctx, &[1, n]).unwrap();
-        exec.run_ops(&[
-            MatmulOp::new(MatmulCall {
-                a: &a,
-                b: &b,
-                c: &c,
-                alpha: 1.0,
-                accumulate: false,
-            })
-            .with_normed_a(&w, eps),
-        ])
-        .unwrap();
+        exec.run_ops(&[MatmulOp::new(MatmulCall {
+            a: &a,
+            b: &b,
+            c: &c,
+            alpha: 1.0,
+            accumulate: false,
+        })
+        .with_normed_a(&w, eps)])
+            .unwrap();
         let mut gpu = vec![0.0; n as usize];
         exec.download(&c, &mut gpu).unwrap();
         let normed = cpu_rms_norm_f64(&host_a, &host_w, eps);
@@ -119,7 +117,8 @@ fn normed_a_composes_with_silu_mul_epilogue_in_graph() {
     // RMSNorm folded in, chained in one exec graph.
     let (k, n) = (512_u32, 640_u32);
     let eps = 2e-5_f32;
-    let (a, b_up, w, host_a, host_b_up, host_w) = setup_normed_case(&ctx, &exec, k, n, true, 21_000);
+    let (a, b_up, w, host_a, host_b_up, host_w) =
+        setup_normed_case(&ctx, &exec, k, n, true, 21_000);
     let mut host_b_gate = vec![0.0; (k * n) as usize];
     fill_det(&mut host_b_gate, 21_500);
     let b_gate = Tensor::uninit_device_f16(&ctx, &[k, n]).unwrap();
@@ -201,33 +200,29 @@ fn normed_a_rejects_conflicting_forms() {
     assert!(err.contains("must equal K"), "unexpected: {err}");
 
     let err = exec
-        .run_ops(&[
-            MatmulOp::with_epilogue(
-                call,
-                Epilogue {
-                    bias: Some(&bias),
-                    activation: Activation::None,
-                    binary: EpilogueBinary::None,
-                },
-            )
-            .with_normed_a(&w, 1e-5),
-        ])
+        .run_ops(&[MatmulOp::with_epilogue(
+            call,
+            Epilogue {
+                bias: Some(&bias),
+                activation: Activation::None,
+                binary: EpilogueBinary::None,
+            },
+        )
+        .with_normed_a(&w, 1e-5)])
         .unwrap_err()
         .to_string();
     assert!(err.contains("epilogue bias"), "unexpected: {err}");
 
     let err = exec
-        .run_ops(&[
-            MatmulOp::with_epilogue(
-                call,
-                Epilogue {
-                    bias: None,
-                    activation: Activation::None,
-                    binary: EpilogueBinary::AddScaled { d: &d, beta: 1.0 },
-                },
-            )
-            .with_normed_a(&w, 1e-5),
-        ])
+        .run_ops(&[MatmulOp::with_epilogue(
+            call,
+            Epilogue {
+                bias: None,
+                activation: Activation::None,
+                binary: EpilogueBinary::AddScaled { d: &d, beta: 1.0 },
+            },
+        )
+        .with_normed_a(&w, 1e-5)])
         .unwrap_err()
         .to_string();
     assert!(err.contains("AddScaled"), "unexpected: {err}");
@@ -235,16 +230,14 @@ fn normed_a_rejects_conflicting_forms() {
     // M > 1 has no row route; the record path must fail loudly rather
     // than silently skip the normalization.
     let err = exec
-        .run_ops(&[
-            MatmulOp::new(MatmulCall {
-                a: &a_wide,
-                b: &b,
-                c: &c_wide,
-                alpha: 1.0,
-                accumulate: false,
-            })
-            .with_normed_a(&w, 1e-5),
-        ])
+        .run_ops(&[MatmulOp::new(MatmulCall {
+            a: &a_wide,
+            b: &b,
+            c: &c_wide,
+            alpha: 1.0,
+            accumulate: false,
+        })
+        .with_normed_a(&w, 1e-5)])
         .unwrap_err()
         .to_string();
     assert!(err.contains("normed-A"), "unexpected: {err}");
@@ -287,6 +280,7 @@ fn rope_scatter_case(kv_f16: bool) {
         head_dim: dh,
         rot_dim,
         pos_base,
+        ..Default::default()
     };
 
     // Reference: rope out-of-place, then strided-copy append.
@@ -301,6 +295,7 @@ fn rope_scatter_case(kv_f16: bool) {
             src_strides: [1, dh, heads * dh],
             dst_offset: pos_base,
             dst_strides: [t_max, dh * t_max, 1],
+            ..Default::default()
         },
     )
     .unwrap();
@@ -313,6 +308,7 @@ fn rope_scatter_case(kv_f16: bool) {
         RopeScatterDesc {
             dst_offset: pos_base,
             dst_strides: [1, dh * t_max, t_max],
+            ..Default::default()
         },
     )
     .unwrap();
@@ -357,13 +353,17 @@ fn rope_scatter_composes_in_exec_graph_and_bounds_check() {
     let (table, host_table) = upload_det(&ctx, &exec, &[t_max, dh / 2, 2], 51_002);
     let k_vec = Tensor::uninit_device(&ctx, &[1, heads * dh]).unwrap();
     let cache = Tensor::uninit_device(&ctx, &[heads, dh, t_max]).unwrap();
-    exec.upload(&vec![0.0; Tensor::numel(&[heads, dh, t_max]) as usize], &cache)
-        .unwrap();
+    exec.upload(
+        &vec![0.0; Tensor::numel(&[heads, dh, t_max]) as usize],
+        &cache,
+    )
+    .unwrap();
     let desc = RopeDesc {
         heads,
         head_dim: dh,
         rot_dim: dh,
         pos_base: pos,
+        ..Default::default()
     };
 
     // The scatter reads the matmul's output: the graph must barrier.
@@ -383,6 +383,7 @@ fn rope_scatter_composes_in_exec_graph_and_bounds_check() {
             scatter: RopeScatterDesc {
                 dst_offset: pos,
                 dst_strides: [1, dh * t_max, t_max],
+                ..Default::default()
             },
         },
     ])
@@ -418,6 +419,7 @@ fn rope_scatter_composes_in_exec_graph_and_bounds_check() {
             RopeScatterDesc {
                 dst_offset: t_max, // last dim index lands past the end
                 dst_strides: [1, dh * t_max, t_max],
+                ..Default::default()
             },
         )
         .unwrap_err()

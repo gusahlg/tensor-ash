@@ -7,17 +7,70 @@
 //! ~10 µs each.  One submission amortizes that to a single wait; the
 //! ops still serialize on the GPU exactly as the per-op path would.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use ash::vk;
 
+use crate::buffer::{Buffer, BufferLocation};
 use crate::matmul::{MatmulOp, ResolvedMatmul, RunStats};
 use crate::tensor::Tensor;
 
 use super::elementwise::ElementwiseDispatch;
+use super::prepared::PreparedOps;
 use super::recording::{record_compute_to_compute_barrier, record_one_matmul};
 use super::{
     AttnDecodeDesc, BinaryOp, CopyDesc, Executor, OpPlan, RopeDesc, RopeScatterDesc, SoftmaxMask,
 };
+
+/// A 4-byte host-visible, device-readable position cell for replayable
+/// decode graphs (see [`Executor::prepare_exec_ops`]).  The ops that
+/// depend on the token position take its [`device_address`]
+/// (`RopeDesc::pos_addr`, `CopyDesc::pos_addr`,
+/// `AttnDecodeDesc::pos_addr`); the recorded shaders read the current
+/// value each execution, so the host just [`set`]s the new position
+/// between replays instead of re-recording push constants.
+///
+/// Host writes made before a `vkQueueSubmit` are visible to that
+/// submission (the submit performs the domain operation; `set` flushes
+/// non-coherent memory), so no barrier is needed — only the usual
+/// "don't write while a replay is in flight" discipline, which
+/// [`PreparedOps::run`]'s fence wait already enforces.
+///
+/// [`device_address`]: Self::device_address
+/// [`set`]: Self::set
+pub struct PosBuffer {
+    buffer: Buffer,
+}
+
+impl PosBuffer {
+    /// Write a new position for the next submission.
+    pub fn set(&self, value: u32) -> Result<()> {
+        self.buffer.write_pod_slice(&[value])
+    }
+
+    /// GPU pointer for the shaders' position indirection; store it in
+    /// the descs' `pos_addr` fields.  The buffer must outlive every
+    /// execution of any op that captured this address.
+    pub fn device_address(&self) -> u64 {
+        self.buffer.device_address()
+    }
+}
+
+impl Executor {
+    /// Allocate a [`PosBuffer`] on this executor's device.
+    pub fn create_pos_buffer(&self) -> Result<PosBuffer> {
+        if !self.ctx.buffer_device_address_enabled {
+            bail!("create_pos_buffer: requires bufferDeviceAddress");
+        }
+        let buffer = Buffer::new(
+            &self.ctx,
+            std::mem::size_of::<u32>() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            BufferLocation::Host,
+        )
+        .context("create_pos_buffer")?;
+        Ok(PosBuffer { buffer })
+    }
+}
 
 /// One step of a mixed-op graph.  All variants execute in submission
 /// order with a full compute barrier between consecutive steps, so a
@@ -125,7 +178,74 @@ impl Executor {
         if !self.ctx.buffer_device_address_enabled {
             bail!("run_exec_ops: requires bufferDeviceAddress");
         }
+        let (planned, accesses, total_flops) = self.plan_exec_ops(ops)?;
 
+        let mut slot = self.checkout_slot();
+        let gpu_time_ns = unsafe {
+            self.submit_timed(
+                &mut slot,
+                "get_query_pool_results (exec graph)",
+                |_dev, cb, _slot| self.record_exec_ops(cb, &planned, &accesses),
+            )
+        }?;
+        Ok(RunStats {
+            gpu_time_ns,
+            n_calls: ops.len(),
+            total_flops,
+        })
+    }
+
+    /// [`run_exec_ops`](Self::run_exec_ops), recorded ONCE for repeated
+    /// replay — the decode-loop machinery: the whole token's op chain
+    /// becomes one resubmittable command buffer, so each token costs a
+    /// single `vkQueueSubmit` with zero re-validation, re-planning, or
+    /// re-recording on the host.
+    ///
+    /// Everything the recording bakes in (device addresses, push
+    /// constants, grids) is fixed at prepare time; token-position
+    /// dependence is expressed through `pos`: descs whose `pos_addr`
+    /// field carries `pos.device_address()` read the position cell at
+    /// execution time, so `pos.set(p)` before each
+    /// [`run`](PreparedOps::run) retargets the replay.  Every
+    /// `pos_addr` used by `ops` must match `pos` (validated here).
+    pub fn prepare_exec_ops<'e, 't>(
+        &'e self,
+        ops: &[ExecOp<'t>],
+        pos: Option<&'t PosBuffer>,
+    ) -> Result<PreparedOps<'e, 't>> {
+        if ops.is_empty() {
+            bail!("prepare_exec_ops: empty op list");
+        }
+        if !self.ctx.buffer_device_address_enabled {
+            bail!("prepare_exec_ops: requires bufferDeviceAddress");
+        }
+        let pos_addr = pos.map_or(0, PosBuffer::device_address);
+        for op in ops {
+            let used = match op {
+                ExecOp::Rope { desc, .. } | ExecOp::RopeScatter { desc, .. } => desc.pos_addr,
+                ExecOp::CopyStrided { desc, .. } => desc.pos_addr,
+                ExecOp::AttnDecode { desc, .. } => desc.pos_addr,
+                _ => 0,
+            };
+            if used != 0 && used != pos_addr {
+                bail!(
+                    "prepare_exec_ops: op references pos_addr {used:#x} but the prepared \
+                     position buffer is {pos_addr:#x} (pass the same PosBuffer)"
+                );
+            }
+        }
+        let (planned, accesses, total_flops) = self.plan_exec_ops(ops)?;
+        self.prepare_recorded(ops.len(), total_flops, |cb| {
+            self.record_exec_ops(cb, &planned, &accesses)
+        })
+    }
+
+    /// Validate and plan every op of a mixed graph; nothing touches the
+    /// queue, so failures cannot leave partial work behind.
+    fn plan_exec_ops<'t, 'p>(
+        &self,
+        ops: &'p [ExecOp<'t>],
+    ) -> Result<(Vec<Planned<'t, 'p>>, Vec<Access>, u64)> {
         let mut planned = Vec::with_capacity(ops.len() + 1);
         let mut accesses = Vec::with_capacity(ops.len() + 1);
         let mut total_flops = 0u64;
@@ -287,67 +407,64 @@ impl Executor {
                 ExecOp::AttnDecode { .. } => unreachable!("handled above"),
             });
         }
+        Ok((planned, accesses, total_flops))
+    }
 
-        let mut slot = self.checkout_slot();
-        let gpu_time_ns = unsafe {
-            self.submit_timed(
-                &mut slot,
-                "get_query_pool_results (exec graph)",
-                |_dev, cb, _slot| {
-                    let mut bound = vk::Pipeline::null();
-                    // Hazard tracking: barrier only when this op reads
-                    // or overwrites something written since the last
-                    // barrier (RAW/WAW), or writes something read since
-                    // (WAR).  Independent neighbours overlap on the
-                    // GPU, which both removes ~7 us of drain per
-                    // avoided barrier and lets tiny dispatches fill
-                    // idle SMs.
-                    let mut pending_writes: Vec<vk::Buffer> = Vec::new();
-                    let mut pending_reads: Vec<vk::Buffer> = Vec::new();
-                    for (index, step) in planned.iter().enumerate() {
-                        let access = &accesses[index];
-                        let hazard = access
-                            .reads
-                            .iter()
-                            .chain(&access.writes)
-                            .any(|b| pending_writes.contains(b))
-                            || access.writes.iter().any(|b| pending_reads.contains(b));
-                        if index > 0 && hazard {
-                            record_compute_to_compute_barrier(&self.ctx, cb);
-                            pending_writes.clear();
-                            pending_reads.clear();
-                        }
-                        pending_reads.extend(&access.reads);
-                        pending_writes.extend(&access.writes);
-                        match step {
-                            Planned::Matmul { op, dims, plan } => {
-                                record_one_matmul(
-                                    &self.ctx,
-                                    &self.pipeline,
-                                    cb,
-                                    vk::DescriptorSet::null(),
-                                    op,
-                                    dims,
-                                    self.pipeline.kernel_at(plan.kernel),
-                                    &mut bound,
-                                )?;
-                            }
-                            Planned::Elementwise(dispatch) => {
-                                self.record_elementwise(cb, dispatch);
-                                // The elementwise bind invalidates the
-                                // matmul bind-tracking.
-                                bound = vk::Pipeline::null();
-                            }
-                        }
-                    }
-                    Ok(())
-                },
-            )
-        }?;
-        Ok(RunStats {
-            gpu_time_ns,
-            n_calls: ops.len(),
-            total_flops,
-        })
+    /// Record a planned mixed graph into `cb` with hazard-aware
+    /// barriers.  Shared verbatim by the immediate
+    /// ([`run_exec_ops`](Self::run_exec_ops)) and prepared
+    /// ([`prepare_exec_ops`](Self::prepare_exec_ops)) paths.
+    fn record_exec_ops(
+        &self,
+        cb: vk::CommandBuffer,
+        planned: &[Planned<'_, '_>],
+        accesses: &[Access],
+    ) -> Result<()> {
+        let mut bound = vk::Pipeline::null();
+        // Hazard tracking: barrier only when this op reads or
+        // overwrites something written since the last barrier
+        // (RAW/WAW), or writes something read since (WAR).
+        // Independent neighbours overlap on the GPU, which both
+        // removes ~7 us of drain per avoided barrier and lets tiny
+        // dispatches fill idle SMs.
+        let mut pending_writes: Vec<vk::Buffer> = Vec::new();
+        let mut pending_reads: Vec<vk::Buffer> = Vec::new();
+        for (index, step) in planned.iter().enumerate() {
+            let access = &accesses[index];
+            let hazard = access
+                .reads
+                .iter()
+                .chain(&access.writes)
+                .any(|b| pending_writes.contains(b))
+                || access.writes.iter().any(|b| pending_reads.contains(b));
+            if index > 0 && hazard {
+                record_compute_to_compute_barrier(&self.ctx, cb);
+                pending_writes.clear();
+                pending_reads.clear();
+            }
+            pending_reads.extend(&access.reads);
+            pending_writes.extend(&access.writes);
+            match step {
+                Planned::Matmul { op, dims, plan } => {
+                    record_one_matmul(
+                        &self.ctx,
+                        &self.pipeline,
+                        cb,
+                        vk::DescriptorSet::null(),
+                        op,
+                        dims,
+                        self.pipeline.kernel_at(plan.kernel),
+                        &mut bound,
+                    )?;
+                }
+                Planned::Elementwise(dispatch) => {
+                    self.record_elementwise(cb, dispatch);
+                    // The elementwise bind invalidates the matmul
+                    // bind-tracking.
+                    bound = vk::Pipeline::null();
+                }
+            }
+        }
+        Ok(())
     }
 }
