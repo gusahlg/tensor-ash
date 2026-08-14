@@ -1,0 +1,10 @@
+#version 460
+// Fused RoPE + strided scatter (f32 destination): rotates [T, H, dh]
+// activations and writes them directly into a strided destination
+// layout (KV-cache append) — one dispatch instead of rope + copy.
+
+#extension GL_GOOGLE_include_directive : require
+
+#define ROPE_SCATTER 1
+
+#include "op_rope_body.glsl"

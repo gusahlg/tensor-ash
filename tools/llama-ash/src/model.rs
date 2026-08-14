@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail, ensure};
 use tensor_ash::{
     ATTN_DECODE_MAX_CHUNKS, Activation, AttnDecodeDesc, BinaryOp, CopyDesc, Epilogue,
     EpilogueBinary, ExecOp, Executor, FlashAttentionDesc, MatmulCall, MatmulOp, RopeDesc,
-    SoftmaxMask, Tensor, VulkanContext,
+    RopeScatterDesc, SoftmaxMask, Tensor, VulkanContext,
 };
 
 use crate::gguf::{GGML_TYPE_F32, GgufFile};
@@ -472,6 +472,64 @@ impl Model {
         }
     }
 
+    /// Decode-only fused QKV: the attention RMSNorm folds into the
+    /// three row GEMVs (reading `x_in` directly, no `xn` round-trip),
+    /// q ropes in place, k ropes straight into the Kt cache, and the
+    /// V row appends — six dispatches instead of nine.
+    fn qkv_fused_decode(&self, layer: &Layer, s: &Scratch, x_in: &Tensor, pos: u32) -> Result<()> {
+        let (kv, dh, t_max) = (self.cfg.kv_heads, self.cfg.dh, self.cfg.t_max);
+        let normed = |b, c| {
+            MatmulOp::new(MatmulCall {
+                a: x_in,
+                b,
+                c,
+                alpha: 1.0,
+                accumulate: false,
+            })
+            .with_normed_a(&layer.attn_norm, self.cfg.rms_eps)
+        };
+        let stats = self.exec.run_ops(&[
+            normed(&layer.wq, &s.q),
+            normed(&layer.wk, &s.k),
+            normed(&layer.wv, &s.v),
+        ])?;
+        self.note("qkv_matmul", &stats);
+        let rope = |heads| RopeDesc {
+            heads,
+            head_dim: dh,
+            rot_dim: dh,
+            pos_base: pos,
+        };
+        let stats = self
+            .exec
+            .run_rope(&s.q, &self.rope_table, &s.q, rope(self.cfg.heads))?;
+        self.note("rope", &stats);
+        let stats = self.exec.run_rope_scatter(
+            &s.k,
+            &self.rope_table,
+            &layer.kt_cache,
+            rope(kv),
+            RopeScatterDesc {
+                dst_offset: pos,
+                dst_strides: [1, dh * t_max, t_max],
+            },
+        )?;
+        self.note("rope_scatter", &stats);
+        let stats = self.exec.run_copy_strided(
+            &s.v,
+            &layer.v_cache,
+            CopyDesc {
+                extent: [dh, kv, 1],
+                src_offset: 0,
+                src_strides: [1, dh, kv * dh],
+                dst_offset: pos * dh,
+                dst_strides: [1, t_max * dh, dh],
+            },
+        )?;
+        self.note("kv_append", &stats);
+        Ok(())
+    }
+
     fn qkv(&self, layer: &Layer, s: &Scratch, pos_base: u32) -> Result<()> {
         let call = |b, c| MatmulCall {
             a: &s.xn,
@@ -646,33 +704,67 @@ impl Model {
             },
         )])?;
         self.note("o_proj_mm", &stats);
-        let stats = self
-            .exec
-            .run_rms_norm(&s.o, &layer.ffn_norm, &s.on, self.cfg.rms_eps)?;
-        self.note("rms_norm", &stats);
-        let stats = self.exec.run_matmuls(&[MatmulCall {
-            a: &s.on,
-            b: &layer.w_up,
-            c: &s.up,
-            alpha: 1.0,
-            accumulate: false,
-        }])?;
-        self.note("ffn_up_mm", &stats);
-        let stats = self.exec.run_ops(&[MatmulOp::with_epilogue(
-            MatmulCall {
+        if s.t == 1 {
+            // Decode: the FFN RMSNorm folds into the up and gate row
+            // GEMVs (gate keeps its Silu+Mul epilogue — llama has no
+            // bias, so the bias slot carries the norm weight).
+            let normed = |b, c| {
+                MatmulOp::new(MatmulCall {
+                    a: &s.o,
+                    b,
+                    c,
+                    alpha: 1.0,
+                    accumulate: false,
+                })
+                .with_normed_a(&layer.ffn_norm, self.cfg.rms_eps)
+            };
+            let stats = self.exec.run_ops(&[normed(&layer.w_up, &s.up)])?;
+            self.note("ffn_up_mm", &stats);
+            let stats = self.exec.run_ops(&[MatmulOp::with_epilogue(
+                MatmulCall {
+                    a: &s.o,
+                    b: &layer.w_gate,
+                    c: &s.gate,
+                    alpha: 1.0,
+                    accumulate: false,
+                },
+                Epilogue {
+                    bias: None,
+                    activation: Activation::Silu,
+                    binary: EpilogueBinary::Mul { d: &s.up },
+                },
+            )
+            .with_normed_a(&layer.ffn_norm, self.cfg.rms_eps)])?;
+            self.note("ffn_gate_mm", &stats);
+        } else {
+            let stats = self
+                .exec
+                .run_rms_norm(&s.o, &layer.ffn_norm, &s.on, self.cfg.rms_eps)?;
+            self.note("rms_norm", &stats);
+            let stats = self.exec.run_matmuls(&[MatmulCall {
                 a: &s.on,
-                b: &layer.w_gate,
-                c: &s.gate,
+                b: &layer.w_up,
+                c: &s.up,
                 alpha: 1.0,
                 accumulate: false,
-            },
-            Epilogue {
-                bias: None,
-                activation: Activation::Silu,
-                binary: EpilogueBinary::Mul { d: &s.up },
-            },
-        )])?;
-        self.note("ffn_gate_mm", &stats);
+            }])?;
+            self.note("ffn_up_mm", &stats);
+            let stats = self.exec.run_ops(&[MatmulOp::with_epilogue(
+                MatmulCall {
+                    a: &s.on,
+                    b: &layer.w_gate,
+                    c: &s.gate,
+                    alpha: 1.0,
+                    accumulate: false,
+                },
+                Epilogue {
+                    bias: None,
+                    activation: Activation::Silu,
+                    binary: EpilogueBinary::Mul { d: &s.up },
+                },
+            )])?;
+            self.note("ffn_gate_mm", &stats);
+        }
         let stats = self.exec.run_ops(&[MatmulOp::with_epilogue(
             MatmulCall {
                 a: &s.gate,
@@ -782,36 +874,35 @@ impl Model {
         let (mut x_in, mut x_out) = (&s.x_a, &s.x_b);
         for layer in &self.layers {
             let scores = s.scores.as_ref().unwrap();
-            ops.push(ExecOp::RmsNorm {
-                input: x_in,
-                weight: &layer.attn_norm,
-                output: &s.xn,
-                eps,
-            });
-            ops.push(ExecOp::Matmul(MatmulOp::new(mm(&s.xn, &layer.wq, &s.q))));
-            ops.push(ExecOp::Matmul(MatmulOp::new(mm(&s.xn, &layer.wk, &s.k))));
-            ops.push(ExecOp::Matmul(MatmulOp::new(mm(&s.xn, &layer.wv, &s.v))));
+            // The attention RMSNorm is folded into the q/k/v row GEMVs
+            // (each recomputes the K-length reduction, which is trivia
+            // next to the weight traffic) — the standalone norm op and
+            // its xn round-trip are gone.
+            ops.push(ExecOp::Matmul(
+                MatmulOp::new(mm(x_in, &layer.wq, &s.q)).with_normed_a(&layer.attn_norm, eps),
+            ));
+            ops.push(ExecOp::Matmul(
+                MatmulOp::new(mm(x_in, &layer.wk, &s.k)).with_normed_a(&layer.attn_norm, eps),
+            ));
+            ops.push(ExecOp::Matmul(
+                MatmulOp::new(mm(x_in, &layer.wv, &s.v)).with_normed_a(&layer.attn_norm, eps),
+            ));
             ops.push(ExecOp::Rope {
                 input: &s.q,
                 table: &self.rope_table,
                 output: &s.q,
                 desc: rope(self.cfg.heads),
             });
-            ops.push(ExecOp::Rope {
+            // k-RoPE writes straight into the Kt cache (the k scratch
+            // is never read again): rope + append as one dispatch.
+            ops.push(ExecOp::RopeScatter {
                 input: &s.k,
                 table: &self.rope_table,
-                output: &s.k,
-                desc: rope(kv),
-            });
-            ops.push(ExecOp::CopyStrided {
-                src: &s.k,
                 dst: &layer.kt_cache,
-                desc: CopyDesc {
-                    extent: [dh, kv, 1],
-                    src_offset: 0,
-                    src_strides: [1, dh, kv * dh],
+                desc: rope(kv),
+                scatter: RopeScatterDesc {
                     dst_offset: pos,
-                    dst_strides: [t_max, dh * t_max, 1],
+                    dst_strides: [1, dh * t_max, t_max],
                 },
             });
             ops.push(ExecOp::CopyStrided {
@@ -865,21 +956,23 @@ impl Model {
                     binary: EpilogueBinary::AddScaled { d: x_in, beta: 1.0 },
                 },
             )));
-            ops.push(ExecOp::RmsNorm {
-                input: &s.o,
-                weight: &layer.ffn_norm,
-                output: &s.on,
-                eps,
-            });
-            ops.push(ExecOp::Matmul(MatmulOp::new(mm(&s.on, &layer.w_up, &s.up))));
-            ops.push(ExecOp::Matmul(MatmulOp::with_epilogue(
-                mm(&s.on, &layer.w_gate, &s.gate),
-                Epilogue {
-                    bias: None,
-                    activation: Activation::Silu,
-                    binary: EpilogueBinary::Mul { d: &s.up },
-                },
-            )));
+            // The FFN RMSNorm folds into the up and gate GEMVs the same
+            // way (gate's Silu+Mul epilogue rides along: llama has no
+            // bias, so the bias slot is free for the norm weight).
+            ops.push(ExecOp::Matmul(
+                MatmulOp::new(mm(&s.o, &layer.w_up, &s.up)).with_normed_a(&layer.ffn_norm, eps),
+            ));
+            ops.push(ExecOp::Matmul(
+                MatmulOp::with_epilogue(
+                    mm(&s.o, &layer.w_gate, &s.gate),
+                    Epilogue {
+                        bias: None,
+                        activation: Activation::Silu,
+                        binary: EpilogueBinary::Mul { d: &s.up },
+                    },
+                )
+                .with_normed_a(&layer.ffn_norm, eps),
+            ));
             ops.push(ExecOp::Matmul(MatmulOp::with_epilogue(
                 mm(&s.gate, &layer.w_down, x_out),
                 Epilogue {
@@ -941,12 +1034,7 @@ impl Model {
             dst_strides: [1, 0, 0],
         };
         for layer in &self.layers {
-            let stats = self
-                .exec
-                .run_rms_norm(x_in, &layer.attn_norm, &s.xn, self.cfg.rms_eps)?;
-            self.note("rms_norm", &stats);
-            self.qkv(layer, s, pos)?;
-            self.append_kv(layer, s, 1, pos)?;
+            self.qkv_fused_decode(layer, s, x_in, pos)?;
             // Reshape q [1, embd] -> [kv_heads, group, dh] (same memory
             // order): one batched matmul covers the GQA groups.
             if self.decode_mode == DecodeMode::Flash {

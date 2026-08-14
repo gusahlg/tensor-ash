@@ -44,13 +44,13 @@ pub use context::{DeviceKind, DevicePreference, DeviceSummary, VulkanContext};
 pub use dtype::DType;
 pub use executor::{
     ATTN_DECODE_MAX_CHUNKS, AttnDecodeDesc, BinaryOp, CopyDesc, DispatchInfo, ExecOp, Executor,
-    ExecutorConfig, FlashAttentionDesc, PreparedOps, RopeDesc, SoftmaxMask,
+    ExecutorConfig, FlashAttentionDesc, PreparedOps, RopeDesc, RopeScatterDesc, SoftmaxMask,
 };
 pub use matmul::{
     Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, MatrixShape, RunStats,
 };
 pub use pipeline::{
-    EpilogueKey, KERNEL_SPECS, KernelSelection, KernelSpec, KernelVariant, MatmulKernel,
-    MatmulPipeline, MatmulPushConstants,
+    EpilogueKey, KERNEL_SPECS, KernelSelection, KernelSpec, KernelVariant, MATMUL_FLAG_NORM_A,
+    MatmulKernel, MatmulPipeline, MatmulPushConstants,
 };
 pub use tensor::Tensor;

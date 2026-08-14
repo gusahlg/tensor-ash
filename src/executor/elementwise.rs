@@ -26,6 +26,10 @@ use super::splitk2::create_pc_only_layout;
 const SPIRV_SOFTMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_softmax_f32_row.spv"));
 const SPIRV_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_rmsnorm_f32.spv"));
 const SPIRV_ROPE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_rope_f32.spv"));
+const SPIRV_ROPE_SCATTER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/op_rope_scatter_f32.spv"));
+const SPIRV_ROPE_SCATTER_TO_F16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/op_rope_scatter_f32_to_f16.spv"));
 const SPIRV_COPY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_copy_strided_f32.spv"));
 const SPIRV_BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_binary_f32.spv"));
 const SPIRV_COPY_TO_F16: &[u8] =
@@ -79,6 +83,20 @@ pub struct RopeDesc {
     pub rot_dim: u32,
     /// Absolute position of the first token in the input.
     pub pos_base: u32,
+}
+
+/// Destination geometry for [`Executor::run_rope_scatter`]: the fused
+/// RoPE + strided-scatter op writes each rotated (or pass-through)
+/// element `(token, head, dim)` to `dst_offset + token*dst_strides[0]
+/// + head*dst_strides[1] + dim*dst_strides[2]` (elements).  Covers the
+/// decode k-rope + Kt-cache append as one dispatch: for a
+/// `[H_kv, dh, T_max]` Kt cache at position `pos`, use
+/// `dst_offset = pos` and `dst_strides = [1, dh * t_max, t_max]`.
+#[derive(Copy, Clone, Debug)]
+pub struct RopeScatterDesc {
+    pub dst_offset: u32,
+    /// Element strides per (token, head, dim).
+    pub dst_strides: [u32; 3],
 }
 
 /// Fused causal-attention geometry for
@@ -192,6 +210,22 @@ struct RopePc {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+struct RopeScatterPc {
+    tokens: u32,
+    heads: u32,
+    head_dim: u32,
+    rot_dim: u32,
+    pos_base: u32,
+    dst_offset: u32,
+    dst_strides: [u32; 3],
+    _pad: u32,
+    in_ptr: u64,
+    dst_ptr: u64,
+    table_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
 struct CopyPc {
     extent: [u32; 3],
     src_offset: u32,
@@ -280,6 +314,8 @@ pub(super) struct ElementwisePipeline {
     pub(super) rmsnorm: OpKernel,
     pub(super) layernorm: OpKernel,
     rope: OpKernel,
+    rope_scatter: OpKernel,
+    rope_scatter_to_f16: OpKernel,
     copy: OpKernel,
     pub(super) binary: OpKernel,
     copy_to_f16: OpKernel,
@@ -301,7 +337,7 @@ impl ElementwisePipeline {
         let layout_guard = scopeguard::guard(layout, |l| unsafe {
             ctx.device.destroy_pipeline_layout(l, None);
         });
-        let built: Vec<OpKernel> = Vec::with_capacity(14);
+        let built: Vec<OpKernel> = Vec::with_capacity(16);
         let mut built_guard = scopeguard::guard(built, |kernels| {
             for kernel in kernels {
                 unsafe {
@@ -315,6 +351,12 @@ impl ElementwisePipeline {
             (SPIRV_NORM, &[0u32][..], "op rmsnorm"),
             (SPIRV_NORM, &[1u32][..], "op layernorm"),
             (SPIRV_ROPE, &[][..], "op rope"),
+            (SPIRV_ROPE_SCATTER, &[][..], "op rope_scatter"),
+            (
+                SPIRV_ROPE_SCATTER_TO_F16,
+                &[][..],
+                "op rope_scatter f32->f16",
+            ),
             (SPIRV_COPY, &[][..], "op copy_strided"),
             (SPIRV_BINARY, &[][..], "op binary"),
             (SPIRV_COPY_TO_F16, &[][..], "op copy_strided f32->f16"),
@@ -345,14 +387,16 @@ impl ElementwisePipeline {
         let built = scopeguard::ScopeGuard::into_inner(built_guard);
         let mut it = built.into_iter();
         #[rustfmt::skip]
-        let (softmax, rmsnorm, layernorm, rope, copy, binary, copy_to_f16,
+        let (softmax, rmsnorm, layernorm, rope, rope_scatter, rope_scatter_to_f16,
+            copy, binary, copy_to_f16,
             flash_dh64, flash_dh128, flash_kv16_dh64, flash_kv16_dh128,
             attn_decode_dh64, attn_decode_kv16_dh64, attn_decode_combine) = (
             it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
             it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
             it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
             it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
-            it.next().unwrap(), it.next().unwrap(),
+            it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
+            it.next().unwrap(),
         );
         Ok(Self {
             ctx: Arc::clone(ctx),
@@ -361,6 +405,8 @@ impl ElementwisePipeline {
             rmsnorm,
             layernorm,
             rope,
+            rope_scatter,
+            rope_scatter_to_f16,
             copy,
             binary,
             copy_to_f16,
@@ -384,6 +430,8 @@ impl Drop for ElementwisePipeline {
                 &self.rmsnorm,
                 &self.layernorm,
                 &self.rope,
+                &self.rope_scatter,
+                &self.rope_scatter_to_f16,
                 &self.copy,
                 &self.binary,
                 &self.copy_to_f16,
@@ -688,6 +736,40 @@ impl Executor {
         self.submit_one_elementwise(dispatch)
     }
 
+    /// Shared rope-geometry validation: returns the token count for
+    /// `input` under `desc`, checking rot_dim and table coverage.
+    fn rope_tokens(op: &str, input: &Tensor, table: &Tensor, desc: RopeDesc) -> Result<u32> {
+        if desc.rot_dim < 2 || !desc.rot_dim.is_multiple_of(2) || desc.rot_dim > desc.head_dim {
+            bail!(
+                "{op}: rot_dim {} must be even, >= 2, and <= head_dim {}",
+                desc.rot_dim,
+                desc.head_dim
+            );
+        }
+        let vec_elems = desc.heads as u64 * desc.head_dim as u64;
+        if vec_elems == 0 || !input.len().is_multiple_of(vec_elems) {
+            bail!(
+                "{op}: input length {} is not a multiple of heads*head_dim {}",
+                input.len(),
+                vec_elems
+            );
+        }
+        let tokens = u32::try_from(input.len() / vec_elems)
+            .map_err(|_| anyhow::anyhow!("{op}: token count exceeds u32"))?;
+        let needed = (desc.pos_base as u64 + tokens as u64) * desc.rot_dim as u64;
+        if table.len() < needed {
+            bail!(
+                "{op}: table length {} < required {} (pos_base {} + {} tokens, rot_dim {})",
+                table.len(),
+                needed,
+                desc.pos_base,
+                tokens,
+                desc.rot_dim
+            );
+        }
+        Ok(tokens)
+    }
+
     pub(super) fn plan_rope(
         &self,
         input: &Tensor,
@@ -705,34 +787,7 @@ impl Executor {
                 input.shape()
             );
         }
-        if desc.rot_dim < 2 || !desc.rot_dim.is_multiple_of(2) || desc.rot_dim > desc.head_dim {
-            bail!(
-                "run_rope: rot_dim {} must be even, >= 2, and <= head_dim {}",
-                desc.rot_dim,
-                desc.head_dim
-            );
-        }
-        let vec_elems = desc.heads as u64 * desc.head_dim as u64;
-        if vec_elems == 0 || !input.len().is_multiple_of(vec_elems) {
-            bail!(
-                "run_rope: input length {} is not a multiple of heads*head_dim {}",
-                input.len(),
-                vec_elems
-            );
-        }
-        let tokens = u32::try_from(input.len() / vec_elems)
-            .map_err(|_| anyhow::anyhow!("run_rope: token count exceeds u32"))?;
-        let needed = (desc.pos_base as u64 + tokens as u64) * desc.rot_dim as u64;
-        if table.len() < needed {
-            bail!(
-                "run_rope: table length {} < required {} (pos_base {} + {} tokens, rot_dim {})",
-                table.len(),
-                needed,
-                desc.pos_base,
-                tokens,
-                desc.rot_dim
-            );
-        }
+        let tokens = Self::rope_tokens("run_rope", input, table, desc)?;
         let pairs = tokens * desc.heads * (desc.rot_dim / 2);
         let pipeline = self.elementwise()?.rope.pipeline;
         self.plan_elementwise(
@@ -746,6 +801,78 @@ impl Executor {
                 _pad: 0,
                 in_ptr: input.device_address(),
                 out_ptr: output.device_address(),
+                table_ptr: table.device_address(),
+            },
+            pairs.div_ceil(WG),
+            1,
+        )
+    }
+
+    /// Fused RoPE + strided scatter: rotate `[T, H, dh]` activations
+    /// (exactly like [`run_rope`](Self::run_rope)) but write every
+    /// element straight into `dst` at the strided location given by
+    /// [`RopeScatterDesc`] — one dispatch covers the decode k-rope
+    /// plus KV-cache append.  `dst` may be f32 or f16 storage (f16
+    /// narrows with RNE like the strided-copy path) and must be a
+    /// different tensor from `input`.
+    pub fn run_rope_scatter(
+        &self,
+        input: &Tensor,
+        table: &Tensor,
+        dst: &Tensor,
+        desc: RopeDesc,
+        scatter: RopeScatterDesc,
+    ) -> Result<RunStats> {
+        let dispatch = self.plan_rope_scatter(input, table, dst, desc, scatter)?;
+        self.submit_one_elementwise(dispatch)
+    }
+
+    pub(super) fn plan_rope_scatter(
+        &self,
+        input: &Tensor,
+        table: &Tensor,
+        dst: &Tensor,
+        desc: RopeDesc,
+        scatter: RopeScatterDesc,
+    ) -> Result<ElementwiseDispatch> {
+        self.ensure_f32(input, "run_rope_scatter", "input")?;
+        self.ensure_f32(table, "run_rope_scatter", "table")?;
+        self.validate_tensor_context(dst, "dst")?;
+        if input.raw_buffer() == dst.raw_buffer() {
+            bail!("run_rope_scatter: input and dst must be different tensors");
+        }
+        let tokens = Self::rope_tokens("run_rope_scatter", input, table, desc)?;
+        // Every (token, head, dim) element is written (rotated lanes
+        // and pass-through lanes alike); bound the farthest one.
+        let max_index = scatter.dst_offset as u64
+            + (tokens as u64 - 1) * scatter.dst_strides[0] as u64
+            + (desc.heads as u64 - 1) * scatter.dst_strides[1] as u64
+            + (desc.head_dim as u64 - 1) * scatter.dst_strides[2] as u64;
+        if max_index >= dst.len() {
+            bail!(
+                "run_rope_scatter: destination access reaches element {max_index} but dst has {}",
+                dst.len()
+            );
+        }
+        let pairs = tokens * desc.heads * (desc.rot_dim / 2);
+        let pipes = self.elementwise()?;
+        let pipeline = match dst.dtype() {
+            DType::F32 => pipes.rope_scatter.pipeline,
+            DType::F16 => pipes.rope_scatter_to_f16.pipeline,
+        };
+        self.plan_elementwise(
+            pipeline,
+            &RopeScatterPc {
+                tokens,
+                heads: desc.heads,
+                head_dim: desc.head_dim,
+                rot_dim: desc.rot_dim,
+                pos_base: desc.pos_base,
+                dst_offset: scatter.dst_offset,
+                dst_strides: scatter.dst_strides,
+                _pad: 0,
+                in_ptr: input.device_address(),
+                dst_ptr: dst.device_address(),
                 table_ptr: table.device_address(),
             },
             pairs.div_ceil(WG),
@@ -1149,6 +1276,8 @@ unsafe impl bytemuck::Pod for NormPc {}
 unsafe impl bytemuck::Zeroable for NormPc {}
 unsafe impl bytemuck::Pod for RopePc {}
 unsafe impl bytemuck::Zeroable for RopePc {}
+unsafe impl bytemuck::Pod for RopeScatterPc {}
+unsafe impl bytemuck::Zeroable for RopeScatterPc {}
 unsafe impl bytemuck::Pod for CopyPc {}
 unsafe impl bytemuck::Zeroable for CopyPc {}
 unsafe impl bytemuck::Pod for FlashPc {}

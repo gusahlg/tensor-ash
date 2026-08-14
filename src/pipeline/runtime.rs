@@ -48,4 +48,12 @@ impl MatmulKernel {
     pub fn weights_f16(&self) -> bool {
         self.name.starts_with("f16w_")
     }
+
+    /// Whether this kernel's shader body implements the fused normed-A
+    /// GEMV (`flags` bit 1: RMSNorm of the A row folded before the
+    /// product).  True for the row-GEMV family only.
+    #[inline]
+    pub fn supports_normed_a(&self) -> bool {
+        self.name.contains("row_bda")
+    }
 }

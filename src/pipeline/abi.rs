@@ -6,6 +6,12 @@
 /// them; the `buffer_reference`-based variants dereference them via
 /// `GL_EXT_buffer_reference` for direct LDG.128 access without the
 /// descriptor indirection.
+/// `flags` bit 1: the row-GEMV kernels fold an RMSNorm of the A row
+/// into the product (`bias_ptr` carries the norm weight, `beta` eps).
+/// Bit 0 is the legacy accumulate flag; bits 16..31 carry split-K
+/// counts.
+pub const MATMUL_FLAG_NORM_A: u32 = 1 << 1;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MatmulPushConstants {

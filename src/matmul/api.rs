@@ -108,6 +108,13 @@ impl Epilogue<'_> {
 pub struct MatmulOp<'a> {
     pub call: MatmulCall<'a>,
     pub epilogue: Epilogue<'a>,
+    /// `(weight, eps)`: RMS-normalize each A row in the kernel before
+    /// the product, i.e. compute `C = rms_norm(A, weight, eps) @ B`.
+    /// Only the row-GEMV (`*row_bda*`) kernels implement this, so it is
+    /// restricted to M=1 decode-style calls; the norm weight rides the
+    /// unused `bias_ptr` slot and `eps` rides `beta`, so it cannot
+    /// combine with an epilogue bias or the `AddScaled` binary.
+    pub normed_a: Option<(&'a Tensor, f32)>,
 }
 
 impl<'a> MatmulOp<'a> {
@@ -116,12 +123,27 @@ impl<'a> MatmulOp<'a> {
         Self {
             call,
             epilogue: Epilogue::NONE,
+            normed_a: None,
         }
     }
 
     #[inline]
     pub fn with_epilogue(call: MatmulCall<'a>, epilogue: Epilogue<'a>) -> Self {
-        Self { call, epilogue }
+        Self {
+            call,
+            epilogue,
+            normed_a: None,
+        }
+    }
+
+    /// Fold an RMSNorm of A into the kernel (see [`MatmulOp::normed_a`]):
+    /// `C = rms_norm(A, weight, eps) @ B`.  Composable with
+    /// [`with_epilogue`](Self::with_epilogue) as long as the epilogue
+    /// carries no bias and no `AddScaled` binary.
+    #[inline]
+    pub fn with_normed_a(mut self, weight: &'a Tensor, eps: f32) -> Self {
+        self.normed_a = Some((weight, eps));
+        self
     }
 }
 

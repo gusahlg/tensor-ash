@@ -24,7 +24,7 @@ use create::{create_epilogue_pipeline, create_kernel, destroy_kernel};
 use selection::{auto_min_large_tiles_for, auto_select_kernel};
 use tuning::{load_tuned, save_tuned, shader_registry_hash};
 
-pub use abi::{EpilogueKey, KernelVariant, MatmulPushConstants};
+pub use abi::{EpilogueKey, KernelVariant, MATMUL_FLAG_NORM_A, MatmulPushConstants};
 pub use catalog::{KERNEL_SPECS, KernelSelection, KernelSpec};
 pub(crate) use create::build_compute_pipeline;
 pub use runtime::MatmulKernel;

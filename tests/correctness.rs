@@ -25,6 +25,8 @@ mod epilogue;
 mod f16;
 #[path = "correctness/flash.rs"]
 mod flash;
+#[path = "correctness/fusion.rs"]
+mod fusion;
 #[path = "correctness/graph.rs"]
 mod graph;
 #[path = "correctness/kernels.rs"]

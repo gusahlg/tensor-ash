@@ -142,7 +142,37 @@ impl ResolvedMatmul {
     pub(crate) fn from_op(op: &MatmulOp<'_>) -> Result<Self> {
         let resolved = Self::from_call(&op.call)?;
         resolved.validate_epilogue(op)?;
+        resolved.validate_normed_a(op)?;
         Ok(resolved)
+    }
+
+    /// The fused normed-A form carries the norm weight in `bias_ptr`
+    /// and eps in `beta`, so it excludes the epilogue forms that use
+    /// those slots.
+    fn validate_normed_a(&self, op: &MatmulOp<'_>) -> Result<()> {
+        let Some((weight, _)) = op.normed_a else {
+            return Ok(());
+        };
+        if weight.dtype() != DType::F32 {
+            bail!("normed-A weight must be f32 storage");
+        }
+        if weight.len() != self.k as u64 {
+            bail!(
+                "normed-A weight length {} must equal K = {}",
+                weight.len(),
+                self.k
+            );
+        }
+        if op.epilogue.bias.is_some() {
+            bail!("normed-A cannot combine with an epilogue bias (both use the bias slot)");
+        }
+        if matches!(
+            op.epilogue.binary,
+            crate::matmul::EpilogueBinary::AddScaled { .. }
+        ) {
+            bail!("normed-A cannot combine with the AddScaled epilogue (both use beta)");
+        }
+        Ok(())
     }
 
     fn validate_epilogue(&self, op: &MatmulOp<'_>) -> Result<()> {

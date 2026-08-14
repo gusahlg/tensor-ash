@@ -1,0 +1,11 @@
+#version 460
+// Fused RoPE + strided scatter narrowing to an f16 destination (RNE
+// via the float16_t conversion) — the KV-cache append path when caches
+// are stored half-precision.
+
+#extension GL_GOOGLE_include_directive : require
+
+#define ROPE_SCATTER 1
+#define DST_F16 1
+
+#include "op_rope_body.glsl"
