@@ -4,6 +4,9 @@
 
 ### Added
 
+- `Executor::upload_f16`: stage raw binary16 host data directly into an
+  f16 tensor, skipping `upload`'s `&[f32]` widen-and-renarrow round-trip
+  for callers that already store half-precision parameters.
 - `tools/llama-ash`: run llama-architecture GGUF models (f16/f32) end to
   end on tensor-ash ops — GGUF loader, flash prefill, composed GQA
   decode, greedy generation and pp/tg benchmarks. TinyLlama-1.1B output

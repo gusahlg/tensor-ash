@@ -11,8 +11,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use tensor_ash::{
-    Activation, CopyDesc, Epilogue, EpilogueBinary, Executor, FlashAttentionDesc, MatmulCall,
-    MatmulOp, RopeDesc, SoftmaxMask, Tensor, VulkanContext,
+    Activation, CopyDesc, Epilogue, EpilogueBinary, ExecOp, Executor, FlashAttentionDesc, MatmulCall, MatmulOp, RopeDesc, SoftmaxMask, Tensor, VulkanContext,
 };
 
 use crate::gguf::{GGML_TYPE_F32, GgufFile};
@@ -140,10 +139,23 @@ pub struct Model {
     pub pos: u32,
     decode_scratch: Scratch,
     prefill_scratch: Option<Scratch>,
-    /// Decode attention: fused flash kernel instead of the composed
-    /// scores/softmax/PV path.  `LLAMA_ASH_DECODE=composed|flash`
-    /// overrides the measured default.
-    flash_decode: bool,
+    /// Decode strategy.  `LLAMA_ASH_DECODE=graph|perop|flash`
+    /// overrides the default (graph: the whole token as one
+    /// submission).
+    decode_mode: DecodeMode,
+    /// Per-op-class GPU nanoseconds for the current perop decode step
+    /// (diagnostics; filled when `LLAMA_ASH_BREAKDOWN=1`).
+    pub breakdown: std::cell::RefCell<Vec<(&'static str, u64)>>,
+}
+
+#[derive(Copy, Clone, PartialEq)]
+enum DecodeMode {
+    /// One `run_exec_ops` submission per token (default).
+    Graph,
+    /// The original per-op path: one submit + wait per dispatch.
+    PerOp,
+    /// Per-op with the fused flash kernel for attention.
+    Flash,
 }
 
 /// GGML row-major [n_out][n_in] -> tensor-ash [n_in][n_out].
@@ -345,10 +357,12 @@ impl Model {
             pos: 0,
             decode_scratch,
             prefill_scratch: None,
-            flash_decode: match std::env::var("LLAMA_ASH_DECODE").as_deref() {
-                Ok("flash") => true,
-                Ok("composed") | Err(_) => false,
-                Ok(other) => bail!("LLAMA_ASH_DECODE must be composed or flash, got {other}"),
+            breakdown: std::cell::RefCell::new(Vec::new()),
+            decode_mode: match std::env::var("LLAMA_ASH_DECODE").as_deref() {
+                Ok("flash") => DecodeMode::Flash,
+                Ok("composed") | Ok("perop") => DecodeMode::PerOp,
+                Ok("graph") | Err(_) => DecodeMode::Graph,
+                Ok(other) => bail!("LLAMA_ASH_DECODE must be graph, perop, or flash, got {other}"),
             },
         })
     }
@@ -384,7 +398,7 @@ impl Model {
     fn append_kv(&self, layer: &Layer, s: &Scratch, t: u32, pos_base: u32) -> Result<()> {
         let (kv, dh, t_max) = (self.cfg.kv_heads, self.cfg.dh, self.cfg.t_max);
         // k [t][h][d] -> Kt[h][d][pos_base + z]
-        self.exec.run_copy_strided(
+        let stats = self.exec.run_copy_strided(
             &s.k,
             &layer.kt_cache,
             CopyDesc {
@@ -395,8 +409,9 @@ impl Model {
                 dst_strides: [t_max, dh * t_max, 1],
             },
         )?;
+        self.note("kv_append", &stats);
         // v [t][h][d] -> V[h][pos_base + z][d]
-        self.exec.run_copy_strided(
+        let stats = self.exec.run_copy_strided(
             &s.v,
             &layer.v_cache,
             CopyDesc {
@@ -407,11 +422,18 @@ impl Model {
                 dst_strides: [1, t_max * dh, dh],
             },
         )?;
+        self.note("kv_append", &stats);
         Ok(())
     }
 
     /// QKV projections + RoPE for `t` tokens at `pos_base`; reads
     /// `s.xn`, fills `s.q`, `s.k`, `s.v` (roped).
+    fn note(&self, class: &'static str, stats: &tensor_ash::RunStats) {
+        if let Some(ns) = stats.gpu_time_ns {
+            self.breakdown.borrow_mut().push((class, ns));
+        }
+    }
+
     fn qkv(&self, layer: &Layer, s: &Scratch, pos_base: u32) -> Result<()> {
         let call = |b, c| MatmulCall {
             a: &s.xn,
@@ -420,21 +442,26 @@ impl Model {
             alpha: 1.0,
             accumulate: false,
         };
-        self.exec.run_matmuls(&[
+        let stats = self.exec.run_matmuls(&[
             call(&layer.wq, &s.q),
             call(&layer.wk, &s.k),
             call(&layer.wv, &s.v),
         ])?;
+        self.note("qkv_matmul", &stats);
         let rope = |heads| RopeDesc {
             heads,
             head_dim: self.cfg.dh,
             rot_dim: self.cfg.dh,
             pos_base,
         };
-        self.exec
+        let stats = self
+            .exec
             .run_rope(&s.q, &self.rope_table, &s.q, rope(self.cfg.heads))?;
-        self.exec
+        self.note("rope", &stats);
+        let stats = self
+            .exec
             .run_rope(&s.k, &self.rope_table, &s.k, rope(self.cfg.kv_heads))?;
+        self.note("rope", &stats);
         Ok(())
     }
 
@@ -455,13 +482,14 @@ impl Model {
         )?;
         self.exec
             .run_rms_norm(&s.last, &self.output_norm, &s.last_n, self.cfg.rms_eps)?;
-        self.exec.run_matmuls(&[MatmulCall {
+        let stats = self.exec.run_matmuls(&[MatmulCall {
             a: &s.last_n,
             b: &self.lm_head,
             c: &s.logits,
             alpha: 1.0,
             accumulate: false,
         }])?;
+        self.note("lm_head_mm", &stats);
         let mut logits = vec![0.0_f32; self.cfg.vocab as usize];
         self.exec.download(&s.logits, &mut logits)?;
         let argmax = logits
@@ -556,7 +584,7 @@ impl Model {
         x_in: &Tensor,
         x_out: &Tensor,
     ) -> Result<()> {
-        self.exec.run_ops(&[MatmulOp::with_epilogue(
+        let stats = self.exec.run_ops(&[MatmulOp::with_epilogue(
             MatmulCall {
                 a: &s.attn_flat,
                 b: &layer.wo,
@@ -570,16 +598,20 @@ impl Model {
                 binary: EpilogueBinary::AddScaled { d: x_in, beta: 1.0 },
             },
         )])?;
-        self.exec
+        self.note("o_proj_mm", &stats);
+        let stats = self
+            .exec
             .run_rms_norm(&s.o, &layer.ffn_norm, &s.on, self.cfg.rms_eps)?;
-        self.exec.run_matmuls(&[MatmulCall {
+        self.note("rms_norm", &stats);
+        let stats = self.exec.run_matmuls(&[MatmulCall {
             a: &s.on,
             b: &layer.w_up,
             c: &s.up,
             alpha: 1.0,
             accumulate: false,
         }])?;
-        self.exec.run_ops(&[MatmulOp::with_epilogue(
+        self.note("ffn_up_mm", &stats);
+        let stats = self.exec.run_ops(&[MatmulOp::with_epilogue(
             MatmulCall {
                 a: &s.on,
                 b: &layer.w_gate,
@@ -593,7 +625,8 @@ impl Model {
                 binary: EpilogueBinary::Mul { d: &s.up },
             },
         )])?;
-        self.exec.run_ops(&[MatmulOp::with_epilogue(
+        self.note("ffn_gate_mm", &stats);
+        let stats = self.exec.run_ops(&[MatmulOp::with_epilogue(
             MatmulCall {
                 a: &s.gate,
                 b: &layer.w_down,
@@ -607,13 +640,196 @@ impl Model {
                 binary: EpilogueBinary::AddScaled { d: &s.o, beta: 1.0 },
             },
         )])?;
+        self.note("ffn_down_mm", &stats);
         Ok(())
     }
 
-    /// One greedy decode step for `token` at the current position
-    /// (composed attention path, exactly like decoder.rs).  Returns the
-    /// next token and its logits.
+    /// One greedy decode step for `token` at the current position.
+    /// Returns the next token and its logits.
     pub fn decode(&mut self, token: u32) -> Result<(u32, Vec<f32>)> {
+        if self.decode_mode == DecodeMode::Graph {
+            return self.decode_graph(token);
+        }
+        self.decode_perop(token)
+    }
+
+    /// The whole token as ONE submission: every op of every layer is
+    /// recorded into a single command buffer (`run_exec_ops`), paying
+    /// one submit + fence wait instead of ~350.
+    fn decode_graph(&mut self, token: u32) -> Result<(u32, Vec<f32>)> {
+        let pos = self.pos;
+        ensure!(pos < self.cfg.t_max, "KV cache overflow");
+        let host_x = self.embed(&[token])?;
+        let (h, dh, kv, t_max) = (self.cfg.embd, self.cfg.dh, self.cfg.kv_heads, self.cfg.t_max);
+        let eps = self.cfg.rms_eps;
+        let s = &self.decode_scratch;
+        self.exec.upload(&host_x, &s.x_a)?;
+
+        fn mm<'t>(a: &'t Tensor, b: &'t Tensor, c: &'t Tensor) -> MatmulCall<'t> {
+            MatmulCall {
+                a,
+                b,
+                c,
+                alpha: 1.0,
+                accumulate: false,
+            }
+        }
+        let straight = CopyDesc {
+            extent: [h, 1, 1],
+            src_offset: 0,
+            src_strides: [1, 0, 0],
+            dst_offset: 0,
+            dst_strides: [1, 0, 0],
+        };
+        let rope = |heads| RopeDesc {
+            heads,
+            head_dim: dh,
+            rot_dim: dh,
+            pos_base: pos,
+        };
+
+        let mut ops: Vec<ExecOp<'_>> = Vec::with_capacity(self.layers.len() * 18 + 3);
+        let (mut x_in, mut x_out) = (&s.x_a, &s.x_b);
+        for layer in &self.layers {
+            let scores = s.scores.as_ref().unwrap();
+            ops.push(ExecOp::RmsNorm {
+                input: x_in,
+                weight: &layer.attn_norm,
+                output: &s.xn,
+                eps,
+            });
+            ops.push(ExecOp::Matmul(MatmulOp::new(mm(&s.xn, &layer.wq, &s.q))));
+            ops.push(ExecOp::Matmul(MatmulOp::new(mm(&s.xn, &layer.wk, &s.k))));
+            ops.push(ExecOp::Matmul(MatmulOp::new(mm(&s.xn, &layer.wv, &s.v))));
+            ops.push(ExecOp::Rope {
+                input: &s.q,
+                table: &self.rope_table,
+                output: &s.q,
+                desc: rope(self.cfg.heads),
+            });
+            ops.push(ExecOp::Rope {
+                input: &s.k,
+                table: &self.rope_table,
+                output: &s.k,
+                desc: rope(kv),
+            });
+            ops.push(ExecOp::CopyStrided {
+                src: &s.k,
+                dst: &layer.kt_cache,
+                desc: CopyDesc {
+                    extent: [dh, kv, 1],
+                    src_offset: 0,
+                    src_strides: [1, dh, kv * dh],
+                    dst_offset: pos,
+                    dst_strides: [t_max, dh * t_max, 1],
+                },
+            });
+            ops.push(ExecOp::CopyStrided {
+                src: &s.v,
+                dst: &layer.v_cache,
+                desc: CopyDesc {
+                    extent: [dh, kv, 1],
+                    src_offset: 0,
+                    src_strides: [1, dh, kv * dh],
+                    dst_offset: pos * dh,
+                    dst_strides: [1, t_max * dh, dh],
+                },
+            });
+            ops.push(ExecOp::CopyStrided {
+                src: &s.q,
+                dst: &s.q_heads,
+                desc: straight,
+            });
+            ops.push(ExecOp::Matmul(MatmulOp::new(mm(
+                &s.q_heads,
+                &layer.kt_cache,
+                scores,
+            ))));
+            ops.push(ExecOp::SoftmaxRows {
+                input: scores,
+                output: scores,
+                scale: 1.0 / (dh as f32).sqrt(),
+                mask: SoftmaxMask::Prefix { valid: pos + 1 },
+            });
+            ops.push(ExecOp::Matmul(MatmulOp::new(mm(
+                scores,
+                &layer.v_cache,
+                &s.attn_heads,
+            ))));
+            ops.push(ExecOp::CopyStrided {
+                src: &s.attn_heads,
+                dst: &s.attn_flat,
+                desc: straight,
+            });
+            ops.push(ExecOp::Matmul(MatmulOp::with_epilogue(
+                mm(&s.attn_flat, &layer.wo, &s.o),
+                Epilogue {
+                    bias: None,
+                    activation: Activation::None,
+                    binary: EpilogueBinary::AddScaled { d: x_in, beta: 1.0 },
+                },
+            )));
+            ops.push(ExecOp::RmsNorm {
+                input: &s.o,
+                weight: &layer.ffn_norm,
+                output: &s.on,
+                eps,
+            });
+            ops.push(ExecOp::Matmul(MatmulOp::new(mm(&s.on, &layer.w_up, &s.up))));
+            ops.push(ExecOp::Matmul(MatmulOp::with_epilogue(
+                mm(&s.on, &layer.w_gate, &s.gate),
+                Epilogue {
+                    bias: None,
+                    activation: Activation::Silu,
+                    binary: EpilogueBinary::Mul { d: &s.up },
+                },
+            )));
+            ops.push(ExecOp::Matmul(MatmulOp::with_epilogue(
+                mm(&s.gate, &layer.w_down, x_out),
+                Epilogue {
+                    bias: None,
+                    activation: Activation::None,
+                    binary: EpilogueBinary::AddScaled { d: &s.o, beta: 1.0 },
+                },
+            )));
+            std::mem::swap(&mut x_in, &mut x_out);
+        }
+        // Final norm + LM head (decode scratch is t=1: last row = x).
+        ops.push(ExecOp::CopyStrided {
+            src: x_in,
+            dst: &s.last,
+            desc: straight,
+        });
+        ops.push(ExecOp::RmsNorm {
+            input: &s.last,
+            weight: &self.output_norm,
+            output: &s.last_n,
+            eps,
+        });
+        ops.push(ExecOp::Matmul(MatmulOp::new(mm(
+            &s.last_n,
+            &self.lm_head,
+            &s.logits,
+        ))));
+        let stats = self.exec.run_exec_ops(&ops)?;
+        self.note("graph_total", &stats);
+        drop(ops);
+
+        let mut logits = vec![0.0_f32; self.cfg.vocab as usize];
+        self.exec.download(&s.logits, &mut logits)?;
+        let argmax = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .context("empty logits")?;
+        self.pos = pos + 1;
+        Ok((argmax, logits))
+    }
+
+    /// One greedy decode step, per-op submission path (composed
+    /// attention exactly like decoder.rs, or flash when selected).
+    fn decode_perop(&mut self, token: u32) -> Result<(u32, Vec<f32>)> {
         let pos = self.pos;
         ensure!(pos < self.cfg.t_max, "KV cache overflow");
         let host_x = self.embed(&[token])?;
@@ -629,13 +845,15 @@ impl Model {
             dst_strides: [1, 0, 0],
         };
         for layer in &self.layers {
-            self.exec
+            let stats = self
+                .exec
                 .run_rms_norm(x_in, &layer.attn_norm, &s.xn, self.cfg.rms_eps)?;
+            self.note("rms_norm", &stats);
             self.qkv(layer, s, pos)?;
             self.append_kv(layer, s, 1, pos)?;
             // Reshape q [1, embd] -> [kv_heads, group, dh] (same memory
             // order): one batched matmul covers the GQA groups.
-            if self.flash_decode {
+            if self.decode_mode == DecodeMode::Flash {
                 // Fused single-row attention; GQA is native.
                 let q_flash = s.q_flash.as_ref().unwrap();
                 let attn_flash = s.attn_flash.as_ref().unwrap();
@@ -657,30 +875,36 @@ impl Model {
                 // Reshape q [1, embd] -> [kv_heads, group, dh] (same
                 // memory order): one batched matmul covers the GQA
                 // groups.
-                self.exec.run_copy_strided(&s.q, &s.q_heads, straight(h))?;
+                let stats = self.exec.run_copy_strided(&s.q, &s.q_heads, straight(h))?;
+                self.note("reshape_copy", &stats);
                 let scores = s.scores.as_ref().unwrap();
-                self.exec.run_matmuls(&[MatmulCall {
+                let stats = self.exec.run_matmuls(&[MatmulCall {
                     a: &s.q_heads,
                     b: &layer.kt_cache,
                     c: scores,
                     alpha: 1.0,
                     accumulate: false,
                 }])?;
-                self.exec.run_softmax_rows(
+                self.note("attn_scores_mm", &stats);
+                let stats = self.exec.run_softmax_rows(
                     scores,
                     scores,
                     1.0 / (dh as f32).sqrt(),
                     SoftmaxMask::Prefix { valid: pos + 1 },
                 )?;
-                self.exec.run_matmuls(&[MatmulCall {
+                self.note("attn_softmax", &stats);
+                let stats = self.exec.run_matmuls(&[MatmulCall {
                     a: scores,
                     b: &layer.v_cache,
                     c: &s.attn_heads,
                     alpha: 1.0,
                     accumulate: false,
                 }])?;
-                self.exec
+                self.note("attn_pv_mm", &stats);
+                let stats = self
+                    .exec
                     .run_copy_strided(&s.attn_heads, &s.attn_flat, straight(h))?;
+                self.note("reshape_copy", &stats);
             }
             self.mlp_block_into(layer, s, x_in, x_out)?;
             std::mem::swap(&mut x_in, &mut x_out);

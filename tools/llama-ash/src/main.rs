@@ -119,6 +119,39 @@ fn bench(args: &Args) -> Result<()> {
     }
     let decode_s = t1.elapsed().as_secs_f64();
 
+    // Per-op-class GPU-time breakdown of one decode step (perop mode
+    // records per-dispatch GPU timestamps; graph mode cannot split
+    // them, so run one instrumented step on the side).
+    if std::env::var("LLAMA_ASH_BREAKDOWN").as_deref() == Ok("1") {
+        model.breakdown.borrow_mut().clear();
+        let _ = model.decode(next)?;
+        let mut per_class: std::collections::BTreeMap<&'static str, (u64, u32)> =
+            std::collections::BTreeMap::new();
+        for (class, ns) in model.breakdown.borrow().iter() {
+            let entry = per_class.entry(class).or_default();
+            entry.0 += ns;
+            entry.1 += 1;
+        }
+        let total: u64 = per_class.values().map(|v| v.0).sum();
+        println!("decode GPU breakdown (one token, {} dispatches):", model
+            .breakdown
+            .borrow()
+            .len());
+        let mut rows: Vec<_> = per_class.into_iter().collect();
+        rows.sort_by_key(|(_, (ns, _))| std::cmp::Reverse(*ns));
+        for (class, (ns, count)) in rows {
+            println!(
+                "  {class:<16} {:>8.1} us  ({count:>3} calls, {:>4.1}%)",
+                ns as f64 / 1e3,
+                ns as f64 * 100.0 / total as f64
+            );
+        }
+        println!(
+            "  {:<16} {:>8.1} us  (GPU-timestamped total)",
+            "sum", total as f64 / 1e3
+        );
+    }
+
     let pp_tps = args.pp as f64 / prefill_s;
     let tg_tps = args.tg as f64 / decode_s;
     println!("model    : {}", args.model.display());

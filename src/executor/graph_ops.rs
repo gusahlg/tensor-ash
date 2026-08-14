@@ -65,6 +65,24 @@ enum Planned<'t, 'p> {
     Elementwise(ElementwiseDispatch),
 }
 
+/// Buffers an op touches, for hazard-aware barrier insertion.
+#[derive(Default)]
+struct Access {
+    reads: Vec<vk::Buffer>,
+    writes: Vec<vk::Buffer>,
+}
+
+impl Access {
+    fn read(mut self, tensor: &Tensor) -> Self {
+        self.reads.push(tensor.raw_buffer());
+        self
+    }
+    fn write(mut self, tensor: &Tensor) -> Self {
+        self.writes.push(tensor.raw_buffer());
+        self
+    }
+}
+
 impl Executor {
     /// Run a dependent chain of mixed ops as one submission.  Every op
     /// is fully validated and planned before anything is recorded, so
@@ -78,8 +96,54 @@ impl Executor {
         }
 
         let mut planned = Vec::with_capacity(ops.len());
+        let mut accesses = Vec::with_capacity(ops.len());
         let mut total_flops = 0u64;
         for op in ops {
+            accesses.push(match op {
+                ExecOp::Matmul(op) => {
+                    let mut access = Access::default()
+                        .read(op.call.a)
+                        .read(op.call.b)
+                        .write(op.call.c);
+                    if op.call.accumulate {
+                        access = access.read(op.call.c);
+                    }
+                    if let Some(bias) = op.epilogue.bias {
+                        access = access.read(bias);
+                    }
+                    if let Some(d) = op.epilogue.d_tensor() {
+                        access = access.read(d);
+                    }
+                    access
+                }
+                ExecOp::RmsNorm {
+                    input,
+                    weight,
+                    output,
+                    ..
+                } => Access::default().read(input).read(weight).write(output),
+                ExecOp::LayerNorm {
+                    input,
+                    weight,
+                    bias,
+                    output,
+                    ..
+                } => Access::default()
+                    .read(input)
+                    .read(weight)
+                    .read(bias)
+                    .write(output),
+                ExecOp::SoftmaxRows { input, output, .. } => {
+                    Access::default().read(input).write(output)
+                }
+                ExecOp::Rope {
+                    input,
+                    table,
+                    output,
+                    ..
+                } => Access::default().read(input).read(table).write(output),
+                ExecOp::CopyStrided { src, dst, .. } => Access::default().read(src).write(dst),
+            });
             planned.push(match op {
                 ExecOp::Matmul(op) => {
                     self.validate_op_context(op)?;
@@ -160,10 +224,30 @@ impl Executor {
                 "get_query_pool_results (exec graph)",
                 |_dev, cb, _slot| {
                     let mut bound = vk::Pipeline::null();
+                    // Hazard tracking: barrier only when this op reads
+                    // or overwrites something written since the last
+                    // barrier (RAW/WAW), or writes something read since
+                    // (WAR).  Independent neighbours overlap on the
+                    // GPU, which both removes ~7 us of drain per
+                    // avoided barrier and lets tiny dispatches fill
+                    // idle SMs.
+                    let mut pending_writes: Vec<vk::Buffer> = Vec::new();
+                    let mut pending_reads: Vec<vk::Buffer> = Vec::new();
                     for (index, step) in planned.iter().enumerate() {
-                        if index > 0 {
+                        let access = &accesses[index];
+                        let hazard = access
+                            .reads
+                            .iter()
+                            .chain(&access.writes)
+                            .any(|b| pending_writes.contains(b))
+                            || access.writes.iter().any(|b| pending_reads.contains(b));
+                        if index > 0 && hazard {
                             record_compute_to_compute_barrier(&self.ctx, cb);
+                            pending_writes.clear();
+                            pending_reads.clear();
                         }
+                        pending_reads.extend(&access.reads);
+                        pending_writes.extend(&access.writes);
                         match step {
                             Planned::Matmul { op, dims, plan } => {
                                 record_one_matmul(
