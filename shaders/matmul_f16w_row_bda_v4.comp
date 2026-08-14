@@ -1,0 +1,8 @@
+#version 460
+// K-cooperative M=1 GEMV, f16 B, four adjacent columns per lane
+// (f16vec4 loads): widens the per-warp B transaction to 256B.
+
+#define B_F16 1
+#define VCOLS 4
+
+#include "matmul_row_bda_kernel.glsl"

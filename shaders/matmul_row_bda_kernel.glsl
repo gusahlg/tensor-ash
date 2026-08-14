@@ -9,6 +9,15 @@
 // Compile-time inputs (set by the .comp wrapper):
 //     B_F16 (optional): B is stored as IEEE half; loads convert to f32
 //     before the FMA, halving global B traffic (the GEMV bottleneck).
+//     VCOLS (optional, B_F16 only, 2 or 4): each lane owns VCOLS
+//     adjacent output columns and reads B as f16vec2/f16vec4, widening
+//     the per-warp B transaction from 64B to 128B/256B per k-step.
+//     The workgroup covers 32*VCOLS columns, so the grid shrinks by
+//     VCOLS (the .comp wrapper's catalog tile_n must be 32*VCOLS).
+//     Per output column the K-order and the fixed-order slice reduce
+//     are identical to VCOLS=1, so results stay bit-exact across
+//     variants.  Ragged N (or an unaligned B base) falls back to an
+//     in-shader scalar path with per-column bounds checks.
 //
 // NORM_A (push-constant flags bit 1): fold an RMSNorm of the A row
 // into the GEMV.  Each workgroup first cooperatively computes
@@ -33,6 +42,17 @@
 #endif
 const uint KSLICES_U = uint(KSLICES);
 
+#ifndef VCOLS
+#define VCOLS 1
+#endif
+#if VCOLS != 1 && !defined(B_F16)
+#error "VCOLS > 1 is implemented for the B_F16 path only"
+#endif
+#if VCOLS != 1 && VCOLS != 2 && VCOLS != 4
+#error "VCOLS must be 1, 2, or 4"
+#endif
+const uint VCOLS_U = uint(VCOLS);
+
 layout(local_size_x = 32, local_size_y = KSLICES, local_size_z = 1) in;
 
 layout(constant_id = 0) const bool ACCUMULATE = false;
@@ -53,6 +73,17 @@ layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32
 layout(buffer_reference, std430, buffer_reference_align = 2) restrict readonly buffer F16ReadOnly {
     float16_t v[];
 };
+#if VCOLS == 2
+#define f16vec_load f16vec2
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F16VecReadOnly {
+    f16vec2 v[];
+};
+#elif VCOLS == 4
+#define f16vec_load f16vec4
+layout(buffer_reference, std430, buffer_reference_align = 8) restrict readonly buffer F16VecReadOnly {
+    f16vec4 v[];
+};
+#endif
 #endif
 
 layout(push_constant) uniform PC {
@@ -75,14 +106,20 @@ layout(push_constant) uniform PC {
 
 #include "matmul_epilogue_common.glsl"
 
+#if VCOLS == 1
 shared float partial[KSLICES][32];
+#define PARTIAL_SCRATCH(s, l) partial[s][l]
+#else
+shared float partial[KSLICES][32][VCOLS];
+#define PARTIAL_SCRATCH(s, l) partial[s][l][0]
+#endif
 
 void main() {
     const uint batch = gl_WorkGroupID.z;
     const uint row = gl_WorkGroupID.y;
     const uint lane = gl_LocalInvocationID.x;
     const uint slice = gl_LocalInvocationID.y;
-    const uint col = gl_WorkGroupID.x * 32u + lane;
+    const uint col = gl_WorkGroupID.x * (32u * VCOLS_U) + lane * VCOLS_U;
     // No early return: every thread must reach the barrier. Dead lanes
     // (column out of range) contribute a zero partial.
     const bool live = INTERIOR_ONLY || col < pc.N;
@@ -106,19 +143,20 @@ void main() {
             const float a = pc.a_ptr.v[a_base + k];
             sumsq = fma(a, a, sumsq);
         }
-        partial[slice][lane] = sumsq;
+        PARTIAL_SCRATCH(slice, lane) = sumsq;
         barrier();
         [[unroll]] for (uint step = wg >> 1u; step > 0u; step >>= 1u) {
             if (tid < step) {
                 const uint other = tid + step;
-                partial[slice][lane] += partial[other >> 5u][other & 31u];
+                PARTIAL_SCRATCH(slice, lane) += PARTIAL_SCRATCH(other >> 5u, other & 31u);
             }
             barrier();
         }
-        a_scale = inversesqrt(partial[0][0] / float(pc.K) + pc.beta);
+        a_scale = inversesqrt(PARTIAL_SCRATCH(0u, 0u) / float(pc.K) + pc.beta);
         // Every thread has read partial[0][0]; safe to reuse below.
         barrier();
     }
+#if VCOLS == 1
     float acc = 0.0;
     if (live) {
         if (norm_a) {
@@ -151,4 +189,81 @@ void main() {
         if (EPI_ANY) value = epi_apply(value, c_index, col, batch);
         pc.c_ptr.v[c_index] = value;
     }
+#else
+    float acc[VCOLS];
+    [[unroll]] for (uint v = 0u; v < VCOLS_U; ++v) acc[v] = 0.0;
+    // The vector path needs every lane's VCOLS columns to share one
+    // aligned f16vec load per k-step: N and the batch stride must be
+    // VCOLS-multiples and the B base pointer f16vec-aligned.  All
+    // three tests are workgroup-uniform; N % VCOLS == 0 also makes
+    // per-lane liveness all-or-nothing (col and N are both
+    // VCOLS-multiples), so `live` covers the whole vector.
+    const bool vec_ok = pc.N % VCOLS_U == 0u
+        && pc.batch_stride_b % VCOLS_U == 0u
+        && (uint64_t(pc.b_ptr) & uint64_t(2u * VCOLS_U - 1u)) == 0ul;
+    if (vec_ok) {
+        if (live) {
+            F16VecReadOnly bv =
+                F16VecReadOnly(uint64_t(pc.b_ptr) + uint64_t(b_base) * 2ul);
+            const uint n_vec = pc.N / VCOLS_U;
+            if (norm_a) {
+                for (uint inner = slice; inner < pc.K; inner += KSLICES_U) {
+                    const float a =
+                        pc.a_ptr.v[a_base + inner] * a_scale * pc.bias_ptr.v[inner];
+                    const f16vec_load w = bv.v[inner * n_vec];
+                    [[unroll]] for (uint v = 0u; v < VCOLS_U; ++v) {
+                        acc[v] = fma(a, float(w[v]), acc[v]);
+                    }
+                }
+            } else {
+                for (uint inner = slice; inner < pc.K; inner += KSLICES_U) {
+                    const float a = pc.a_ptr.v[a_base + inner];
+                    const f16vec_load w = bv.v[inner * n_vec];
+                    [[unroll]] for (uint v = 0u; v < VCOLS_U; ++v) {
+                        acc[v] = fma(a, float(w[v]), acc[v]);
+                    }
+                }
+            }
+        }
+    } else if (live) {
+        // Ragged-N / unaligned fallback: scalar loads, per-column
+        // bounds checks (only the last live lane can be partial).
+        if (norm_a) {
+            for (uint inner = slice; inner < pc.K; inner += KSLICES_U) {
+                const float a =
+                    pc.a_ptr.v[a_base + inner] * a_scale * pc.bias_ptr.v[inner];
+                [[unroll]] for (uint v = 0u; v < VCOLS_U; ++v) {
+                    if (INTERIOR_ONLY || col + v < pc.N) {
+                        acc[v] = fma(a, float(b.v[b_base + inner * pc.N + v]), acc[v]);
+                    }
+                }
+            }
+        } else {
+            for (uint inner = slice; inner < pc.K; inner += KSLICES_U) {
+                const float a = pc.a_ptr.v[a_base + inner];
+                [[unroll]] for (uint v = 0u; v < VCOLS_U; ++v) {
+                    if (INTERIOR_ONLY || col + v < pc.N) {
+                        acc[v] = fma(a, float(b.v[b_base + inner * pc.N + v]), acc[v]);
+                    }
+                }
+            }
+        }
+    }
+    [[unroll]] for (uint v = 0u; v < VCOLS_U; ++v) partial[slice][lane][v] = acc[v];
+    barrier();
+
+    if (slice == 0u && live) {
+        [[unroll]] for (uint v = 0u; v < VCOLS_U; ++v) {
+            const uint c = col + v;
+            if (!INTERIOR_ONLY && c >= pc.N) break;
+            float sum = partial[0][lane][v];
+            [[unroll]] for (uint s = 1u; s < KSLICES_U; ++s) sum += partial[s][lane][v];
+            const uint c_index = batch * pc.batch_stride_c + row * pc.N + c;
+            float value = ALPHA_IS_ONE ? sum : pc.alpha * sum;
+            if (ACCUMULATE) value += pc.c_ptr.v[c_index];
+            if (EPI_ANY) value = epi_apply(value, c_index, c, batch);
+            pc.c_ptr.v[c_index] = value;
+        }
+    }
+#endif
 }
