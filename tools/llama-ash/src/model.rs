@@ -43,9 +43,10 @@ struct Layer {
     w_down: Tensor,
     attn_norm: Tensor,
     ffn_norm: Tensor,
-    /// Kt cache f32 [kv_heads, dh, t_max].
+    /// Kt cache [kv_heads, dh, t_max], f16 by default
+    /// (`LLAMA_ASH_KV=f32` opts out).
     kt_cache: Tensor,
-    /// V cache f32 [kv_heads, t_max, dh].
+    /// V cache [kv_heads, t_max, dh], same storage as `kt_cache`.
     v_cache: Tensor,
 }
 
@@ -550,8 +551,8 @@ impl Model {
         Ok(())
     }
 
-    /// QKV projections + RoPE for `t` tokens at `pos_base`; reads
-    /// `s.xn`, fills `s.q`, `s.k`, `s.v` (roped).
+    /// Record one op-class GPU time into the `LLAMA_ASH_BREAKDOWN`
+    /// diagnostics table.
     fn note(&self, class: &'static str, stats: &tensor_ash::RunStats) {
         if let Some(ns) = stats.gpu_time_ns {
             self.breakdown.borrow_mut().push((class, ns));
@@ -611,6 +612,8 @@ impl Model {
         Ok(())
     }
 
+    /// QKV projections + RoPE for `t` tokens at `pos_base`; reads
+    /// `s.xn`, fills `s.q`, `s.k`, `s.v` (roped).
     fn qkv(&self, layer: &Layer, s: &Scratch, pos_base: u32) -> Result<()> {
         let stats = self.exec.run_matmuls(&[
             mm(&s.xn, &layer.wq, &s.q),
