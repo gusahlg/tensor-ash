@@ -11,7 +11,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use tensor_ash::{
-    Activation, CopyDesc, Epilogue, EpilogueBinary, ExecOp, Executor, FlashAttentionDesc, MatmulCall, MatmulOp, RopeDesc, SoftmaxMask, Tensor, VulkanContext,
+    Activation, CopyDesc, Epilogue, EpilogueBinary, ExecOp, Executor, FlashAttentionDesc,
+    MatmulCall, MatmulOp, RopeDesc, SoftmaxMask, Tensor, VulkanContext,
 };
 
 use crate::gguf::{GGML_TYPE_F32, GgufFile};
@@ -660,7 +661,12 @@ impl Model {
         let pos = self.pos;
         ensure!(pos < self.cfg.t_max, "KV cache overflow");
         let host_x = self.embed(&[token])?;
-        let (h, dh, kv, t_max) = (self.cfg.embd, self.cfg.dh, self.cfg.kv_heads, self.cfg.t_max);
+        let (h, dh, kv, t_max) = (
+            self.cfg.embd,
+            self.cfg.dh,
+            self.cfg.kv_heads,
+            self.cfg.t_max,
+        );
         let eps = self.cfg.rms_eps;
         let s = &self.decode_scratch;
         self.exec.upload(&host_x, &s.x_a)?;
@@ -688,7 +694,13 @@ impl Model {
             pos_base: pos,
         };
 
-        let mut ops: Vec<ExecOp<'_>> = Vec::with_capacity(self.layers.len() * 18 + 3);
+        // Contiguous reshapes are free: the GQA-batched attention
+        // views of q and of the attention output share memory with
+        // their flat forms, eliminating two copy dispatches per layer.
+        let group = self.cfg.heads / kv;
+        let q_gqa = s.q.alias_with_shape(&[kv, group, dh])?;
+        let attn_gqa = s.attn_flat.alias_with_shape(&[kv, group, dh])?;
+        let mut ops: Vec<ExecOp<'_>> = Vec::with_capacity(self.layers.len() * 16 + 3);
         let (mut x_in, mut x_out) = (&s.x_a, &s.x_b);
         for layer in &self.layers {
             let scores = s.scores.as_ref().unwrap();
@@ -735,13 +747,8 @@ impl Model {
                     dst_strides: [1, t_max * dh, dh],
                 },
             });
-            ops.push(ExecOp::CopyStrided {
-                src: &s.q,
-                dst: &s.q_heads,
-                desc: straight,
-            });
             ops.push(ExecOp::Matmul(MatmulOp::new(mm(
-                &s.q_heads,
+                &q_gqa,
                 &layer.kt_cache,
                 scores,
             ))));
@@ -754,13 +761,8 @@ impl Model {
             ops.push(ExecOp::Matmul(MatmulOp::new(mm(
                 scores,
                 &layer.v_cache,
-                &s.attn_heads,
+                &attn_gqa,
             ))));
-            ops.push(ExecOp::CopyStrided {
-                src: &s.attn_heads,
-                dst: &s.attn_flat,
-                desc: straight,
-            });
             ops.push(ExecOp::Matmul(MatmulOp::with_epilogue(
                 mm(&s.attn_flat, &layer.wo, &s.o),
                 Epilogue {

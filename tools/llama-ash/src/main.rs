@@ -133,10 +133,10 @@ fn bench(args: &Args) -> Result<()> {
             entry.1 += 1;
         }
         let total: u64 = per_class.values().map(|v| v.0).sum();
-        println!("decode GPU breakdown (one token, {} dispatches):", model
-            .breakdown
-            .borrow()
-            .len());
+        println!(
+            "decode GPU breakdown (one token, {} dispatches):",
+            model.breakdown.borrow().len()
+        );
         let mut rows: Vec<_> = per_class.into_iter().collect();
         rows.sort_by_key(|(_, (ns, _))| std::cmp::Reverse(*ns));
         for (class, (ns, count)) in rows {
@@ -148,7 +148,8 @@ fn bench(args: &Args) -> Result<()> {
         }
         println!(
             "  {:<16} {:>8.1} us  (GPU-timestamped total)",
-            "sum", total as f64 / 1e3
+            "sum",
+            total as f64 / 1e3
         );
     }
 

@@ -192,6 +192,11 @@ kernel_catalog! {
         ["f16w_m128n64k64_bda_v4", "f16w_m128n64k64"]),
     F16wRowBda => ("f16w_row_bda", 1, 32, 1, "matmul_f16w_row_bda.spv", false,
         ["f16w_row_bda", "f16w_row"]),
+    // Deep-K / narrow-N f16-weights GEMV: sixteen K-slice warps
+    // instead of eight (ffn_down- and kv-projection-shaped decode
+    // matmuls leave half the device idle at eight).
+    F16wRowBdaK16 => ("f16w_row_bda_k16", 1, 32, 1, "matmul_f16w_row_bda_k16.spv", false,
+        ["f16w_row_bda_k16", "f16w_row_k16"]),
     // Tensor-core GEMM (KHR cooperative matrix): A f32 converted to
     // f16 at staging, B f16 storage, f32 accumulate.  Strictly aligned
     // (the suffix drives the host-side M/N/K % tile check) because
