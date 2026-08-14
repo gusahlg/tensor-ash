@@ -318,6 +318,34 @@ impl MatmulPipeline {
             .expect("auto selection must resolve to a concrete kernel")
     }
 
+    /// Epilogue-capable kernel for this shape: the normal heuristic
+    /// pick when it fuses, else the SIMT BDA_V4 sibling of the tile
+    /// class.  Used to demote routes (heuristic coopmat, or a tuned
+    /// winner recorded for the plain shape) that land on kernels
+    /// without the fused-epilogue specialization.
+    pub(crate) fn epilogue_fallback_index(
+        &self,
+        batch: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+        b_f16: bool,
+    ) -> usize {
+        let index = self.heuristic_kernel_index(batch, m, n, k, b_f16);
+        if self.kernel_at(index).supports_epilogue() {
+            return index;
+        }
+        let tile = auto_select_kernel(batch, m, n, k, self.auto_min_large_tiles);
+        let selection = if b_f16 {
+            to_f16w(tile)
+        } else {
+            maybe_to_bda(tile)
+        };
+        selection
+            .index()
+            .expect("epilogue fallback must resolve to a concrete kernel")
+    }
+
     /// True when the auto selector is active (no explicit `ML_KERNEL`)
     /// — the only mode in which measured tuning applies.
     #[inline]

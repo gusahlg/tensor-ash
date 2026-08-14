@@ -202,6 +202,27 @@ impl Executor {
         OpPlan { kernel, splitk2 }
     }
 
+    /// Reroute a fused-epilogue op whose planned kernel cannot fuse
+    /// (heuristic coopmat, or a tuned winner measured for the plain
+    /// shape) onto the epilogue-capable SIMT sibling.  No-op for plain
+    /// ops and for routes that already fuse.
+    pub(super) fn demote_for_epilogue(
+        &self,
+        epilogue: &crate::matmul::Epilogue<'_>,
+        dims: &crate::matmul::ResolvedMatmul,
+        plan: OpPlan,
+    ) -> OpPlan {
+        if epilogue.is_none() || self.pipeline.kernel_at(plan.kernel).supports_epilogue() {
+            return plan;
+        }
+        OpPlan {
+            kernel: self
+                .pipeline
+                .epilogue_fallback_index(dims.batch, dims.m, dims.n, dims.k, dims.b_f16),
+            splitk2: None,
+        }
+    }
+
     /// `n_slots` = how many submissions can be in flight at once. 2 is
     /// the sweet spot: one being recorded by the host while the other
     /// runs on the GPU.  Higher values benefit hosts that submit

@@ -64,6 +64,10 @@ struct Scratch {
     attn_heads: Tensor,
     /// Decode only: [kv_heads, group, t_max] score rows.
     scores: Option<Tensor>,
+    /// Decode only: same memory order as `q_heads`/`attn_heads` but
+    /// shaped [heads, 1, dh] for the flash-decode variant.
+    q_flash: Option<Tensor>,
+    attn_flash: Option<Tensor>,
     attn_flat: Tensor,
     o: Tensor,
     on: Tensor,
@@ -79,17 +83,21 @@ impl Scratch {
         let (h, f, kv) = (cfg.embd, cfg.ffn, cfg.kv_heads * cfg.dh);
         let dev = |shape: &[u32]| Tensor::uninit_device(ctx, shape);
         let decode = t == 1;
-        let (q_heads, attn_heads, scores) = if decode {
+        let (q_heads, attn_heads, scores, q_flash, attn_flash) = if decode {
             let group = cfg.heads / cfg.kv_heads;
             (
                 dev(&[cfg.kv_heads, group, cfg.dh])?,
                 dev(&[cfg.kv_heads, group, cfg.dh])?,
                 Some(dev(&[cfg.kv_heads, group, cfg.t_max])?),
+                Some(dev(&[cfg.heads, 1, cfg.dh])?),
+                Some(dev(&[cfg.heads, 1, cfg.dh])?),
             )
         } else {
             (
                 dev(&[cfg.heads, t, cfg.dh])?,
                 dev(&[cfg.heads, t, cfg.dh])?,
+                None,
+                None,
                 None,
             )
         };
@@ -104,6 +112,8 @@ impl Scratch {
             q_heads,
             attn_heads,
             scores,
+            q_flash,
+            attn_flash,
             attn_flat: dev(&[t, h])?,
             o: dev(&[t, h])?,
             on: dev(&[t, h])?,
@@ -130,6 +140,10 @@ pub struct Model {
     pub pos: u32,
     decode_scratch: Scratch,
     prefill_scratch: Option<Scratch>,
+    /// Decode attention: fused flash kernel instead of the composed
+    /// scores/softmax/PV path.  `LLAMA_ASH_DECODE=composed|flash`
+    /// overrides the measured default.
+    flash_decode: bool,
 }
 
 /// GGML row-major [n_out][n_in] -> tensor-ash [n_in][n_out].
@@ -331,6 +345,11 @@ impl Model {
             pos: 0,
             decode_scratch,
             prefill_scratch: None,
+            flash_decode: match std::env::var("LLAMA_ASH_DECODE").as_deref() {
+                Ok("flash") => true,
+                Ok("composed") | Err(_) => false,
+                Ok(other) => bail!("LLAMA_ASH_DECODE must be composed or flash, got {other}"),
+            },
         })
     }
 
@@ -616,30 +635,53 @@ impl Model {
             self.append_kv(layer, s, 1, pos)?;
             // Reshape q [1, embd] -> [kv_heads, group, dh] (same memory
             // order): one batched matmul covers the GQA groups.
-            self.exec.run_copy_strided(&s.q, &s.q_heads, straight(h))?;
-            let scores = s.scores.as_ref().unwrap();
-            self.exec.run_matmuls(&[MatmulCall {
-                a: &s.q_heads,
-                b: &layer.kt_cache,
-                c: scores,
-                alpha: 1.0,
-                accumulate: false,
-            }])?;
-            self.exec.run_softmax_rows(
-                scores,
-                scores,
-                1.0 / (dh as f32).sqrt(),
-                SoftmaxMask::Prefix { valid: pos + 1 },
-            )?;
-            self.exec.run_matmuls(&[MatmulCall {
-                a: scores,
-                b: &layer.v_cache,
-                c: &s.attn_heads,
-                alpha: 1.0,
-                accumulate: false,
-            }])?;
-            self.exec
-                .run_copy_strided(&s.attn_heads, &s.attn_flat, straight(h))?;
+            if self.flash_decode {
+                // Fused single-row attention; GQA is native.
+                let q_flash = s.q_flash.as_ref().unwrap();
+                let attn_flash = s.attn_flash.as_ref().unwrap();
+                self.exec.run_copy_strided(&s.q, q_flash, straight(h))?;
+                self.exec.run_flash_attention(
+                    q_flash,
+                    &layer.kt_cache,
+                    &layer.v_cache,
+                    attn_flash,
+                    FlashAttentionDesc {
+                        kv_len: pos + 1,
+                        pos_base: pos,
+                        scale: 1.0 / (dh as f32).sqrt(),
+                    },
+                )?;
+                self.exec
+                    .run_copy_strided(attn_flash, &s.attn_flat, straight(h))?;
+            } else {
+                // Reshape q [1, embd] -> [kv_heads, group, dh] (same
+                // memory order): one batched matmul covers the GQA
+                // groups.
+                self.exec.run_copy_strided(&s.q, &s.q_heads, straight(h))?;
+                let scores = s.scores.as_ref().unwrap();
+                self.exec.run_matmuls(&[MatmulCall {
+                    a: &s.q_heads,
+                    b: &layer.kt_cache,
+                    c: scores,
+                    alpha: 1.0,
+                    accumulate: false,
+                }])?;
+                self.exec.run_softmax_rows(
+                    scores,
+                    scores,
+                    1.0 / (dh as f32).sqrt(),
+                    SoftmaxMask::Prefix { valid: pos + 1 },
+                )?;
+                self.exec.run_matmuls(&[MatmulCall {
+                    a: scores,
+                    b: &layer.v_cache,
+                    c: &s.attn_heads,
+                    alpha: 1.0,
+                    accumulate: false,
+                }])?;
+                self.exec
+                    .run_copy_strided(&s.attn_heads, &s.attn_flat, straight(h))?;
+            }
             self.mlp_block_into(layer, s, x_in, x_out)?;
             std::mem::swap(&mut x_in, &mut x_out);
         }

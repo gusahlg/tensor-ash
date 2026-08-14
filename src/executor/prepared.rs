@@ -101,9 +101,13 @@ impl Executor {
 
         // Data-parallel routes only: split-K2's scratch is slot-owned
         // and per-submission, so it cannot live in a replayable buffer.
-        let plans: Vec<OpPlan> = resolved
+        let plans: Vec<OpPlan> = ops
             .iter()
-            .map(|dims| self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, false))
+            .zip(resolved.iter())
+            .map(|(op, dims)| {
+                let plan = self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, false);
+                self.demote_for_epilogue(&op.epilogue, dims, plan)
+            })
             .collect();
         if let Some(plan) = plans
             .iter()
