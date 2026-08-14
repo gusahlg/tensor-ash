@@ -61,6 +61,10 @@ callable GEMM component; those runtimes still need their own adapter layer.
   LayerNorm, partial-rotary RoPE, and a generic strided copy for
   transpose / KV-append / head reshaping. Together with fused-epilogue
   GEMM these cover a full transformer decoder block.
+- **Fused flash-attention prefill** (`run_flash_attention`): causal
+  online-softmax attention in one dispatch — no materialized score
+  tensor, causal tile skipping, GQA, warm-cache offsets; interoperates
+  with the composed softmax/matmul path on the same KV-cache layouts.
 - **FP16 weights** (`Tensor::uninit_device_f16`): store B as IEEE half with
   f32 accumulation — half the weight memory and ~1.9x on bandwidth-bound
   decode GEMV shapes, neutral on compute-bound ones. The `&[f32]` host API

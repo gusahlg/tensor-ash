@@ -27,6 +27,10 @@ const SPIRV_SOFTMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_softma
 const SPIRV_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_rmsnorm_f32.spv"));
 const SPIRV_ROPE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_rope_f32.spv"));
 const SPIRV_COPY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_copy_strided_f32.spv"));
+const SPIRV_FLASH_DH64: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/op_flash_attention_dh64.spv"));
+const SPIRV_FLASH_DH128: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/op_flash_attention_dh128.spv"));
 
 /// Threads per workgroup in every op shader.
 const WG: u32 = 256;
@@ -58,6 +62,21 @@ pub struct RopeDesc {
     pub rot_dim: u32,
     /// Absolute position of the first token in the input.
     pub pos_base: u32,
+}
+
+/// Fused causal-attention geometry for
+/// [`Executor::run_flash_attention`].  Query row `i` attends to
+/// positions `< min(kv_len, pos_base + i + 1)` — the same semantics as
+/// [`SoftmaxMask::Causal`] in the composed path.
+#[derive(Copy, Clone, Debug)]
+pub struct FlashAttentionDesc {
+    /// Valid K/V positions in the caches (for a from-scratch prefill
+    /// of T tokens this is T; with a warm cache, `pos_base + t_q`).
+    pub kv_len: u32,
+    /// Absolute position of query row 0.
+    pub pos_base: u32,
+    /// `1/sqrt(dh)` for standard attention.
+    pub scale: f32,
 }
 
 /// Strided-copy geometry for [`Executor::run_copy_strided`]: for every
@@ -126,6 +145,23 @@ struct CopyPc {
     dst_ptr: u64,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct FlashPc {
+    t_q: u32,
+    t_max: u32,
+    kv_len: u32,
+    pos_base: u32,
+    group_size: u32,
+    scale: f32,
+    _pad0: u32,
+    _pad1: u32,
+    q_ptr: u64,
+    kt_ptr: u64,
+    v_ptr: u64,
+    out_ptr: u64,
+}
+
 struct OpKernel {
     module: vk::ShaderModule,
     pipeline: vk::Pipeline,
@@ -139,6 +175,8 @@ pub(super) struct ElementwisePipeline {
     layernorm: OpKernel,
     rope: OpKernel,
     copy: OpKernel,
+    flash_dh64: OpKernel,
+    flash_dh128: OpKernel,
 }
 
 impl ElementwisePipeline {
@@ -150,7 +188,7 @@ impl ElementwisePipeline {
         let layout_guard = scopeguard::guard(layout, |l| unsafe {
             ctx.device.destroy_pipeline_layout(l, None);
         });
-        let built: Vec<OpKernel> = Vec::with_capacity(5);
+        let built: Vec<OpKernel> = Vec::with_capacity(7);
         let mut built_guard = scopeguard::guard(built, |kernels| {
             for kernel in kernels {
                 unsafe {
@@ -165,6 +203,8 @@ impl ElementwisePipeline {
             (SPIRV_NORM, &[1u32][..], "op layernorm"),
             (SPIRV_ROPE, &[][..], "op rope"),
             (SPIRV_COPY, &[][..], "op copy_strided"),
+            (SPIRV_FLASH_DH64, &[][..], "op flash_attention dh64"),
+            (SPIRV_FLASH_DH128, &[][..], "op flash_attention dh128"),
         ] {
             let (module, pipeline) =
                 crate::pipeline::build_compute_pipeline(ctx, layout, spec, spv, label)?;
@@ -172,7 +212,9 @@ impl ElementwisePipeline {
         }
         let built = scopeguard::ScopeGuard::into_inner(built_guard);
         let mut it = built.into_iter();
-        let (softmax, rmsnorm, layernorm, rope, copy) = (
+        let (softmax, rmsnorm, layernorm, rope, copy, flash_dh64, flash_dh128) = (
+            it.next().unwrap(),
+            it.next().unwrap(),
             it.next().unwrap(),
             it.next().unwrap(),
             it.next().unwrap(),
@@ -187,6 +229,8 @@ impl ElementwisePipeline {
             layernorm,
             rope,
             copy,
+            flash_dh64,
+            flash_dh128,
         })
     }
 }
@@ -201,6 +245,8 @@ impl Drop for ElementwisePipeline {
                 &self.layernorm,
                 &self.rope,
                 &self.copy,
+                &self.flash_dh64,
+                &self.flash_dh128,
             ] {
                 self.ctx.device.destroy_pipeline(kernel.pipeline, None);
                 self.ctx.device.destroy_shader_module(kernel.module, None);
@@ -248,13 +294,27 @@ impl Executor {
         pc: &T,
         groups_x: u32,
     ) -> Result<RunStats> {
+        self.run_elementwise_2d(pipeline, pc, groups_x, 1)
+    }
+
+    fn run_elementwise_2d<T: bytemuck::Pod>(
+        &self,
+        pipeline: vk::Pipeline,
+        pc: &T,
+        groups_x: u32,
+        groups_y: u32,
+    ) -> Result<RunStats> {
         let max = self
             .ctx
             .device_properties
             .limits
-            .max_compute_work_group_count[0];
-        if groups_x > max {
-            bail!("elementwise dispatch ({groups_x} groups) exceeds device limit {max}");
+            .max_compute_work_group_count;
+        if groups_x > max[0] || groups_y > max[1] {
+            bail!(
+                "elementwise dispatch ({groups_x}, {groups_y}) exceeds device limits ({}, {})",
+                max[0],
+                max[1]
+            );
         }
         let layout = self.elementwise()?.layout;
         let mut slot = self.checkout_slot();
@@ -271,7 +331,7 @@ impl Executor {
                         0,
                         bytemuck::bytes_of(pc),
                     );
-                    dev.cmd_dispatch(cb, groups_x, 1, 1);
+                    dev.cmd_dispatch(cb, groups_x, groups_y, 1);
                     Ok(())
                 },
             )
@@ -497,6 +557,96 @@ impl Executor {
         )
     }
 
+    /// Fused causal prefill attention (FlashAttention pattern):
+    /// `out = softmax_causal(q @ K^T * scale) @ V` in one dispatch with
+    /// online softmax — score tiles never touch global memory, and
+    /// tiles above the causal frontier are skipped.  Layouts match the
+    /// composed path: `q`/`out` are `[H, T_q, dh]`, `kt` is
+    /// `[H_kv, dh, T_max]`, `v` is `[H_kv, T_max, dh]`; GQA works when
+    /// `H` is a multiple of `H_kv`.  `dh` must be 64 or 128 (the
+    /// compiled head-dimension variants).
+    pub fn run_flash_attention(
+        &self,
+        q: &Tensor,
+        kt: &Tensor,
+        v: &Tensor,
+        out: &Tensor,
+        desc: FlashAttentionDesc,
+    ) -> Result<RunStats> {
+        self.ensure_f32(q, "run_flash_attention", "q")?;
+        self.ensure_f32(kt, "run_flash_attention", "kt")?;
+        self.ensure_f32(v, "run_flash_attention", "v")?;
+        self.ensure_f32(out, "run_flash_attention", "out")?;
+        let [heads, t_q, dh] = *q.shape() else {
+            bail!(
+                "run_flash_attention: q must be [H, T_q, dh], got {:?}",
+                q.shape()
+            );
+        };
+        if out.shape() != q.shape() {
+            bail!(
+                "run_flash_attention: out shape {:?} must equal q shape {:?}",
+                out.shape(),
+                q.shape()
+            );
+        }
+        let [kv_heads, kt_dh, t_max] = *kt.shape() else {
+            bail!(
+                "run_flash_attention: kt must be [H_kv, dh, T_max], got {:?}",
+                kt.shape()
+            );
+        };
+        let [v_heads, v_t, v_dh] = *v.shape() else {
+            bail!(
+                "run_flash_attention: v must be [H_kv, T_max, dh], got {:?}",
+                v.shape()
+            );
+        };
+        if kt_dh != dh || v_dh != dh || v_t != t_max || v_heads != kv_heads {
+            bail!(
+                "run_flash_attention: inconsistent shapes q {:?}, kt {:?}, v {:?}",
+                q.shape(),
+                kt.shape(),
+                v.shape()
+            );
+        }
+        if kv_heads == 0 || !heads.is_multiple_of(kv_heads) {
+            bail!("run_flash_attention: H={heads} must be a multiple of H_kv={kv_heads}");
+        }
+        if desc.kv_len > t_max {
+            bail!(
+                "run_flash_attention: kv_len {} exceeds cache T_max {t_max}",
+                desc.kv_len
+            );
+        }
+        let (pipeline, rows_per_wg) = match dh {
+            64 => (self.elementwise()?.flash_dh64.pipeline, 128),
+            128 => (self.elementwise()?.flash_dh128.pipeline, 128),
+            other => bail!(
+                "run_flash_attention: head dimension {other} unsupported (compiled variants: 64, 128)"
+            ),
+        };
+        self.run_elementwise_2d(
+            pipeline,
+            &FlashPc {
+                t_q,
+                t_max,
+                kv_len: desc.kv_len,
+                pos_base: desc.pos_base,
+                group_size: heads / kv_heads,
+                scale: desc.scale,
+                _pad0: 0,
+                _pad1: 0,
+                q_ptr: q.device_address(),
+                kt_ptr: kt.device_address(),
+                v_ptr: v.device_address(),
+                out_ptr: out.device_address(),
+            },
+            t_q.div_ceil(rows_per_wg),
+            heads,
+        )
+    }
+
     /// Strided 3D copy (see [`CopyDesc`]): covers transpose/permute,
     /// KV-cache append, head reshaping, and sub-matrix extraction.
     /// `src` and `dst` must be different tensors — invocations are
@@ -563,3 +713,5 @@ unsafe impl bytemuck::Pod for RopePc {}
 unsafe impl bytemuck::Zeroable for RopePc {}
 unsafe impl bytemuck::Pod for CopyPc {}
 unsafe impl bytemuck::Zeroable for CopyPc {}
+unsafe impl bytemuck::Pod for FlashPc {}
+unsafe impl bytemuck::Zeroable for FlashPc {}

@@ -1,4 +1,73 @@
-# Experiment branch log — `experiment/model-inference`
+# Experiment branch log
+
+## Leg 2 — `experiment/flash-attention` (branched from main@v2.0.0, 2026-08-14)
+
+### Design: fused causal prefill attention (flash-attention style)
+
+**Why:** the composed prefill path materializes `scores [H, T_q, T_kv]`
+and moves it through global memory three times (matmul write, softmax
+read+write, PV read). At T=4096, H=32 that is 32·4096² floats = 2 GiB of
+score traffic per layer vs the ~100 MiB of Q/K/V/O. An online-softmax
+fused kernel keeps score tiles in registers/shared and never leaves the
+chip — the classic FlashAttention result, expected to dominate at T ≥ 1k.
+
+**Design (v1, SIMT f32):**
+- One workgroup per (head, q-tile). One thread owns one query row: its
+  running max `m`, running sum `l`, and the `acc[DH]` output row in
+  registers. `DH` is a specialization constant (64/80/96/128 pipelines
+  compiled lazily per model geometry).
+- K-loop over key tiles staged in shared memory, read directly from the
+  existing cache layouts (`Kt [H, dh, T_max]`, `V [H, T_max, dh]`) so the
+  fused and composed paths interoperate on the same tensors.
+- Per tile: S-row = q·K tile (from shared), causal/prefix mask, tile max,
+  one rescale of `l`/`acc` per tile (never per element), P·V accumulate.
+  Final `out = acc / l` (all-masked rows store 0).
+- Causal semantics match `SoftmaxMask::Causal`: query row `i` attends to
+  positions `< pos_base + i + 1`, clamped by `kv_len`; causal tiles fully
+  above the diagonal are skipped, so early rows do ~half the work.
+- GQA: `kv_head = head / group_size` push constant, no K/V duplication.
+
+**Method:** baseline first (composed path measured per stage at
+T=512..4096, dh=64/128), fused kernel must beat the *sum*; correctness
+against f64 CPU reference and bit-agreement checks vs the composed path
+on shared inputs; paired A/B in one process.
+
+### Leg 2 results: fused flash-attention prefill (v1 shipped)
+
+**Measured A/B (paired, same process, H=32):**
+
+| case | composed sum | flash | speedup |
+|---|---|---|---|
+| dh64 T1024 | 1.53 ms | 1.46 ms | 1.05x |
+| dh64 T2048 | 5.81 ms | 4.30 ms | **1.35x** |
+| dh128 T2048 | 7.98 ms | 8.87 ms | 0.90x |
+| dh128 T4096 | 32.8 ms | 32.3 ms | 1.02x |
+
+Equally important: flash never allocates the `[H, T_q, T_kv]` score tensor —
+**2.1 GiB at H32/T4096** on the composed path — so long-context prefill fits
+where the composed path cannot. Correctness pinned against an f64 CPU
+reference across five geometries (poisoned cache tails, GQA groups,
+warm-cache offsets, ragged sizes, single-row) plus 1e-5 agreement with the
+composed path on shared inputs. Suite is 83 GPU tests.
+
+**Optimization attempts, all measured and rejected:**
+- *V via warp-uniform L1 reads instead of shared staging*: 2-4x SLOWER —
+  per-element uniform global loads serialize through the LSU inside the hot
+  FMA loop; shared-memory broadcast is genuinely free, L1 is not.
+- *SPLIT=2 (two lanes per query row) for dh128*: 0.61-0.76x — halving rows
+  per workgroup doubles K/V staging cost per row, swamping the register
+  relief.
+- *BK=16 for dh128*: 0.52-0.71x — twice the tiles means twice the online
+  rescales (`acc[128]` multiply each) and barriers.
+
+**Verdict:** v1 (BK=32, one lane per row) is the optimum of this design
+family on GA104. dh128 SIMT flash is register-bound (~180/thread) and only
+reaches parity; the ceiling-breaker there is a cooperative-matrix flash
+kernel (tensor-core S and PV tiles) — recorded as the next candidate leg.
+Routing guidance in docs: flash for dh64 at T >= ~1k, or whenever score
+memory is prohibitive; composed path otherwise.
+
+# Leg 1 log — `experiment/model-inference` (merged as v2.0.0, PR #1)
 
 Branched from `main@18d0f88` (v1.5.0-dev) on 2026-08-14. This file tracks every
 major shift on this branch: what was tried, why, how it was verified, and

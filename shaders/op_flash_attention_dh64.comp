@@ -1,0 +1,6 @@
+#version 460
+// Fused causal prefill attention, head dimension 64.
+
+#define DH 64u
+
+#include "attention_flash_kernel.glsl"

@@ -21,6 +21,8 @@ mod elementwise;
 mod epilogue;
 #[path = "correctness/f16.rs"]
 mod f16;
+#[path = "correctness/flash.rs"]
+mod flash;
 #[path = "correctness/graph.rs"]
 mod graph;
 #[path = "correctness/kernels.rs"]
