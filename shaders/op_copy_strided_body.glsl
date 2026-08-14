@@ -9,6 +9,11 @@
 // Bandwidth-trivial by design; extent[0] is the fastest-varying axis,
 // so pick the layout that makes it contiguous in at least one of
 // src/dst for coalescing.
+//
+// Position indirection (replayable command buffers): when
+// `pos_ptr != 0` it points at one u32 position `p` and the effective
+// dst_offset becomes `dst_offset + p * pos_scale`, so a recorded
+// KV-append dispatch replays correctly as the host bumps `p`.
 
 #ifdef DST_F16
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -30,6 +35,9 @@ layout(buffer_reference, std430, buffer_reference_align = 2) restrict buffer F16
     float16_t v[];
 };
 #endif
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer U32ReadOnly {
+    uint v[];
+};
 
 layout(push_constant) uniform PC {
     uint extent_x;
@@ -43,9 +51,10 @@ layout(push_constant) uniform PC {
     uint dst_stride_x;
     uint dst_stride_y;
     uint dst_stride_z;
-    uint _pad;
+    uint pos_scale; // dst_offset advance per indirect position
     F32ReadOnly src_ptr;
     F32ReadWrite dst_ptr;
+    U32ReadOnly pos_ptr; // optional indirect position (0 = unused)
 } pc;
 
 // The destination is written through this view when DST_F16 is set;
@@ -61,8 +70,10 @@ void main() {
     const uint y = (id / pc.extent_x) % pc.extent_y;
     const uint z = id / plane;
 
+    const uint p = uint64_t(pc.pos_ptr) != 0ul ? pc.pos_ptr.v[0] : 0u;
     const uint src = pc.src_offset + x * pc.src_stride_x + y * pc.src_stride_y + z * pc.src_stride_z;
-    const uint dst = pc.dst_offset + x * pc.dst_stride_x + y * pc.dst_stride_y + z * pc.dst_stride_z;
+    const uint dst = pc.dst_offset + p * pc.pos_scale
+        + x * pc.dst_stride_x + y * pc.dst_stride_y + z * pc.dst_stride_z;
 #ifdef DST_F16
     F16WriteOut out16 = F16WriteOut(uint64_t(pc.dst_ptr));
     out16.v[dst] = float16_t(pc.src_ptr.v[src]);

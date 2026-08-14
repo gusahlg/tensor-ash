@@ -44,7 +44,8 @@ pub use context::{DeviceKind, DevicePreference, DeviceSummary, VulkanContext};
 pub use dtype::DType;
 pub use executor::{
     ATTN_DECODE_MAX_CHUNKS, AttnDecodeDesc, BinaryOp, CopyDesc, DispatchInfo, ExecOp, Executor,
-    ExecutorConfig, FlashAttentionDesc, PreparedOps, RopeDesc, RopeScatterDesc, SoftmaxMask,
+    ExecutorConfig, FlashAttentionDesc, PosBuffer, PreparedOps, RopeDesc, RopeScatterDesc,
+    SoftmaxMask,
 };
 pub use matmul::{
     Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, MatrixShape, RunStats,

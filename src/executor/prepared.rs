@@ -37,11 +37,12 @@ use super::recording::{record_matmul_commands, record_matmul_graph_commands};
 use super::submission::{read_gpu_time_ns, record_timestamped, submit_one, wait_fence_spin};
 use super::{Executor, OpPlan};
 
-/// A validated, pre-recorded batch of matmul ops bound to fixed
-/// tensors.  Create with [`Executor::prepare_matmuls`],
-/// [`Executor::prepare_ops`], or [`Executor::prepare_op_graph`]; replay
-/// with [`run`](Self::run) or the [`submit`](Self::submit) /
-/// [`wait`](Self::wait) pair.
+/// A validated, pre-recorded batch of ops bound to fixed tensors.
+/// Create with [`Executor::prepare_matmuls`],
+/// [`Executor::prepare_ops`], [`Executor::prepare_op_graph`], or (for
+/// mixed matmul + model-op chains with optional position indirection)
+/// [`Executor::prepare_exec_ops`]; replay with [`run`](Self::run) or
+/// the [`submit`](Self::submit) / [`wait`](Self::wait) pair.
 pub struct PreparedOps<'e, 't> {
     exec: &'e Executor,
     cmd_pool: vk::CommandPool,
@@ -120,6 +121,47 @@ impl Executor {
             );
         }
 
+        // The BDA kernels never bind descriptor sets, so null handles
+        // satisfy the recorder.
+        let null_sets = vec![vk::DescriptorSet::null(); ops.len()];
+        self.prepare_recorded(ops.len(), flops, |cmd| {
+            if with_dependency_barriers {
+                record_matmul_graph_commands(
+                    &self.ctx,
+                    &self.pipeline,
+                    cmd,
+                    &null_sets,
+                    ops,
+                    resolved,
+                    &plans,
+                    None,
+                )
+            } else {
+                record_matmul_commands(
+                    &self.ctx,
+                    &self.pipeline,
+                    cmd,
+                    &null_sets,
+                    ops,
+                    resolved,
+                    &plans,
+                )
+            }
+        })
+    }
+
+    /// Shared record-once machinery for every prepared flavor: create a
+    /// dedicated command pool + resubmittable command buffer + fence
+    /// (+ timestamp query pool when supported), record `record`'s
+    /// commands exactly once, and wrap them as a [`PreparedOps`].  The
+    /// caller has already validated the ops and ensures every device
+    /// address the recording bakes in stays alive for lifetime `'t`.
+    pub(super) fn prepare_recorded<'e, 't>(
+        &'e self,
+        n_calls: usize,
+        total_flops: u64,
+        record: impl FnOnce(vk::CommandBuffer) -> Result<()>,
+    ) -> Result<PreparedOps<'e, 't>> {
         let dev = &self.ctx.device;
         unsafe {
             let cmd_pool = dev
@@ -163,35 +205,10 @@ impl Executor {
             });
 
             // Record once, without ONE_TIME_SUBMIT, so the buffer can
-            // be resubmitted indefinitely.  The BDA kernels never bind
-            // descriptor sets, so null handles satisfy the recorder.
+            // be resubmitted indefinitely.
             dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
                 .context("begin_command_buffer (prepared)")?;
-            let null_sets = vec![vk::DescriptorSet::null(); ops.len()];
-            record_timestamped(dev, cmd, query_pool, || {
-                if with_dependency_barriers {
-                    record_matmul_graph_commands(
-                        &self.ctx,
-                        &self.pipeline,
-                        cmd,
-                        &null_sets,
-                        ops,
-                        resolved,
-                        &plans,
-                        None,
-                    )
-                } else {
-                    record_matmul_commands(
-                        &self.ctx,
-                        &self.pipeline,
-                        cmd,
-                        &null_sets,
-                        ops,
-                        resolved,
-                        &plans,
-                    )
-                }
-            })?;
+            record_timestamped(dev, cmd, query_pool, || record(cmd))?;
             dev.end_command_buffer(cmd)
                 .context("end_command_buffer (prepared)")?;
 
@@ -202,8 +219,8 @@ impl Executor {
                 fence: scopeguard::ScopeGuard::into_inner(fence_guard),
                 query_pool: scopeguard::ScopeGuard::into_inner(query_guard),
                 in_flight: false,
-                n_calls: ops.len(),
-                total_flops: flops,
+                n_calls,
+                total_flops,
                 _tensors: PhantomData,
             })
         }

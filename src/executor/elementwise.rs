@@ -74,7 +74,7 @@ pub enum SoftmaxMask {
 }
 
 /// Rotary-embedding geometry for [`Executor::run_rope`].
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct RopeDesc {
     pub heads: u32,
     pub head_dim: u32,
@@ -83,6 +83,14 @@ pub struct RopeDesc {
     pub rot_dim: u32,
     /// Absolute position of the first token in the input.
     pub pos_base: u32,
+    /// Optional device address of a [`PosBuffer`](super::PosBuffer)
+    /// (0 = none).  When set, the shader reads position `p` from it at
+    /// execution time and the effective base becomes `pos_base + p` —
+    /// the indirection that lets a recorded command buffer replay at a
+    /// new position each token.  The buffer must stay alive for every
+    /// execution; table-coverage validation only sees `pos_base`, so
+    /// the caller keeps `pos_base + p + tokens` within the table.
+    pub pos_addr: u64,
 }
 
 /// Destination geometry for [`Executor::run_rope_scatter`]: the fused
@@ -92,11 +100,15 @@ pub struct RopeDesc {
 /// decode k-rope + Kt-cache append as one dispatch: for a
 /// `[H_kv, dh, T_max]` Kt cache at position `pos`, use
 /// `dst_offset = pos` and `dst_strides = [1, dh * t_max, t_max]`.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct RopeScatterDesc {
     pub dst_offset: u32,
     /// Element strides per (token, head, dim).
     pub dst_strides: [u32; 3],
+    /// `dst_offset` advance per indirect position: when the paired
+    /// [`RopeDesc::pos_addr`] is set, the effective destination offset
+    /// is `dst_offset + p * pos_scale` (Kt-column append: 1).
+    pub pos_scale: u32,
 }
 
 /// Fused causal-attention geometry for
@@ -119,12 +131,20 @@ pub struct FlashAttentionDesc {
 /// the `kv_len` valid cache positions (prefix mask, scale applied
 /// before the max — identical semantics to the composed
 /// scores/softmax/PV trio, but only the valid prefix is ever read).
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct AttnDecodeDesc {
     /// Valid K/V positions in the caches (`>= 1`).
     pub kv_len: u32,
     /// `1/sqrt(dh)` for standard attention.
     pub scale: f32,
+    /// Optional device address of a [`PosBuffer`](super::PosBuffer)
+    /// (0 = none).  When set, the effective KV length is
+    /// `kv_len + p` (record with `kv_len = 1` for a decode step at
+    /// position `p`), and BOTH stages dispatch the fixed
+    /// [`ATTN_DECODE_MAX_CHUNKS`] grid — chunks past the effective
+    /// length write neutral partials that merge exactly, so one
+    /// recorded grid covers every position.
+    pub pos_addr: u64,
 }
 
 /// Upper bound on split-K chunks in decode attention; sizes the
@@ -159,13 +179,21 @@ pub enum BinaryOp {
 /// `(x, y, z)` in `extent`, element `src_offset + x*src_strides[0] +
 /// y*src_strides[1] + z*src_strides[2]` is copied to the equivalent
 /// destination index.  Strides and offsets are in elements.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct CopyDesc {
     pub extent: [u32; 3],
     pub src_offset: u32,
     pub src_strides: [u32; 3],
     pub dst_offset: u32,
     pub dst_strides: [u32; 3],
+    /// Optional device address of a [`PosBuffer`](super::PosBuffer)
+    /// (0 = none): the effective destination offset becomes
+    /// `dst_offset + p * pos_scale` at execution time, so a recorded
+    /// KV-append replays at each new position.  Bounds validation only
+    /// sees `dst_offset`; the caller keeps the runtime offset in range.
+    pub pos_addr: u64,
+    /// `dst_offset` advance per indirect position (V-row append: dh).
+    pub pos_scale: u32,
 }
 
 #[repr(C)]
@@ -206,6 +234,7 @@ struct RopePc {
     in_ptr: u64,
     out_ptr: u64,
     table_ptr: u64,
+    pos_ptr: u64,
 }
 
 #[repr(C)]
@@ -218,10 +247,11 @@ struct RopeScatterPc {
     pos_base: u32,
     dst_offset: u32,
     dst_strides: [u32; 3],
-    _pad: u32,
+    pos_scale: u32,
     in_ptr: u64,
     dst_ptr: u64,
     table_ptr: u64,
+    pos_ptr: u64,
 }
 
 #[repr(C)]
@@ -232,9 +262,10 @@ struct CopyPc {
     src_strides: [u32; 3],
     dst_offset: u32,
     dst_strides: [u32; 3],
-    _pad: u32,
+    pos_scale: u32,
     src_ptr: u64,
     dst_ptr: u64,
+    pos_ptr: u64,
 }
 
 #[repr(C)]
@@ -279,6 +310,7 @@ struct AttnDecodePc {
     kt_ptr: u64,
     v_ptr: u64,
     scratch_ptr: u64,
+    pos_ptr: u64,
 }
 
 #[repr(C)]
@@ -292,12 +324,17 @@ struct AttnCombinePc {
     out_ptr: u64,
 }
 
+/// Push-constant budget of the shared elementwise layout: the largest
+/// block (`CopyPc` / `RopeScatterPc`, 72 bytes) rounded up for slack;
+/// well under the 128-byte device minimum.
+const ELEMENTWISE_PC_BYTES: usize = 80;
+
 /// A fully planned elementwise dispatch: pipeline, push constants,
 /// and grid — ready to record into any command buffer.
 pub(super) struct ElementwiseDispatch {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
-    push: [u8; 64],
+    push: [u8; ELEMENTWISE_PC_BYTES],
     push_len: usize,
     groups: (u32, u32),
 }
@@ -330,9 +367,10 @@ pub(super) struct ElementwisePipeline {
 
 impl ElementwisePipeline {
     pub(super) fn new(ctx: &Arc<VulkanContext>) -> Result<Self> {
-        // One PC-only layout sized for the largest block (CopyPc);
-        // a range larger than a shader's declared block is valid.
-        let layout = unsafe { create_pc_only_layout(ctx, std::mem::size_of::<CopyPc>() as u32) }
+        // One PC-only layout sized for the largest block (see
+        // ELEMENTWISE_PC_BYTES); a range larger than a shader's
+        // declared block is valid.
+        let layout = unsafe { create_pc_only_layout(ctx, ELEMENTWISE_PC_BYTES as u32) }
             .context("elementwise pipeline layout")?;
         let layout_guard = scopeguard::guard(layout, |l| unsafe {
             ctx.device.destroy_pipeline_layout(l, None);
@@ -503,7 +541,7 @@ impl Executor {
             );
         }
         let bytes = bytemuck::bytes_of(pc);
-        let mut push = [0u8; 64];
+        let mut push = [0u8; ELEMENTWISE_PC_BYTES];
         push[..bytes.len()].copy_from_slice(bytes);
         Ok(ElementwiseDispatch {
             pipeline,
@@ -802,6 +840,7 @@ impl Executor {
                 in_ptr: input.device_address(),
                 out_ptr: output.device_address(),
                 table_ptr: table.device_address(),
+                pos_ptr: desc.pos_addr,
             },
             pairs.div_ceil(WG),
             1,
@@ -870,10 +909,11 @@ impl Executor {
                 pos_base: desc.pos_base,
                 dst_offset: scatter.dst_offset,
                 dst_strides: scatter.dst_strides,
-                _pad: 0,
+                pos_scale: scatter.pos_scale,
                 in_ptr: input.device_address(),
                 dst_ptr: dst.device_address(),
                 table_ptr: table.device_address(),
+                pos_ptr: desc.pos_addr,
             },
             pairs.div_ceil(WG),
             1,
@@ -1095,7 +1135,14 @@ impl Executor {
                 desc.kv_len
             );
         }
-        let num_chunks = attn_decode_num_chunks(desc.kv_len);
+        // Position-driven dispatches cannot size the grid per token, so
+        // they always use the fixed MAX_CHUNKS decomposition; chunks
+        // past the effective kv_len write neutral partials.
+        let num_chunks = if desc.pos_addr != 0 {
+            ATTN_DECODE_MAX_CHUNKS
+        } else {
+            attn_decode_num_chunks(desc.kv_len)
+        };
         let needed = kv_heads as u64 * num_chunks as u64 * group as u64 * (dh as u64 + 2);
         if scratch.len() < needed {
             bail!(
@@ -1123,6 +1170,7 @@ impl Executor {
                 kt_ptr: kt.device_address(),
                 v_ptr: v.device_address(),
                 scratch_ptr: scratch.device_address(),
+                pos_ptr: desc.pos_addr,
             },
             num_chunks,
             kv_heads,
@@ -1259,9 +1307,10 @@ impl Executor {
                 src_strides: desc.src_strides,
                 dst_offset: desc.dst_offset,
                 dst_strides: desc.dst_strides,
-                _pad: 0,
+                pos_scale: desc.pos_scale,
                 src_ptr: src.device_address(),
                 dst_ptr: dst.device_address(),
+                pos_ptr: desc.pos_addr,
             },
             total.div_ceil(WG),
             1,

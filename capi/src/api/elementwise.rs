@@ -166,6 +166,7 @@ pub unsafe extern "C" fn ta_rope(
                     head_dim: desc.head_dim,
                     rot_dim: desc.rot_dim,
                     pos_base: desc.pos_base,
+                    ..Default::default()
                 },
             )?,
         );
@@ -210,6 +211,7 @@ pub unsafe extern "C" fn ta_copy_strided(
                     src_strides: desc.src_strides,
                     dst_offset: desc.dst_offset,
                     dst_strides: desc.dst_strides,
+                    ..Default::default()
                 },
             )?,
         );

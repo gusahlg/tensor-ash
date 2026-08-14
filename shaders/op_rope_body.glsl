@@ -18,6 +18,12 @@
 //     Kt-cache layout.  Input and destination must not overlap.
 //     DST_F16 (ROPE_SCATTER only): destination stores IEEE half (RNE
 //     via the float16_t conversion), for f16 KV caches.
+//
+// Position indirection (replayable command buffers): when
+// `pos_ptr != 0` it points at one u32 position `p`; the effective
+// pos_base becomes `pc.pos_base + p` and (ROPE_SCATTER) the effective
+// dst_offset becomes `pc.dst_offset + p * pc.pos_scale`, so a recorded
+// dispatch replays correctly as the host bumps `p` between tokens.
 
 #ifdef DST_F16
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -39,6 +45,9 @@ layout(buffer_reference, std430, buffer_reference_align = 2) restrict buffer F16
     float16_t v[];
 };
 #endif
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer U32ReadOnly {
+    uint v[];
+};
 
 #ifdef ROPE_SCATTER
 layout(push_constant) uniform PC {
@@ -51,10 +60,11 @@ layout(push_constant) uniform PC {
     uint dst_stride_token;
     uint dst_stride_head;
     uint dst_stride_dim;
-    uint _pad;
+    uint pos_scale; // dst_offset advance per indirect position
     F32ReadOnly in_ptr;
     F32ReadWrite dst_ptr;
     F32ReadOnly table_ptr; // [T_max, rot_dim/2, 2] = (cos, sin) pairs
+    U32ReadOnly pos_ptr;   // optional indirect position (0 = unused)
 } pc;
 
 void store_dst(uint index, float value) {
@@ -76,6 +86,7 @@ layout(push_constant) uniform PC {
     F32ReadOnly in_ptr;
     F32ReadWrite out_ptr;
     F32ReadOnly table_ptr; // [T_max, rot_dim/2, 2] = (cos, sin) pairs
+    U32ReadOnly pos_ptr;   // optional indirect position (0 = unused)
 } pc;
 #endif
 
@@ -89,12 +100,14 @@ void main() {
     const uint head = (id / half_rot) % pc.heads;
     const uint token = id / (half_rot * pc.heads);
 
+    const uint p = uint64_t(pc.pos_ptr) != 0ul ? pc.pos_ptr.v[0] : 0u;
+
     const uint vec_base = (token * pc.heads + head) * pc.head_dim;
     const uint i0 = vec_base + pair * 2u;
     const float x0 = pc.in_ptr.v[i0];
     const float x1 = pc.in_ptr.v[i0 + 1u];
 
-    const uint angle = ((pc.pos_base + token) * half_rot + pair) * 2u;
+    const uint angle = ((pc.pos_base + p + token) * half_rot + pair) * 2u;
     const float c = pc.table_ptr.v[angle];
     const float s = pc.table_ptr.v[angle + 1u];
 
@@ -102,8 +115,8 @@ void main() {
     const float r1 = fma(x0, s, x1 * c);
 
 #ifdef ROPE_SCATTER
-    const uint dst_base =
-        pc.dst_offset + token * pc.dst_stride_token + head * pc.dst_stride_head;
+    const uint dst_base = pc.dst_offset + p * pc.pos_scale
+        + token * pc.dst_stride_token + head * pc.dst_stride_head;
     const uint d0 = dst_base + (pair * 2u) * pc.dst_stride_dim;
     store_dst(d0, r0);
     store_dst(d0 + pc.dst_stride_dim, r1);

@@ -190,6 +190,7 @@ fn llama_decoder_layer_decode_step_matches_cpu() {
         head_dim: dh,
         rot_dim: dh,
         pos_base: KV_LEN as u32,
+        ..Default::default()
     };
     exec.run_rope(&q, &table, &q, rope).unwrap();
     exec.run_rope(&k, &table, &k, rope).unwrap();
@@ -203,6 +204,7 @@ fn llama_decoder_layer_decode_step_matches_cpu() {
             src_strides: [1, dh, 0],
             dst_offset: KV_LEN as u32,
             dst_strides: [t_max, dh * t_max, 0],
+            ..Default::default()
         },
     )
     .unwrap();
@@ -215,6 +217,7 @@ fn llama_decoder_layer_decode_step_matches_cpu() {
             src_strides: [1, dh, 0],
             dst_offset: (KV_LEN as u32) * dh,
             dst_strides: [1, t_max * dh, 0],
+            ..Default::default()
         },
     )
     .unwrap();
@@ -232,6 +235,7 @@ fn llama_decoder_layer_decode_step_matches_cpu() {
             src_strides: [1, 0, 0],
             dst_offset: 0,
             dst_strides: [1, 0, 0],
+            ..Default::default()
         },
     )
     .unwrap();
@@ -271,6 +275,7 @@ fn llama_decoder_layer_decode_step_matches_cpu() {
             src_strides: [1, 0, 0],
             dst_offset: 0,
             dst_strides: [1, 0, 0],
+            ..Default::default()
         },
     )
     .unwrap();

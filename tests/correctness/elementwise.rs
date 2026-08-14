@@ -175,6 +175,7 @@ fn rope_rotates_pairs_with_partial_dim_and_offset() {
             head_dim,
             rot_dim,
             pos_base,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -209,6 +210,7 @@ fn rope_rotates_pairs_with_partial_dim_and_offset() {
             head_dim,
             rot_dim,
             pos_base,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -238,6 +240,7 @@ fn copy_strided_transposes_and_appends() {
             src_strides: [1, cols, 0],
             dst_offset: 0,
             dst_strides: [rows, 1, 0],
+            ..Default::default()
         },
     )
     .unwrap();
@@ -269,6 +272,7 @@ fn copy_strided_transposes_and_appends() {
             src_strides: [1, dh, 0],
             dst_offset: t,
             dst_strides: [t_max, dh * t_max, 0],
+            ..Default::default()
         },
     )
     .unwrap();
@@ -299,6 +303,7 @@ fn copy_strided_transposes_and_appends() {
                 src_strides: [1, dh, 0],
                 dst_offset: t_max,
                 dst_strides: [t_max, dh * t_max, 0],
+                ..Default::default()
             },
         )
         .unwrap_err()

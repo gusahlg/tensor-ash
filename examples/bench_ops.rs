@@ -75,6 +75,7 @@ fn main() -> Result<()> {
         head_dim: dh,
         rot_dim: dh,
         pos_base: 0,
+        ..Default::default()
     };
     let bytes = (tokens as u64 * heads as u64 * dh as u64) * 4 * 2;
     let ms = median_gpu_ms(
@@ -96,6 +97,7 @@ fn main() -> Result<()> {
                         src_strides: [1, cols, 0],
                         dst_offset: 0,
                         dst_strides: [rows, 1, 0],
+                        ..Default::default()
                     },
                 )?
                 .gpu_time_ns)
