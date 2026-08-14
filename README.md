@@ -1,6 +1,6 @@
 # tensor-ash
 
-Version: `1.4.1`
+Version: `2.0.0`
 
 `tensor-ash` is a small Vulkan compute library for high-throughput FP32 matrix
 multiplication, written in Rust on top of [`ash`](https://crates.io/crates/ash).
@@ -65,6 +65,20 @@ callable GEMM component; those runtimes still need their own adapter layer.
   online-softmax attention in one dispatch — no materialized score
   tensor, causal tile skipping, GQA, warm-cache offsets; interoperates
   with the composed softmax/matmul path on the same KV-cache layouts.
+- **Fused split-K decode attention** (`run_attn_decode`): single-token
+  attention over only the valid KV prefix as two dispatches (chunked
+  online-softmax partials + exact combine); f32 or f16 caches,
+  GQA-native, measured-tuned chunking.
+- **Replayable decode graphs** (`prepare_exec_ops` / `PosBuffer` /
+  `HostU32Buffer`): record a whole mixed matmul + model-op token step
+  once and replay it per token. Position indirection through a 4-byte
+  device-read cell retargets the recording, and the on-GPU argmax +
+  embedding-gather tail feeds the next step, so a decode token costs
+  one `vkQueueSubmit`, one u32 write, and one u32 read.
+- **Model runner** (`tools/llama-ash`): llama-architecture GGUF models
+  end to end on library ops. TinyLlama-1.1B generation is byte-identical
+  to llama.cpp CUDA at temp 0; decode tg128 163-166 t/s vs CUDA's 175
+  (0.94x), prefill pp512 ~8.0k vs 16.7k t/s (~0.48x).
 - **FP16 weights** (`Tensor::uninit_device_f16`): store B as IEEE half with
   f32 accumulation — half the weight memory and ~1.9x on bandwidth-bound
   decode GEMV shapes, neutral on compute-bound ones. The `&[f32]` host API

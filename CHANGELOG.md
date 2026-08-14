@@ -4,6 +4,52 @@
 
 ### Added
 
+- **GPU token loop** (`run_argmax`, `run_embed_gather`, `HostU32Buffer`,
+  `ExecOp::{Argmax, EmbedGather}`): one-workgroup argmax whose tie-break
+  (largest index wins) exactly matches Rust's `max_by(f32::total_cmp)`,
+  plus a device-indexed embedding-row gather (f16/f32 table, f16 widens
+  exactly) that reads the token id from a 4-byte host-readable cell.
+  Chained at the tail of the prepared decode graph the loop feeds itself
+  on-GPU: per token the host writes one position u32 and reads one token
+  u32 — no logits download, CPU argmax, or embedding upload. llama-ash
+  tg128 160 -> 165 t/s (0.94x llama.cpp CUDA); token stream identical to
+  the CPU sampler.
+- **Replayable mixed-op graphs** (`PosBuffer`,
+  `Executor::prepare_exec_ops`): record a matmul + model-op chain ONCE
+  and replay it with one `vkQueueSubmit` per call. Position-dependent
+  ops (`RopeDesc` / `CopyDesc` / `AttnDecodeDesc` gain `pos_addr` +
+  `pos_scale`) read a 4-byte position buffer at execution time, so the
+  host retargets a recording by rewriting one u32. Pos-driven decode
+  attention always dispatches the fixed 32-chunk grid; empty chunks
+  write online-softmax identity partials that merge exactly. Replay is
+  bitwise-identical to the immediate path; llama-ash prepared decode
+  (the new default) tg128 147 -> 160 t/s.
+- **Decode micro-op fusions**: normed-A row GEMV
+  (`MatmulOp::with_normed_a` — the RMSNorm reduction folds into the
+  GEMV's A loads, norm weight riding the unused bias slot) and fused
+  RoPE + strided scatter (`run_rope_scatter`, `ExecOp::RopeScatter` —
+  k-rope written straight into the Kt cache). 16 -> 13 graph ops per
+  decode layer; llama-ash tg128 141 -> 147 t/s.
+- **Fused split-K decode attention** (`run_attn_decode`,
+  `AttnDecodeDesc`, `ExecOp::AttnDecode`): the scores/softmax/PV trio
+  for ONE query row per head as two dispatches — chunked online-softmax
+  partials plus an exact combine — reading only the valid cache prefix.
+  dh64, f32/f16 caches, GQA group <= 8; chunking tuned by measurement
+  (~32 positions/chunk within [8, 32]). llama-ash decode attention
+  2,752 -> 526 us/token; tg128 107 -> 141 t/s (0.81x CUDA, was 0.61x).
+- **f16 KV caches**: f32->f16 strided-copy and rope-scatter variants
+  (RNE narrowing on append) and kv16 flash / decode-attention kernels;
+  selection is cache-dtype-driven. Halves KV memory (44 vs 88 MB at 2k
+  context), speed-neutral at short contexts; llama-ash defaults to f16
+  caches (`LLAMA_ASH_KV=f32` opts out) with byte-identical generation.
+- **Standalone binary elementwise op** (`run_binary`, `BinaryOp`,
+  `ExecOp::Binary`): `a + beta*b` and `silu(a)*b` as one bandwidth
+  pass, so coopmat-routed GEMMs — which cannot fuse epilogues — keep
+  the tensor cores. llama-ash uses it for T >= 256 projections:
+  pp512 5,435 -> 7,795 t/s (+43%), decode-neutral.
+- Widened `f16w_row_bda_k16` auto-routing to square-ish GEMV shapes
+  (K >= 2048 and N <= 2048): o_proj / q-projection -23%, llama-ash
+  decode +3%.
 - **Mixed-op single-submission graphs** (`ExecOp`, `Executor::run_exec_ops`):
   record a dependent chain of matmuls and model ops into one command
   buffer with hazard-aware barriers (fence only on real RAW/WAW/WAR;
