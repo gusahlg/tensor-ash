@@ -49,7 +49,10 @@ use slot::Slot;
 use splitk2::SplitK2Pipeline;
 
 pub use crate::matmul::{MatmulCall, RunStats};
-pub use elementwise::{BinaryOp, CopyDesc, FlashAttentionDesc, RopeDesc, SoftmaxMask};
+pub use elementwise::{
+    ATTN_DECODE_MAX_CHUNKS, AttnDecodeDesc, BinaryOp, CopyDesc, FlashAttentionDesc, RopeDesc,
+    SoftmaxMask,
+};
 pub use graph_ops::ExecOp;
 pub use prepared::PreparedOps;
 

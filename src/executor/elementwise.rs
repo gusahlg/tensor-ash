@@ -30,14 +30,24 @@ const SPIRV_COPY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_copy_stri
 const SPIRV_BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_binary_f32.spv"));
 const SPIRV_COPY_TO_F16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/op_copy_strided_f32_to_f16.spv"));
-const SPIRV_FLASH_KV16_DH64: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/op_flash_attention_kv16_dh64.spv"));
-const SPIRV_FLASH_KV16_DH128: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/op_flash_attention_kv16_dh128.spv"));
+const SPIRV_FLASH_KV16_DH64: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/op_flash_attention_kv16_dh64.spv"
+));
+const SPIRV_FLASH_KV16_DH128: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/op_flash_attention_kv16_dh128.spv"
+));
 const SPIRV_FLASH_DH64: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/op_flash_attention_dh64.spv"));
 const SPIRV_FLASH_DH128: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/op_flash_attention_dh128.spv"));
+const SPIRV_ATTN_DECODE_DH64: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/op_attn_decode_dh64.spv"));
+const SPIRV_ATTN_DECODE_KV16_DH64: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/op_attn_decode_kv16_dh64.spv"));
+const SPIRV_ATTN_DECODE_COMBINE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/op_attn_decode_combine.spv"));
 
 /// Threads per workgroup in every op shader.
 const WG: u32 = 256;
@@ -84,6 +94,35 @@ pub struct FlashAttentionDesc {
     pub pos_base: u32,
     /// `1/sqrt(dh)` for standard attention.
     pub scale: f32,
+}
+
+/// Fused split-K decode-attention geometry for
+/// [`Executor::run_attn_decode`]: ONE query row per head attends to
+/// the `kv_len` valid cache positions (prefix mask, scale applied
+/// before the max — identical semantics to the composed
+/// scores/softmax/PV trio, but only the valid prefix is ever read).
+#[derive(Copy, Clone, Debug)]
+pub struct AttnDecodeDesc {
+    /// Valid K/V positions in the caches (`>= 1`).
+    pub kv_len: u32,
+    /// `1/sqrt(dh)` for standard attention.
+    pub scale: f32,
+}
+
+/// Upper bound on split-K chunks in decode attention; sizes the
+/// caller-provided scratch: `kv_heads * MAX_CHUNKS * group * (dh+2)`
+/// f32 elements covers every `kv_len`.
+pub const ATTN_DECODE_MAX_CHUNKS: u32 = 32;
+
+/// Sequence chunks for one decode-attention dispatch: enough
+/// workgroups to fill the device (grid = num_chunks * kv_heads)
+/// without shrinking chunks below the merge overhead.  Measured on
+/// GA104 at kv_heads=4 (TinyLlama, kv_len ~640): 8 chunks 715 us/22
+/// layers, 16 -> 565, 20 -> 526, 32 -> 523; short contexts favor the
+/// floor of 8 and deep ones the cap of 32, so target ~32 positions
+/// per chunk inside [8, 32].
+fn attn_decode_num_chunks(kv_len: u32) -> u32 {
+    kv_len.div_ceil(32).clamp(8, ATTN_DECODE_MAX_CHUNKS)
 }
 
 /// Standalone binary elementwise operator for
@@ -193,6 +232,32 @@ struct FlashPc {
     out_ptr: u64,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct AttnDecodePc {
+    kv_len: u32,
+    num_chunks: u32,
+    group: u32,
+    t_max: u32,
+    scale: f32,
+    _pad0: u32,
+    q_ptr: u64,
+    kt_ptr: u64,
+    v_ptr: u64,
+    scratch_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct AttnCombinePc {
+    num_chunks: u32,
+    group: u32,
+    dh: u32,
+    _pad0: u32,
+    scratch_ptr: u64,
+    out_ptr: u64,
+}
+
 /// A fully planned elementwise dispatch: pipeline, push constants,
 /// and grid — ready to record into any command buffer.
 pub(super) struct ElementwiseDispatch {
@@ -222,6 +287,9 @@ pub(super) struct ElementwisePipeline {
     flash_dh128: OpKernel,
     flash_kv16_dh64: OpKernel,
     flash_kv16_dh128: OpKernel,
+    attn_decode_dh64: OpKernel,
+    attn_decode_kv16_dh64: OpKernel,
+    attn_decode_combine: OpKernel,
 }
 
 impl ElementwisePipeline {
@@ -233,7 +301,7 @@ impl ElementwisePipeline {
         let layout_guard = scopeguard::guard(layout, |l| unsafe {
             ctx.device.destroy_pipeline_layout(l, None);
         });
-        let built: Vec<OpKernel> = Vec::with_capacity(11);
+        let built: Vec<OpKernel> = Vec::with_capacity(14);
         let mut built_guard = scopeguard::guard(built, |kernels| {
             for kernel in kernels {
                 unsafe {
@@ -252,8 +320,23 @@ impl ElementwisePipeline {
             (SPIRV_COPY_TO_F16, &[][..], "op copy_strided f32->f16"),
             (SPIRV_FLASH_DH64, &[][..], "op flash_attention dh64"),
             (SPIRV_FLASH_DH128, &[][..], "op flash_attention dh128"),
-            (SPIRV_FLASH_KV16_DH64, &[][..], "op flash_attention kv16 dh64"),
-            (SPIRV_FLASH_KV16_DH128, &[][..], "op flash_attention kv16 dh128"),
+            (
+                SPIRV_FLASH_KV16_DH64,
+                &[][..],
+                "op flash_attention kv16 dh64",
+            ),
+            (
+                SPIRV_FLASH_KV16_DH128,
+                &[][..],
+                "op flash_attention kv16 dh128",
+            ),
+            (SPIRV_ATTN_DECODE_DH64, &[][..], "op attn_decode dh64"),
+            (
+                SPIRV_ATTN_DECODE_KV16_DH64,
+                &[][..],
+                "op attn_decode kv16 dh64",
+            ),
+            (SPIRV_ATTN_DECODE_COMBINE, &[][..], "op attn_decode combine"),
         ] {
             let (module, pipeline) =
                 crate::pipeline::build_compute_pipeline(ctx, layout, spec, spv, label)?;
@@ -263,7 +346,9 @@ impl ElementwisePipeline {
         let mut it = built.into_iter();
         #[rustfmt::skip]
         let (softmax, rmsnorm, layernorm, rope, copy, binary, copy_to_f16,
-            flash_dh64, flash_dh128, flash_kv16_dh64, flash_kv16_dh128) = (
+            flash_dh64, flash_dh128, flash_kv16_dh64, flash_kv16_dh128,
+            attn_decode_dh64, attn_decode_kv16_dh64, attn_decode_combine) = (
+            it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
             it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
             it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
             it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
@@ -283,6 +368,9 @@ impl ElementwisePipeline {
             flash_dh128,
             flash_kv16_dh64,
             flash_kv16_dh128,
+            attn_decode_dh64,
+            attn_decode_kv16_dh64,
+            attn_decode_combine,
         })
     }
 }
@@ -303,6 +391,9 @@ impl Drop for ElementwisePipeline {
                 &self.flash_dh128,
                 &self.flash_kv16_dh64,
                 &self.flash_kv16_dh128,
+                &self.attn_decode_dh64,
+                &self.attn_decode_kv16_dh64,
+                &self.attn_decode_combine,
             ] {
                 self.ctx.device.destroy_pipeline(kernel.pipeline, None);
                 self.ctx.device.destroy_shader_module(kernel.module, None);
@@ -763,6 +854,168 @@ impl Executor {
         )
     }
 
+    /// Fused split-K decode attention: `out = softmax(q @ K^T * scale)
+    /// @ V` for ONE query row per head, reading only the `kv_len`
+    /// valid cache prefix.  Two dispatches in one submission: stage 1
+    /// writes per-chunk online-softmax partials to `scratch`
+    /// (`[kv_heads, num_chunks, group, dh+2]` f32, at least
+    /// `kv_heads * ATTN_DECODE_MAX_CHUNKS * group * (dh+2)` elements),
+    /// stage 2 merges them exactly.  Layouts match the composed path:
+    /// `q`/`out` are `[kv_heads, group, dh]` (or any contiguous
+    /// reshape ending in `dh`), `kt` is `[H_kv, dh, T_max]`, `v` is
+    /// `[H_kv, T_max, dh]`, f32 or f16 caches (matching).  `dh` must
+    /// be 64 (the compiled variant) and `group <= 8`.
+    pub fn run_attn_decode(
+        &self,
+        q: &Tensor,
+        kt: &Tensor,
+        v: &Tensor,
+        scratch: &Tensor,
+        out: &Tensor,
+        desc: AttnDecodeDesc,
+    ) -> Result<RunStats> {
+        let (stage1, combine) = self.plan_attn_decode(q, kt, v, scratch, out, desc)?;
+        let mut slot = self.checkout_slot();
+        let gpu_time_ns = unsafe {
+            self.submit_timed(
+                &mut slot,
+                "get_query_pool_results (attn_decode)",
+                |_dev, cb, _slot| {
+                    self.record_elementwise(cb, &stage1);
+                    super::recording::record_compute_to_compute_barrier(&self.ctx, cb);
+                    self.record_elementwise(cb, &combine);
+                    Ok(())
+                },
+            )
+        }?;
+        Ok(RunStats {
+            gpu_time_ns,
+            n_calls: 2,
+            total_flops: 0,
+        })
+    }
+
+    /// Validate and plan both decode-attention dispatches.  The caller
+    /// must place a compute barrier between them (stage 2 reads the
+    /// scratch stage 1 writes).
+    pub(super) fn plan_attn_decode(
+        &self,
+        q: &Tensor,
+        kt: &Tensor,
+        v: &Tensor,
+        scratch: &Tensor,
+        out: &Tensor,
+        desc: AttnDecodeDesc,
+    ) -> Result<(ElementwiseDispatch, ElementwiseDispatch)> {
+        self.ensure_f32(q, "run_attn_decode", "q")?;
+        self.validate_tensor_context(kt, "kt")?;
+        self.validate_tensor_context(v, "v")?;
+        self.ensure_f32(scratch, "run_attn_decode", "scratch")?;
+        self.ensure_f32(out, "run_attn_decode", "out")?;
+        if kt.dtype() != v.dtype() {
+            bail!(
+                "run_attn_decode: kt ({}) and v ({}) must share a storage type",
+                kt.dtype().name(),
+                v.dtype().name()
+            );
+        }
+        let kv_f16 = kt.dtype() == DType::F16;
+        let [kv_heads, kt_dh, t_max] = *kt.shape() else {
+            bail!(
+                "run_attn_decode: kt must be [H_kv, dh, T_max], got {:?}",
+                kt.shape()
+            );
+        };
+        let [v_heads, v_t, v_dh] = *v.shape() else {
+            bail!(
+                "run_attn_decode: v must be [H_kv, T_max, dh], got {:?}",
+                v.shape()
+            );
+        };
+        let dh = kt_dh;
+        if v_dh != dh || v_t != t_max || v_heads != kv_heads || kv_heads == 0 {
+            bail!(
+                "run_attn_decode: inconsistent caches kt {:?}, v {:?}",
+                kt.shape(),
+                v.shape()
+            );
+        }
+        if dh != 64 {
+            bail!("run_attn_decode: head dimension {dh} unsupported (compiled variant: 64)");
+        }
+        let heads_elems = kv_heads as u64 * dh as u64;
+        if q.is_empty() || !q.len().is_multiple_of(heads_elems) {
+            bail!(
+                "run_attn_decode: q length {} must be kv_heads*group*dh (kv_heads {kv_heads}, dh {dh})",
+                q.len()
+            );
+        }
+        let group = u32::try_from(q.len() / heads_elems)
+            .map_err(|_| anyhow::anyhow!("run_attn_decode: group exceeds u32"))?;
+        if group == 0 || group > 8 {
+            bail!("run_attn_decode: GQA group {group} unsupported (1..=8)");
+        }
+        if out.len() != q.len() {
+            bail!(
+                "run_attn_decode: out length {} must equal q length {}",
+                out.len(),
+                q.len()
+            );
+        }
+        if desc.kv_len == 0 || desc.kv_len > t_max {
+            bail!(
+                "run_attn_decode: kv_len {} out of range 1..={t_max}",
+                desc.kv_len
+            );
+        }
+        let num_chunks = attn_decode_num_chunks(desc.kv_len);
+        let needed = kv_heads as u64 * num_chunks as u64 * group as u64 * (dh as u64 + 2);
+        if scratch.len() < needed {
+            bail!(
+                "run_attn_decode: scratch length {} < required {needed} \
+                 (kv_heads {kv_heads} * chunks {num_chunks} * group {group} * (dh+2))",
+                scratch.len()
+            );
+        }
+        let pipes = self.elementwise()?;
+        let stage1_pipeline = if kv_f16 {
+            pipes.attn_decode_kv16_dh64.pipeline
+        } else {
+            pipes.attn_decode_dh64.pipeline
+        };
+        let stage1 = self.plan_elementwise(
+            stage1_pipeline,
+            &AttnDecodePc {
+                kv_len: desc.kv_len,
+                num_chunks,
+                group,
+                t_max,
+                scale: desc.scale,
+                _pad0: 0,
+                q_ptr: q.device_address(),
+                kt_ptr: kt.device_address(),
+                v_ptr: v.device_address(),
+                scratch_ptr: scratch.device_address(),
+            },
+            num_chunks,
+            kv_heads,
+        )?;
+        let combine = self.plan_elementwise(
+            pipes.attn_decode_combine.pipeline,
+            &AttnCombinePc {
+                num_chunks,
+                group,
+                dh,
+                _pad0: 0,
+                scratch_ptr: scratch.device_address(),
+                out_ptr: out.device_address(),
+            },
+            kv_heads * group,
+            1,
+        )?;
+        Ok((stage1, combine))
+    }
+
     /// Strided 3D copy (see [`CopyDesc`]): covers transpose/permute,
     /// KV-cache append, head reshaping, and sub-matrix extraction.
     /// `src` and `dst` must be different tensors — invocations are
@@ -900,5 +1153,9 @@ unsafe impl bytemuck::Pod for CopyPc {}
 unsafe impl bytemuck::Zeroable for CopyPc {}
 unsafe impl bytemuck::Pod for FlashPc {}
 unsafe impl bytemuck::Zeroable for FlashPc {}
+unsafe impl bytemuck::Pod for AttnDecodePc {}
+unsafe impl bytemuck::Zeroable for AttnDecodePc {}
+unsafe impl bytemuck::Pod for AttnCombinePc {}
+unsafe impl bytemuck::Zeroable for AttnCombinePc {}
 unsafe impl bytemuck::Pod for BinaryPc {}
 unsafe impl bytemuck::Zeroable for BinaryPc {}

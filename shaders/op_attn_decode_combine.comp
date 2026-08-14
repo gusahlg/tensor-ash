@@ -1,0 +1,74 @@
+#version 460
+// Split-K decode attention, stage 2: merge the per-chunk partials.
+//
+// One workgroup per output row (grid x = kv_heads * group).  Stage 1
+// left `num_chunks` partial online-softmax states per row in scratch
+// ([kv_heads, num_chunks, group, dh+2] f32, m at [dh], l at [dh+1]);
+// the exact combined row is
+//
+//   m* = max_i m_i,   w_i = exp(m_i - m*)
+//   out[d] = sum_i acc_i[d] * w_i / sum_i l_i * w_i
+//
+// Empty chunks carry the identity (m ~ -inf, l = 0) and drop out via
+// w_i = 0.  Chunk weights are precomputed once into registers, then
+// 64 threads stride the head dimension.  `dh` is a runtime value, so
+// one compiled kernel serves every head size.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const uint MAX_CHUNKS = 32u;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32ReadWrite {
+    float v[];
+};
+
+layout(push_constant) uniform PC {
+    uint num_chunks;
+    uint group;
+    uint dh;
+    uint _pad0;
+    F32ReadOnly scratch_ptr;
+    F32ReadWrite out_ptr;
+} pc;
+
+void main() {
+    const uint row_id = gl_WorkGroupID.x; // kv_head * group + row
+    const uint tid = gl_LocalInvocationID.x;
+    const uint kv_head = row_id / pc.group;
+    const uint row = row_id % pc.group;
+    const uint stride = pc.dh + 2u;
+    const uint row_base =
+        (kv_head * pc.num_chunks * pc.group + row) * stride;
+    const uint chunk_step = pc.group * stride;
+
+    // Every thread computes the (tiny) chunk-weight prologue
+    // redundantly; num_chunks <= 32 reads.
+    float m_star = -3.402823466e38;
+    for (uint i = 0u; i < pc.num_chunks; ++i) {
+        m_star = max(m_star, pc.scratch_ptr.v[row_base + i * chunk_step + pc.dh]);
+    }
+    float w[MAX_CHUNKS];
+    float l_total = 0.0;
+    for (uint i = 0u; i < pc.num_chunks; ++i) {
+        const uint base = row_base + i * chunk_step;
+        w[i] = exp(pc.scratch_ptr.v[base + pc.dh] - m_star);
+        l_total = fma(pc.scratch_ptr.v[base + pc.dh + 1u], w[i], l_total);
+    }
+    const float inv = l_total > 0.0 ? 1.0 / l_total : 0.0;
+
+    for (uint d = tid; d < pc.dh; d += 64u) {
+        float num = 0.0;
+        for (uint i = 0u; i < pc.num_chunks; ++i) {
+            num = fma(pc.scratch_ptr.v[row_base + i * chunk_step + d], w[i], num);
+        }
+        pc.out_ptr.v[row_id * pc.dh + d] = num * inv;
+    }
+}

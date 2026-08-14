@@ -11,8 +11,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use tensor_ash::{
-    Activation, BinaryOp, CopyDesc, Epilogue, EpilogueBinary, ExecOp, Executor, FlashAttentionDesc,
-    MatmulCall, MatmulOp, RopeDesc, SoftmaxMask, Tensor, VulkanContext,
+    ATTN_DECODE_MAX_CHUNKS, Activation, AttnDecodeDesc, BinaryOp, CopyDesc, Epilogue,
+    EpilogueBinary, ExecOp, Executor, FlashAttentionDesc, MatmulCall, MatmulOp, RopeDesc,
+    SoftmaxMask, Tensor, VulkanContext,
 };
 
 use crate::gguf::{GGML_TYPE_F32, GgufFile};
@@ -64,6 +65,9 @@ struct Scratch {
     attn_heads: Tensor,
     /// Decode only: [kv_heads, group, t_max] score rows.
     scores: Option<Tensor>,
+    /// Decode only: split-K partials for the fused attention op,
+    /// [kv_heads * MAX_CHUNKS * group * (dh+2)] f32.
+    attn_partials: Option<Tensor>,
     /// Decode only: same memory order as `q_heads`/`attn_heads` but
     /// shaped [heads, 1, dh] for the flash-decode variant.
     q_flash: Option<Tensor>,
@@ -83,12 +87,14 @@ impl Scratch {
         let (h, f, kv) = (cfg.embd, cfg.ffn, cfg.kv_heads * cfg.dh);
         let dev = |shape: &[u32]| Tensor::uninit_device(ctx, shape);
         let decode = t == 1;
-        let (q_heads, attn_heads, scores, q_flash, attn_flash) = if decode {
+        let (q_heads, attn_heads, scores, attn_partials, q_flash, attn_flash) = if decode {
             let group = cfg.heads / cfg.kv_heads;
+            let partials_len = cfg.kv_heads * ATTN_DECODE_MAX_CHUNKS * group * (cfg.dh + 2);
             (
                 dev(&[cfg.kv_heads, group, cfg.dh])?,
                 dev(&[cfg.kv_heads, group, cfg.dh])?,
                 Some(dev(&[cfg.kv_heads, group, cfg.t_max])?),
+                Some(dev(&[partials_len])?),
                 Some(dev(&[cfg.heads, 1, cfg.dh])?),
                 Some(dev(&[cfg.heads, 1, cfg.dh])?),
             )
@@ -96,6 +102,7 @@ impl Scratch {
             (
                 dev(&[cfg.heads, t, cfg.dh])?,
                 dev(&[cfg.heads, t, cfg.dh])?,
+                None,
                 None,
                 None,
                 None,
@@ -112,6 +119,7 @@ impl Scratch {
             q_heads,
             attn_heads,
             scores,
+            attn_partials,
             q_flash,
             attn_flash,
             attn_flat: dev(&[t, h])?,
@@ -144,6 +152,9 @@ pub struct Model {
     /// overrides the default (graph: the whole token as one
     /// submission).
     decode_mode: DecodeMode,
+    /// Fused split-K decode attention (default when dh == 64).
+    /// `LLAMA_ASH_ATTN=composed` restores the scores/softmax/PV trio.
+    fused_attn: bool,
     /// Per-op-class GPU nanoseconds for the current perop decode step
     /// (diagnostics; filled when `LLAMA_ASH_BREAKDOWN=1`).
     pub breakdown: std::cell::RefCell<Vec<(&'static str, u64)>>,
@@ -378,6 +389,18 @@ impl Model {
                 Ok("composed") | Ok("perop") => DecodeMode::PerOp,
                 Ok("graph") | Err(_) => DecodeMode::Graph,
                 Ok(other) => bail!("LLAMA_ASH_DECODE must be graph, perop, or flash, got {other}"),
+            },
+            // The fused split-K decode-attention op ships a dh64
+            // kernel only; dh128 models keep the composed trio.
+            fused_attn: match std::env::var("LLAMA_ASH_ATTN").as_deref() {
+                Ok("composed") => false,
+                Ok("fused") | Err(_) => {
+                    if dh != 64 {
+                        log::info!("fused decode attention needs dh 64 (have {dh}); composed path");
+                    }
+                    dh == 64
+                }
+                Ok(other) => bail!("LLAMA_ASH_ATTN must be fused or composed, got {other}"),
             },
         })
     }
@@ -802,22 +825,38 @@ impl Model {
                     dst_strides: [1, t_max * dh, dh],
                 },
             });
-            ops.push(ExecOp::Matmul(MatmulOp::new(mm(
-                &q_gqa,
-                &layer.kt_cache,
-                scores,
-            ))));
-            ops.push(ExecOp::SoftmaxRows {
-                input: scores,
-                output: scores,
-                scale: 1.0 / (dh as f32).sqrt(),
-                mask: SoftmaxMask::Prefix { valid: pos + 1 },
-            });
-            ops.push(ExecOp::Matmul(MatmulOp::new(mm(
-                scores,
-                &layer.v_cache,
-                &attn_gqa,
-            ))));
+            if self.fused_attn {
+                // 2 dispatches instead of 3, no scores round-trip, and
+                // only the valid cache prefix is read.
+                ops.push(ExecOp::AttnDecode {
+                    q: &q_gqa,
+                    kt: &layer.kt_cache,
+                    v: &layer.v_cache,
+                    scratch: s.attn_partials.as_ref().unwrap(),
+                    out: &attn_gqa,
+                    desc: AttnDecodeDesc {
+                        kv_len: pos + 1,
+                        scale: 1.0 / (dh as f32).sqrt(),
+                    },
+                });
+            } else {
+                ops.push(ExecOp::Matmul(MatmulOp::new(mm(
+                    &q_gqa,
+                    &layer.kt_cache,
+                    scores,
+                ))));
+                ops.push(ExecOp::SoftmaxRows {
+                    input: scores,
+                    output: scores,
+                    scale: 1.0 / (dh as f32).sqrt(),
+                    mask: SoftmaxMask::Prefix { valid: pos + 1 },
+                });
+                ops.push(ExecOp::Matmul(MatmulOp::new(mm(
+                    scores,
+                    &layer.v_cache,
+                    &attn_gqa,
+                ))));
+            }
             ops.push(ExecOp::Matmul(MatmulOp::with_epilogue(
                 mm(&s.attn_flat, &layer.wo, &s.o),
                 Epilogue {
@@ -928,6 +967,25 @@ impl Model {
                 )?;
                 self.exec
                     .run_copy_strided(attn_flash, &s.attn_flat, straight(h))?;
+            } else if self.fused_attn {
+                // Fused split-K decode attention.  The GQA views of q
+                // and of the attention output are contiguous reshapes,
+                // so no copies bracket the op.
+                let (kv, group) = (self.cfg.kv_heads, self.cfg.heads / self.cfg.kv_heads);
+                let q_gqa = s.q.alias_with_shape(&[kv, group, dh])?;
+                let attn_gqa = s.attn_flat.alias_with_shape(&[kv, group, dh])?;
+                let stats = self.exec.run_attn_decode(
+                    &q_gqa,
+                    &layer.kt_cache,
+                    &layer.v_cache,
+                    s.attn_partials.as_ref().unwrap(),
+                    &attn_gqa,
+                    AttnDecodeDesc {
+                        kv_len: pos + 1,
+                        scale: 1.0 / (dh as f32).sqrt(),
+                    },
+                )?;
+                self.note("attn_decode", &stats);
             } else {
                 // Reshape q [1, embd] -> [kv_heads, group, dh] (same
                 // memory order): one batched matmul covers the GQA

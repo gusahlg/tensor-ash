@@ -11,6 +11,8 @@
 
 mod common;
 
+#[path = "correctness/attn_decode.rs"]
+mod attn_decode;
 #[path = "correctness/batch.rs"]
 mod batch;
 #[path = "correctness/decoder.rs"]
