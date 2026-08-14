@@ -96,12 +96,17 @@ fn bench(args: &Args) -> Result<()> {
         .chain((1..args.pp).map(|i| 100 + (i % 1000)))
         .collect();
 
-    // Warmup: burn in clocks with an untimed prefill, then reset.
+    // Warmup: burn in clocks with an untimed prefill plus decode steps
+    // (decode-sized dispatches warm that phase's pipelines), then reset.
     let (warm_id, warm_logits) = model.prefill(&prompt)?;
     if !warm_logits.iter().all(|v| v.is_finite()) {
         bail!("warmup prefill produced non-finite logits");
     }
-    log::info!("warmup prefill done (argmax {warm_id}); resetting caches");
+    let mut warm_next = warm_id;
+    for _ in 0..16 {
+        (warm_next, _) = model.decode(warm_next)?;
+    }
+    log::info!("warmup prefill + decode done (argmax {warm_id}); resetting caches");
     model.reset()?;
 
     let t0 = Instant::now();
