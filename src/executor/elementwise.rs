@@ -23,37 +23,50 @@ use crate::tensor::Tensor;
 use super::Executor;
 use super::splitk2::create_pc_only_layout;
 
-const SPIRV_SOFTMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_softmax_f32_row.spv"));
-const SPIRV_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_rmsnorm_f32.spv"));
-const SPIRV_ROPE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_rope_f32.spv"));
-const SPIRV_ROPE_SCATTER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/op_rope_scatter_f32.spv"));
-const SPIRV_ROPE_SCATTER_TO_F16: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/op_rope_scatter_f32_to_f16.spv"));
-const SPIRV_COPY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_copy_strided_f32.spv"));
-const SPIRV_BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_binary_f32.spv"));
-const SPIRV_COPY_TO_F16: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/op_copy_strided_f32_to_f16.spv"));
-const SPIRV_FLASH_KV16_DH64: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/op_flash_attention_kv16_dh64.spv"
-));
-const SPIRV_FLASH_KV16_DH128: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/op_flash_attention_kv16_dh128.spv"
-));
-const SPIRV_FLASH_DH64: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/op_flash_attention_dh64.spv"));
-const SPIRV_FLASH_DH128: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/op_flash_attention_dh128.spv"));
-const SPIRV_ATTN_DECODE_DH64: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/op_attn_decode_dh64.spv"));
-const SPIRV_ATTN_DECODE_KV16_DH64: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/op_attn_decode_kv16_dh64.spv"));
-const SPIRV_ATTN_DECODE_COMBINE: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/op_attn_decode_combine.spv"));
-const SPIRV_ARGMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_argmax_f32.spv"));
-const SPIRV_EMBED_GATHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_embed_gather.spv"));
+/// Declares the elementwise kernel set ONCE: the [`Op`] index enum and
+/// the same-order `(spirv, spec constants, debug label)` build table.
+/// Adding a kernel is one line here plus its dispatch site.
+macro_rules! op_kernels {
+    ($($variant:ident => ($file:literal, $spec:expr, $label:literal)),+ $(,)?) => {
+        /// Index of one compiled elementwise kernel (see `KERNELS`).
+        #[derive(Copy, Clone)]
+        enum Op { $($variant),+ }
+
+        impl Op {
+            const COUNT: usize = [$(Op::$variant),+].len();
+        }
+
+        /// Build inputs per [`Op`] variant, in declaration order.
+        const KERNELS: [(&[u8], &[u32], &str); Op::COUNT] = [
+            $((
+                include_bytes!(concat!(env!("OUT_DIR"), "/", $file, ".spv")),
+                $spec,
+                $label,
+            )),+
+        ];
+    };
+}
+
+op_kernels! {
+    Softmax => ("op_softmax_f32_row", &[], "op softmax"),
+    RmsNorm => ("op_rmsnorm_f32", &[0], "op rmsnorm"),
+    LayerNorm => ("op_rmsnorm_f32", &[1], "op layernorm"),
+    Rope => ("op_rope_f32", &[], "op rope"),
+    RopeScatter => ("op_rope_scatter_f32", &[], "op rope_scatter"),
+    RopeScatterToF16 => ("op_rope_scatter_f32_to_f16", &[], "op rope_scatter f32->f16"),
+    Copy => ("op_copy_strided_f32", &[], "op copy_strided"),
+    Binary => ("op_binary_f32", &[], "op binary"),
+    CopyToF16 => ("op_copy_strided_f32_to_f16", &[], "op copy_strided f32->f16"),
+    FlashDh64 => ("op_flash_attention_dh64", &[], "op flash_attention dh64"),
+    FlashDh128 => ("op_flash_attention_dh128", &[], "op flash_attention dh128"),
+    FlashKv16Dh64 => ("op_flash_attention_kv16_dh64", &[], "op flash_attention kv16 dh64"),
+    FlashKv16Dh128 => ("op_flash_attention_kv16_dh128", &[], "op flash_attention kv16 dh128"),
+    AttnDecodeDh64 => ("op_attn_decode_dh64", &[], "op attn_decode dh64"),
+    AttnDecodeKv16Dh64 => ("op_attn_decode_kv16_dh64", &[], "op attn_decode kv16 dh64"),
+    AttnDecodeCombine => ("op_attn_decode_combine", &[], "op attn_decode combine"),
+    Argmax => ("op_argmax_f32", &[], "op argmax"),
+    EmbedGather => ("op_embed_gather", &[], "op embed_gather"),
+}
 
 /// Threads per workgroup in every op shader.
 const WG: u32 = 256;
@@ -362,35 +375,22 @@ pub(super) struct ElementwiseDispatch {
     groups: (u32, u32),
 }
 
-pub(super) struct OpKernel {
+struct OpKernel {
     module: vk::ShaderModule,
-    pub(super) pipeline: vk::Pipeline,
+    pipeline: vk::Pipeline,
 }
 
 pub(super) struct ElementwisePipeline {
     ctx: Arc<VulkanContext>,
     layout: vk::PipelineLayout,
-    softmax: OpKernel,
-    pub(super) rmsnorm: OpKernel,
-    pub(super) layernorm: OpKernel,
-    rope: OpKernel,
-    rope_scatter: OpKernel,
-    rope_scatter_to_f16: OpKernel,
-    copy: OpKernel,
-    pub(super) binary: OpKernel,
-    copy_to_f16: OpKernel,
-    flash_dh64: OpKernel,
-    flash_dh128: OpKernel,
-    flash_kv16_dh64: OpKernel,
-    flash_kv16_dh128: OpKernel,
-    attn_decode_dh64: OpKernel,
-    attn_decode_kv16_dh64: OpKernel,
-    attn_decode_combine: OpKernel,
-    argmax: OpKernel,
-    embed_gather: OpKernel,
+    kernels: [OpKernel; Op::COUNT],
 }
 
 impl ElementwisePipeline {
+    fn pipeline(&self, op: Op) -> vk::Pipeline {
+        self.kernels[op as usize].pipeline
+    }
+
     pub(super) fn new(ctx: &Arc<VulkanContext>) -> Result<Self> {
         // One PC-only layout sized for the largest block (see
         // ELEMENTWISE_PC_BYTES); a range larger than a shader's
@@ -400,7 +400,7 @@ impl ElementwisePipeline {
         let layout_guard = scopeguard::guard(layout, |l| unsafe {
             ctx.device.destroy_pipeline_layout(l, None);
         });
-        let built: Vec<OpKernel> = Vec::with_capacity(18);
+        let built: Vec<OpKernel> = Vec::with_capacity(Op::COUNT);
         let mut built_guard = scopeguard::guard(built, |kernels| {
             for kernel in kernels {
                 unsafe {
@@ -409,82 +409,18 @@ impl ElementwisePipeline {
                 }
             }
         });
-        for (spv, spec, label) in [
-            (SPIRV_SOFTMAX, &[][..], "op softmax"),
-            (SPIRV_NORM, &[0u32][..], "op rmsnorm"),
-            (SPIRV_NORM, &[1u32][..], "op layernorm"),
-            (SPIRV_ROPE, &[][..], "op rope"),
-            (SPIRV_ROPE_SCATTER, &[][..], "op rope_scatter"),
-            (
-                SPIRV_ROPE_SCATTER_TO_F16,
-                &[][..],
-                "op rope_scatter f32->f16",
-            ),
-            (SPIRV_COPY, &[][..], "op copy_strided"),
-            (SPIRV_BINARY, &[][..], "op binary"),
-            (SPIRV_COPY_TO_F16, &[][..], "op copy_strided f32->f16"),
-            (SPIRV_FLASH_DH64, &[][..], "op flash_attention dh64"),
-            (SPIRV_FLASH_DH128, &[][..], "op flash_attention dh128"),
-            (
-                SPIRV_FLASH_KV16_DH64,
-                &[][..],
-                "op flash_attention kv16 dh64",
-            ),
-            (
-                SPIRV_FLASH_KV16_DH128,
-                &[][..],
-                "op flash_attention kv16 dh128",
-            ),
-            (SPIRV_ATTN_DECODE_DH64, &[][..], "op attn_decode dh64"),
-            (
-                SPIRV_ATTN_DECODE_KV16_DH64,
-                &[][..],
-                "op attn_decode kv16 dh64",
-            ),
-            (SPIRV_ATTN_DECODE_COMBINE, &[][..], "op attn_decode combine"),
-            (SPIRV_ARGMAX, &[][..], "op argmax"),
-            (SPIRV_EMBED_GATHER, &[][..], "op embed_gather"),
-        ] {
+        for (spv, spec, label) in KERNELS {
             let (module, pipeline) =
                 crate::pipeline::build_compute_pipeline(ctx, layout, spec, spv, label)?;
             built_guard.push(OpKernel { module, pipeline });
         }
-        let built = scopeguard::ScopeGuard::into_inner(built_guard);
-        let mut it = built.into_iter();
-        #[rustfmt::skip]
-        let (softmax, rmsnorm, layernorm, rope, rope_scatter, rope_scatter_to_f16,
-            copy, binary, copy_to_f16,
-            flash_dh64, flash_dh128, flash_kv16_dh64, flash_kv16_dh128,
-            attn_decode_dh64, attn_decode_kv16_dh64, attn_decode_combine,
-            argmax, embed_gather) = (
-            it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
-            it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
-            it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
-            it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
-            it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
-            it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
-        );
+        let kernels = scopeguard::ScopeGuard::into_inner(built_guard)
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("KERNELS has Op::COUNT entries"));
         Ok(Self {
             ctx: Arc::clone(ctx),
             layout: scopeguard::ScopeGuard::into_inner(layout_guard),
-            softmax,
-            rmsnorm,
-            layernorm,
-            rope,
-            rope_scatter,
-            rope_scatter_to_f16,
-            copy,
-            binary,
-            copy_to_f16,
-            flash_dh64,
-            flash_dh128,
-            flash_kv16_dh64,
-            flash_kv16_dh128,
-            attn_decode_dh64,
-            attn_decode_kv16_dh64,
-            attn_decode_combine,
-            argmax,
-            embed_gather,
+            kernels,
         })
     }
 }
@@ -493,26 +429,7 @@ impl Drop for ElementwisePipeline {
     fn drop(&mut self) {
         unsafe {
             let _ = self.ctx.device.device_wait_idle();
-            for kernel in [
-                &self.softmax,
-                &self.rmsnorm,
-                &self.layernorm,
-                &self.rope,
-                &self.rope_scatter,
-                &self.rope_scatter_to_f16,
-                &self.copy,
-                &self.binary,
-                &self.copy_to_f16,
-                &self.flash_dh64,
-                &self.flash_dh128,
-                &self.flash_kv16_dh64,
-                &self.flash_kv16_dh128,
-                &self.attn_decode_dh64,
-                &self.attn_decode_kv16_dh64,
-                &self.attn_decode_combine,
-                &self.argmax,
-                &self.embed_gather,
-            ] {
+            for kernel in &self.kernels {
                 self.ctx.device.destroy_pipeline(kernel.pipeline, None);
                 self.ctx.device.destroy_shader_module(kernel.module, None);
             }
@@ -548,6 +465,18 @@ impl Executor {
         self.validate_tensor_context(tensor, operand)?;
         if tensor.dtype() != DType::F32 {
             bail!("{op}: {operand} must be f32 storage");
+        }
+        Ok(())
+    }
+
+    /// Shared in-place-capable shape check: `output` must match `input`.
+    fn ensure_same_shape(op: &str, input: &Tensor, output: &Tensor) -> Result<()> {
+        if input.shape() != output.shape() {
+            bail!(
+                "{op}: output shape {:?} must equal input shape {:?}",
+                output.shape(),
+                input.shape()
+            );
         }
         Ok(())
     }
@@ -655,13 +584,7 @@ impl Executor {
     ) -> Result<ElementwiseDispatch> {
         self.ensure_f32(input, "run_softmax_rows", "input")?;
         self.ensure_f32(output, "run_softmax_rows", "output")?;
-        if input.shape() != output.shape() {
-            bail!(
-                "run_softmax_rows: output shape {:?} must equal input shape {:?}",
-                output.shape(),
-                input.shape()
-            );
-        }
+        Self::ensure_same_shape("run_softmax_rows", input, output)?;
         let (rows, cols) = rows_cols(input, "run_softmax_rows")?;
         let (valid_base, rows_per_group, causal) = match mask {
             SoftmaxMask::Full => (cols, 1, 0),
@@ -678,7 +601,7 @@ impl Executor {
                 (prefix, rows_per_group, 1)
             }
         };
-        let pipeline = self.elementwise()?.softmax.pipeline;
+        let pipeline = self.elementwise()?.pipeline(Op::Softmax);
         self.plan_elementwise(
             pipeline,
             &SoftmaxPc {
@@ -705,11 +628,7 @@ impl Executor {
         output: &Tensor,
         eps: f32,
     ) -> Result<RunStats> {
-        let pipeline = self
-            .norm_common("run_rms_norm", input, weight, None, output)?
-            .rmsnorm
-            .pipeline;
-        let dispatch = self.plan_norm(pipeline, input, weight, None, output, eps)?;
+        let dispatch = self.plan_norm("run_rms_norm", input, weight, None, output, eps)?;
         self.submit_one_elementwise(dispatch)
     }
 
@@ -723,36 +642,30 @@ impl Executor {
         output: &Tensor,
         eps: f32,
     ) -> Result<RunStats> {
-        let pipeline = self
-            .norm_common("run_layer_norm", input, weight, Some(bias), output)?
-            .layernorm
-            .pipeline;
-        let dispatch = self.plan_norm(pipeline, input, weight, Some(bias), output, eps)?;
+        let dispatch = self.plan_norm("run_layer_norm", input, weight, Some(bias), output, eps)?;
         self.submit_one_elementwise(dispatch)
     }
 
-    pub(super) fn norm_common(
+    /// Validate and plan one norm dispatch: RMSNorm when `bias` is
+    /// `None`, LayerNorm when `Some` (the two specializations of the
+    /// same shader).
+    pub(super) fn plan_norm(
         &self,
         op: &str,
         input: &Tensor,
         weight: &Tensor,
         bias: Option<&Tensor>,
         output: &Tensor,
-    ) -> Result<&ElementwisePipeline> {
+        eps: f32,
+    ) -> Result<ElementwiseDispatch> {
         self.ensure_f32(input, op, "input")?;
         self.ensure_f32(weight, op, "weight")?;
         self.ensure_f32(output, op, "output")?;
         if let Some(bias) = bias {
             self.ensure_f32(bias, op, "bias")?;
         }
-        if input.shape() != output.shape() {
-            bail!(
-                "{op}: output shape {:?} must equal input shape {:?}",
-                output.shape(),
-                input.shape()
-            );
-        }
-        let (_, cols) = rows_cols(input, op)?;
+        Self::ensure_same_shape(op, input, output)?;
+        let (rows, cols) = rows_cols(input, op)?;
         if weight.len() != cols as u64 {
             bail!("{op}: weight length {} != row length {cols}", weight.len());
         }
@@ -761,21 +674,13 @@ impl Executor {
         {
             bail!("{op}: bias length {} != row length {cols}", bias.len());
         }
-        self.elementwise()
-    }
-
-    pub(super) fn plan_norm(
-        &self,
-        pipeline: vk::Pipeline,
-        input: &Tensor,
-        weight: &Tensor,
-        bias: Option<&Tensor>,
-        output: &Tensor,
-        eps: f32,
-    ) -> Result<ElementwiseDispatch> {
-        let (rows, cols) = rows_cols(input, "norm")?;
+        let kernel = if bias.is_some() {
+            Op::LayerNorm
+        } else {
+            Op::RmsNorm
+        };
         self.plan_elementwise(
-            pipeline,
+            self.elementwise()?.pipeline(kernel),
             &NormPc {
                 rows,
                 cols,
@@ -850,16 +755,10 @@ impl Executor {
         self.ensure_f32(input, "run_rope", "input")?;
         self.ensure_f32(table, "run_rope", "table")?;
         self.ensure_f32(output, "run_rope", "output")?;
-        if input.shape() != output.shape() {
-            bail!(
-                "run_rope: output shape {:?} must equal input shape {:?}",
-                output.shape(),
-                input.shape()
-            );
-        }
+        Self::ensure_same_shape("run_rope", input, output)?;
         let tokens = Self::rope_tokens("run_rope", input, table, desc)?;
         let pairs = tokens * desc.heads * (desc.rot_dim / 2);
-        let pipeline = self.elementwise()?.rope.pipeline;
+        let pipeline = self.elementwise()?.pipeline(Op::Rope);
         self.plan_elementwise(
             pipeline,
             &RopePc {
@@ -926,11 +825,10 @@ impl Executor {
             );
         }
         let pairs = tokens * desc.heads * (desc.rot_dim / 2);
-        let pipes = self.elementwise()?;
-        let pipeline = match dst.dtype() {
-            DType::F32 => pipes.rope_scatter.pipeline,
-            DType::F16 => pipes.rope_scatter_to_f16.pipeline,
-        };
+        let pipeline = self.elementwise()?.pipeline(match dst.dtype() {
+            DType::F32 => Op::RopeScatter,
+            DType::F16 => Op::RopeScatterToF16,
+        });
         self.plan_elementwise(
             pipeline,
             &RopeScatterPc {
@@ -1022,18 +920,17 @@ impl Executor {
                 desc.kv_len
             );
         }
-        let pipes = self.elementwise()?;
-        let (pipeline, rows_per_wg) = match (dh, kv_f16) {
-            (64, false) => (pipes.flash_dh64.pipeline, 128),
-            (128, false) => (pipes.flash_dh128.pipeline, 128),
-            (64, true) => (pipes.flash_kv16_dh64.pipeline, 128),
-            (128, true) => (pipes.flash_kv16_dh128.pipeline, 128),
+        let (kernel, rows_per_wg) = match (dh, kv_f16) {
+            (64, false) => (Op::FlashDh64, 128),
+            (128, false) => (Op::FlashDh128, 128),
+            (64, true) => (Op::FlashKv16Dh64, 128),
+            (128, true) => (Op::FlashKv16Dh128, 128),
             (other, _) => bail!(
                 "run_flash_attention: head dimension {other} unsupported (compiled variants: 64, 128)"
             ),
         };
         self.run_elementwise_2d(
-            pipeline,
+            self.elementwise()?.pipeline(kernel),
             &FlashPc {
                 t_q,
                 t_max,
@@ -1184,13 +1081,13 @@ impl Executor {
             );
         }
         let pipes = self.elementwise()?;
-        let stage1_pipeline = if kv_f16 {
-            pipes.attn_decode_kv16_dh64.pipeline
+        let stage1_kernel = if kv_f16 {
+            Op::AttnDecodeKv16Dh64
         } else {
-            pipes.attn_decode_dh64.pipeline
+            Op::AttnDecodeDh64
         };
         let stage1 = self.plan_elementwise(
-            stage1_pipeline,
+            pipes.pipeline(stage1_kernel),
             &AttnDecodePc {
                 kv_len: desc.kv_len,
                 num_chunks,
@@ -1208,7 +1105,7 @@ impl Executor {
             kv_heads,
         )?;
         let combine = self.plan_elementwise(
-            pipes.attn_decode_combine.pipeline,
+            pipes.pipeline(Op::AttnDecodeCombine),
             &AttnCombinePc {
                 num_chunks,
                 group,
@@ -1223,10 +1120,6 @@ impl Executor {
         Ok((stage1, combine))
     }
 
-    /// Strided 3D copy (see [`CopyDesc`]): covers transpose/permute,
-    /// KV-cache append, head reshaping, and sub-matrix extraction.
-    /// `src` and `dst` must be different tensors — invocations are
-    /// unordered, so overlapping in-place copies would race.
     /// Binary elementwise combine (see [`BinaryOp`]).  Shapes must
     /// have identical element counts; `out` may alias either input.
     pub fn run_binary(
@@ -1263,7 +1156,7 @@ impl Executor {
             BinaryOp::AddScaled { beta } => (0, beta),
             BinaryOp::SiluMul => (1, 0.0),
         };
-        let pipeline = self.elementwise()?.binary.pipeline;
+        let pipeline = self.elementwise()?.pipeline(Op::Binary);
         self.plan_elementwise(
             pipeline,
             &BinaryPc {
@@ -1280,6 +1173,10 @@ impl Executor {
         )
     }
 
+    /// Strided 3D copy (see [`CopyDesc`]): covers transpose/permute,
+    /// KV-cache append, head reshaping, and sub-matrix extraction.
+    /// `src` and `dst` must be different tensors — invocations are
+    /// unordered, so overlapping in-place copies would race.
     pub fn run_copy_strided(&self, src: &Tensor, dst: &Tensor, desc: CopyDesc) -> Result<RunStats> {
         let dispatch = self.plan_copy_strided(src, dst, desc)?;
         self.submit_one_elementwise(dispatch)
@@ -1327,10 +1224,10 @@ impl Executor {
         }
         let total = u32::try_from(extent_product)
             .map_err(|_| anyhow::anyhow!("run_copy_strided: extent product exceeds u32"))?;
-        let pipeline = match dst.dtype() {
-            DType::F32 => self.elementwise()?.copy.pipeline,
-            DType::F16 => self.elementwise()?.copy_to_f16.pipeline,
-        };
+        let pipeline = self.elementwise()?.pipeline(match dst.dtype() {
+            DType::F32 => Op::Copy,
+            DType::F16 => Op::CopyToF16,
+        });
         self.plan_elementwise(
             pipeline,
             &CopyPc {
@@ -1379,7 +1276,7 @@ impl Executor {
         if n == 0 {
             bail!("run_argmax: input is empty");
         }
-        let pipeline = self.elementwise()?.argmax.pipeline;
+        let pipeline = self.elementwise()?.pipeline(Op::Argmax);
         // ONE workgroup: 256 threads stride the n elements, then a
         // shared tree reduce — at n = 32000 the whole op is ~4 us.
         self.plan_elementwise(
@@ -1438,7 +1335,7 @@ impl Executor {
         if out.len() != embd as u64 {
             bail!("run_embed_gather: out length {} != embd {embd}", out.len());
         }
-        let pipeline = self.elementwise()?.embed_gather.pipeline;
+        let pipeline = self.elementwise()?.pipeline(Op::EmbedGather);
         self.plan_elementwise(
             pipeline,
             &EmbedGatherPc {
