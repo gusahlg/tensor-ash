@@ -102,22 +102,18 @@ fn bench(args: &Args) -> Result<()> {
     if !warm_logits.iter().all(|v| v.is_finite()) {
         bail!("warmup prefill produced non-finite logits");
     }
-    let mut warm_next = warm_id;
-    for _ in 0..16 {
-        (warm_next, _) = model.decode(warm_next)?;
-    }
+    model.decode_many(warm_id, 16)?;
     log::info!("warmup prefill + decode done (argmax {warm_id}); resetting caches");
     model.reset()?;
 
     let t0 = Instant::now();
-    let (mut next, _) = model.prefill(&prompt)?;
+    let (next, _) = model.prefill(&prompt)?;
     let prefill_s = t0.elapsed().as_secs_f64();
 
     let t1 = Instant::now();
-    for _ in 0..args.tg {
-        (next, _) = model.decode(next)?;
-    }
+    let generated = model.decode_many(next, args.tg)?;
     let decode_s = t1.elapsed().as_secs_f64();
+    let next = generated.last().copied().unwrap_or(next);
 
     // Per-op-class GPU-time breakdown of one decode step (perop mode
     // records per-dispatch GPU timestamps; graph mode cannot split
@@ -187,10 +183,8 @@ fn generate(args: &Args) -> Result<()> {
 
     let mut generated = vec![first];
     let t1 = Instant::now();
-    while generated.len() < args.n as usize {
-        let (next, _) = model.decode(*generated.last().unwrap())?;
-        generated.push(next);
-    }
+    let rest = model.decode_many(first, (args.n as usize).saturating_sub(1) as u32)?;
+    generated.extend(rest);
     let decode_s = t1.elapsed().as_secs_f64();
 
     let ids: Vec<String> = generated.iter().map(u32::to_string).collect();

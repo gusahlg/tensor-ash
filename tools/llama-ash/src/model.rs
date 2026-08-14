@@ -12,8 +12,8 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail, ensure};
 use tensor_ash::{
     ATTN_DECODE_MAX_CHUNKS, Activation, AttnDecodeDesc, BinaryOp, CopyDesc, Epilogue,
-    EpilogueBinary, ExecOp, Executor, FlashAttentionDesc, MatmulCall, MatmulOp, RopeDesc,
-    RopeScatterDesc, SoftmaxMask, Tensor, VulkanContext,
+    EpilogueBinary, ExecOp, Executor, FlashAttentionDesc, MatmulCall, MatmulOp, PosBuffer,
+    RopeDesc, RopeScatterDesc, SoftmaxMask, Tensor, VulkanContext,
 };
 
 use crate::gguf::{GGML_TYPE_F32, GgufFile};
@@ -72,6 +72,10 @@ struct Scratch {
     /// shaped [heads, 1, dh] for the flash-decode variant.
     q_flash: Option<Tensor>,
     attn_flash: Option<Tensor>,
+    /// Decode only: free contiguous reshapes of `q` / `attn_flat` to
+    /// [kv_heads, group, dh] for the fused GQA attention op.
+    q_gqa: Option<Tensor>,
+    attn_gqa: Option<Tensor>,
     attn_flat: Tensor,
     o: Tensor,
     on: Tensor,
@@ -87,6 +91,17 @@ impl Scratch {
         let (h, f, kv) = (cfg.embd, cfg.ffn, cfg.kv_heads * cfg.dh);
         let dev = |shape: &[u32]| Tensor::uninit_device(ctx, shape);
         let decode = t == 1;
+        let q = dev(&[t, h])?;
+        let attn_flat = dev(&[t, h])?;
+        let (q_gqa, attn_gqa) = if decode {
+            let group = cfg.heads / cfg.kv_heads;
+            (
+                Some(q.alias_with_shape(&[cfg.kv_heads, group, cfg.dh])?),
+                Some(attn_flat.alias_with_shape(&[cfg.kv_heads, group, cfg.dh])?),
+            )
+        } else {
+            (None, None)
+        };
         let (q_heads, attn_heads, scores, attn_partials, q_flash, attn_flash) = if decode {
             let group = cfg.heads / cfg.kv_heads;
             let partials_len = cfg.kv_heads * ATTN_DECODE_MAX_CHUNKS * group * (cfg.dh + 2);
@@ -113,7 +128,7 @@ impl Scratch {
             x_a: dev(&[t, h])?,
             x_b: dev(&[t, h])?,
             xn: dev(&[t, h])?,
-            q: dev(&[t, h])?,
+            q,
             k: dev(&[t, kv])?,
             v: dev(&[t, kv])?,
             q_heads,
@@ -122,7 +137,9 @@ impl Scratch {
             attn_partials,
             q_flash,
             attn_flash,
-            attn_flat: dev(&[t, h])?,
+            q_gqa,
+            attn_gqa,
+            attn_flat,
             o: dev(&[t, h])?,
             on: dev(&[t, h])?,
             up: dev(&[t, f])?,
@@ -148,9 +165,12 @@ pub struct Model {
     pub pos: u32,
     decode_scratch: Scratch,
     prefill_scratch: Option<Scratch>,
-    /// Decode strategy.  `LLAMA_ASH_DECODE=graph|perop|flash`
-    /// overrides the default (graph: the whole token as one
-    /// submission).
+    /// The 4-byte device-readable position cell the prepared decode
+    /// graph reads; the host bumps it between replays.
+    pos_buf: PosBuffer,
+    /// Decode strategy.  `LLAMA_ASH_DECODE=prepared|graph|perop|flash`
+    /// overrides the default (prepared: record the token's command
+    /// buffer once, replay it per token via the position buffer).
     decode_mode: DecodeMode,
     /// Fused split-K decode attention (default when dh == 64).
     /// `LLAMA_ASH_ATTN=composed` restores the scores/softmax/PV trio.
@@ -162,12 +182,27 @@ pub struct Model {
 
 #[derive(Copy, Clone, PartialEq)]
 enum DecodeMode {
-    /// One `run_exec_ops` submission per token (default).
+    /// Record the whole token ONCE, replay per token (default): the
+    /// position-dependent values are read from a device-side position
+    /// buffer, so a decode step costs one `vkQueueSubmit` with zero
+    /// host-side re-recording.  Requires the fused decode attention.
+    Prepared,
+    /// One `run_exec_ops` submission per token, re-recorded each call.
     Graph,
     /// The original per-op path: one submit + wait per dispatch.
     PerOp,
     /// Per-op with the fused flash kernel for attention.
     Flash,
+}
+
+/// Greedy sampling: index of the largest logit.
+fn argmax(logits: &[f32]) -> Result<u32> {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i as u32)
+        .context("empty logits")
 }
 
 /// GGML row-major [n_out][n_in] -> tensor-ash [n_in][n_out].
@@ -370,6 +405,7 @@ impl Model {
         exec.upload(&table, &rope_table)?;
 
         let decode_scratch = Scratch::new(ctx, &cfg, 1)?;
+        let pos_buf = exec.create_pos_buffer()?;
         log::info!("model loaded in {:.2}s", start.elapsed().as_secs_f64());
         Ok(Self {
             ctx: ctx.clone(),
@@ -383,12 +419,16 @@ impl Model {
             pos: 0,
             decode_scratch,
             prefill_scratch: None,
+            pos_buf,
             breakdown: std::cell::RefCell::new(Vec::new()),
             decode_mode: match std::env::var("LLAMA_ASH_DECODE").as_deref() {
                 Ok("flash") => DecodeMode::Flash,
                 Ok("composed") | Ok("perop") => DecodeMode::PerOp,
-                Ok("graph") | Err(_) => DecodeMode::Graph,
-                Ok(other) => bail!("LLAMA_ASH_DECODE must be graph, perop, or flash, got {other}"),
+                Ok("graph") => DecodeMode::Graph,
+                Ok("prepared") | Err(_) => DecodeMode::Prepared,
+                Ok(other) => {
+                    bail!("LLAMA_ASH_DECODE must be prepared, graph, perop, or flash, got {other}")
+                }
             },
             // The fused split-K decode-attention op ships a dh64
             // kernel only; dh128 models keep the composed trio.
@@ -445,6 +485,7 @@ impl Model {
                 src_strides: [1, dh, kv * dh],
                 dst_offset: pos_base,
                 dst_strides: [t_max, dh * t_max, 1],
+                ..Default::default()
             },
         )?;
         self.note("kv_append", &stats);
@@ -458,6 +499,7 @@ impl Model {
                 src_strides: [1, dh, kv * dh],
                 dst_offset: pos_base * dh,
                 dst_strides: [1, t_max * dh, dh],
+                ..Default::default()
             },
         )?;
         self.note("kv_append", &stats);
@@ -499,6 +541,7 @@ impl Model {
             head_dim: dh,
             rot_dim: dh,
             pos_base: pos,
+            ..Default::default()
         };
         let stats = self
             .exec
@@ -512,6 +555,7 @@ impl Model {
             RopeScatterDesc {
                 dst_offset: pos,
                 dst_strides: [1, dh * t_max, t_max],
+                ..Default::default()
             },
         )?;
         self.note("rope_scatter", &stats);
@@ -524,6 +568,7 @@ impl Model {
                 src_strides: [1, dh, kv * dh],
                 dst_offset: pos * dh,
                 dst_strides: [1, t_max * dh, dh],
+                ..Default::default()
             },
         )?;
         self.note("kv_append", &stats);
@@ -549,6 +594,7 @@ impl Model {
             head_dim: self.cfg.dh,
             rot_dim: self.cfg.dh,
             pos_base,
+            ..Default::default()
         };
         let stats = self
             .exec
@@ -574,6 +620,7 @@ impl Model {
                 src_strides: [1, 0, 0],
                 dst_offset: 0,
                 dst_strides: [1, 0, 0],
+                ..Default::default()
             },
         )?;
         self.exec
@@ -588,13 +635,8 @@ impl Model {
         self.note("lm_head_mm", &stats);
         let mut logits = vec![0.0_f32; self.cfg.vocab as usize];
         self.exec.download(&s.logits, &mut logits)?;
-        let argmax = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(i, _)| i as u32)
-            .context("empty logits")?;
-        Ok((argmax, logits))
+        let best = argmax(&logits)?;
+        Ok((best, logits))
     }
 
     /// Prefill `tokens` starting from the current position (flash
@@ -641,6 +683,7 @@ impl Model {
                     src_strides: [1, heads * dh, dh],
                     dst_offset: 0,
                     dst_strides: [1, dh, t * dh],
+                    ..Default::default()
                 },
             )?;
             self.exec.run_flash_attention(
@@ -664,6 +707,7 @@ impl Model {
                     src_strides: [1, dh, t * dh],
                     dst_offset: 0,
                     dst_strides: [1, heads * dh, dh],
+                    ..Default::default()
                 },
             )?;
             self.mlp_block_into(layer, s, x_in, x_out)?;
@@ -818,7 +862,10 @@ impl Model {
     /// One greedy decode step for `token` at the current position.
     /// Returns the next token and its logits.
     pub fn decode(&mut self, token: u32) -> Result<(u32, Vec<f32>)> {
-        if self.decode_mode == DecodeMode::Graph {
+        // A single prepared step would pay the recording without any
+        // replays to amortize it; batch decoding goes through
+        // `decode_many`, so one-off steps take the graph path.
+        if matches!(self.decode_mode, DecodeMode::Graph | DecodeMode::Prepared) {
             return self.decode_graph(token);
         }
         self.decode_perop(token)
@@ -831,6 +878,76 @@ impl Model {
         let pos = self.pos;
         ensure!(pos < self.cfg.t_max, "KV cache overflow");
         let host_x = self.embed(&[token])?;
+        let s = &self.decode_scratch;
+        self.exec.upload(&host_x, &s.x_a)?;
+        let ops = self.decode_ops(s, pos, 0);
+        let stats = self.exec.run_exec_ops(&ops)?;
+        self.note("graph_total", &stats);
+        drop(ops);
+
+        let mut logits = vec![0.0_f32; self.cfg.vocab as usize];
+        self.exec.download(&s.logits, &mut logits)?;
+        let argmax = argmax(&logits)?;
+        self.pos = pos + 1;
+        Ok((argmax, logits))
+    }
+
+    /// Prepared decode: record the token's op chain ONCE, then replay
+    /// it for `n` greedy steps, bumping only the device-side position
+    /// buffer between submits — no host-side re-validation, planning,
+    /// or recording per token.  Falls back to per-token [`decode`]
+    /// (graph/perop/flash) when the mode or the fused attention
+    /// requirement says so.  Returns the `n` generated tokens.
+    ///
+    /// [`decode`]: Self::decode
+    pub fn decode_many(&mut self, mut token: u32, n: u32) -> Result<Vec<u32>> {
+        if self.decode_mode != DecodeMode::Prepared || !self.fused_attn {
+            let mut generated = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                (token, _) = self.decode(token)?;
+                generated.push(token);
+            }
+            return Ok(generated);
+        }
+        let start_pos = self.pos;
+        ensure!(start_pos + n <= self.cfg.t_max, "KV cache overflow");
+        let mut generated = Vec::with_capacity(n as usize);
+        {
+            let s = &self.decode_scratch;
+            // Pos-relative descs + the position buffer: one recording
+            // serves every token position.
+            let ops = self.decode_ops(s, 0, self.pos_buf.device_address());
+            let mut prepared = self.exec.prepare_exec_ops(&ops, Some(&self.pos_buf))?;
+            let mut logits = vec![0.0_f32; self.cfg.vocab as usize];
+            for i in 0..n {
+                let host_x = self.embed(&[token])?;
+                // The upload is its own submission on the same queue,
+                // so it is ordered before the replay; the position
+                // write is host-visible and becomes visible to the
+                // device at submit.
+                self.exec.upload(&host_x, &s.x_a)?;
+                self.pos_buf.set(start_pos + i)?;
+                let stats = prepared.run()?;
+                self.note("prepared_total", &stats);
+                self.exec.download(&s.logits, &mut logits)?;
+                token = argmax(&logits)?;
+                generated.push(token);
+            }
+        }
+        self.pos = start_pos + n;
+        Ok(generated)
+    }
+
+    /// Build the decode step's full op chain against `s`.
+    ///
+    /// `pos_addr == 0`: the literal `pos` is baked into the push
+    /// constants (the re-recorded graph path).  Non-zero `pos_addr`
+    /// (the [`PosBuffer`] address): the position-dependent values are
+    /// recorded in pos-relative form — RoPE bases 0, KV-append offsets
+    /// 0 with a per-position scale, attention `kv_len` 1 with the
+    /// fixed chunk grid — and the shaders add the buffered position at
+    /// execution time, which is what makes the recording replayable.
+    fn decode_ops<'a>(&'a self, s: &'a Scratch, pos: u32, pos_addr: u64) -> Vec<ExecOp<'a>> {
         let (h, dh, kv, t_max) = (
             self.cfg.embd,
             self.cfg.dh,
@@ -838,8 +955,13 @@ impl Model {
             self.cfg.t_max,
         );
         let eps = self.cfg.rms_eps;
-        let s = &self.decode_scratch;
-        self.exec.upload(&host_x, &s.x_a)?;
+        assert!(
+            pos_addr == 0 || self.fused_attn,
+            "pos-relative decode needs the fused attention (composed softmax has no pos read)"
+        );
+        // Position-dependent bases: zero when the position buffer
+        // supplies the offset at execution time.
+        let base = if pos_addr == 0 { pos } else { 0 };
 
         fn mm<'t>(a: &'t Tensor, b: &'t Tensor, c: &'t Tensor) -> MatmulCall<'t> {
             MatmulCall {
@@ -856,21 +978,22 @@ impl Model {
             src_strides: [1, 0, 0],
             dst_offset: 0,
             dst_strides: [1, 0, 0],
+            ..Default::default()
         };
         let rope = |heads| RopeDesc {
             heads,
             head_dim: dh,
             rot_dim: dh,
-            pos_base: pos,
+            pos_base: base,
+            pos_addr,
         };
 
         // Contiguous reshapes are free: the GQA-batched attention
         // views of q and of the attention output share memory with
         // their flat forms, eliminating two copy dispatches per layer.
-        let group = self.cfg.heads / kv;
-        let q_gqa = s.q.alias_with_shape(&[kv, group, dh])?;
-        let attn_gqa = s.attn_flat.alias_with_shape(&[kv, group, dh])?;
-        let mut ops: Vec<ExecOp<'_>> = Vec::with_capacity(self.layers.len() * 16 + 3);
+        let q_gqa = s.q_gqa.as_ref().unwrap();
+        let attn_gqa = s.attn_gqa.as_ref().unwrap();
+        let mut ops: Vec<ExecOp<'a>> = Vec::with_capacity(self.layers.len() * 16 + 3);
         let (mut x_in, mut x_out) = (&s.x_a, &s.x_b);
         for layer in &self.layers {
             let scores = s.scores.as_ref().unwrap();
@@ -901,8 +1024,10 @@ impl Model {
                 dst: &layer.kt_cache,
                 desc: rope(kv),
                 scatter: RopeScatterDesc {
-                    dst_offset: pos,
+                    dst_offset: base,
                     dst_strides: [1, dh * t_max, t_max],
+                    // Kt append: one column per position.
+                    pos_scale: 1,
                 },
             });
             ops.push(ExecOp::CopyStrided {
@@ -912,27 +1037,32 @@ impl Model {
                     extent: [dh, kv, 1],
                     src_offset: 0,
                     src_strides: [1, dh, kv * dh],
-                    dst_offset: pos * dh,
+                    dst_offset: base * dh,
                     dst_strides: [1, t_max * dh, dh],
+                    pos_addr,
+                    // V append: one dh-row per position.
+                    pos_scale: dh,
                 },
             });
             if self.fused_attn {
                 // 2 dispatches instead of 3, no scores round-trip, and
                 // only the valid cache prefix is read.
                 ops.push(ExecOp::AttnDecode {
-                    q: &q_gqa,
+                    q: q_gqa,
                     kt: &layer.kt_cache,
                     v: &layer.v_cache,
                     scratch: s.attn_partials.as_ref().unwrap(),
-                    out: &attn_gqa,
+                    out: attn_gqa,
                     desc: AttnDecodeDesc {
-                        kv_len: pos + 1,
+                        // Effective kv_len is base + 1 + buffered pos.
+                        kv_len: base + 1,
                         scale: 1.0 / (dh as f32).sqrt(),
+                        pos_addr,
                     },
                 });
             } else {
                 ops.push(ExecOp::Matmul(MatmulOp::new(mm(
-                    &q_gqa,
+                    q_gqa,
                     &layer.kt_cache,
                     scores,
                 ))));
@@ -945,7 +1075,7 @@ impl Model {
                 ops.push(ExecOp::Matmul(MatmulOp::new(mm(
                     scores,
                     &layer.v_cache,
-                    &attn_gqa,
+                    attn_gqa,
                 ))));
             }
             ops.push(ExecOp::Matmul(MatmulOp::with_epilogue(
@@ -1000,20 +1130,7 @@ impl Model {
             &self.lm_head,
             &s.logits,
         ))));
-        let stats = self.exec.run_exec_ops(&ops)?;
-        self.note("graph_total", &stats);
-        drop(ops);
-
-        let mut logits = vec![0.0_f32; self.cfg.vocab as usize];
-        self.exec.download(&s.logits, &mut logits)?;
-        let argmax = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(i, _)| i as u32)
-            .context("empty logits")?;
-        self.pos = pos + 1;
-        Ok((argmax, logits))
+        ops
     }
 
     /// One greedy decode step, per-op submission path (composed
@@ -1032,6 +1149,7 @@ impl Model {
             src_strides: [1, 0, 0],
             dst_offset: 0,
             dst_strides: [1, 0, 0],
+            ..Default::default()
         };
         for layer in &self.layers {
             self.qkv_fused_decode(layer, s, x_in, pos)?;
@@ -1071,6 +1189,7 @@ impl Model {
                     AttnDecodeDesc {
                         kv_len: pos + 1,
                         scale: 1.0 / (dh as f32).sqrt(),
+                        ..Default::default()
                     },
                 )?;
                 self.note("attn_decode", &stats);
