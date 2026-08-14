@@ -183,3 +183,47 @@ load-time only). Suite is now 78 GPU tests.
 **Direction check:** a decoder block now composes end-to-end in-library.
 Remaining: expose the five ops through the C ABI, then coopmat Phase B
 (tensor cores) for prompt-side compute.
+
+### 2026-08-14 — steps 6-8: C ABI model ops, TENSOR CORES, decoder-layer proof
+
+**C ABI ops (2351bfe):** the five model ops exported (37 total C entry
+points); smoke example checks rms_norm/masked-softmax/transpose on GPU.
+
+**Cooperative matrix (514006d) — the headline result.** KHR coopmat kernel
+(`f16w_coopmat_aligned`): 8 subgroups, 128×128×BK32 tile, 4×2 fragments of
+16×16×16 per subgroup, A f32→f16 (RNE) at shared staging, B f16 storage,
+f32 accumulate, uvec4-staged shared tiles with 16-byte skew (NVIDIA
+vk_cooperative_matrix_perf pattern). Strictly aligned by design — coopmat
+requires subgroup-uniform control flow, so ragged shapes keep the SIMT f16w
+route and the `_aligned` suffix reuses the existing host-side check.
+Measured (paired in-process, GPU medians):
+
+| shape | f32 (best DP) | coopmat | speedup | TF/s |
+|---|---|---|---|---|
+| 4096³ | 11.89 ms | **3.97 ms** | **3.0x** | **34.6** (~87% of TC f32-acc peak) |
+| 2048³ | 1.486 ms | 0.539 ms | 2.76x | 31.9 |
+| 1024³ | 0.188 ms | 0.093 ms | 2.0x | 23.0 |
+| 512³ | 0.037 ms | 0.035 ms | ~1.06x | — (occupancy floor; threshold M,N ≥ 256) |
+| prefill 512×4096×4096 | — | 0.579 ms | — | 29.7 |
+
+The library's f32 program ceiling was ~13 TF/s (63-68% of FFMA peak, v1.1
+analysis); tensor cores nearly triple it. Correctness pinned by a
+dual-rounded-reference test (f16×f16 products are exact in f32, so the
+standard `tolerance(k)` holds) covering batch, alpha, and accumulate.
+`ML_NO_COOPMAT=1` kill-switch; registry slot empty without the extension.
+
+**Decoder-layer proof (this commit):** one llama-style decode step composed
+entirely from library ops — RMSNorm → QKV (f16 weights) → RoPE → KV-cache
+append via strided copy → masked attention over the zero-padded cache →
+o_proj with fused residual → RMSNorm → SwiGLU MLP with fused gate/residual —
+matches an f64 CPU reference (observed error ~1e-5 vs 8×tolerance bound).
+Suite: 80 GPU tests.
+
+**Direction check:** the mandate is delivered — FP16 in two tiers (storage
+and tensor cores), a C ABI that can drive a real decoder, verified building
+blocks for llama-class models. Remaining ideas for future legs: coopmat
+BK/tile tuning + double buffering (the ~13% gap to TC peak), a fused
+flash-attention prefill kernel, lda/offset views to avoid padded-cache
+reads at long context, test-scaffolding dedup (~250-400 LOC), GEMM+norm
+op-graph integration so a whole layer replays as one PreparedOps command
+buffer.
