@@ -126,7 +126,11 @@ pub(super) fn run_case(
     let n = case.n;
     let k = case.k;
     let a = Tensor::uninit_device(ctx, &[bsz, m, k])?;
-    let b = Tensor::uninit_device(ctx, &[bsz, k, n])?;
+    let b = if case.b_f16 {
+        Tensor::uninit_device_f16(ctx, &[bsz, k, n])?
+    } else {
+        Tensor::uninit_device(ctx, &[bsz, k, n])?
+    };
     let c = Tensor::uninit_device(ctx, &[bsz, m, n])?;
     let mut h_a = vec![0.0f32; host_len(&[bsz, m, k])?];
     let mut h_b = vec![0.0f32; host_len(&[bsz, k, n])?];
@@ -134,6 +138,12 @@ pub(super) fn run_case(
     fill_det(&mut h_b, 11);
     exec.upload(&h_a, &a)?;
     exec.upload(&h_b, &b)?;
+    if case.b_f16 {
+        // Validation compares against exactly what the GPU stores.
+        for value in &mut h_b {
+            *value = tensor_ash::dtype::round_f32_via_f16(*value);
+        }
+    }
 
     let flops = 2.0f64 * bsz as f64 * m as f64 * n as f64 * k as f64;
     let split_k2 = env_u32("ML_SPLIT_K2", 0);
@@ -187,7 +197,7 @@ pub(super) fn run_case(
     };
     // Split factors below 2 execute the normal dispatch path, so report it.
     let dispatch = if split_k2 < 2 {
-        exec.dispatch_info(bsz, m, n, k)
+        exec.dispatch_info_for(bsz, m, n, k, case.b_f16)
     } else {
         tensor_ash::DispatchInfo::split_k2(m, n, split_k2)
     };
@@ -265,6 +275,7 @@ pub(super) fn single(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(20.3);
     let case = BenchCase {
+        b_f16: false,
         label: Cow::Owned(format!("B={b} M={m} N={n} K={k}")),
         b,
         m,

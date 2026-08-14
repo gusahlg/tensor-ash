@@ -103,7 +103,7 @@ impl Executor {
         // and per-submission, so it cannot live in a replayable buffer.
         let plans: Vec<OpPlan> = resolved
             .iter()
-            .map(|dims| self.plan_shape(dims.batch, dims.m, dims.n, dims.k, false))
+            .map(|dims| self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, false))
             .collect();
         if let Some(plan) = plans
             .iter()

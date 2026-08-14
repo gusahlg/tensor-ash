@@ -128,9 +128,23 @@ pub(crate) struct OpPlan {
 
 impl Executor {
     /// Report the kernel and optional tuned split-K2 route a plain,
-    /// non-accumulating matmul would use. Useful for benchmark diagnostics.
+    /// non-accumulating matmul (f32 B) would use. Useful for benchmark
+    /// diagnostics.
     pub fn dispatch_info(&self, batch: u32, m: u32, n: u32, k: u32) -> DispatchInfo {
-        let plan = self.plan_shape(batch, m, n, k, true);
+        self.dispatch_info_for(batch, m, n, k, false)
+    }
+
+    /// Like [`Self::dispatch_info`] with the B storage type explicit:
+    /// `b_f16 = true` reports the route for an f16-weights matmul.
+    pub fn dispatch_info_for(
+        &self,
+        batch: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+        b_f16: bool,
+    ) -> DispatchInfo {
+        let plan = self.plan_shape(batch, m, n, k, b_f16, true);
         let (kernel_name, tile) = match plan.splitk2 {
             Some(_) => splitk2::stage1_dispatch_info(m, n),
             None => {
@@ -156,25 +170,30 @@ impl Executor {
         m: u32,
         n: u32,
         k: u32,
+        b_f16: bool,
         splitk2_eligible: bool,
     ) -> OpPlan {
-        let (kernel, tuned) = self.pipeline.route(batch, m, n, k);
-        let splitk2 =
-            (splitk2_eligible && self.pipeline.is_auto() && self.ctx.buffer_device_address_enabled)
-                .then(|| {
-                    let heuristic = (tuned.is_none()
-                        && self.ctx.device_kind() == DeviceKind::DiscreteGpu)
-                        .then(|| splitk2::heuristic_splits(batch, m, n, k))
-                        .flatten();
-                    let splits = splitk2::resolve_auto_splits(tuned, heuristic)?;
-                    let max = self
-                        .ctx
-                        .device_properties
-                        .limits
-                        .max_compute_work_group_count;
-                    splitk2::auto_route_fits(max, batch, m, n, k, splits).then_some(splits)
-                })
-                .flatten();
+        let (kernel, tuned) = self.pipeline.route(batch, m, n, k, b_f16);
+        // Split-K2's stage-1 kernels read f32 B only, so f16-weight
+        // calls always take the data-parallel route.
+        let splitk2 = (splitk2_eligible
+            && !b_f16
+            && self.pipeline.is_auto()
+            && self.ctx.buffer_device_address_enabled)
+            .then(|| {
+                let heuristic = (tuned.is_none()
+                    && self.ctx.device_kind() == DeviceKind::DiscreteGpu)
+                    .then(|| splitk2::heuristic_splits(batch, m, n, k))
+                    .flatten();
+                let splits = splitk2::resolve_auto_splits(tuned, heuristic)?;
+                let max = self
+                    .ctx
+                    .device_properties
+                    .limits
+                    .max_compute_work_group_count;
+                splitk2::auto_route_fits(max, batch, m, n, k, splits).then_some(splits)
+            })
+            .flatten();
         OpPlan { kernel, splitk2 }
     }
 

@@ -85,6 +85,21 @@ pub(super) fn record_one_matmul(
         [kernel.tile_m, kernel.tile_n, kernel.tile_k],
         [dims.m, dims.n, dims.k],
     )?;
+    // Storage-type agreement: an f16w kernel would misread f32 bits
+    // and vice versa.  Auto routes always agree; this guards explicit
+    // ML_KERNEL selections.
+    if kernel.weights_f16() != dims.b_f16 {
+        bail!(
+            "kernel '{}' expects {} B storage but B is {} (pick an {} kernel or unset ML_KERNEL)",
+            kernel.name,
+            if kernel.weights_f16() { "f16" } else { "f32" },
+            if dims.b_f16 { "f16" } else { "f32" },
+            if dims.b_f16 { "f16w_*" } else { "f32" },
+        );
+    }
+    if dims.b_f16 && !ctx.buffer_device_address_enabled {
+        bail!("f16-weight matmuls require bufferDeviceAddress, which this device lacks");
+    }
 
     let call = &op.call;
     let max_groups = ctx.device_properties.limits.max_compute_work_group_count;

@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 
 use super::{MatmulCall, MatmulOp};
+use crate::dtype::DType;
 use crate::pipeline::MatmulPushConstants;
 use crate::tensor::Tensor;
 
@@ -85,6 +86,8 @@ pub(crate) struct ResolvedMatmul {
     pub batch_stride_b: u32,
     pub batch_stride_c: u32,
     pub total_flops: u64,
+    /// B is stored as f16; routes must pick an `f16w_*` kernel.
+    pub b_f16: bool,
 }
 
 pub(crate) enum ResolvedMatmulBatch {
@@ -113,11 +116,27 @@ impl ResolvedMatmulBatch {
 
 impl ResolvedMatmul {
     pub(crate) fn from_call(call: &MatmulCall<'_>) -> Result<Self> {
-        Self::from_matrix_shapes(
+        // Storage types: A and C must be f32; B may be f16 (weights).
+        // The f16 kernels convert B on load and accumulate in f32.
+        if call.a.dtype() != DType::F32 {
+            bail!(
+                "matmul A must be f32 storage (got {})",
+                call.a.dtype().name()
+            );
+        }
+        if call.c.dtype() != DType::F32 {
+            bail!(
+                "matmul C must be f32 storage (got {})",
+                call.c.dtype().name()
+            );
+        }
+        let mut resolved = Self::from_matrix_shapes(
             MatrixShape::from_tensor(call.a)?,
             MatrixShape::from_tensor(call.b)?,
             MatrixShape::from_tensor(call.c)?,
-        )
+        )?;
+        resolved.b_f16 = call.b.dtype() == DType::F16;
+        Ok(resolved)
     }
 
     pub(crate) fn from_op(op: &MatmulOp<'_>) -> Result<Self> {
@@ -129,15 +148,21 @@ impl ResolvedMatmul {
     fn validate_epilogue(&self, op: &MatmulOp<'_>) -> Result<()> {
         if let Some(bias) = op.epilogue.bias {
             self.validate_bias_shape(bias.shape())?;
+            if bias.dtype() != DType::F32 {
+                bail!("epilogue bias must be f32 storage");
+            }
         }
-        if let Some(d) = op.epilogue.d_tensor()
-            && d.shape() != op.call.c.shape()
-        {
-            bail!(
-                "epilogue D shape {:?} must equal C shape {:?}",
-                d.shape(),
-                op.call.c.shape()
-            );
+        if let Some(d) = op.epilogue.d_tensor() {
+            if d.shape() != op.call.c.shape() {
+                bail!(
+                    "epilogue D shape {:?} must equal C shape {:?}",
+                    d.shape(),
+                    op.call.c.shape()
+                );
+            }
+            if d.dtype() != DType::F32 {
+                bail!("epilogue D operand must be f32 storage");
+            }
         }
         Ok(())
     }
@@ -237,6 +262,7 @@ impl ResolvedMatmul {
             batch_stride_b: b.batch_stride("B")?,
             batch_stride_c: c.batch_stride("C")?,
             total_flops: checked_flops(c.batch, a.rows, b.cols, a.cols)?,
+            b_f16: false,
         })
     }
 }

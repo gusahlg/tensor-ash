@@ -14,6 +14,14 @@ pub struct KernelSpec {
     pub uses_descriptors: bool,
 }
 
+impl KernelSpec {
+    /// Whether the shader reads B as f16 storage (the `f16w_*` family).
+    #[inline]
+    pub fn weights_f16(&self) -> bool {
+        self.name.starts_with("f16w_")
+    }
+}
+
 /// Defines kernel identity once and derives the public selection enum,
 /// parser, stable registry order, and selection-to-registry mapping.
 macro_rules! kernel_catalog {
@@ -51,7 +59,7 @@ macro_rules! kernel_catalog {
                     "" | "auto" => Ok(Self::Auto),
                     $($($alias)|+ => Ok(Self::$variant),)+
                     other => bail!(
-                        "invalid ML_KERNEL '{other}', expected one of auto, large, small, m64n128, m128n64, m128n64k64, m64n32, k64, row_bda, col_bda, outer_bda, bk16, v2, m64n128k64, m128n128_t4, m256n64, v3, or any *_bda / *_bda_v4 variant"
+                        "invalid ML_KERNEL '{other}', expected one of auto, large, small, m64n128, m128n64, m128n64k64, m64n32, k64, row_bda, col_bda, outer_bda, bk16, v2, m64n128k64, m128n128_t4, m256n64, v3, any *_bda / *_bda_v4 variant, or an f16w_* kernel (f16 weights)"
                     ),
                 }
             }
@@ -169,6 +177,21 @@ kernel_catalog! {
     // loop keeps it general-shape correct when selected explicitly.
     OuterBda => ("outer_bda", 16, 128, 1, "matmul_f32_outer_bda.spv", false,
         ["outer_bda", "outer", "k1"]),
+    // f16-storage-B ("f16w_" = half-precision weights) siblings of the
+    // heuristic winners.  Same tiles and f32 accumulate; only global B
+    // traffic halves.  Requires `VulkanContext::f16_storage_enabled`;
+    // on devices without it these registry slots hold no pipelines.
+    F16wLargeBdaV4 => ("f16w_large_bda_v4", 128, 128, 32,
+        "matmul_f16w_large_bda_v4.spv", false, ["f16w_large_bda_v4", "f16w_large"]),
+    F16wSmallBdaV4 => ("f16w_small_bda_v4", 64, 64, 32,
+        "matmul_f16w_small_bda_v4.spv", false, ["f16w_small_bda_v4", "f16w_small"]),
+    F16wK64BdaV4 => ("f16w_k64_bda_v4", 64, 64, 64,
+        "matmul_f16w_k64_bda_v4.spv", false, ["f16w_k64_bda_v4", "f16w_k64"]),
+    F16wM128N64K64BdaV4 => ("f16w_m128n64k64_bda_v4", 128, 64, 64,
+        "matmul_f16w_m128n64k64_bda_v4.spv", false,
+        ["f16w_m128n64k64_bda_v4", "f16w_m128n64k64"]),
+    F16wRowBda => ("f16w_row_bda", 1, 32, 1, "matmul_f16w_row_bda.spv", false,
+        ["f16w_row_bda", "f16w_row"]),
 }
 
 #[cfg(test)]

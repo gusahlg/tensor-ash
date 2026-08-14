@@ -53,6 +53,11 @@ pub struct VulkanContext {
     /// this, Stream-K pipeline creation is rejected and callers fall
     /// back to the regular DP path.
     pub shader_buffer_float32_atomic_add_enabled: bool,
+    /// Whether `shaderFloat16` + `storageBuffer16BitAccess` were both
+    /// enabled.  Required for the f16-storage kernel variants; without
+    /// it f16 tensors are rejected at matmul time and the f16 kernels
+    /// are not built.
+    pub f16_storage_enabled: bool,
     /// Pipeline cache, seeded from disk on init and flushed back on drop.
     /// Persisting it avoids the SPIR-V -> ISA recompile (50-200 ms on
     /// NVIDIA) on every cold start.

@@ -107,3 +107,46 @@ vk_cooperative_matrix_perf, llama.cpp Vulkan backend, Vulkanised 2025):
   `khr::cooperative_matrix::Instance` at runtime; expect 16x8x8/16x8x16/
   16x16x16 f16·f16+f32 subgroup-scope. Env-var kill-switch pattern
   (llama.cpp `GGML_VK_DISABLE_COOPMAT`) worth copying.
+
+### 2026-08-14 — step 2: FP16 Phase A landed (f16 weights, f32 accumulate)
+
+**What:** `DType::{F32,F16}` on `Tensor` (`uninit_device_f16`), CPU RNE
+f16↔f32 conversion in the `&[f32]` upload/download path (host API unchanged),
+`shaderFloat16`+`storageBuffer16BitAccess` enabled when present
+(`ctx.f16_storage_enabled`), and six new `f16w_*` registry kernels sharing the
+existing bodies via `#ifdef B_F16`: large/m128n64k64/k64/small BDA_V4 tiles +
+the K-cooperative row GEMV. B loads are `uvec4` packets (8 halves, LDG.128)
+unpacked to f32 at shared-staging time, so the proven FFMA inner loop is
+byte-identical; only global B traffic halves. Registry slots for `f16w_*`
+kernels stay empty on devices without the features; routing, tuning
+(`TuneKey.b_f16`, store header v3), split-K2 veto, and explicit-selection
+validation all understand storage type. Mismatches error clearly
+(`kernel 'x' expects f32 B storage…`).
+
+**Measured (RTX 3070, paired same-process runs):**
+
+| shape | f32 GPU ms | f16w GPU ms | speedup |
+|---|---|---|---|
+| decode GEMV 1×4096×4096 | 0.158 | 0.084 | **1.88x** |
+| llama down-proj 1×4096×11008 | 0.420 | 0.218 | **1.93x** |
+| sq1024 (m128n64k64 class) | 0.212 | 0.209 | 1.01x |
+| tall 4096×1024×1024 | 0.799 | 0.792 | 1.01x |
+| mid384 (k64 class) | 0.019 | 0.018 | ~1.03x |
+| sq2048 / batched 8×256³ | 1.485 / 0.032 | 1.498 / 0.032 | ~0.99x / 1.0x |
+
+Exactly the predicted profile: bandwidth-bound decode shapes approach 2x,
+compute-bound shapes are neutral (H2F unpack hides under the FFMA pipeline).
+One route bug found by the bench and fixed: `to_f16w` initially mapped the
+m128n64k64 class onto the large tile (−18% on 1024³); adding the
+`f16w_m128n64k64_bda_v4` sibling restored parity, and the route test now pins
+the class mirror.
+
+**Verified:** 73/73 GPU tests (5 new f16 tests: rounded-reference matmuls
+across all tile classes + ragged edges, route/split-K2 assertions, GEMV +
+batched-broadcast epilogue, explicit-mismatch rejection, upload/download
+roundtrip), 45 unit tests (RNE encode/decode vectors), clippy clean.
+
+**Direction check:** decode is now ~2x on half the memory footprint — the
+local-model lever works. Next: model ops (softmax/rmsnorm/rope/copy) so a
+decoder block composes end-to-end, then C ABI v2 exposing dtype + ops + prepared,
+then coopmat Phase B for the compute-bound prompt side.

@@ -17,7 +17,7 @@ cargo run --release -p ml-bench -- sweep
 Other subcommands are `single`, `cases`, `concurrent`, `transfer`, and
 `prepared` (which compares synchronous dispatch, prepared replay, and
 pipelined prepared submission for one repeated shape). `cases`
-runs multiple `label,b,m,n,k` arguments in one process, avoiding repeated
+runs multiple `label,b,m,n,k[,f16w]` arguments in one process, avoiding repeated
 pipeline startup and GPU clock perturbation in automation. The environment
 knobs are documented in the workspace `README.md`; `ML_DEVICE`, `ML_KERNEL`,
 `ML_TUNE`, `ML_B`/`ML_M`/`ML_N`/`ML_K`, and `ML_OUTPUT` are the common ones.

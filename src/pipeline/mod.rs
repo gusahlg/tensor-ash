@@ -13,7 +13,7 @@ mod tuning;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use ash::vk;
 use parking_lot::{Mutex, RwLock};
 use scopeguard::ScopeGuard;
@@ -41,9 +41,13 @@ pub struct MatmulPipeline {
     /// dispatch path skips `vkUpdateDescriptorSets` and
     /// `vkCmdBindDescriptorSets` entirely.
     pub pipeline_layout_bda: vk::PipelineLayout,
-    /// One `MatmulKernel` per entry in `KERNEL_SPECS`, in the same order.
-    /// Index with `KernelSelection::index()` (after resolving `Auto`).
-    kernels: Vec<MatmulKernel>,
+    /// One slot per entry in `KERNEL_SPECS`, in the same order. Index
+    /// with `KernelSelection::index()` (after resolving `Auto`).
+    /// `None` marks a kernel gated off by missing device features
+    /// (today: the `f16w_*` family without f16 storage support);
+    /// routing, tuning, and explicit-selection validation all skip
+    /// empty slots, so `kernel_at` on a routed index cannot fail.
+    kernels: Vec<Option<MatmulKernel>>,
     /// Lazily-built aligned and epilogue specializations, keyed by (kernel
     /// name, base-variant index, epilogue key). The eager `variants` arrays
     /// hold four bounds-checked fallbacks; real workloads use a small subset
@@ -141,13 +145,21 @@ impl MatmulPipeline {
             // Build every kernel in the registry.  We wrap the accumulator
             // in a scopeguard so any already-built kernels are torn down
             // if a later one fails to build.
-            let kernels_acc: Vec<MatmulKernel> = Vec::with_capacity(KERNEL_SPECS.len());
+            let kernels_acc: Vec<Option<MatmulKernel>> = Vec::with_capacity(KERNEL_SPECS.len());
             let mut kernels_guard = scopeguard::guard(kernels_acc, |built| {
-                for kernel in built {
+                for kernel in built.into_iter().flatten() {
                     destroy_kernel(ctx, kernel);
                 }
             });
             for spec in KERNEL_SPECS {
+                // f16-storage kernels declare SPIR-V capabilities the
+                // device may not have; leave their registry slots empty
+                // instead of failing the whole pipeline. Routing and
+                // validation never select an empty slot.
+                if spec.weights_f16() && !ctx.f16_storage_enabled {
+                    kernels_guard.push(None);
+                    continue;
+                }
                 let layout = if spec.uses_descriptors {
                     pipeline_layout
                 } else {
@@ -155,7 +167,16 @@ impl MatmulPipeline {
                 };
                 let kernel = create_kernel(ctx, layout, spec)
                     .with_context(|| format!("create {} matmul kernel", spec.name))?;
-                kernels_guard.push(kernel);
+                kernels_guard.push(Some(kernel));
+            }
+            if let Some(index) = selection.index()
+                && kernels_guard[index].is_none()
+            {
+                bail!(
+                    "ML_KERNEL selects '{}', which requires f16 storage support \
+                     (shaderFloat16 + storageBuffer16BitAccess) this device lacks",
+                    KERNEL_SPECS[index].name
+                );
             }
             // Disarm the cleanup: kernels now belong to the pipeline.
             let kernels = ScopeGuard::into_inner(kernels_guard);
@@ -178,7 +199,7 @@ impl MatmulPipeline {
     }
 
     pub fn select_kernel(&self, batch: u32, m: u32, n: u32, k: u32) -> &MatmulKernel {
-        &self.kernels[self.route(batch, m, n, k).0]
+        self.kernel_at(self.route(batch, m, n, k, false).0)
     }
 
     /// Atomically snapshot the complete route for this shape in one
@@ -189,13 +210,27 @@ impl MatmulPipeline {
     /// measured DP winner vetoes the split heuristic, and
     /// `Some(Some(s))` when split-K2 measured faster than every DP
     /// kernel.
-    pub(crate) fn route(&self, batch: u32, m: u32, n: u32, k: u32) -> (usize, Option<Option<u32>>) {
+    pub(crate) fn route(
+        &self,
+        batch: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+        b_f16: bool,
+    ) -> (usize, Option<Option<u32>>) {
         match self.selection {
             KernelSelection::Auto => {
-                if let Some(entry) = self.tuned.read().get(&TuneKey { batch, m, n, k }) {
+                let key = TuneKey {
+                    batch,
+                    m,
+                    n,
+                    k,
+                    b_f16,
+                };
+                if let Some(entry) = self.tuned.read().get(&key) {
                     return (entry.kernel, Some(entry.splitk2_splits));
                 }
-                (self.heuristic_kernel_index(batch, m, n, k), None)
+                (self.heuristic_kernel_index(batch, m, n, k, b_f16), None)
             }
             explicit => (
                 explicit
@@ -209,13 +244,24 @@ impl MatmulPipeline {
     /// The static shape heuristic's pick, ignoring any tuned winner.
     /// Serves as the tuner's prior and as the fallback for untuned
     /// shapes.
-    pub(crate) fn heuristic_kernel_index(&self, batch: u32, m: u32, n: u32, k: u32) -> usize {
+    pub(crate) fn heuristic_kernel_index(
+        &self,
+        batch: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+        b_f16: bool,
+    ) -> usize {
         if self.ctx.buffer_device_address_enabled {
             let selection = if m == 1 {
-                Some(KernelSelection::RowBda)
-            } else if n == 1 {
+                Some(if b_f16 {
+                    KernelSelection::F16wRowBda
+                } else {
+                    KernelSelection::RowBda
+                })
+            } else if n == 1 && !b_f16 {
                 Some(KernelSelection::ColBda)
-            } else if k == 1 {
+            } else if k == 1 && !b_f16 {
                 Some(KernelSelection::OuterBda)
             } else {
                 None
@@ -236,7 +282,11 @@ impl MatmulPipeline {
             }
         }
         let tile = auto_select_kernel(batch, m, n, k, self.auto_min_large_tiles);
-        let selection = if self.ctx.buffer_device_address_enabled {
+        let selection = if b_f16 {
+            // f16-storage B is validated as BDA-capable upstream; map
+            // the tile class onto the nearest f16w sibling.
+            to_f16w(tile)
+        } else if self.ctx.buffer_device_address_enabled {
             maybe_to_bda(tile)
         } else {
             tile
@@ -270,17 +320,19 @@ impl MatmulPipeline {
     /// only — the strict `*_aligned` variants are excluded).  Requires
     /// `bufferDeviceAddress`; on devices without it the tuner is
     /// disabled and the heuristic stands.
-    pub(crate) fn tune_candidate_indices(&self, m: u32, n: u32, k: u32) -> Vec<usize> {
+    pub(crate) fn tune_candidate_indices(&self, m: u32, n: u32, k: u32, b_f16: bool) -> Vec<usize> {
         if !self.ctx.buffer_device_address_enabled {
             return Vec::new();
         }
         self.kernels
             .iter()
             .enumerate()
+            .filter_map(|(idx, kernel)| kernel.as_ref().map(|kernel| (idx, kernel)))
             .filter(|(_, kernel)| {
                 !kernel.uses_descriptors
                     && !kernel.name.ends_with("_aligned")
-                    && (m == 1 || kernel.name != "row_bda")
+                    && kernel.weights_f16() == b_f16
+                    && (m == 1 || !kernel.name.ends_with("row_bda"))
                     && (n == 1 || kernel.name != "col_bda")
                     && (k == 1 || kernel.name != "outer_bda")
             })
@@ -290,7 +342,9 @@ impl MatmulPipeline {
 
     #[inline]
     pub(crate) fn kernel_at(&self, idx: usize) -> &MatmulKernel {
-        &self.kernels[idx]
+        self.kernels[idx]
+            .as_ref()
+            .expect("routed kernel is gated off on this device")
     }
 
     /// Record a measured winner and persist the store.
@@ -340,6 +394,21 @@ impl MatmulPipeline {
 /// another 5-15% on every TN>=4 tile we measured.  For the TN=2
 /// `m64n32` kernel the V4 path isn't available (LDS.128 over a 2-col
 /// stride is non-sensical), so we fall back to the plain BDA sibling.
+/// Map an auto-selected tile class onto its f16-storage-B sibling.
+/// Coarser than the f32 family on purpose: three tile classes cover
+/// the heuristic winners, and the measured tuner refines per shape
+/// within the f16w candidate set.
+fn to_f16w(tile: KernelSelection) -> KernelSelection {
+    match tile {
+        KernelSelection::Large | KernelSelection::M64N128 => KernelSelection::F16wLargeBdaV4,
+        KernelSelection::M128N64 | KernelSelection::M128N64K64 => {
+            KernelSelection::F16wM128N64K64BdaV4
+        }
+        KernelSelection::K64 => KernelSelection::F16wK64BdaV4,
+        _ => KernelSelection::F16wSmallBdaV4,
+    }
+}
+
 fn maybe_to_bda(tile: KernelSelection) -> KernelSelection {
     match tile {
         KernelSelection::Large => KernelSelection::LargeBdaV4,
@@ -370,7 +439,7 @@ impl Drop for MatmulPipeline {
                     self.ctx.device.destroy_pipeline(pipeline, None);
                 }
             }
-            for kernel in self.kernels.drain(..) {
+            for kernel in self.kernels.drain(..).flatten() {
                 destroy_kernel(&self.ctx, kernel);
             }
             self.ctx

@@ -113,15 +113,23 @@ pub(super) fn create(
             && device_properties.limits.timestamp_period > 0.0;
         let timestamp_valid_bits = queue_families[compute_family as usize].timestamp_valid_bits;
 
+        let mut vulkan11_query = vk::PhysicalDeviceVulkan11Features::default();
         let mut vulkan12_query = vk::PhysicalDeviceVulkan12Features::default();
         let mut atomic_float_query = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
         let mut features_query = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut vulkan11_query)
             .push_next(&mut vulkan12_query)
             .push_next(&mut atomic_float_query);
         instance.get_physical_device_features2(physical_device, &mut features_query);
         let buffer_device_address_supported = vulkan12_query.buffer_device_address == vk::TRUE;
         let atomic_float_supported =
             atomic_float_query.shader_buffer_float32_atomic_add == vk::TRUE;
+        // f16 storage kernels need both halves: `shaderFloat16` for the
+        // arithmetic types and `storageBuffer16BitAccess` for 16-bit
+        // access through physical-storage-buffer pointers (the SPIR-V
+        // capability covers BDA loads too, not just descriptor SSBOs).
+        let f16_storage_supported = vulkan12_query.shader_float16 == vk::TRUE
+            && vulkan11_query.storage_buffer16_bit_access == vk::TRUE;
 
         // A supported feature bit is not enough for an extension feature: the
         // corresponding extension must also be enabled when creating the device.
@@ -143,16 +151,22 @@ pub(super) fn create(
             .queue_family_index(compute_family)
             .queue_priorities(&priorities)];
         let features = vk::PhysicalDeviceFeatures::default();
+        let mut vulkan11 = vk::PhysicalDeviceVulkan11Features::default()
+            .storage_buffer16_bit_access(f16_storage_supported);
         let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default()
-            .buffer_device_address(buffer_device_address_supported);
+            .buffer_device_address(buffer_device_address_supported)
+            .shader_float16(f16_storage_supported);
         let mut atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default()
             .shader_buffer_float32_atomic_add(enable_atomic_float);
         let mut device_ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_ci)
             .enabled_features(&features)
             .enabled_extension_names(&enabled_device_extensions);
-        if buffer_device_address_supported {
+        if buffer_device_address_supported || f16_storage_supported {
             device_ci = device_ci.push_next(&mut vulkan12);
+        }
+        if f16_storage_supported {
+            device_ci = device_ci.push_next(&mut vulkan11);
         }
         if enable_atomic_float {
             device_ci = device_ci.push_next(&mut atomic_float);
@@ -199,6 +213,7 @@ pub(super) fn create(
             timestamps_supported,
             buffer_device_address_enabled: buffer_device_address_supported,
             shader_buffer_float32_atomic_add_enabled: enable_atomic_float,
+            f16_storage_enabled: f16_storage_supported,
             pipeline_cache,
             pipeline_cache_path,
             debug_loader,

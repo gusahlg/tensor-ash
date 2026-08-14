@@ -55,6 +55,11 @@ callable GEMM component; those runtimes still need their own adapter layer.
   replay with one `vkQueueSubmit` per call; the split `submit`/`wait` lets two
   prepared objects ping-pong so submission overlaps GPU execution (1.26x over
   the synchronous path on the smallest GEMMs, 1.9x versus v1.4.1).
+- **FP16 weights** (`Tensor::uninit_device_f16`): store B as IEEE half with
+  f32 accumulation — half the weight memory and ~1.9x on bandwidth-bound
+  decode GEMV shapes, neutral on compute-bound ones. The `&[f32]` host API
+  is unchanged (CPU round-to-nearest-even conversion); the auto-router and
+  tuner pick `f16w_*` kernels per storage type.
 - **Two-stage split-K** (`run_matmuls_split_k2`): deterministic scratch-plane
   partials + reduce, no atomics; up to 16x over the data-parallel path on
   deep-K skinny shapes and auto-routed by a conservative heuristic or tuner.

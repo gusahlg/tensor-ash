@@ -12,6 +12,8 @@ pub(super) struct BenchCase {
     pub(super) m: u32,
     pub(super) n: u32,
     pub(super) k: u32,
+    /// Store B as f16 (append `,f16w` to the case spec).
+    pub(super) b_f16: bool,
 }
 
 impl BenchCase {
@@ -22,6 +24,7 @@ impl BenchCase {
             m,
             n,
             k,
+            b_f16: false,
         }
     }
 
@@ -49,8 +52,15 @@ impl BenchCase {
             dimension("N")?,
             dimension("K")?,
         );
+        let b_f16 = match fields.next() {
+            None => false,
+            Some("f16w") => true,
+            Some(other) => bail!(
+                "benchmark case '{label}' has unknown flag '{other}'; expected label,b,m,n,k[,f16w]"
+            ),
+        };
         if fields.next().is_some() {
-            bail!("benchmark case '{label}' has extra fields; expected label,b,m,n,k");
+            bail!("benchmark case '{label}' has extra fields; expected label,b,m,n,k[,f16w]");
         }
         Ok(Self {
             label: Cow::Owned(label.into()),
@@ -58,6 +68,7 @@ impl BenchCase {
             m,
             n,
             k,
+            b_f16,
         })
     }
 }

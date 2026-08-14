@@ -33,6 +33,7 @@
 
 pub mod buffer;
 pub mod context;
+pub mod dtype;
 pub mod executor;
 pub mod matmul;
 pub mod pipeline;
@@ -40,6 +41,7 @@ pub mod tensor;
 
 pub use buffer::{Buffer, BufferLocation};
 pub use context::{DeviceKind, DevicePreference, DeviceSummary, VulkanContext};
+pub use dtype::DType;
 pub use executor::{DispatchInfo, Executor, ExecutorConfig, PreparedOps};
 pub use matmul::{
     Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, MatrixShape, RunStats,

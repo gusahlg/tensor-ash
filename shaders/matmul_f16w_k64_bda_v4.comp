@@ -1,0 +1,14 @@
+#version 460
+// 64x64/BK=64 BDA+V4 TM=8 TN=4 (the measured k64 heuristic winner)
+// with f16-storage B; f32 accumulate.
+
+#define B_F16 1
+
+#define BM 64u
+#define BN 64u
+#define BK 64u
+#define TM  8u
+#define TN  4u
+#define TN_RAW 4
+
+#include "matmul_bda_v4_kernel.glsl"

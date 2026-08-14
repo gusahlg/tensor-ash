@@ -129,6 +129,7 @@ impl Executor {
                 m: dims.m,
                 n: dims.n,
                 k: dims.k,
+                b_f16: dims.b_f16,
             };
             if !self.pipeline.is_tuned(key)
                 && self.ctx.timestamps_supported
@@ -155,7 +156,7 @@ impl Executor {
                 let eligible = !op.call.accumulate
                     && op.epilogue.is_none()
                     && (with_dependency_barriers || ops.len() == 1);
-                self.plan_shape(dims.batch, dims.m, dims.n, dims.k, eligible)
+                self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, eligible)
             })
             .collect();
 

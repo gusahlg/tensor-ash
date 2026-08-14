@@ -4,6 +4,25 @@
 
 ### Added
 
+- **FP16 weight storage** (`DType::F16`, `Tensor::uninit_device_f16`): B
+  (weights) may be stored as IEEE half while A/C and accumulation stay f32.
+  Upload/download keep the `&[f32]` host API and convert with
+  round-to-nearest-even on the CPU. Six `f16w_*` kernels (large,
+  m128n64k64, k64, small BDA_V4 tiles + the K-cooperative row GEMV) share
+  the existing shader bodies via `#ifdef B_F16`, loading B as uvec4
+  packets (8 halves per LDG.128) and unpacking at shared-staging time so
+  the f32 FMA inner loop is unchanged. Measured on RTX 3070: decode GEMV
+  1x4096x4096 **1.88x** (0.158 -> 0.084 ms), llama-style down-proj
+  1x4096x11008 **1.93x**, compute-bound shapes neutral (+-1%). Routing,
+  the measured tuner (`TuneKey` gains a storage bit; store header v3),
+  split-K2 eligibility (f16 always data-parallel), and explicit-selection
+  validation are all storage-aware; `f16w_*` registry slots stay empty on
+  devices without `shaderFloat16` + `storageBuffer16BitAccess`.
+- `Executor::dispatch_info_for(batch, m, n, k, b_f16)` reports routes per
+  storage type; `dispatch_info` keeps its f32 meaning.
+- `ml-bench cases` accepts an optional `,f16w` flag per case
+  (`label,b,m,n,k,f16w`) to store B in f16.
+
 - `col_bda`, a cooperative column-GEMV kernel for `N=1`, with automatic
   routing, tuning support, batched broadcasting, accumulation, and fused
   epilogues.

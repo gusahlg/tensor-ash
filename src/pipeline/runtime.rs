@@ -40,4 +40,12 @@ impl MatmulKernel {
     pub fn supports_epilogue(&self) -> bool {
         !self.uses_descriptors && !self.name.ends_with("_aligned")
     }
+
+    /// Whether the shader reads B as f16 storage (the `f16w_*` family).
+    /// A dispatch must pair such a kernel with an f16 B tensor and any
+    /// other kernel with an f32 one; `record_one_matmul` enforces it.
+    #[inline]
+    pub fn weights_f16(&self) -> bool {
+        self.name.starts_with("f16w_")
+    }
 }

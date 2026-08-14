@@ -16,7 +16,13 @@ impl Executor {
     /// tuning store for shapes an inference workload will hit, without
     /// paying the measurement cost on the first real call.
     pub fn tune_shape(&self, batch: u32, m: u32, n: u32, k: u32) -> Result<()> {
-        let key = TuneKey { batch, m, n, k };
+        let key = TuneKey {
+            batch,
+            m,
+            n,
+            k,
+            b_f16: false,
+        };
         if self.pipeline.is_tuned(key) {
             return Ok(());
         }
@@ -75,7 +81,7 @@ impl Executor {
             .max_compute_work_group_count;
         let candidates = self
             .pipeline
-            .tune_candidate_indices(dims.m, dims.n, dims.k)
+            .tune_candidate_indices(dims.m, dims.n, dims.k, dims.b_f16)
             .into_iter()
             .filter(|&idx| {
                 let kernel = self.pipeline.kernel_at(idx);
@@ -89,7 +95,7 @@ impl Executor {
         }
         let heuristic_idx = self
             .pipeline
-            .heuristic_kernel_index(dims.batch, dims.m, dims.n, dims.k);
+            .heuristic_kernel_index(dims.batch, dims.m, dims.n, dims.k, dims.b_f16);
 
         // Fewer rounds for expensive shapes: at ~5 TFLOPS a round of
         // ~20 candidates on a 30 ms problem already costs ~600 ms.
@@ -163,6 +169,7 @@ impl Executor {
             m: dims.m,
             n: dims.n,
             k: dims.k,
+            b_f16: dims.b_f16,
         };
         self.pipeline.record_tuned(
             key,
@@ -201,9 +208,10 @@ impl Executor {
         rounds: u32,
     ) -> Result<Option<(u32, u64)>> {
         // Deep-K, few-tiles gate: DP already saturates the device
-        // otherwise and the probe would be wasted work.
+        // otherwise and the probe would be wasted work.  Split-K2's
+        // stage-1 kernels read f32 B only.
         let tiles = dims.m.div_ceil(128) as u64 * dims.n.div_ceil(128) as u64 * dims.batch as u64;
-        if dims.k < 1024 || tiles > 48 {
+        if dims.b_f16 || dims.k < 1024 || tiles > 48 {
             return Ok(None);
         }
         let mn = dims.m as u64 * dims.n as u64 * dims.batch as u64;
