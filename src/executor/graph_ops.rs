@@ -15,7 +15,7 @@ use crate::tensor::Tensor;
 
 use super::elementwise::ElementwiseDispatch;
 use super::recording::{record_compute_to_compute_barrier, record_one_matmul};
-use super::{BinaryOp, CopyDesc, Executor, OpPlan, RopeDesc, SoftmaxMask};
+use super::{AttnDecodeDesc, BinaryOp, CopyDesc, Executor, OpPlan, RopeDesc, SoftmaxMask};
 
 /// One step of a mixed-op graph.  All variants execute in submission
 /// order with a full compute barrier between consecutive steps, so a
@@ -60,6 +60,19 @@ pub enum ExecOp<'t> {
         out: &'t Tensor,
         op: BinaryOp,
     },
+    /// Fused split-K decode attention (see
+    /// [`Executor::run_attn_decode`]).  Plans as TWO dispatches
+    /// (stage 1 writes per-chunk partials to `scratch`, stage 2 merges
+    /// them into `out`) whose access sets force the hazard barrier
+    /// between them.
+    AttnDecode {
+        q: &'t Tensor,
+        kt: &'t Tensor,
+        v: &'t Tensor,
+        scratch: &'t Tensor,
+        out: &'t Tensor,
+        desc: AttnDecodeDesc,
+    },
 }
 
 enum Planned<'t, 'p> {
@@ -101,10 +114,29 @@ impl Executor {
             bail!("run_exec_ops: requires bufferDeviceAddress");
         }
 
-        let mut planned = Vec::with_capacity(ops.len());
-        let mut accesses = Vec::with_capacity(ops.len());
+        let mut planned = Vec::with_capacity(ops.len() + 1);
+        let mut accesses = Vec::with_capacity(ops.len() + 1);
         let mut total_flops = 0u64;
         for op in ops {
+            // Multi-dispatch ops push one (planned, access) pair per
+            // dispatch so the hazard tracker sees their internal
+            // dependency.
+            if let ExecOp::AttnDecode {
+                q,
+                kt,
+                v,
+                scratch,
+                out,
+                desc,
+            } = op
+            {
+                let (stage1, combine) = self.plan_attn_decode(q, kt, v, scratch, out, *desc)?;
+                accesses.push(Access::default().read(q).read(kt).read(v).write(scratch));
+                planned.push(Planned::Elementwise(stage1));
+                accesses.push(Access::default().read(scratch).write(out));
+                planned.push(Planned::Elementwise(combine));
+                continue;
+            }
             accesses.push(match op {
                 ExecOp::Matmul(op) => {
                     let mut access = Access::default()
@@ -150,6 +182,7 @@ impl Executor {
                 } => Access::default().read(input).read(table).write(output),
                 ExecOp::CopyStrided { src, dst, .. } => Access::default().read(src).write(dst),
                 ExecOp::Binary { a, b, out, .. } => Access::default().read(a).read(b).write(out),
+                ExecOp::AttnDecode { .. } => unreachable!("handled above"),
             });
             planned.push(match op {
                 ExecOp::Matmul(op) => {
@@ -224,6 +257,7 @@ impl Executor {
                 ExecOp::Binary { a, b, out, op } => {
                     Planned::Elementwise(self.plan_binary(a, b, out, *op)?)
                 }
+                ExecOp::AttnDecode { .. } => unreachable!("handled above"),
             });
         }
 

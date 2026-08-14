@@ -1,0 +1,6 @@
+#version 460
+// Split-K decode attention stage 1, head dimension 64, f32 KV caches.
+
+#define DH 64u
+
+#include "attention_decode_kernel.glsl"
