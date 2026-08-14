@@ -1,5 +1,47 @@
 # Experiment branch log
 
+## Leg 4 — `experiment/llama-runner` (real-model E2E vs CUDA)
+
+### TinyLlama-1.1B f16 on tensor-ash, compared against llama.cpp CUDA
+
+`tools/llama-ash`: GGUF f16 loader + full TinyLlama forward pass composed
+purely from library ops (flash prefill, composed GQA decode, fused
+epilogues, RoPE, strided-copy KV caches). **Correctness: greedy generation
+is byte-identical to llama.cpp CUDA for all 24 reference tokens** (temp 0,
+same prompt ids, same f16 weights).
+
+| metric (RTX 3070) | tensor-ash | llama.cpp CUDA (fa) | ratio |
+|---|---|---|---|
+| prefill pp512 | 5,525 t/s | ~16,100 t/s | 0.34x |
+| decode tg128 | 84.8 t/s | ~176 t/s | 0.48x |
+
+**Honest verdict: correct, not yet faster in practice.** Gap analysis:
+
+1. **Decode is host-submission-bound**: ~350 synchronous dispatches/token
+   (22 layers × ~16 ops), each paying ~10 µs submit+wait ⇒ a ~3.5 ms/token
+   floor before GPU work. llama.cpp submits one CUDA graph per token.
+   Fix: extend PreparedOps replay to elementwise/attention ops so a whole
+   token is one pre-recorded command buffer (gameplan item since v1.5).
+2. **Fused-epilogue ops demote off the tensor cores** (the routing fix
+   that made prefill *work* also costs it): gate/up/down/o_proj carry
+   epilogues ⇒ SIMT BDA_V4 instead of coopmat. Fix options: epilogue
+   support in the coopmat kernel via shared-staging stores, or a measured
+   route choice between fused-SIMT and coopmat+separate-elementwise.
+3. **f32 activations**: llama.cpp runs f16 end-to-end; our activations
+   double the bandwidth on every op. f16 activation tensors are the
+   natural Phase C of the dtype work.
+4. Attention: SIMT f32 flash vs their tensor-core FA.
+
+Also fixed on this branch (found BY the real model): auto-routing sent
+fused-epilogue ops to `f16w_coopmat_aligned`, which cannot fuse — every
+aligned T≥256 prefill with a residual failed. Fused ops now demote to the
+epilogue-capable SIMT sibling (auto routes only; explicit ML_KERNEL keeps
+its loud failure), with a regression test pinning the demoted route and
+numerics. This class of bug is exactly why practice-testing matters: no
+synthetic test had combined aligned-f16 shapes with epilogues.
+
+
+
 ## Leg 2 — `experiment/flash-attention` (branched from main@v2.0.0, 2026-08-14)
 
 ### Design: fused causal prefill attention (flash-attention style)

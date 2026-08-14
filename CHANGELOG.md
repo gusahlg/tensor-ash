@@ -4,6 +4,23 @@
 
 ### Added
 
+- `tools/llama-ash`: run llama-architecture GGUF models (f16/f32) end to
+  end on tensor-ash ops — GGUF loader, flash prefill, composed GQA
+  decode, greedy generation and pp/tg benchmarks. TinyLlama-1.1B output
+  is byte-identical to llama.cpp CUDA at temp 0 (24/24 tokens); current
+  throughput 5.5k t/s prefill / 85 t/s decode vs CUDA's 16.1k / 176
+  (gap analysis in benchmarks/experiment-branch.md).
+
+### Fixed
+
+- Fused-epilogue ops on aligned f16-weight shapes routed onto the
+  cooperative-matrix kernel, which cannot fuse epilogues, failing at
+  record time (any T>=256 aligned prefill with a residual). Auto routes
+  now demote such ops to the epilogue-capable SIMT sibling; explicit
+  ML_KERNEL selections keep their loud failure.
+
+### Added
+
 - **Fused flash-attention prefill** (`Executor::run_flash_attention`,
   `FlashAttentionDesc`): causal `softmax(q @ K^T * scale) @ V` in one
   dispatch with online softmax — the `[H, T_q, T_kv]` score tensor is
