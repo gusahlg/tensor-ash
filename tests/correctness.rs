@@ -49,5 +49,7 @@ mod shapes;
 mod splitk2;
 #[path = "correctness/submission.rs"]
 mod submission;
+#[path = "correctness/token_loop.rs"]
+mod token_loop;
 #[path = "correctness/tuning.rs"]
 mod tuning;

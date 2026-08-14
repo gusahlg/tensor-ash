@@ -1,0 +1,77 @@
+#version 460
+// Greedy-sampling argmax over a contiguous f32 vector: ONE workgroup
+// of 256 threads strides the n elements tracking (max, index), then a
+// fixed-order shared-memory tree reduce; thread 0 writes the winning
+// u32 index to a 4-byte result cell (host-visible in the decode loop,
+// so the host reads ONE u32 instead of downloading the logits).
+//
+// Tie-break contract: the LARGEST index among equal maxima wins —
+// exactly Rust's `Iterator::max_by(total_cmp)`, which returns the last
+// maximum element, so GPU greedy decode reproduces the CPU argmax
+// token-for-token.  (The per-thread ascending scan updates on `>=`,
+// and the merge prefers the larger index on equal values; both halves
+// of a merge see disjoint index sets, so "larger index" is exact.)
+// Assumes finite inputs: total_cmp orders NaN above +inf but IEEE
+// compares reject it, and -0.0/+0.0 ties compare equal here while
+// total_cmp separates them.  Model logits are finite, and callers that
+// aren't models shouldn't be argmaxing NaNs.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer U32ReadWrite {
+    uint v[];
+};
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint _pad;
+    F32ReadOnly in_ptr;
+    U32ReadWrite result_ptr;
+} pc;
+
+shared float sval[256];
+shared uint sidx[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+
+    // Per-thread scan.  The -inf/index-0 sentinel of an element-less
+    // thread can only tie a real -inf element, and the larger-index
+    // merge rule then discards the sentinel.
+    float best = uintBitsToFloat(0xFF800000u); // -inf
+    uint best_idx = 0u;
+    for (uint i = tid; i < pc.n; i += 256u) {
+        const float v = pc.in_ptr.v[i];
+        if (v >= best) {
+            best = v;
+            best_idx = i;
+        }
+    }
+    sval[tid] = best;
+    sidx[tid] = best_idx;
+    barrier();
+
+    [[unroll]] for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const float other = sval[tid + stride];
+            const uint other_idx = sidx[tid + stride];
+            if (other > sval[tid] || (other == sval[tid] && other_idx > sidx[tid])) {
+                sval[tid] = other;
+                sidx[tid] = other_idx;
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        pc.result_ptr.v[0] = sidx[0];
+    }
+}

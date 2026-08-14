@@ -52,6 +52,8 @@ const SPIRV_ATTN_DECODE_KV16_DH64: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/op_attn_decode_kv16_dh64.spv"));
 const SPIRV_ATTN_DECODE_COMBINE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/op_attn_decode_combine.spv"));
+const SPIRV_ARGMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_argmax_f32.spv"));
+const SPIRV_EMBED_GATHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/op_embed_gather.spv"));
 
 /// Threads per workgroup in every op shader.
 const WG: u32 = 256;
@@ -315,6 +317,27 @@ struct AttnDecodePc {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+struct ArgmaxPc {
+    n: u32,
+    _pad: u32,
+    in_ptr: u64,
+    result_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct EmbedGatherPc {
+    embd: u32,
+    vocab: u32,
+    table_f16: u32,
+    _pad: u32,
+    token_ptr: u64,
+    table_ptr: u64,
+    out_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
 struct AttnCombinePc {
     num_chunks: u32,
     group: u32,
@@ -363,6 +386,8 @@ pub(super) struct ElementwisePipeline {
     attn_decode_dh64: OpKernel,
     attn_decode_kv16_dh64: OpKernel,
     attn_decode_combine: OpKernel,
+    argmax: OpKernel,
+    embed_gather: OpKernel,
 }
 
 impl ElementwisePipeline {
@@ -375,7 +400,7 @@ impl ElementwisePipeline {
         let layout_guard = scopeguard::guard(layout, |l| unsafe {
             ctx.device.destroy_pipeline_layout(l, None);
         });
-        let built: Vec<OpKernel> = Vec::with_capacity(16);
+        let built: Vec<OpKernel> = Vec::with_capacity(18);
         let mut built_guard = scopeguard::guard(built, |kernels| {
             for kernel in kernels {
                 unsafe {
@@ -417,6 +442,8 @@ impl ElementwisePipeline {
                 "op attn_decode kv16 dh64",
             ),
             (SPIRV_ATTN_DECODE_COMBINE, &[][..], "op attn_decode combine"),
+            (SPIRV_ARGMAX, &[][..], "op argmax"),
+            (SPIRV_EMBED_GATHER, &[][..], "op embed_gather"),
         ] {
             let (module, pipeline) =
                 crate::pipeline::build_compute_pipeline(ctx, layout, spec, spv, label)?;
@@ -428,13 +455,14 @@ impl ElementwisePipeline {
         let (softmax, rmsnorm, layernorm, rope, rope_scatter, rope_scatter_to_f16,
             copy, binary, copy_to_f16,
             flash_dh64, flash_dh128, flash_kv16_dh64, flash_kv16_dh128,
-            attn_decode_dh64, attn_decode_kv16_dh64, attn_decode_combine) = (
+            attn_decode_dh64, attn_decode_kv16_dh64, attn_decode_combine,
+            argmax, embed_gather) = (
             it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
             it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
             it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
             it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
             it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
-            it.next().unwrap(),
+            it.next().unwrap(), it.next().unwrap(), it.next().unwrap(),
         );
         Ok(Self {
             ctx: Arc::clone(ctx),
@@ -455,6 +483,8 @@ impl ElementwisePipeline {
             attn_decode_dh64,
             attn_decode_kv16_dh64,
             attn_decode_combine,
+            argmax,
+            embed_gather,
         })
     }
 }
@@ -480,6 +510,8 @@ impl Drop for ElementwisePipeline {
                 &self.attn_decode_dh64,
                 &self.attn_decode_kv16_dh64,
                 &self.attn_decode_combine,
+                &self.argmax,
+                &self.embed_gather,
             ] {
                 self.ctx.device.destroy_pipeline(kernel.pipeline, None);
                 self.ctx.device.destroy_shader_module(kernel.module, None);
@@ -1316,6 +1348,112 @@ impl Executor {
             1,
         )
     }
+
+    /// Greedy-sampling argmax: writes the index of the largest element
+    /// of `input` (any shape, treated flat) into `result` as one u32.
+    /// Ties resolve to the LARGEST index — exactly Rust's
+    /// `Iterator::max_by(f32::total_cmp)`, which keeps the last
+    /// maximum, so a GPU-argmaxed decode loop reproduces a CPU greedy
+    /// sampler token-for-token (finite inputs assumed; see the shader
+    /// header for the NaN / signed-zero caveats).  The result cell is
+    /// host-readable: [`HostU32Buffer::read`] after the submission
+    /// completes returns the token without touching the logits.
+    ///
+    /// [`HostU32Buffer::read`]: super::HostU32Buffer::read
+    pub fn run_argmax(&self, input: &Tensor, result: &super::HostU32Buffer) -> Result<RunStats> {
+        let dispatch = self.plan_argmax(input, result)?;
+        self.submit_one_elementwise(dispatch)
+    }
+
+    pub(super) fn plan_argmax(
+        &self,
+        input: &Tensor,
+        result: &super::HostU32Buffer,
+    ) -> Result<ElementwiseDispatch> {
+        self.ensure_f32(input, "run_argmax", "input")?;
+        if !result.buffer().belongs_to(&self.ctx) {
+            bail!("run_argmax: result buffer belongs to a different VulkanContext");
+        }
+        let n = u32::try_from(input.len())
+            .map_err(|_| anyhow::anyhow!("run_argmax: input length exceeds u32"))?;
+        if n == 0 {
+            bail!("run_argmax: input is empty");
+        }
+        let pipeline = self.elementwise()?.argmax.pipeline;
+        // ONE workgroup: 256 threads stride the n elements, then a
+        // shared tree reduce — at n = 32000 the whole op is ~4 us.
+        self.plan_elementwise(
+            pipeline,
+            &ArgmaxPc {
+                n,
+                _pad: 0,
+                in_ptr: input.device_address(),
+                result_ptr: result.device_address(),
+            },
+            1,
+            1,
+        )
+    }
+
+    /// Embedding-row gather with a device-side token id: copies row
+    /// `token` of the `[vocab, embd]` `table` (f16 or f32; f16 widens
+    /// exactly) into the f32 `out` (`embd` elements).  `token` is read
+    /// from the u32 cell at execution time — chain it after
+    /// [`run_argmax`](Self::run_argmax) and the decode loop feeds
+    /// itself on the GPU, no host trip.  Out-of-range ids clamp to
+    /// `vocab - 1`.
+    pub fn run_embed_gather(
+        &self,
+        token: &super::HostU32Buffer,
+        table: &Tensor,
+        out: &Tensor,
+    ) -> Result<RunStats> {
+        let dispatch = self.plan_embed_gather(token, table, out)?;
+        self.submit_one_elementwise(dispatch)
+    }
+
+    pub(super) fn plan_embed_gather(
+        &self,
+        token: &super::HostU32Buffer,
+        table: &Tensor,
+        out: &Tensor,
+    ) -> Result<ElementwiseDispatch> {
+        self.validate_tensor_context(table, "table")?;
+        self.ensure_f32(out, "run_embed_gather", "out")?;
+        if !token.buffer().belongs_to(&self.ctx) {
+            bail!("run_embed_gather: token buffer belongs to a different VulkanContext");
+        }
+        let [vocab, embd] = *table.shape() else {
+            bail!(
+                "run_embed_gather: table must be [vocab, embd], got {:?}",
+                table.shape()
+            );
+        };
+        if vocab == 0 || embd == 0 {
+            bail!(
+                "run_embed_gather: table {:?} has a zero axis",
+                table.shape()
+            );
+        }
+        if out.len() != embd as u64 {
+            bail!("run_embed_gather: out length {} != embd {embd}", out.len());
+        }
+        let pipeline = self.elementwise()?.embed_gather.pipeline;
+        self.plan_elementwise(
+            pipeline,
+            &EmbedGatherPc {
+                embd,
+                vocab,
+                table_f16: (table.dtype() == DType::F16) as u32,
+                _pad: 0,
+                token_ptr: token.device_address(),
+                table_ptr: table.device_address(),
+                out_ptr: out.device_address(),
+            },
+            embd.div_ceil(WG),
+            1,
+        )
+    }
 }
 
 // SAFETY: plain-old-data push-constant mirrors of the GLSL blocks.
@@ -1335,5 +1473,9 @@ unsafe impl bytemuck::Pod for AttnDecodePc {}
 unsafe impl bytemuck::Zeroable for AttnDecodePc {}
 unsafe impl bytemuck::Pod for AttnCombinePc {}
 unsafe impl bytemuck::Zeroable for AttnCombinePc {}
+unsafe impl bytemuck::Pod for ArgmaxPc {}
+unsafe impl bytemuck::Zeroable for ArgmaxPc {}
+unsafe impl bytemuck::Pod for EmbedGatherPc {}
+unsafe impl bytemuck::Zeroable for EmbedGatherPc {}
 unsafe impl bytemuck::Pod for BinaryPc {}
 unsafe impl bytemuck::Zeroable for BinaryPc {}
