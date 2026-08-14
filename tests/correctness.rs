@@ -21,6 +21,10 @@ mod graph;
 mod kernels;
 #[path = "correctness/ops.rs"]
 mod ops;
+#[path = "correctness/outer.rs"]
+mod outer;
+#[path = "correctness/prepared.rs"]
+mod prepared;
 #[path = "correctness/property.rs"]
 mod property;
 #[path = "correctness/row.rs"]

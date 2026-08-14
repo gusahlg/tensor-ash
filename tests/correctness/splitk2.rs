@@ -3,7 +3,7 @@
 
 use crate::common::*;
 
-use tensor_ash::{MatmulCall, Tensor};
+use tensor_ash::{DeviceKind, KernelSelection, MatmulCall, Tensor};
 
 fn run_splitk2_case(
     batch: u32,
@@ -56,6 +56,45 @@ fn splitk2_deep_k_tiny_mn() {
     let (got, expect) = run_splitk2_case(1, 64, 64, 8192, 0, 1.0);
     let (e, _) = max_abs_err(&got, &expect);
     assert!(e <= 2.0 * tolerance(8192), "splitk2 64x64x8192 err {e:.3e}");
+}
+
+#[test]
+#[ignore]
+fn auto_routes_deep_k_only_and_matches_cpu() {
+    let (ctx, exec) = make_setup_with_kernel(2, 8, KernelSelection::Auto);
+    if ctx.device_kind() != DeviceKind::DiscreteGpu || !ctx.buffer_device_address_enabled {
+        return;
+    }
+
+    // Odd dimensions exercise stage-1 bounds and make a pre-existing tuned
+    // store entry for this integration-only shape exceedingly unlikely.
+    let (m, n, k) = (37, 41, 1088);
+    let route = exec.dispatch_info(1, m, n, k);
+    assert_eq!(
+        route.split_k2_splits,
+        Some(16),
+        "unexpected route: {route:?}"
+    );
+    assert!(route.kernel.starts_with("split_k2_"));
+
+    let (got, expect) = run_one(
+        &ctx,
+        &exec,
+        &[m, k],
+        &[k, n],
+        &[m, n],
+        0.75,
+        false,
+        131,
+        137,
+        None,
+    );
+    let (e, _) = max_abs_err(&got, &expect);
+    assert!(e <= 2.0 * tolerance(k), "auto split-K2 err {e:.3e}");
+
+    let dp = exec.dispatch_info(1, m, n, 1000);
+    assert_eq!(dp.split_k2_splits, None, "unexpected route: {dp:?}");
+    assert!(!dp.kernel.starts_with("split_k2_"));
 }
 
 #[test]

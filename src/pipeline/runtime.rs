@@ -9,7 +9,10 @@ pub struct MatmulKernel {
     pub tile_n: u32,
     pub tile_k: u32,
     pub shader_module: vk::ShaderModule,
-    /// One pipeline per `KernelVariant`; indexed by `KernelVariant::index()`.
+    /// A correctness-safe pipeline for each `KernelVariant`, indexed by
+    /// `KernelVariant::index()`. Entries with the same accumulate/alpha flags
+    /// initially alias one bounds-checked fallback; the dispatcher lazily
+    /// builds exact interior/K specializations.
     pub variants: [vk::Pipeline; KernelVariant::COUNT],
     /// The pipeline layout the kernel's pipelines were built against,
     /// and the layout the dispatcher must pass to

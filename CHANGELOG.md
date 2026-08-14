@@ -2,6 +2,64 @@
 
 ## [Unreleased]
 
+### Added
+
+- `col_bda`, a cooperative column-GEMV kernel for `N=1`, with automatic
+  routing, tuning support, batched broadcasting, accumulation, and fused
+  epilogues.
+- `outer_bda`, a register-only `K=1` outer-product kernel (no shared memory or
+  barriers), auto-routed after the GEMV rules. On the RTX 3070 it cuts K=1
+  GPU time by 39% at 512^2 and 11-12% at 1024^2-2048^2, and roughly halves
+  odd-shape edge cases versus the tiled route.
+- `PreparedOps` (`Executor::prepare_matmuls` / `prepare_ops` /
+  `prepare_op_graph`): validate, route, and record a fixed op batch once and
+  replay it with one queue submit per call (`submit` is `unsafe` — leaking an
+  in-flight object would skip the fence wait in `Drop`). Two ping-ponged
+  prepared objects sustain 13.1 us/call at 64^3 under matched clocks, 1.26x
+  over the spin-wait synchronous path and 1.9x over the previous release's
+  blocking path.
+- `ML_SPLIT_K2=N` support in `ml_bench` for controlled split-factor sweeps,
+  and an `ml_bench prepared` subcommand comparing synchronous, replayed, and
+  pipelined submission on one shape.
+
+### Changed
+
+- The `M=1` row GEMV (`row_bda`) is now K-cooperative: eight K-slice warps
+  per workgroup share the same 32 columns with a deterministic fixed-order
+  reduce. Lone-row GEMVs run 2.4-5x faster on the RTX 3070 (1x4096x4096:
+  0.375 -> 0.158 ms, ~91% of memory bandwidth); large-batch M=1 workloads
+  are unchanged.
+- Untuned deep-K GEMMs with too few output tiles now use a conservative,
+  device-validated two-stage Split-K route. On the RTX 3070 regression case
+  `64x64x8192`, median GPU time fell from 0.365 ms to 0.022 ms.
+- Matmul pipelines eagerly build four correctness-safe variants per kernel and
+  create alignment-specialized variants on first use. Empty-cache startup fell
+  from 147 seconds to 46 seconds while warmed GEMM throughput stayed flat.
+- K-aligned V4 kernels retain 128-bit operand loads for interior workgroups at
+  M/N edges, improving isolated edge cases by about 3-4%.
+- Synchronous submissions spin briefly (bounded at 50 us) before blocking on
+  the fence, removing the scheduler-wakeup latency: per-call wall time fell
+  25-33% on small GEMMs and median host overhead dropped from ~0.020 ms to
+  ~0.010 ms.
+- Every op's dispatch route now resolves once per submission into an `OpPlan`
+  consumed by descriptor updates, recording, graph planning, and
+  `dispatch_info`, replacing repeated kernel selection and the split-K2 side
+  channel; a concurrent first-use tune can no longer split one submission
+  across two registry states.
+- Buffer device addresses are cached at creation instead of queried from the
+  driver on every recorded dispatch.
+
+### Removed
+
+- `MatmulPipeline::select_kernel_index` (superseded by the internal route
+  snapshot; `select_kernel` remains for external kernel inspection).
+
+### Fixed
+
+- Automatic Split-K routing uses checked grid/address/scratch arithmetic,
+  preserves measured data-parallel winners, and caps aggregate graph scratch;
+  over-budget graph operations safely remain data parallel.
+
 ## v1.4.1 - 2026-08-13
 
 Measured-performance and correctness patch release.

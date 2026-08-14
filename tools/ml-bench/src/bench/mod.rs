@@ -48,12 +48,13 @@ pub fn run() -> Result<()> {
         "cases" => commands::cases(&ctx, &exec, args)?,
         "concurrent" => commands::concurrent(ctx.clone(), exec.clone())?,
         "transfer" => commands::transfer(&ctx, &exec)?,
+        "prepared" => commands::prepared(&ctx, &exec)?,
         "all" => {
             commands::correctness(&ctx, &exec)?;
             commands::sweep(&ctx, &exec)?;
         }
         _ => anyhow::bail!(
-            "unknown subcommand '{cmd}'; expected self-check, correctness, sweep, single, cases, concurrent, transfer, or all"
+            "unknown subcommand '{cmd}'; expected self-check, correctness, sweep, single, cases, concurrent, transfer, prepared, or all"
         ),
     }
     Ok(())

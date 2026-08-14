@@ -44,12 +44,10 @@ pub struct MatmulPipeline {
     /// One `MatmulKernel` per entry in `KERNEL_SPECS`, in the same order.
     /// Index with `KernelSelection::index()` (after resolving `Auto`).
     kernels: Vec<MatmulKernel>,
-    /// Lazily-built pipelines for non-zero epilogue specializations,
-    /// keyed by (kernel name, base-variant index, epilogue key).  The
-    /// eager `variants` arrays only cover the zero epilogue; real
-    /// workloads use a handful of epilogue combos, so building them on
-    /// first use (against the persistent pipeline cache) keeps startup
-    /// flat.
+    /// Lazily-built aligned and epilogue specializations, keyed by (kernel
+    /// name, base-variant index, epilogue key). The eager `variants` arrays
+    /// hold four bounds-checked fallbacks; real workloads use a small subset
+    /// of the other combinations, so first-use creation keeps startup flat.
     epilogue_pipelines: Mutex<HashMap<(&'static str, usize, EpilogueKey), vk::Pipeline>>,
     selection: KernelSelection,
     /// Minimum number of large-kernel tiles a problem must produce
@@ -180,79 +178,62 @@ impl MatmulPipeline {
     }
 
     pub fn select_kernel(&self, batch: u32, m: u32, n: u32, k: u32) -> &MatmulKernel {
-        &self.kernels[self.select_kernel_index(batch, m, n, k)]
+        &self.kernels[self.route(batch, m, n, k).0]
     }
 
-    /// Atomically snapshot the DP kernel and optional split-K2 route used by
-    /// a plain, non-accumulating call. Benchmark diagnostics use this so a
-    /// concurrent first-use tune cannot mix two registry states.
-    pub(crate) fn dispatch_selection(
-        &self,
-        batch: u32,
-        m: u32,
-        n: u32,
-        k: u32,
-    ) -> (&MatmulKernel, Option<u32>) {
-        match self.selection {
-            KernelSelection::Auto => {
-                let tuned = self.tuned.read();
-                if let Some(entry) = tuned.get(&TuneKey { batch, m, n, k }) {
-                    return (&self.kernels[entry.kernel], entry.splitk2_splits);
-                }
-                drop(tuned);
-                (
-                    &self.kernels[self.heuristic_kernel_index(batch, m, n, k)],
-                    None,
-                )
-            }
-            explicit => (
-                &self.kernels[explicit
-                    .index()
-                    .expect("explicit selection has a concrete kernel")],
-                None,
-            ),
-        }
-    }
-
-    /// Index into `KERNEL_SPECS` for this problem.  Resolution order:
-    /// explicit `ML_KERNEL=` selection > measured tuned winner >
-    /// static shape heuristic.
-    pub fn select_kernel_index(&self, batch: u32, m: u32, n: u32, k: u32) -> usize {
+    /// Atomically snapshot the complete route for this shape in one
+    /// tuned-map read.  The kernel index resolves as: explicit
+    /// `ML_KERNEL=` selection, else measured tuned winner, else static
+    /// shape heuristic.  The second field is the tuned split-K2
+    /// verdict: `None` for an untuned shape, `Some(None)` when a
+    /// measured DP winner vetoes the split heuristic, and
+    /// `Some(Some(s))` when split-K2 measured faster than every DP
+    /// kernel.
+    pub(crate) fn route(&self, batch: u32, m: u32, n: u32, k: u32) -> (usize, Option<Option<u32>>) {
         match self.selection {
             KernelSelection::Auto => {
                 if let Some(entry) = self.tuned.read().get(&TuneKey { batch, m, n, k }) {
-                    return entry.kernel;
+                    return (entry.kernel, Some(entry.splitk2_splits));
                 }
-                self.heuristic_kernel_index(batch, m, n, k)
+                (self.heuristic_kernel_index(batch, m, n, k), None)
             }
-            explicit => explicit
-                .index()
-                .expect("explicit selection has a concrete kernel"),
+            explicit => (
+                explicit
+                    .index()
+                    .expect("explicit selection has a concrete kernel"),
+                None,
+            ),
         }
-    }
-
-    /// Measured split-K2 routing for this shape: `Some(splits)` when
-    /// the two-stage split-K beat every DP kernel during tuning.  Only
-    /// meaningful for single plain calls; batched / accumulate /
-    /// epilogue dispatches use the DP winner instead.
-    pub(crate) fn tuned_splitk2(&self, batch: u32, m: u32, n: u32, k: u32) -> Option<u32> {
-        if !self.is_auto() {
-            return None;
-        }
-        self.tuned
-            .read()
-            .get(&TuneKey { batch, m, n, k })
-            .and_then(|entry| entry.splitk2_splits)
     }
 
     /// The static shape heuristic's pick, ignoring any tuned winner.
     /// Serves as the tuner's prior and as the fallback for untuned
     /// shapes.
     pub(crate) fn heuristic_kernel_index(&self, batch: u32, m: u32, n: u32, k: u32) -> usize {
-        if m == 1 && self.ctx.buffer_device_address_enabled {
-            return KernelSelection::RowBda
-                .index()
-                .expect("row kernel has a concrete index");
+        if self.ctx.buffer_device_address_enabled {
+            let selection = if m == 1 {
+                Some(KernelSelection::RowBda)
+            } else if n == 1 {
+                Some(KernelSelection::ColBda)
+            } else if k == 1 {
+                Some(KernelSelection::OuterBda)
+            } else {
+                None
+            };
+            if let Some(selection) = selection {
+                let spec = &KERNEL_SPECS[selection.index().expect("GEMV kernel is concrete")];
+                let max_groups = self
+                    .ctx
+                    .device_properties
+                    .limits
+                    .max_compute_work_group_count;
+                if n.div_ceil(spec.tile_n) <= max_groups[0]
+                    && m.div_ceil(spec.tile_m) <= max_groups[1]
+                    && batch <= max_groups[2]
+                {
+                    return selection.index().expect("GEMV kernel is concrete");
+                }
+            }
         }
         let tile = auto_select_kernel(batch, m, n, k, self.auto_min_large_tiles);
         let selection = if self.ctx.buffer_device_address_enabled {
@@ -289,7 +270,7 @@ impl MatmulPipeline {
     /// only — the strict `*_aligned` variants are excluded).  Requires
     /// `bufferDeviceAddress`; on devices without it the tuner is
     /// disabled and the heuristic stands.
-    pub(crate) fn tune_candidate_indices(&self, m: u32) -> Vec<usize> {
+    pub(crate) fn tune_candidate_indices(&self, m: u32, n: u32, k: u32) -> Vec<usize> {
         if !self.ctx.buffer_device_address_enabled {
             return Vec::new();
         }
@@ -300,6 +281,8 @@ impl MatmulPipeline {
                 !kernel.uses_descriptors
                     && !kernel.name.ends_with("_aligned")
                     && (m == 1 || kernel.name != "row_bda")
+                    && (n == 1 || kernel.name != "col_bda")
+                    && (k == 1 || kernel.name != "outer_bda")
             })
             .map(|(idx, _)| idx)
             .collect()
@@ -321,19 +304,18 @@ impl MatmulPipeline {
         save_tuned(&self.ctx, self.shader_hash, &snapshot);
     }
 
-    /// Pipeline for a (kernel, base-variant, epilogue) triple.  The
-    /// zero epilogue resolves to the eagerly-built variant table; any
-    /// other combination is compiled on first use and cached for the
-    /// lifetime of the pipeline.  Compilation goes through the
-    /// persistent `VkPipelineCache`, so repeat processes skip the
-    /// ISA compile.
+    /// Pipeline for a (kernel, base-variant, epilogue) triple. Fully
+    /// bounds-checked zero-epilogue variants resolve to the eager fallback;
+    /// every other combination is compiled on first use and cached for the
+    /// pipeline lifetime. Creation goes through the persistent
+    /// `VkPipelineCache`, so repeat processes skip the ISA compile.
     pub(crate) fn pipeline_for_epilogue(
         &self,
         kernel: &MatmulKernel,
         variant: KernelVariant,
         epilogue: EpilogueKey,
     ) -> Result<vk::Pipeline> {
-        if epilogue.is_none() {
+        if epilogue.is_none() && variant == variant.fallback() {
             return Ok(kernel.pipeline_for(variant));
         }
         let key = (kernel.name, variant.index(), epilogue);

@@ -8,8 +8,8 @@ use crate::context::VulkanContext;
 use crate::matmul::{MatmulOp, ResolvedMatmul};
 use crate::pipeline::{KernelVariant, MatmulPipeline};
 
-use super::MatmulCall;
 use super::splitk::SplitKKernel;
+use super::{MatmulCall, OpPlan};
 
 pub(super) use descriptors::{update_matmul_descriptor_sets, update_split_k_descriptor_set};
 pub(super) use graph::{GraphSplitK2, record_matmul_graph_commands};
@@ -42,15 +42,16 @@ pub(super) fn record_matmul_commands(
     descriptor_sets: &[vk::DescriptorSet],
     ops: &[MatmulOp<'_>],
     resolved: &[ResolvedMatmul],
+    plans: &[OpPlan],
 ) -> Result<()> {
     let mut bound_pipeline = vk::Pipeline::null();
-    for ((set, op), dims) in descriptor_sets
+    for (((set, op), dims), plan) in descriptor_sets
         .iter()
         .copied()
         .zip(ops.iter())
         .zip(resolved.iter())
+        .zip(plans.iter())
     {
-        let kernel = pipeline.select_kernel(dims.batch, dims.m, dims.n, dims.k);
         record_one_matmul(
             ctx,
             pipeline,
@@ -58,7 +59,7 @@ pub(super) fn record_matmul_commands(
             set,
             op,
             dims,
-            kernel,
+            pipeline.kernel_at(plan.kernel),
             &mut bound_pipeline,
         )?;
     }
@@ -67,8 +68,8 @@ pub(super) fn record_matmul_commands(
 }
 
 /// Record one dispatch with an explicitly-chosen kernel.  The regular
-/// paths resolve the kernel through `MatmulPipeline::select_kernel`;
-/// the auto-tuner forces each candidate in turn.
+/// paths resolve the kernel from the submission's per-op plans; the
+/// auto-tuner forces each candidate in turn.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record_one_matmul(
     ctx: &VulkanContext,
@@ -90,9 +91,9 @@ pub(super) fn record_one_matmul(
     let max_groups = ctx.device_properties.limits.max_compute_work_group_count;
     let (a_ptr, b_ptr, c_ptr) = if ctx.buffer_device_address_enabled {
         (
-            ctx.buffer_device_address(call.a.raw_buffer()),
-            ctx.buffer_device_address(call.b.raw_buffer()),
-            ctx.buffer_device_address(call.c.raw_buffer()),
+            call.a.device_address(),
+            call.b.device_address(),
+            call.c.device_address(),
         )
     } else {
         (0, 0, 0)
@@ -102,18 +103,19 @@ pub(super) fn record_one_matmul(
     // Pick the specialization variant whose constants match this call.
     // `interior_only` is safe whenever M and N are tile-aligned to the
     // selected kernel's tile size — the shader then skips all
-    // m_full/n_full bounds checks.
+    // m_full/n_full bounds checks.  `tile_k == 1` divides every K and
+    // those kernels (row/col/outer) never read K_MULTIPLE; forcing the
+    // flag false lets their plain unaligned dispatches resolve to the
+    // eager fallback pipeline instead of the lazy-cache mutex.
     let variant = KernelVariant {
         accumulate: call.accumulate,
         alpha_is_one: call.alpha == 1.0,
         interior_only: dims.m.is_multiple_of(kernel.tile_m) && dims.n.is_multiple_of(kernel.tile_n),
-        k_multiple: dims.k.is_multiple_of(kernel.tile_k),
+        k_multiple: kernel.tile_k > 1 && dims.k.is_multiple_of(kernel.tile_k),
     };
 
     let epilogue = &op.epilogue;
-    let variant_pipeline = if epilogue.is_none() {
-        kernel.pipeline_for(variant)
-    } else {
+    if !epilogue.is_none() {
         if !ctx.buffer_device_address_enabled {
             bail!("fused epilogues require bufferDeviceAddress, which this device lacks");
         }
@@ -125,7 +127,7 @@ pub(super) fn record_one_matmul(
             );
         }
         if let Some(bias) = epilogue.bias {
-            pc.bias_ptr = ctx.buffer_device_address(bias.raw_buffer());
+            pc.bias_ptr = bias.device_address();
             pc.bias_batch_stride = if bias.len() == dims.n as u64 {
                 0
             } else {
@@ -133,11 +135,11 @@ pub(super) fn record_one_matmul(
             };
         }
         if let Some(d) = epilogue.d_tensor() {
-            pc.d_ptr = ctx.buffer_device_address(d.raw_buffer());
+            pc.d_ptr = d.device_address();
         }
         pc.beta = epilogue.beta();
-        pipeline.pipeline_for_epilogue(kernel, variant, epilogue.key())?
-    };
+    }
+    let variant_pipeline = pipeline.pipeline_for_epilogue(kernel, variant, epilogue.key())?;
 
     let gx = dims.n.div_ceil(kernel.tile_n);
     let gy = dims.m.div_ceil(kernel.tile_m);
@@ -221,9 +223,9 @@ pub(super) fn record_matmul_split_k_commands(
 
     let (a_ptr, b_ptr, c_ptr) = if ctx.buffer_device_address_enabled {
         (
-            ctx.buffer_device_address(call.a.raw_buffer()),
-            ctx.buffer_device_address(call.b.raw_buffer()),
-            ctx.buffer_device_address(call.c.raw_buffer()),
+            call.a.device_address(),
+            call.b.device_address(),
+            call.c.device_address(),
         )
     } else {
         bail!("split-K kernel requires bufferDeviceAddress");

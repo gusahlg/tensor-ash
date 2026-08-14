@@ -136,15 +136,25 @@ pub(super) fn run_case(
     exec.upload(&h_b, &b)?;
 
     let flops = 2.0f64 * bsz as f64 * m as f64 * n as f64 * k as f64;
+    let split_k2 = env_u32("ML_SPLIT_K2", 0);
 
-    for _ in 0..warmup {
-        exec.run_matmuls(&[MatmulCall {
+    let run_once = || {
+        let call = MatmulCall {
             a: &a,
             b: &b,
             c: &c,
             alpha: 1.0,
             accumulate: false,
-        }])?;
+        };
+        if split_k2 < 2 {
+            exec.run_matmuls(std::slice::from_ref(&call))
+        } else {
+            exec.run_matmuls_split_k2(call, split_k2)
+        }
+    };
+
+    for _ in 0..warmup {
+        run_once()?;
     }
 
     // Keep GPU and wall measurements paired so host overhead is derived from
@@ -152,13 +162,7 @@ pub(super) fn run_case(
     let mut samples = Vec::with_capacity(iters as usize);
     for _ in 0..iters {
         let t0 = Instant::now();
-        let stats = exec.run_matmuls(&[MatmulCall {
-            a: &a,
-            b: &b,
-            c: &c,
-            alpha: 1.0,
-            accumulate: false,
-        }])?;
+        let stats = run_once()?;
         samples.push((
             t0.elapsed().as_secs_f64() * 1e3,
             stats.gpu_time_ns.map(|ns| ns as f64 / 1e6),
@@ -181,7 +185,12 @@ pub(super) fn run_case(
     } else {
         f64::NAN
     };
-    let dispatch = exec.dispatch_info(bsz, m, n, k);
+    // Split factors below 2 execute the normal dispatch path, so report it.
+    let dispatch = if split_k2 < 2 {
+        exec.dispatch_info(bsz, m, n, k)
+    } else {
+        tensor_ash::DispatchInfo::split_k2(m, n, split_k2)
+    };
     Ok(BenchResult {
         case,
         dispatch,
@@ -402,6 +411,138 @@ pub(super) fn transfer(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> 
             );
         }
     }
+    Ok(())
+}
+
+/// Compare synchronous dispatch against prepared replay and pipelined
+/// prepared submission for one repeated shape.  Host overhead dominates
+/// the smallest GEMMs, so this reports per-call wall time.
+pub(super) fn prepared(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
+    let b = env_u32("ML_B", 1);
+    let m = env_u32("ML_M", 256);
+    let n = env_u32("ML_N", 256);
+    let k = env_u32("ML_K", 256);
+    let iters = env_u32("ML_ITERS", 500).max(1) as usize;
+    let warmup = env_u32("ML_WARMUP", 20) as usize;
+
+    let shape: &[u32] = &[b, m, k];
+    let shape_b: &[u32] = &[b, k, n];
+    let shape_c: &[u32] = &[b, m, n];
+    let a = Tensor::uninit_device(ctx, shape)?;
+    let bt = Tensor::uninit_device(ctx, shape_b)?;
+    let c_sync = Tensor::uninit_device(ctx, shape_c)?;
+    let c_prep = Tensor::uninit_device(ctx, shape_c)?;
+    let c_ping = Tensor::uninit_device(ctx, shape_c)?;
+    let c_pong = Tensor::uninit_device(ctx, shape_c)?;
+    let mut host_a = vec![0.0f32; host_len(shape)?];
+    let mut host_b = vec![0.0f32; host_len(shape_b)?];
+    fill_det(&mut host_a, 41);
+    fill_det(&mut host_b, 42);
+    exec.upload(&host_a, &a)?;
+    exec.upload(&host_b, &bt)?;
+
+    fn call<'t>(a: &'t Tensor, b: &'t Tensor, c: &'t Tensor) -> MatmulCall<'t> {
+        MatmulCall {
+            a,
+            b,
+            c,
+            alpha: 1.0,
+            accumulate: false,
+        }
+    }
+    let per_call_us =
+        |elapsed: std::time::Duration, calls: usize| elapsed.as_secs_f64() * 1e6 / calls as f64;
+
+    // Prepare everything up front, then burn in the GPU clocks with the
+    // sync path for a fixed wall budget so mode ordering does not hand
+    // the later modes warmer clocks than the first.
+    let mut prep = exec.prepare_matmuls(&[call(&a, &bt, &c_prep)])?;
+    let mut ping = exec.prepare_matmuls(&[call(&a, &bt, &c_ping)])?;
+    let mut pong = exec.prepare_matmuls(&[call(&a, &bt, &c_pong)])?;
+    let burn_start = Instant::now();
+    while burn_start.elapsed() < std::time::Duration::from_millis(300) {
+        exec.run_matmuls(&[call(&a, &bt, &c_sync)])?;
+    }
+
+    // Mode 1: the regular synchronous path.
+    for _ in 0..warmup {
+        exec.run_matmuls(&[call(&a, &bt, &c_sync)])?;
+    }
+    let start = Instant::now();
+    for _ in 0..iters {
+        exec.run_matmuls(&[call(&a, &bt, &c_sync)])?;
+    }
+    let sync_us = per_call_us(start.elapsed(), iters);
+
+    // Mode 2: record once, replay synchronously.
+    for _ in 0..warmup {
+        prep.run()?;
+    }
+    let start = Instant::now();
+    for _ in 0..iters {
+        prep.run()?;
+    }
+    let prepared_us = per_call_us(start.elapsed(), iters);
+
+    // Mode 3: two prepared objects ping-ponging so submission and GPU
+    // execution overlap; sustained throughput, not per-call latency.
+    // Same total warmup calls as the other modes.
+    for _ in 0..warmup.div_ceil(2) {
+        ping.run()?;
+        pong.run()?;
+    }
+    let pairs = iters.div_ceil(2);
+    let start = Instant::now();
+    // SAFETY: ping/pong are waited before this function returns and are
+    // never leaked while in flight.
+    unsafe {
+        ping.submit()?;
+        pong.submit()?;
+        for _ in 1..pairs {
+            ping.wait()?;
+            ping.submit()?;
+            pong.wait()?;
+            pong.submit()?;
+        }
+    }
+    ping.wait()?;
+    pong.wait()?;
+    let pipelined_us = per_call_us(start.elapsed(), pairs * 2);
+
+    let expected = cpu_bmm(&host_a, &host_b, None, b, m, n, k, 1.0, false);
+    for (label, c) in [
+        ("sync", &c_sync),
+        ("prepared", &c_prep),
+        ("ping", &c_ping),
+        ("pong", &c_pong),
+    ] {
+        let mut got = vec![0.0f32; expected.len()];
+        exec.download(c, &mut got)?;
+        let (error, index) = max_abs_err(&got, &expected);
+        anyhow::ensure!(
+            error <= 2.0 * tolerance(k),
+            "prepared bench '{label}' output error {error:.3e} at {index}"
+        );
+    }
+
+    let route = exec.dispatch_info(b, m, n, k);
+    println!("prepared: B={b} {m}x{n}x{k}, {iters} iters (all outputs validated)");
+    match route.split_k2_splits {
+        Some(splits) => println!(
+            "  note: sync auto-routes split-K2 x{splits}; prepared replays the DP kernel \
+             — the ratios include that routing difference"
+        ),
+        None => println!("  kernel: {}", route.kernel),
+    }
+    println!("  sync run_matmuls : {sync_us:>8.2} us/call");
+    println!(
+        "  prepared replay  : {prepared_us:>8.2} us/call  ({:.2}x)",
+        sync_us / prepared_us
+    );
+    println!(
+        "  pipelined x2     : {pipelined_us:>8.2} us/call  ({:.2}x)",
+        sync_us / pipelined_us
+    );
     Ok(())
 }
 

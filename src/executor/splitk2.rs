@@ -42,6 +42,47 @@ pub(super) fn stage1_dispatch_info(m: u32, n: u32) -> (&'static str, [u32; 3]) {
     }
 }
 
+/// Conservative untuned route for deep-K shapes whose data-parallel grid is
+/// too small to fill the device. The two stage-1 tile families have different
+/// occupancy targets; keep at least 64/128 K values per split so reduction
+/// overhead never replaces useful inner-loop work.
+pub(super) fn heuristic_splits(batch: u32, m: u32, n: u32, k: u32) -> Option<u32> {
+    if batch == 0 || m <= 1 || n <= 1 || k < 1024 {
+        return None;
+    }
+    let use_m128 = m >= 128 && n >= 128;
+    let tile = if use_m128 { 128 } else { 64 };
+    let tiles = u64::from(batch)
+        .saturating_mul(u64::from(m.div_ceil(tile)))
+        .saturating_mul(u64::from(n.div_ceil(tile)));
+    let (target_wgs, min_k_per_split) = if use_m128 {
+        let min_k = match tiles {
+            1 => 1024,
+            2..=4 => 2048,
+            5..=16 => 4096,
+            _ => return None,
+        };
+        if k < min_k {
+            return None;
+        }
+        (if tiles >= 9 && k >= 8192 { 128u64 } else { 64 }, 128u32)
+    } else {
+        if tiles > 4 {
+            return None;
+        }
+        (128u64, 64u32)
+    };
+    let wanted = target_wgs.div_ceil(tiles);
+    let max_splits = if use_m128 && tiles == 1 {
+        (k / min_k_per_split).max(16)
+    } else {
+        k / min_k_per_split
+    };
+    [64, 32, 16, 8, 4]
+        .into_iter()
+        .find(|&splits| u64::from(splits) <= wanted && splits <= max_splits)
+}
+
 /// Push constants for the reduce stage.  Bit-for-bit identical to the
 /// GLSL `PC` block in `matmul_f32_splitk2_reduce.comp`.
 #[repr(C)]
@@ -57,6 +98,62 @@ pub struct SplitK2ReducePushConstants {
 
 /// Threads per reduce workgroup (matches `local_size_x` in the shader).
 pub(super) const REDUCE_WG_SIZE: u32 = 256;
+
+/// Automatic routing stays below this per-submission scratch budget. Explicit
+/// split-K2 calls remain free to request larger allocations.
+pub(super) const AUTO_SCRATCH_CAP_BYTES: u64 = 256 << 20;
+
+/// Resolve the automatic route without letting a heuristic overwrite a
+/// measured DP winner (`Some(None)`).
+pub(super) fn resolve_auto_splits(
+    tuned: Option<Option<u32>>,
+    heuristic: Option<u32>,
+) -> Option<u32> {
+    tuned.unwrap_or(heuristic)
+}
+
+/// Check every device/addressing limit used by an automatically selected
+/// split-K2 route before allocating scratch or constructing a dispatch plan.
+pub(super) fn auto_route_fits(
+    max_groups: [u32; 3],
+    batch: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    splits: u32,
+) -> bool {
+    if batch == 0 || m == 0 || n == 0 || !(2..=0xFFFF).contains(&splits) || splits > k {
+        return false;
+    }
+    let (_, [tile_m, tile_n, _]) = stage1_dispatch_info(m, n);
+    let Some(total) = u64::from(batch)
+        .checked_mul(u64::from(m))
+        .and_then(|v| v.checked_mul(u64::from(n)))
+    else {
+        return false;
+    };
+    let Some(scratch_elements) = total.checked_mul(u64::from(splits)) else {
+        return false;
+    };
+    let Some(scratch_bytes) = scratch_elements.checked_mul(4) else {
+        return false;
+    };
+    let Some(gz) = batch.checked_mul(splits) else {
+        return false;
+    };
+    n.div_ceil(tile_n) <= max_groups[0]
+        && m.div_ceil(tile_m) <= max_groups[1]
+        && gz <= max_groups[2]
+        && total.div_ceil(4 * u64::from(REDUCE_WG_SIZE)) <= u64::from(max_groups[0])
+        && scratch_elements <= u64::from(u32::MAX) + 1
+        && scratch_bytes <= AUTO_SCRATCH_CAP_BYTES
+}
+
+/// Reserve an aligned region inside the aggregate automatic graph budget.
+pub(super) fn checked_auto_scratch_end(offset: u64, bytes: u64) -> Option<u64> {
+    let end = offset.checked_add(bytes.checked_next_multiple_of(16)?)?;
+    (end <= AUTO_SCRATCH_CAP_BYTES).then_some(end)
+}
 
 /// Validated dispatch geometry + scratch requirement for one split-K2
 /// execution.  Computing this up front lets both the standalone entry
@@ -424,7 +521,10 @@ impl Drop for SplitK2Pipeline {
 
 #[cfg(test)]
 mod tests {
-    use super::{stage1_dispatch_info, validate_scratch_geometry};
+    use super::{
+        AUTO_SCRATCH_CAP_BYTES, auto_route_fits, checked_auto_scratch_end, heuristic_splits,
+        resolve_auto_splits, stage1_dispatch_info, validate_scratch_geometry,
+    };
 
     #[test]
     fn scratch_geometry_rejects_empty_splits_and_uint_wrap() {
@@ -437,5 +537,90 @@ mod tests {
     fn dispatch_info_matches_stage1_tile_choice() {
         assert_eq!(stage1_dispatch_info(128, 128).1, [128, 128, 32]);
         assert_eq!(stage1_dispatch_info(127, 128).1, [64, 64, 32]);
+    }
+
+    #[test]
+    fn heuristic_targets_stage_occupancy_without_short_k_splits() {
+        let cases = [
+            ((1, 64, 64, 1024), Some(16)),
+            ((1, 64, 64, 2048), Some(32)),
+            ((1, 64, 128, 8192), Some(64)),
+            ((4, 64, 64, 4096), Some(32)),
+            ((1, 128, 128, 1024), Some(16)),
+            ((1, 256, 256, 1024), None),
+            ((1, 256, 256, 2048), Some(16)),
+            ((1, 512, 512, 2048), None),
+            ((1, 512, 512, 4096), Some(4)),
+            ((1, 512, 512, 8192), Some(8)),
+            ((1, 1024, 1024, 8192), None),
+            ((1, 1, 4096, 8192), None),
+            ((0, 64, 64, 1024), None),
+        ];
+        for ((batch, m, n, k), expected) in cases {
+            assert_eq!(
+                heuristic_splits(batch, m, n, k),
+                expected,
+                "{batch}x{m}x{n}x{k}"
+            );
+        }
+    }
+
+    #[test]
+    fn measured_route_or_dp_winner_precedes_heuristic() {
+        assert_eq!(resolve_auto_splits(Some(Some(8)), Some(64)), Some(8));
+        assert_eq!(resolve_auto_splits(Some(None), Some(64)), None);
+        assert_eq!(resolve_auto_splits(None, Some(64)), Some(64));
+        assert_eq!(resolve_auto_splits(None, None), None);
+    }
+
+    #[test]
+    fn auto_route_checks_grid_addressing_and_scratch_limits() {
+        let ample = [u32::MAX; 3];
+        assert!(auto_route_fits(ample, 1, 64, 64, 1024, 16));
+        assert!(!auto_route_fits(ample, 0, 64, 64, 1024, 16));
+        assert!(!auto_route_fits(ample, 1, 64, 64, 1024, 1));
+        assert!(!auto_route_fits(ample, 1, 64, 64, 65_536, 65_536));
+        assert!(!auto_route_fits(ample, 1, 64, 64, 8, 16));
+        assert!(!auto_route_fits([1, 1, 15], 1, 64, 64, 1024, 16));
+        assert!(!auto_route_fits([1, 1, u32::MAX], 1, 65, 64, 1024, 16));
+        assert!(!auto_route_fits(
+            [1, u32::MAX, u32::MAX],
+            1,
+            64,
+            65,
+            1024,
+            16
+        ));
+        assert!(!auto_route_fits(
+            [1, u32::MAX, u32::MAX],
+            1,
+            1025,
+            64,
+            1024,
+            16
+        ));
+        assert!(!auto_route_fits(
+            ample,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            2
+        ));
+        // 4 * 1024 * 1024 * 64 == the 256 MiB automatic budget.
+        assert!(auto_route_fits(ample, 1, 1024, 1024, 4096, 64));
+        assert!(!auto_route_fits(ample, 1, 1024, 1025, 4096, 64));
+    }
+
+    #[test]
+    fn graph_scratch_reservation_is_aligned_checked_and_capped() {
+        assert_eq!(checked_auto_scratch_end(0, 1), Some(16));
+        assert_eq!(
+            checked_auto_scratch_end(AUTO_SCRATCH_CAP_BYTES - 16, 16),
+            Some(AUTO_SCRATCH_CAP_BYTES)
+        );
+        assert_eq!(checked_auto_scratch_end(AUTO_SCRATCH_CAP_BYTES, 1), None);
+        assert_eq!(checked_auto_scratch_end(u64::MAX - 7, 8), None);
+        assert_eq!(checked_auto_scratch_end(0, u64::MAX), None);
     }
 }

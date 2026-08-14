@@ -10,7 +10,8 @@ use super::{EpilogueKey, KernelSpec, KernelVariant, MatmulKernel};
 
 /// Build one pipeline for a (kernel, base-variant, epilogue) triple.
 /// Used by the lazy epilogue-pipeline cache in `MatmulPipeline` — the
-/// eager `create_kernel` path only builds the zero-epilogue variants.
+/// eager `create_kernel` path only builds bounds-checked, zero-epilogue
+/// fallbacks.
 pub(super) fn create_epilogue_pipeline(
     ctx: &Arc<VulkanContext>,
     kernel: &MatmulKernel,
@@ -19,7 +20,8 @@ pub(super) fn create_epilogue_pipeline(
 ) -> Result<vk::Pipeline> {
     unsafe {
         let entry = std::ffi::CString::new("main").unwrap();
-        let spec_entries: Vec<vk::SpecializationMapEntry> = (0u32..7)
+        let spec_count = if kernel.supports_epilogue() { 7 } else { 4 };
+        let spec_entries: Vec<vk::SpecializationMapEntry> = (0u32..spec_count)
             .map(|i| {
                 vk::SpecializationMapEntry::default()
                     .constant_id(i)
@@ -38,7 +40,7 @@ pub(super) fn create_epilogue_pipeline(
         ];
         let spec_info = vk::SpecializationInfo::default()
             .map_entries(&spec_entries)
-            .data(bytemuck::cast_slice(&spec_data));
+            .data(bytemuck::cast_slice(&spec_data[..spec_count as usize]));
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(kernel.shader_module)
@@ -73,8 +75,9 @@ pub(super) fn create_epilogue_pipeline(
 /// partially-built kernel: null handles are skipped.
 pub(super) unsafe fn destroy_kernel(ctx: &Arc<VulkanContext>, kernel: MatmulKernel) {
     unsafe {
-        for p in kernel.variants {
-            if p != vk::Pipeline::null() {
+        for i in 0..KernelVariant::COUNT {
+            let p = kernel.variants[i];
+            if p != vk::Pipeline::null() && !kernel.variants[..i].contains(&p) {
                 ctx.device.destroy_pipeline(p, None);
             }
         }
@@ -106,8 +109,9 @@ pub(super) fn create_kernel(
             scopeguard::guard(shader_module, |m| ctx.device.destroy_shader_module(m, None));
         let entry = std::ffi::CString::new("main").unwrap();
 
-        // One pipeline per specialization tuple, batched so the driver
-        // can amortize and de-duplicate ISA compilation.
+        // Only accumulate/alpha affect semantics.  Build the four fully
+        // bounds-checked variants eagerly; aligned M/N/K specializations
+        // are compiled on first use through `pipeline_for_epilogue`.
         let spec_entries = [
             vk::SpecializationMapEntry::default()
                 .constant_id(0)
@@ -127,7 +131,7 @@ pub(super) fn create_kernel(
                 .size(4),
         ];
 
-        let spec_data: Vec<[u32; 4]> = (0..KernelVariant::COUNT)
+        let spec_data: Vec<[u32; 4]> = (0..KernelVariant::FALLBACK_COUNT)
             .map(|i| {
                 let v = KernelVariant::from_index(i);
                 [
@@ -139,7 +143,7 @@ pub(super) fn create_kernel(
             })
             .collect();
 
-        let spec_infos: Vec<vk::SpecializationInfo> = (0..KernelVariant::COUNT)
+        let spec_infos: Vec<vk::SpecializationInfo> = (0..KernelVariant::FALLBACK_COUNT)
             .map(|i| {
                 vk::SpecializationInfo::default()
                     .map_entries(&spec_entries)
@@ -147,7 +151,7 @@ pub(super) fn create_kernel(
             })
             .collect();
 
-        let stages: Vec<vk::PipelineShaderStageCreateInfo> = (0..KernelVariant::COUNT)
+        let stages: Vec<vk::PipelineShaderStageCreateInfo> = (0..KernelVariant::FALLBACK_COUNT)
             .map(|i| {
                 vk::PipelineShaderStageCreateInfo::default()
                     .stage(vk::ShaderStageFlags::COMPUTE)
@@ -157,7 +161,7 @@ pub(super) fn create_kernel(
             })
             .collect();
 
-        let create_infos: Vec<vk::ComputePipelineCreateInfo> = (0..KernelVariant::COUNT)
+        let create_infos: Vec<vk::ComputePipelineCreateInfo> = (0..KernelVariant::FALLBACK_COUNT)
             .map(|i| {
                 vk::ComputePipelineCreateInfo::default()
                     .stage(stages[i])
@@ -182,8 +186,8 @@ pub(super) fn create_kernel(
             };
 
         let mut variants = [vk::Pipeline::null(); KernelVariant::COUNT];
-        for (i, p) in pipelines.iter().enumerate() {
-            variants[i] = *p;
+        for (i, variant) in variants.iter_mut().enumerate() {
+            *variant = pipelines[KernelVariant::from_index(i).fallback().index()];
         }
 
         Ok(MatmulKernel {

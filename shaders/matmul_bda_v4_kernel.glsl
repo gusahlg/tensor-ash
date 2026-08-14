@@ -208,6 +208,19 @@ void main() {
         if (INTERIOR_ONLY && K_MULTIPLE) {
             load_a_tile_v4(a_base, block_row, k_base, tid);
             load_b_tile_v4(b_base, block_col, k_base, tid);
+        } else if (K_MULTIPLE) {
+            // An M/N edge need not scalarize every interior workgroup. K is
+            // tile-aligned here, so A rows are 16-byte aligned; B additionally
+            // needs a four-float row stride. Keeping this behind the existing
+            // specialization flag leaves odd-K codegen identical.
+            if (m_full)
+                load_a_tile_v4(a_base, block_row, k_base, tid);
+            else
+                load_a_tile_scalar(a_base, block_row, k_base, tid, m_full, true);
+            if (n_full && (pc.N & 3u) == 0u)
+                load_b_tile_v4(b_base, block_col, k_base, tid);
+            else
+                load_b_tile_scalar(b_base, block_col, k_base, tid, n_full, true);
         } else {
             load_a_tile_scalar(a_base, block_row, k_base, tid, m_full, true);
             load_b_tile_scalar(b_base, block_col, k_base, tid, n_full, true);

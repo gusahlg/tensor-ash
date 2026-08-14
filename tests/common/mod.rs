@@ -1,7 +1,9 @@
 //! Shared test helpers.
 use std::sync::Arc;
 
-use tensor_ash::{Executor, KernelSelection, MatmulPipeline, Tensor, VulkanContext};
+use tensor_ash::{
+    Executor, ExecutorConfig, KernelSelection, MatmulPipeline, Tensor, VulkanContext,
+};
 
 pub use tensor_ash_test_support::{LcgRng, cpu_bmm, fill_det, max_abs_err, tolerance};
 
@@ -14,10 +16,23 @@ fn validate_from_env() -> bool {
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Tests construct executors with tuning explicitly disabled so a suite
+/// run under `ML_TUNE=1` cannot persist winners for the odd shapes whose
+/// heuristic routes the tests assert.  Explicit `tune_shape` calls still
+/// work — only the implicit first-use tuner is off.
+fn executor_config(n_slots: usize, max_calls: u32) -> ExecutorConfig {
+    ExecutorConfig {
+        n_slots,
+        max_calls_per_submit: max_calls,
+        tune: false,
+    }
+}
+
 pub fn make_setup(n_slots: usize, max_calls: u32) -> (Arc<VulkanContext>, Executor) {
     let ctx = VulkanContext::new(validate_from_env()).expect("Vulkan init");
     let pipe = Arc::new(MatmulPipeline::new(&ctx).expect("pipeline"));
-    let exec = Executor::new(ctx.clone(), pipe, n_slots, max_calls).expect("executor");
+    let exec = Executor::new_with_config(ctx.clone(), pipe, executor_config(n_slots, max_calls))
+        .expect("executor");
     (ctx, exec)
 }
 
@@ -29,7 +44,8 @@ pub fn make_setup_with_kernel(
     let ctx = VulkanContext::new(validate_from_env()).expect("Vulkan init");
     let pipe =
         Arc::new(MatmulPipeline::new_with_kernel_selection(&ctx, selection).expect("pipeline"));
-    let exec = Executor::new(ctx.clone(), pipe, n_slots, max_calls).expect("executor");
+    let exec = Executor::new_with_config(ctx.clone(), pipe, executor_config(n_slots, max_calls))
+        .expect("executor");
     (ctx, exec)
 }
 

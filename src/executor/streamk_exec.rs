@@ -245,9 +245,9 @@ impl Executor {
                 resolved.k,
             );
         }
-        let a_ptr = self.ctx.buffer_device_address(call.a.raw_buffer());
-        let b_ptr = self.ctx.buffer_device_address(call.b.raw_buffer());
-        let c_ptr = self.ctx.buffer_device_address(call.c.raw_buffer());
+        let a_ptr = call.a.device_address();
+        let b_ptr = call.b.device_address();
+        let c_ptr = call.c.device_address();
 
         let pc = StreamKPushConstants {
             m: resolved.m,

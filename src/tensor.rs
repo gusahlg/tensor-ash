@@ -107,6 +107,13 @@ impl Tensor {
     pub fn raw_buffer(&self) -> vk::Buffer {
         self.buffer.raw_buffer()
     }
+
+    /// Cached GPU pointer for `buffer_reference` addressing; 0 when
+    /// `bufferDeviceAddress` is disabled.
+    #[inline]
+    pub(crate) fn device_address(&self) -> u64 {
+        self.buffer.device_address()
+    }
     #[inline]
     pub fn size_bytes(&self) -> vk::DeviceSize {
         self.buffer.size_bytes()

@@ -33,6 +33,11 @@ pub struct Buffer {
     memory_flags: vk::MemoryPropertyFlags,
     /// Persistent mapping pointer for host-visible buffers; null otherwise.
     mapped: *mut u8,
+    /// GPU pointer for the kernel-side `buffer_reference` path, queried
+    /// once at creation; 0 when `bufferDeviceAddress` is disabled.  The
+    /// address is immutable for the buffer's lifetime, so caching it
+    /// removes a driver call from every recorded dispatch.
+    device_address: u64,
 }
 
 // The pointer is owned: no aliasing across threads other than synchronized
@@ -50,6 +55,13 @@ impl Buffer {
     #[inline]
     pub fn raw_buffer(&self) -> vk::Buffer {
         self.raw
+    }
+
+    /// Cached GPU pointer for `buffer_reference` addressing; 0 when
+    /// `bufferDeviceAddress` is disabled.
+    #[inline]
+    pub(crate) fn device_address(&self) -> u64 {
+        self.device_address
     }
 
     /// Raw Vulkan allocation backing this buffer. The `Buffer` retains
@@ -152,6 +164,12 @@ impl Buffer {
                 std::ptr::null_mut()
             };
 
+            let device_address = if ctx.buffer_device_address_enabled {
+                ctx.buffer_device_address(raw)
+            } else {
+                0
+            };
+
             Ok(Self {
                 ctx: Arc::clone(ctx),
                 raw: ScopeGuard::into_inner(raw_guard),
@@ -160,6 +178,7 @@ impl Buffer {
                 location,
                 memory_flags,
                 mapped,
+                device_address,
             })
         }
     }

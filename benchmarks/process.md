@@ -94,7 +94,7 @@ Layered post-`v1.0.0`:
   exposes `bufferDeviceAddress`, with a plain BDA fallback for the TN=2
   `m64n32` tile. Explicit `ML_KERNEL=...` selections are honored verbatim.
 
-`KERNEL_SPECS` currently lists 35 SPIR-V variants, including descriptor-bound,
+`KERNEL_SPECS` currently lists 37 SPIR-V variants, including descriptor-bound,
 BDA, BDA_V4, register-tile, strict-aligned, exploratory, and row/GEMV entries.
 The catalog macro prevents the selection enum, parser aliases, registry order,
 and index mapping from drifting apart. Multiplied by the `K_MULTIPLE` /
@@ -422,6 +422,110 @@ That's a transpose-free reinterpretation, not a copy — the SGEMM kernel that
 runs is the same one PyTorch / CuPy dispatch to. See the comment at the top
 of `cublas_bench.cu` for the exact argument mapping.
 
+## 2026-08-13 Post-v1.4.1 Optimization Log
+
+All figures below are RTX 3070 GPU-timestamp medians with an explicit clock
+warmup. Baseline and candidate used the same shape order, 15-25 warmups, and
+50-100 paired samples. Unchanged controls were kept in each run.
+
+- **Column GEMV (`N=1`) — kept.** Reusing `row_bda` was rejected: it improved
+  only the 256 case and was 4-5x slower at scale. A dedicated cooperative K
+  reduction was tested at one, four, then two output rows per workgroup. Two
+  rows won the fixed seven-case set and left the existing `M=1` path unchanged.
+  Exact release comparison at 4096x1x4096: 0.269 -> 0.157 ms (41.5% lower).
+- **Automatic Split-K2 — kept.** Factors 4/8/16/32/64 were swept over 23
+  M/N/K/batch combinations. The retained heuristic targets 64-128 aggregate
+  stage-one workgroups while limiting K work per split and scratch to 256 MiB.
+  Exact release comparison at 64x64x8192: 0.365 -> 0.022 ms (16.3x faster).
+  Four data-parallel control shapes changed by less than 0.6% in the initial
+  sweep.
+- **Lazy specialization variants — kept.** Eager pipeline creation fell from
+  16 to four correctness-safe variants per kernel (576 -> 144 total); aligned
+  variants are cached on first use. Empty-cache self-check fell from 147 to 46
+  seconds (68.7%), while warmed regression GEMMs stayed within 1.2%.
+- **Exact K-tail compute — rejected twice.** A dynamic remainder loop improved
+  K=65 by 24% but lost compiler unrolling and made K=63 3.6x slower. An
+  unrolled-loop-with-break form still made K=63 over 3x slower. Both patches
+  were fully removed.
+- **Per-operand V4 edge loads — narrowed, then kept.** The first runtime form
+  improved M/N edges but regressed the fully odd guard by 2-3%. Restricting it
+  to the existing compile-time `K_MULTIPLE` specialization restored odd-K
+  codegen. Repeated alternating runs improved M+1 by 3.3% and N+4 by 3.7%; an
+  aligned control, a K-tail control, and 1023x1025x1027 stayed within 0.4%.
+
+The full 69-case Vulkan correctness suite passed after the retained changes.
+
+## 2026-08-14 Overnight Optimization Log
+
+RTX 3070, driver 595.80. GPU-timestamp medians, 50 paired samples with 10
+warmups per case, identical shape order between baseline and candidate runs,
+all shapes of a comparison inside one `ml_bench cases` process. Wall-clock
+per-call figures for the submission work used 1000 iterations at hot clocks.
+
+- **`OpPlan` route unification (gameplan 13) — kept, perf-neutral.** Verified
+  neutral on eleven control shapes (all within noise, identical routes
+  including auto Split-K2 on 64x64x8192). Deleted the duplicate
+  `select_kernel` calls in descriptor updates, recording, and graph recording,
+  and the `Option<Option<u32>>` side channel (`tuned_splitk2_route` /
+  `selected_splitk2_splits` are gone; `pipeline.route()` +
+  `Executor::plan_shape` replace them).
+- **`K=1` outer-product kernel (gameplan 15) — kept.** `outer_bda`,
+  tile (16, 128, 1): 128-thread workgroups, each thread a 4-row x vec4 register
+  tile, no shared memory, no barriers, a tiny inner K loop for general-shape
+  safety under explicit selection. GPU medians vs the tiled route:
+  512x512x1 5.60 -> 3.41 us (-39%), 1024x1024x1 13.50 -> 12.00 (-11%),
+  2048x2048x1 47.8 -> 42.0 (-12%), 4096x4096x1 166.0 -> 160.9 (-3%, already
+  ~90% of store bandwidth). A three-path body (interior vec4 / full-workgroup
+  scalar / guarded edge) matters: the first all-scalar edge path ran
+  1023x1021x1 at 22.1 us; the per-workgroup interiority test brought it to
+  12.8 us. A TM=8 (32, 128, 1) variant was neutral on aligned shapes and worse
+  on odd/small — rejected.
+- **Spin-then-block fence wait — kept.** `wait_for_fences` costs a scheduler
+  wakeup that dominates small dispatches; a 50 us bounded spin on
+  `get_fence_status` before blocking cut the synchronous per-call wall time by
+  25-33% (64^3: 24.9 -> 16.7 us, 256^3: 31.4 -> 22.8, 512^3: 71.4 -> 53.3)
+  and median sync host overhead from ~0.018 to ~0.010 ms. The full GPU test
+  suite wall time fell 80 -> 46 s as a side effect. CPU burn is capped at
+  50 us per call; the multi-threaded `concurrent` path was unaffected.
+- **`PreparedOps` record-once/replay-many (gameplan 14) — kept.** Replay alone
+  is only 1.02-1.09x: recording accounts for just ~1-2 us of the overhead —
+  the submit + fence round trip dominates. The split `submit`/`wait` is the
+  real win: two prepared objects ping-ponging sustain 13.1 us/call at 64^3
+  against 16.5 us for the spin-wait sync path (1.26x) and 24.9 us for the
+  previous blocking path (1.9x). An earlier measurement showed 1.72x for the
+  pipelined mode because the bench timed the sync mode first on cold clocks;
+  the subcommand now burns in clocks before mode 1 — treat mode-ordered
+  benches without a shared burn-in as suspect. Scope: BDA kernels,
+  data-parallel routes; `submit` is `unsafe` because leaking an in-flight
+  object (`mem::forget`) would skip the fence wait in `Drop` and end the
+  tensor borrows while the GPU still dereferences their baked addresses —
+  found by adversarial review, contained by the documented safety contract.
+- **Buffer device-address caching — kept.** Addresses are now queried once at
+  buffer creation instead of 3+ driver calls per op per submission. Wall-time
+  neutral (the driver call was cheap) but it removes driver traffic from every
+  recording path and simplified all call sites.
+- **Odd-shape kernel sweep — no change.** All nine plausible kernels forced on
+  1023x1025x1027: the heuristic's `m128n64k64_bda_v4` (8.59 TFLOPS) is within
+  1% of the best (`k64_bda_v4_tm8_tn4`, 8.68). The cuBLAS gap on fully-odd
+  shapes is structural (see gameplan 17).
+- **K-cooperative row GEMV — kept.** The single-warp `row_bda` ran a lone
+  `1x4096x4096` on only ~128 warps (~180 GB/s). Eight K-slice warps per
+  workgroup now cooperate on the same 32 columns with a fixed-order
+  shared-memory reduce (grid and tile unchanged). A/B at matched clocks:
+  1x4096x4096 0.375 -> 0.158 ms (2.37x), 1x1024x1024 0.058 -> 0.011 ms
+  (5.0x) — both now ~91% of memory bandwidth, matching the column GEMV.
+  The original large-batch M=1 use case (1000x and 10000x batches) is
+  occupancy-saturated by batch count and stayed neutral. Results remain
+  deterministic; all row/epilogue/broadcast tests pass.
+- **Measurement note.** `tall_4096x1024x1024` / `wide_1024x4096x1024` GPU
+  medians moved +6-7% in one regression run and reverted exactly when the
+  baseline's preceding workload (2048^3, 4096^3, batched) was replicated —
+  memory-heavy shapes are sensitive to the clock state left by prior cases.
+  Keep comparing them only under identical case order.
+
+The full Vulkan correctness suite (now 75 cases: +3 `outer_bda`,
++3 `PreparedOps`) passed after the retained changes.
+
 ## Optimization Gameplan
 
 Status legend: DONE, in progress, NEXT.
@@ -460,6 +564,28 @@ Status legend: DONE, in progress, NEXT.
 11. **DONE** — Split `scripts/bench_compare.py` into backend adapters, data
     models/case sets, and report generation, retaining the original module as
     the CLI and compatibility facade.
+12. **DONE** — Dedicated `N=1` column GEMV, conservative automatic Split-K2,
+    and lazy alignment-specialized pipeline creation (measurements above).
+13. **DONE** — Every op's route now resolves once per submission into an
+    `OpPlan` (kernel index plus validated split-K2 leg) that descriptor
+    updates, recording, graph planning, and `dispatch_info` all consume; the
+    tuned map is read exactly once per op, closing the window where a
+    concurrent first-use tune could split one submission across two registry
+    states.
+14. **DONE** — `PreparedOps` record-once/replay-many submission with a split
+    `submit`/`wait`, plus a spin-then-block fence wait on every synchronous
+    path (measurements in the 2026-08-14 log).
+15. **DONE** — Dedicated `K=1` outer-product kernel (`outer_bda`), auto-routed
+    after the GEMV rules (measurements in the 2026-08-14 log).
+16. **NEXT** — Expose the prepared/replay path through the C ABI
+    (`ta_prepared_create` / `ta_prepared_run` / destroy) so Ollama-style
+    integrations get the pipelined small-GEMM rate.
+17. **NEXT** — The fully-odd large-GEMM gap vs cuBLAS (for example
+    1023x1025x1027) is not a tile-choice problem: a forced sweep of all nine
+    plausible kernels found the heuristic's pick within 1% of the best. The
+    remaining gap lives in the bounds-checked store path (no vec4 stores when
+    `N % 4 != 0`) and the K tail; closing it needs a fundamentally different
+    edge strategy, not more tiles.
 
 ### Dead Ends — Do Not Retry
 

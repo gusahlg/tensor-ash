@@ -75,7 +75,7 @@ impl Executor {
             .max_compute_work_group_count;
         let candidates = self
             .pipeline
-            .tune_candidate_indices(dims.m)
+            .tune_candidate_indices(dims.m, dims.n, dims.k)
             .into_iter()
             .filter(|&idx| {
                 let kernel = self.pipeline.kernel_at(idx);

@@ -353,6 +353,11 @@ fn v4_kernels_handle_n_not_multiple_of_4() {
             // Larger N with both an interior tile column and a
             // bounds-checked column.
             (tile_m * 2u32, tile_n * 2u32 + 1u32, 64u32, 131u64, 137u64),
+            // K-aligned M/N edges exercise the per-operand vec4 recovery:
+            // interior workgroups vector-load while the final tile stays
+            // bounds checked.
+            (tile_m + 1u32, tile_n, 64u32, 139u64, 149u64),
+            (tile_m, tile_n + 4u32, 64u32, 151u64, 157u64),
         ] {
             let (gpu, cpu) = run_one(
                 &ctx,

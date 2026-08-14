@@ -50,9 +50,14 @@ callable GEMM component; those runtimes still need their own adapter layer.
 - **Graph submission** (`run_matmul_graph` / `run_op_graph`): dependent
   chains recorded into one command buffer with automatic hazard barriers;
   one fence wait per chain.
+- **Prepared submission** (`prepare_matmuls` / `prepare_ops` /
+  `prepare_op_graph`): validate, route, and record a fixed batch once, then
+  replay with one `vkQueueSubmit` per call; the split `submit`/`wait` lets two
+  prepared objects ping-pong so submission overlaps GPU execution (1.26x over
+  the synchronous path on the smallest GEMMs, 1.9x versus v1.4.1).
 - **Two-stage split-K** (`run_matmuls_split_k2`): deterministic scratch-plane
   partials + reduce, no atomics; up to 16x over the data-parallel path on
-  deep-K skinny shapes and auto-routed via the tuner.
+  deep-K skinny shapes and auto-routed by a conservative heuristic or tuner.
 - Manual override (`ML_KERNEL=...`) over the entire registry.
 - Persistent device-qualified Vulkan pipeline cache under
   `$XDG_CACHE_HOME/tensor-ash/`.
@@ -72,13 +77,21 @@ descriptor-bound tiles:
 - **BDA_V4 aligned** — strict no-bounds-check siblings of the 128x128 and
   m128n64k64 tiles for shapes where `M % BM == N % BN == K % BK == 0`.
   Sources only emit the LDG.E.128 / LDS.E.128 / FFMA hot path and the
-  STG.E.128 epilogue; the dispatcher promotes through `maybe_to_aligned`
-  when the shape qualifies.
-- **Row BDA** — one warp computes one output-row tile without materializing
-  the mostly-empty 64x64 tiles used by a general GEMM. It is selected
-  automatically for `M=1`, including large batches of private neural-network
-  layers, and supports the same broadcasting, accumulation, and fused
-  epilogues as the other bounds-checked BDA kernels.
+  STG.E.128 epilogue; they remain explicit experimental selections because
+  the specialization-constant V4 path is faster on the measured device.
+- **Row BDA** — eight K-slice warps cooperate on one output-row tile
+  without materializing the mostly-empty 64x64 tiles used by a general GEMM.
+  It is selected automatically for `M=1`, saturates memory bandwidth even for
+  a lone row, scales to large batches of private neural-network layers, and
+  supports the same broadcasting, accumulation, and fused epilogues as the
+  other bounds-checked BDA kernels.
+- **Column BDA** — one warp cooperatively reduces K for two output rows. It is
+  selected automatically for `N=1`, reuses B across the two rows, and supports
+  broadcasting, accumulation, and fused epilogues.
+- **Outer BDA** — register-only rank-1 update for `K=1`, where a tiled GEMM
+  wastes ~97% of its staging and math. Each thread owns a 4-row x vec4 tile
+  with no shared memory or barriers; selected automatically for `K=1` and
+  general-shape correct under explicit selection.
 
 On an RTX 3070, every tile we measured gains roughly +5-15% from BDA and
 another +5-15% from V4. The auto-selector promotes its picks to BDA_V4 at
@@ -228,13 +241,14 @@ version + shader build. Persisted winners are applied on **every** run —
 tuning enabled or not — whenever `ML_KERNEL` is `auto`. Delete the store (or
 update the driver / rebuild shaders) to reset it.
 
-`ML_KERNEL=auto` is the default. Concrete names span every entry in
-`KERNEL_SPECS` currently contains 35 concrete choices. They include the
+`ML_KERNEL=auto` is the default. `KERNEL_SPECS` currently contains 37 concrete
+choices. They include the
 descriptor-bound tiles (`large`, `small`, `m64n128`, `m128n64`,
 `m128n64k64`, `m64n32`, `k64`, `bk16`, `v2`, `m64n128k64`,
 `m128n128_t4`, `m256n64`, `v3`), BDA / BDA_V4 and register-tile variants,
-the strict-aligned kernels, and `row_bda` for batched matrix-vector work. The
-authoritative names and aliases live together in `src/pipeline/catalog.rs`.
+the strict-aligned kernels, and the shape-specialized `row_bda` (`M=1`),
+`col_bda` (`N=1`), and `outer_bda` (`K=1`) kernels. The authoritative names
+and aliases live together in `src/pipeline/catalog.rs`.
 `ML_DEVICE` accepts `auto`, `discrete`, `integrated`, `virtual`, `cpu`,
 `index:N`, `name:TEXT`, or a bare name substring.
 
@@ -294,9 +308,11 @@ other GPUs).
   `64x64x8192` runs 16.5x faster than the data-parallel path
   (0.413→0.025 ms), `128x128x8192` 4.6x, `256x256x4096` 1.8x — and is
   deterministic, unlike the atomic split-K.
-- Median synchronous host/submission overhead: ~0.020 ms per GEMM call;
-  reported TFLOPS uses GPU timestamps and excludes it. Dependent chains can
-  amortize it via `run_matmul_graph` (one submission + one fence per chain).
+- Median synchronous host/submission overhead: ~0.010 ms per GEMM call (a
+  bounded spin before the blocking fence wait removed the scheduler wakeup);
+  reported TFLOPS uses GPU timestamps and excludes it. Dependent chains
+  amortize it via `run_matmul_graph`, and repeated fixed batches drop to
+  ~0.013 ms/call end-to-end with two ping-ponged `PreparedOps`.
 
 So: ahead of pure cuBLAS on geomean, decisively ahead of PyTorch CUDA, still
 trailing cuBLAS on a handful of big square / non-pow2 cases

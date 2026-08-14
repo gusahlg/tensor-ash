@@ -133,11 +133,32 @@ impl Executor {
                     .context("queue_submit")?;
             }
 
-            dev.wait_for_fences(&[slot.fence], true, u64::MAX)
-                .context("wait_for_fences")?;
+            wait_fence_spin(dev, slot.fence)?;
             dev.reset_fences(&[slot.fence]).context("reset_fences")?;
             Ok(())
         }
+    }
+}
+
+/// Wait for a fence with a short bounded spin before blocking.  Small
+/// dispatches signal within microseconds, and the blocking wait's
+/// scheduler wakeup costs more than the GPU work itself; the spin
+/// budget caps the wasted CPU on long dispatches at a few microseconds.
+pub(super) fn wait_fence_spin(dev: &ash::Device, fence: vk::Fence) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_micros(50);
+    loop {
+        match unsafe { dev.get_fence_status(fence) } {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(err) => return Err(err).context("get_fence_status"),
+        }
+        if std::time::Instant::now() >= deadline {
+            return unsafe {
+                dev.wait_for_fences(&[fence], true, u64::MAX)
+                    .context("wait_for_fences")
+            };
+        }
+        std::hint::spin_loop();
     }
 }
 

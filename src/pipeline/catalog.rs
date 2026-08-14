@@ -51,7 +51,7 @@ macro_rules! kernel_catalog {
                     "" | "auto" => Ok(Self::Auto),
                     $($($alias)|+ => Ok(Self::$variant),)+
                     other => bail!(
-                        "invalid ML_KERNEL '{other}', expected one of auto, large, small, m64n128, m128n64, m128n64k64, m64n32, k64, row_bda, bk16, v2, m64n128k64, m128n128_t4, m256n64, v3, or any *_bda / *_bda_v4 variant"
+                        "invalid ML_KERNEL '{other}', expected one of auto, large, small, m64n128, m128n64, m128n64k64, m64n32, k64, row_bda, col_bda, outer_bda, bk16, v2, m64n128k64, m128n128_t4, m256n64, v3, or any *_bda / *_bda_v4 variant"
                     ),
                 }
             }
@@ -161,6 +161,14 @@ kernel_catalog! {
     // Warp-sized row kernel for large batches of matrix-vector products.
     RowBda => ("row_bda", 1, 32, 1, "matmul_f32_row_bda.spv", false,
         ["row_bda", "row", "gemv_bda"]),
+    // Cooperative K reduction for column vectors; general-shape correct so it
+    // remains safe when selected explicitly for experiments.
+    ColBda => ("col_bda", 2, 1, 1, "matmul_f32_col_bda.spv", false,
+        ["col_bda", "col", "gemv_col_bda"]),
+    // Register-only outer product for K=1 (rank-1 update); the tiny inner
+    // loop keeps it general-shape correct when selected explicitly.
+    OuterBda => ("outer_bda", 16, 128, 1, "matmul_f32_outer_bda.spv", false,
+        ["outer_bda", "outer", "k1"]),
 }
 
 #[cfg(test)]
