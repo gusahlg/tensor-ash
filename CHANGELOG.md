@@ -18,6 +18,17 @@
   `examples/c_smoke.c` now exercises a bias+SiLU op, prepared replay
   (run and submit/wait), and an f16-weights matmul.
 
+- **Model ops** (`run_softmax_rows`, `run_rms_norm`, `run_layer_norm`,
+  `run_rope`, `run_copy_strided`): the minimal non-GEMM kernel family for a
+  transformer decoder block, structured as a lazily-built sibling pipeline
+  beside split-K2. Row softmax supports prefix and causal valid-length
+  masks and stores exact zeros in the masked tail, so attention over a
+  zero-padded KV cache composes correctly with plain batched matmuls
+  (pinned by an end-to-end decode-attention test). RMSNorm runs at memory
+  bandwidth (~450 GB/s effective on RTX 3070); RoPE supports partial
+  rotary dims and in-place operation; the strided copy covers transpose,
+  KV-cache append, and head reshaping. `examples/bench_ops.rs` reports op
+  bandwidths.
 - **FP16 weight storage** (`DType::F16`, `Tensor::uninit_device_f16`): B
   (weights) may be stored as IEEE half while A/C and accumulation stay f32.
   Upload/download keep the `&[f32]` host API and convert with

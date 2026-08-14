@@ -1,0 +1,69 @@
+#version 460
+// Rotary position embedding over [T, H, dh] activations.
+//
+// Rotates interleaved pairs (x[2i], x[2i+1]) within the first
+// `rot_dim` lanes of each head vector by angles from a precomputed
+// [T_max, rot_dim/2, 2] cos/sin table (uploaded once as a plain f32
+// tensor). Lanes at or past rot_dim pass through untouched (partial
+// rotary, e.g. Phi). Out-of-place safe and in-place safe: each pair
+// is read and written exactly once by one invocation.
+//
+// One invocation per rotated pair: global id over T * H * rot_dim/2.
+
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32ReadWrite {
+    float v[];
+};
+
+layout(push_constant) uniform PC {
+    uint tokens;
+    uint heads;
+    uint head_dim;
+    uint rot_dim;   // even, <= head_dim
+    uint pos_base;  // absolute position of token 0 (decode step offset)
+    uint _pad;
+    F32ReadOnly in_ptr;
+    F32ReadWrite out_ptr;
+    F32ReadOnly table_ptr; // [T_max, rot_dim/2, 2] = (cos, sin) pairs
+} pc;
+
+void main() {
+    const uint half_rot = pc.rot_dim / 2u;
+    const uint pairs = pc.tokens * pc.heads * half_rot;
+    const uint id = gl_GlobalInvocationID.x;
+    if (id >= pairs) return;
+
+    const uint pair = id % half_rot;
+    const uint head = (id / half_rot) % pc.heads;
+    const uint token = id / (half_rot * pc.heads);
+
+    const uint vec_base = (token * pc.heads + head) * pc.head_dim;
+    const uint i0 = vec_base + pair * 2u;
+    const float x0 = pc.in_ptr.v[i0];
+    const float x1 = pc.in_ptr.v[i0 + 1u];
+
+    const uint angle = ((pc.pos_base + token) * half_rot + pair) * 2u;
+    const float c = pc.table_ptr.v[angle];
+    const float s = pc.table_ptr.v[angle + 1u];
+
+    pc.out_ptr.v[i0] = fma(x0, c, -x1 * s);
+    pc.out_ptr.v[i0 + 1u] = fma(x0, s, x1 * c);
+
+    // Pass-through lanes past rot_dim, distributed over the pair ids
+    // of this head vector so no second dispatch is needed.
+    if (pc.rot_dim < pc.head_dim) {
+        const uint tail = pc.head_dim - pc.rot_dim;
+        for (uint lane = pair; lane < tail; lane += half_rot) {
+            const uint idx = vec_base + pc.rot_dim + lane;
+            pc.out_ptr.v[idx] = pc.in_ptr.v[idx];
+        }
+    }
+}

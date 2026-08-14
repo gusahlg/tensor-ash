@@ -423,7 +423,7 @@ impl SplitK2Pipeline {
     }
 }
 
-unsafe fn create_pc_only_layout(
+pub(super) unsafe fn create_pc_only_layout(
     ctx: &Arc<VulkanContext>,
     pc_size: u32,
 ) -> Result<vk::PipelineLayout> {

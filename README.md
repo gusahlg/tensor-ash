@@ -55,6 +55,12 @@ callable GEMM component; those runtimes still need their own adapter layer.
   replay with one `vkQueueSubmit` per call; the split `submit`/`wait` lets two
   prepared objects ping-pong so submission overlaps GPU execution (1.26x over
   the synchronous path on the smallest GEMMs, 1.9x versus v1.4.1).
+- **Model ops** (`run_softmax_rows` / `run_rms_norm` / `run_layer_norm` /
+  `run_rope` / `run_copy_strided`): masked row softmax (exact-zero masked
+  tail — zero-padded KV caches compose exactly), bandwidth-rate RMSNorm /
+  LayerNorm, partial-rotary RoPE, and a generic strided copy for
+  transpose / KV-append / head reshaping. Together with fused-epilogue
+  GEMM these cover a full transformer decoder block.
 - **FP16 weights** (`Tensor::uninit_device_f16`): store B as IEEE half with
   f32 accumulation — half the weight memory and ~1.9x on bandwidth-bound
   decode GEMV shapes, neutral on compute-bound ones. The `&[f32]` host API

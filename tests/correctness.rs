@@ -13,6 +13,8 @@ mod common;
 
 #[path = "correctness/batch.rs"]
 mod batch;
+#[path = "correctness/elementwise.rs"]
+mod elementwise;
 #[path = "correctness/epilogue.rs"]
 mod epilogue;
 #[path = "correctness/f16.rs"]

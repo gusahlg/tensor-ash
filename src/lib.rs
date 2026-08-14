@@ -42,7 +42,9 @@ pub mod tensor;
 pub use buffer::{Buffer, BufferLocation};
 pub use context::{DeviceKind, DevicePreference, DeviceSummary, VulkanContext};
 pub use dtype::DType;
-pub use executor::{DispatchInfo, Executor, ExecutorConfig, PreparedOps};
+pub use executor::{
+    CopyDesc, DispatchInfo, Executor, ExecutorConfig, PreparedOps, RopeDesc, SoftmaxMask,
+};
 pub use matmul::{
     Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, MatrixShape, RunStats,
 };

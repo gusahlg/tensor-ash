@@ -1,0 +1,91 @@
+#version 460
+// Numerically stable row softmax with a valid-length mask.
+//
+// One workgroup per row, 256 threads striding the columns; two
+// fixed-order tree reductions (max, then sum) through shared memory
+// keep results deterministic. Columns at or past the row's valid
+// length contribute -inf to the max, 0 to the sum, and store exactly
+// 0.0 — so attention over a zero-padded KV cache stays correct: the
+// padded tail gets zero probability and a downstream P@V matmul over
+// the full padded extent is exact.
+//
+// Row valid length:
+//   causal == 0:  valid_base                     (decode: kv_len)
+//   causal == 1:  valid_base + (row % rows_per_group) + 1u
+//     (prefill: rows are [H, T_q] flattened with rows_per_group = T_q;
+//      valid_base = cache prefix p0, so row i attends to p0 + i + 1)
+//
+// `scale` is folded in before the max pass (1/sqrt(dh) or 1.0).
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32ReadWrite {
+    float v[];
+};
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint valid_base;
+    uint rows_per_group;
+    uint causal;
+    float scale;
+    F32ReadOnly in_ptr;
+    F32ReadWrite out_ptr;
+} pc;
+
+shared float red[256];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+
+    const uint valid = pc.causal != 0u
+        ? min(pc.cols, pc.valid_base + (row % pc.rows_per_group) + 1u)
+        : min(pc.cols, pc.valid_base);
+    const uint base = row * pc.cols;
+
+    // Pass 1: masked row max.
+    float local_max = -3.402823466e38;
+    for (uint col = tid; col < valid; col += 256u) {
+        local_max = max(local_max, pc.in_ptr.v[base + col] * pc.scale);
+    }
+    red[tid] = local_max;
+    barrier();
+    [[unroll]] for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) red[tid] = max(red[tid], red[tid + stride]);
+        barrier();
+    }
+    const float row_max = red[0];
+    barrier();
+
+    // Pass 2: exp sum. An all-masked row (valid == 0) degenerates to
+    // sum 0; guard the divide so it stores zeros instead of NaN.
+    float local_sum = 0.0;
+    for (uint col = tid; col < valid; col += 256u) {
+        local_sum += exp(pc.in_ptr.v[base + col] * pc.scale - row_max);
+    }
+    red[tid] = local_sum;
+    barrier();
+    [[unroll]] for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) red[tid] += red[tid + stride];
+        barrier();
+    }
+    const float inv_sum = red[0] > 0.0 ? 1.0 / red[0] : 0.0;
+
+    // Pass 3: write probabilities; masked tail stores exact zeros.
+    for (uint col = tid; col < pc.cols; col += 256u) {
+        pc.out_ptr.v[base + col] = col < valid
+            ? exp(pc.in_ptr.v[base + col] * pc.scale - row_max) * inv_sum
+            : 0.0;
+    }
+}

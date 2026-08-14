@@ -23,6 +23,7 @@
 //! overlap of consecutive submissions).
 
 mod dispatch;
+mod elementwise;
 mod prepared;
 mod recording;
 mod reduction;
@@ -47,6 +48,7 @@ use slot::Slot;
 use splitk2::SplitK2Pipeline;
 
 pub use crate::matmul::{MatmulCall, RunStats};
+pub use elementwise::{CopyDesc, RopeDesc, SoftmaxMask};
 pub use prepared::PreparedOps;
 
 /// Read-only description of the route selected for a plain matmul shape.
@@ -102,6 +104,9 @@ pub struct Executor {
     /// Two-stage split-K pipeline (scratch partials + reduce), lazily
     /// built on first use of `run_matmuls_split_k2`.
     split_k2: OnceLock<SplitK2Pipeline>,
+    /// Non-GEMM model ops (softmax/norm/RoPE/copy), lazily built on
+    /// first use of any `run_*` elementwise entry point.
+    elementwise: OnceLock<elementwise::ElementwisePipeline>,
     /// `ML_TUNE=1`: measure every eligible kernel the first time a new
     /// shape is submitted, record the winner in the pipeline's
     /// persistent tuning store, and use it from then on.  Off by
@@ -246,6 +251,7 @@ impl Executor {
             slot_avail: Condvar::new(),
             max_calls_per_submit,
             split_k2: OnceLock::new(),
+            elementwise: OnceLock::new(),
             tune_enabled: config.tune,
         })
     }
