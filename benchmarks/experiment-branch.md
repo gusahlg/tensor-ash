@@ -1,5 +1,102 @@
 # Experiment branch log
 
+## Leg 15 — `experiment/decode-store-fusion` (rope/copy fused into q/k/v GEMV stores)
+
+A fused **store epilogue** on the f16-weights row GEMVs (`STORE_MODE`
+spec constant 7, `STORE_DST_F16` 8): the decode q projection RoPE-
+rotates its output pairs as it stores (partner column read back from
+the already-barriered shared partials for VCOLS=1, lane-local for
+VCOLS=2 — bit-exact with the standalone rope), the k projection
+rotates AND scatters straight into the `[H, dh, T_max]` Kt cache, and
+the v projection scatters into the `[H, T_max, dh]` V cache (f16 RNE
+or f32 by cache dtype).  Push constants grow 80 -> 128 bytes (the
+Vulkan guaranteed minimum) carrying table/dst/pos pointers + scatter
+geometry; position indirection reuses the `PosBuffer` cell, so the
+prepared decode graph stays record-once.  Host: `MatmulStore` on
+`MatmulOp`, resolution-time validation (M=1, f16 B, no
+accumulate/epilogue, `head_dim | N`, table coverage, dst bounds),
+store-aware kernel demotion, and precise graph access sets (the
+scatter modes write the cache and never C, so the attention's cache
+reads barrier correctly).
+
+**Decode graph shrinkage** (TinyLlama: 22 layers): `Rope(q)`,
+`RopeScatter(k)`, `CopyStrided(v)` deleted from the decode graph —
+12 -> 9 ops/layer, 66 fewer dispatches/token (269 -> 203), and the
+k-append hazard barrier is gone (8 -> 7 barriers/layer, −22
+barriers/token ≈ −170 µs of drain at the measured ~7.7 µs/barrier).
+The standalone Rope / RopeScatter / CopyStrided ExecOps stay — prefill
+and the perop path still use them.
+
+Phased interleaved A/Bs (RTX 3070, `llama_ash bench --pp 512 --tg
+128`, alternating binaries in one session, warmup prefill + 16 decode
+steps burn-in per run; tg128 t/s):
+
+Phase F1+F3 (q-rope + v-scatter) vs main@682f01d — branch 5/6 pairs:
+
+| pair | main | F1+F3 |
+|---|---|---|
+| 1 | 167.58 | 168.30 |
+| 2 | 166.82 | 167.45 |
+| 3 | 162.16 | 168.35 |
+| 4 | 168.10 | 167.39 |
+| 5 | 167.15 | 167.33 |
+| 6 | 167.06 | 167.70 |
+| mean | 166.48 | **167.75** (+0.8%) |
+
+Phase F2 (k rope-scatter) vs F1+F3 — F2 6/6 pairs:
+
+| pair | F1+F3 | F2 |
+|---|---|---|
+| 1 | 167.65 | 169.00 |
+| 2 | 167.35 | 169.08 |
+| 3 | 167.33 | 168.52 |
+| 4 | 168.47 | 168.95 |
+| 5 | 168.33 | 169.80 |
+| 6 | 168.21 | 169.94 |
+| mean | 167.89 | **169.22** (+0.8%) |
+
+Final (main vs branch, 8 pairs) — branch 7/8 pairs; pairs 4-6 caught a
+clock-throttle window on BOTH sides (the interleave keeps the
+comparison valid), where the branch degraded far less — consistent
+with lower per-token launch + barrier overhead:
+
+| pair | main pp512 | branch pp512 | main tg128 | branch tg128 |
+|---|---|---|---|---|
+| 1 | 8211 | 9373 | 168.40 | 170.17 |
+| 2 | 9006 | 8712 | 168.25 | 169.35 |
+| 3 | 9370 | 8731 | 168.04 | 166.17 |
+| 4 | 8067 | 8242 | 151.49 | 154.85 |
+| 5 | 8225 | 7131 | 147.89 | 156.65 |
+| 6 | 8870 | 8527 | 156.59 | 169.82 |
+| 7 | 9023 | 8944 | 168.35 | 168.99 |
+| 8 | 9113 | 9263 | 168.06 | 168.86 |
+| median | 8938 | 8722 | 168.05 | **168.93** |
+
+Net: tg128 ~166.5-168 -> ~168.5-170 clean-clock (+1.5% across the two
+gated phases, both individually positive); pp512 neutral (prefill is
+untouched).  **The 175 t/s CUDA-parity goal is NOT reached** — the
+fusion removed a quarter of the dispatches and the graph is now
+GEMV-dominated; the residual ~6 t/s lives in the seven remaining
+hazard barriers/layer and the GEMV kernel time itself (already at
+81-89% of bandwidth).
+
+**Phase F4 (QKV weight concat) SKIPPED**, with justification: the
+three projection GEMVs already execute as one barrier-free group, so a
+single [2048, 2560] GEMV saves only 2 launch slots/layer, not barrier
+drain; per-segment stores need a fourth store mode with two dst
+pointers + segment bases, pushing the shared push-constant block past
+the 128-byte guaranteed minimum for every matmul pipeline in the
+library; and the measured yield of pure dispatch-count reduction
+(F1+F3: −44 dispatches -> +0.8%) bounds the expected win at well under
++0.5% for materially higher complexity and a portability regression.
+
+Correctness: 7 new GPU tests (fused-vs-composed BITWISE equality for
+rope / scatter / rope-scatter on k16 and k16_v2 routes, interior and
+ragged N, f16 + f32 caches; pos-cell indirection; validation
+rejections incl. loud record-time failure on non-store kernels).
+Suite 113/113 + 45 unit, clippy clean.  Token gate 24/24
+byte-identical in prepared, graph, and `LLAMA_ASH_KV=f32` modes.
+
 ## Leg 14 — `experiment/cm2-flash` (NV_cooperative_matrix2 flash attention)
 
 Tensor-core flash-attention prefill via `GL_NV_cooperative_matrix2`
