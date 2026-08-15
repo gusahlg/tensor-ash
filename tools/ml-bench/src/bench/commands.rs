@@ -12,6 +12,20 @@ use super::cases::{BenchCase, BenchResult, SampleSummary, host_len, sweep_cases}
 use super::env::{OutputMode, SweepMode, env_u32, env_usize};
 use super::report::{BenchReporter, csv_escape};
 
+/// Shared measurement knobs: `ML_ITERS`/`ML_WARMUP` plus a reporter
+/// scaled by `ML_PEAK_TFLOPS`, header already printed.
+fn reporter_setup(ctx: &Arc<VulkanContext>) -> (BenchReporter<'_>, u32, u32) {
+    let iters = env_u32("ML_ITERS", 20).max(1);
+    let warmup = env_u32("ML_WARMUP", 3);
+    let peak = env::var("ML_PEAK_TFLOPS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(20.3);
+    let mut reporter = BenchReporter::new(OutputMode::from_env(), peak, ctx);
+    reporter.print_header();
+    (reporter, iters, warmup)
+}
+
 pub(super) fn correctness(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
     let b = env_u32("ML_B", 2);
     let m = env_u32("ML_M", 64);
@@ -52,7 +66,7 @@ fn correctness_impl(
 
     let cpu = cpu_bmm(&ha, &hb, None, B, M, N, K, 1.0, false);
     let (e, idx) = max_abs_err(&hc, &cpu);
-    let tol = 8.0 * (K as f32) * f32::EPSILON;
+    let tol = tolerance(K);
     log::info!(
         "correctness: max|err|={e:.3e}  tol={tol:.3e}  \
          at idx {idx}: gpu={:.6}  cpu={:.6}",
@@ -65,20 +79,13 @@ fn correctness_impl(
 }
 
 pub(super) fn sweep(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
-    let iters = env_u32("ML_ITERS", 20).max(1);
-    let warmup = env_u32("ML_WARMUP", 3);
     let default_sweep = if ctx.device_kind() == DeviceKind::Cpu {
         SweepMode::Smoke
     } else {
         SweepMode::Standard
     };
     let sweep_mode = SweepMode::from_env(default_sweep);
-    let peak = env::var("ML_PEAK_TFLOPS")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(20.3);
-    let mut reporter = BenchReporter::new(OutputMode::from_env(), peak, ctx);
-    reporter.print_header();
+    let (mut reporter, iters, warmup) = reporter_setup(ctx);
 
     for case in sweep_cases(sweep_mode) {
         let result = run_case(ctx, exec, case.clone(), iters, warmup)?;
@@ -100,14 +107,7 @@ pub(super) fn cases(
         !cases.is_empty(),
         "cases requires at least one label,b,m,n,k argument"
     );
-    let iters = env_u32("ML_ITERS", 20).max(1);
-    let warmup = env_u32("ML_WARMUP", 3);
-    let peak = env::var("ML_PEAK_TFLOPS")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(20.3);
-    let mut reporter = BenchReporter::new(OutputMode::from_env(), peak, ctx);
-    reporter.print_header();
+    let (mut reporter, iters, warmup) = reporter_setup(ctx);
     for case in cases {
         reporter.print_case(&run_case(ctx, exec, case, iters, warmup)?);
     }
@@ -279,12 +279,6 @@ pub(super) fn single(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
     let m = env_u32("ML_M", 4096);
     let n = env_u32("ML_N", 4096);
     let k = env_u32("ML_K", 4096);
-    let iters = env_u32("ML_ITERS", 20).max(1);
-    let warmup = env_u32("ML_WARMUP", 3);
-    let peak = env::var("ML_PEAK_TFLOPS")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(20.3);
     let case = BenchCase {
         b_f16: false,
         label: Cow::Owned(format!("B={b} M={m} N={n} K={k}")),
@@ -293,8 +287,7 @@ pub(super) fn single(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
         n,
         k,
     };
-    let mut reporter = BenchReporter::new(OutputMode::from_env(), peak, ctx);
-    reporter.print_header();
+    let (mut reporter, iters, warmup) = reporter_setup(ctx);
     let result = run_case(ctx, exec, case, iters, warmup)?;
     reporter.print_case(&result);
     Ok(())

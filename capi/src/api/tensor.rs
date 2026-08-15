@@ -1,12 +1,31 @@
 use std::ffi::c_int;
 use std::sync::Arc;
 
-use tensor_ash_core::{DType, Tensor};
+use tensor_ash_core::{DType, Tensor, VulkanContext};
 
 use crate::error::{
     checked_ref, checked_slice, checked_slice_mut, destroy_handle, ffi_create, ffi_status,
 };
 use crate::handles::{ta_context, ta_executor, ta_tensor};
+
+/// Shared body of the four `ta_tensor_create*` exports.
+fn tensor_create(
+    ctx: &Arc<VulkanContext>,
+    shape: *const u32,
+    rank: usize,
+    dtype: DType,
+    operation: &str,
+) -> anyhow::Result<*mut ta_tensor> {
+    let shape = checked_slice(shape, rank, &format!("{operation}: shape is null"))?;
+    let tensor = match dtype {
+        DType::F16 => Tensor::uninit_device_f16(ctx, shape)?,
+        DType::F32 => Tensor::uninit_device(ctx, shape)?,
+    };
+    Ok(Box::into_raw(Box::new(ta_tensor {
+        ctx: Arc::clone(ctx),
+        tensor,
+    })))
+}
 
 /// Allocate a device-local tensor from a context.
 ///
@@ -22,12 +41,7 @@ pub unsafe extern "C" fn ta_tensor_create(
 ) -> *mut ta_tensor {
     ffi_create(|| {
         let ctx = checked_ref(ctx, "ta_tensor_create: ctx is null")?;
-        let shape = checked_slice(shape, rank, "ta_tensor_create: shape is null")?;
-        let tensor = Tensor::uninit_device(&ctx.ctx, shape)?;
-        Ok(Box::into_raw(Box::new(ta_tensor {
-            ctx: Arc::clone(&ctx.ctx),
-            tensor,
-        })))
+        tensor_create(&ctx.ctx, shape, rank, DType::F32, "ta_tensor_create")
     })
 }
 
@@ -45,12 +59,13 @@ pub unsafe extern "C" fn ta_tensor_create_on_executor(
 ) -> *mut ta_tensor {
     ffi_create(|| {
         let exec = checked_ref(exec, "ta_tensor_create_on_executor: exec is null")?;
-        let shape = checked_slice(shape, rank, "ta_tensor_create_on_executor: shape is null")?;
-        let tensor = Tensor::uninit_device(&exec.ctx, shape)?;
-        Ok(Box::into_raw(Box::new(ta_tensor {
-            ctx: Arc::clone(&exec.ctx),
-            tensor,
-        })))
+        tensor_create(
+            &exec.ctx,
+            shape,
+            rank,
+            DType::F32,
+            "ta_tensor_create_on_executor",
+        )
     })
 }
 
@@ -74,12 +89,7 @@ pub unsafe extern "C" fn ta_tensor_create_f16(
 ) -> *mut ta_tensor {
     ffi_create(|| {
         let ctx = checked_ref(ctx, "ta_tensor_create_f16: ctx is null")?;
-        let shape = checked_slice(shape, rank, "ta_tensor_create_f16: shape is null")?;
-        let tensor = Tensor::uninit_device_f16(&ctx.ctx, shape)?;
-        Ok(Box::into_raw(Box::new(ta_tensor {
-            ctx: Arc::clone(&ctx.ctx),
-            tensor,
-        })))
+        tensor_create(&ctx.ctx, shape, rank, DType::F16, "ta_tensor_create_f16")
     })
 }
 
@@ -97,16 +107,13 @@ pub unsafe extern "C" fn ta_tensor_create_f16_on_executor(
 ) -> *mut ta_tensor {
     ffi_create(|| {
         let exec = checked_ref(exec, "ta_tensor_create_f16_on_executor: exec is null")?;
-        let shape = checked_slice(
+        tensor_create(
+            &exec.ctx,
             shape,
             rank,
-            "ta_tensor_create_f16_on_executor: shape is null",
-        )?;
-        let tensor = Tensor::uninit_device_f16(&exec.ctx, shape)?;
-        Ok(Box::into_raw(Box::new(ta_tensor {
-            ctx: Arc::clone(&exec.ctx),
-            tensor,
-        })))
+            DType::F16,
+            "ta_tensor_create_f16_on_executor",
+        )
     })
 }
 

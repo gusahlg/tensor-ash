@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 use ash::vk;
 
-use crate::buffer::{Buffer, BufferLocation};
+use crate::buffer::BufferLocation;
 use crate::matmul::ResolvedMatmul;
 
 use super::splitk2::{self, SplitK2Pipeline, default_num_k_splits};
@@ -81,22 +81,13 @@ impl Executor {
     /// Grow the slot-local split-K2 scratch to at least `bytes` and
     /// return its device address.
     pub(super) fn ensure_splitk2_scratch(&self, slot: &mut Slot, bytes: u64) -> Result<u64> {
-        let needs_new = slot
-            .splitk2_scratch
-            .as_ref()
-            .is_none_or(|buffer| buffer.size < bytes);
-        if needs_new {
-            slot.splitk2_scratch = Some(Buffer::new(
-                &self.ctx,
-                bytes,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-                BufferLocation::Device,
-            )?);
-        }
-        let scratch = slot
-            .splitk2_scratch
-            .as_ref()
-            .expect("split-K2 scratch initialized above");
+        let scratch = super::slot::ensure_slot_buffer(
+            &self.ctx,
+            &mut slot.splitk2_scratch,
+            bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            BufferLocation::Device,
+        )?;
         Ok(self.ctx.buffer_device_address(scratch.raw))
     }
 

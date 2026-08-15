@@ -66,6 +66,13 @@ pub(crate) fn checked_ref<'a, T>(ptr: *const T, message: &str) -> Result<&'a T> 
     Ok(unsafe { &*ptr })
 }
 
+pub(crate) fn checked_mut<'a, T>(ptr: *mut T, message: &str) -> Result<&'a mut T> {
+    if ptr.is_null() {
+        bail!("{message}");
+    }
+    Ok(unsafe { &mut *ptr })
+}
+
 pub(crate) fn checked_slice<'a, T>(ptr: *const T, len: usize, message: &str) -> Result<&'a [T]> {
     if len == 0 {
         return Ok(&[]);

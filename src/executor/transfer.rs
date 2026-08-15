@@ -3,11 +3,16 @@
 use anyhow::{Result, anyhow, bail};
 use ash::vk;
 
-use crate::buffer::{Buffer, BufferLocation};
+use crate::buffer::BufferLocation;
 use crate::dtype::{DType, f16_bits_to_f32, f32_to_f16_bits};
 use crate::tensor::Tensor;
 
+use super::slot::ensure_slot_buffer;
 use super::{Executor, Slot};
+
+const STAGING_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::TRANSFER_SRC.as_raw() | vk::BufferUsageFlags::TRANSFER_DST.as_raw(),
+);
 
 impl Executor {
     /// Synchronous host->device upload via the slot-local staging buffer.
@@ -86,7 +91,13 @@ impl Executor {
         size: vk::DeviceSize,
     ) -> Result<()> {
         let staging_raw = {
-            let staging = self.ensure_upload_staging(slot, size)?;
+            let staging = ensure_slot_buffer(
+                &self.ctx,
+                &mut slot.upload_staging,
+                size,
+                STAGING_USAGE,
+                BufferLocation::Host,
+            )?;
             staging.write_pod_slice(src)?;
             staging.raw
         };
@@ -100,58 +111,19 @@ impl Executor {
         dst: &mut [T],
         size: vk::DeviceSize,
     ) -> Result<()> {
-        let staging_raw = self.ensure_download_staging(slot, size)?.raw;
+        let staging_raw = ensure_slot_buffer(
+            &self.ctx,
+            &mut slot.download_staging,
+            size,
+            STAGING_USAGE,
+            BufferLocation::HostCached,
+        )?
+        .raw;
         self.run_copy_on_slot(slot, src.raw_buffer(), staging_raw, size)?;
         slot.download_staging
             .as_ref()
-            .expect("download staging exists after ensure_download_staging")
+            .expect("download staging exists after ensure_slot_buffer")
             .read_pod_slice(dst)
-    }
-
-    fn ensure_upload_staging<'a>(
-        &self,
-        slot: &'a mut Slot,
-        size: vk::DeviceSize,
-    ) -> Result<&'a Buffer> {
-        let needs_new = slot
-            .upload_staging
-            .as_ref()
-            .is_none_or(|buffer| buffer.size < size);
-        if needs_new {
-            slot.upload_staging = Some(Buffer::new(
-                &self.ctx,
-                size,
-                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                BufferLocation::Host,
-            )?);
-        }
-        Ok(slot
-            .upload_staging
-            .as_ref()
-            .expect("upload staging buffer is initialized"))
-    }
-
-    fn ensure_download_staging<'a>(
-        &self,
-        slot: &'a mut Slot,
-        size: vk::DeviceSize,
-    ) -> Result<&'a Buffer> {
-        let needs_new = slot
-            .download_staging
-            .as_ref()
-            .is_none_or(|buffer| buffer.size < size);
-        if needs_new {
-            slot.download_staging = Some(Buffer::new(
-                &self.ctx,
-                size,
-                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                BufferLocation::HostCached,
-            )?);
-        }
-        Ok(slot
-            .download_staging
-            .as_ref()
-            .expect("download staging buffer is initialized"))
     }
 
     fn run_copy_on_slot(

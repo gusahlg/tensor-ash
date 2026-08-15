@@ -3,7 +3,7 @@
 use std::ffi::c_int;
 use std::sync::Arc;
 
-use crate::error::{checked_ref, destroy_handle, ffi_create, ffi_status};
+use crate::error::{checked_mut, checked_ref, destroy_handle, ffi_create, ffi_status};
 use crate::handles::{ta_executor, ta_prepared};
 use crate::types::{ta_matmul_op, ta_run_stats};
 
@@ -69,10 +69,7 @@ pub unsafe extern "C" fn ta_prepared_run(
     stats: *mut ta_run_stats,
 ) -> c_int {
     ffi_status(|| {
-        if prepared.is_null() {
-            anyhow::bail!("ta_prepared_run: prepared is null");
-        }
-        let prepared = unsafe { &mut *prepared };
+        let prepared = checked_mut(prepared, "ta_prepared_run: prepared is null")?;
         write_stats(stats, prepared.prepared.run()?);
         Ok(())
     })
@@ -95,10 +92,7 @@ pub unsafe extern "C" fn ta_prepared_run(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ta_prepared_submit(prepared: *mut ta_prepared) -> c_int {
     ffi_status(|| {
-        if prepared.is_null() {
-            anyhow::bail!("ta_prepared_submit: prepared is null");
-        }
-        let prepared = unsafe { &mut *prepared };
+        let prepared = checked_mut(prepared, "ta_prepared_submit: prepared is null")?;
         // SAFETY: the C contract documented on `ta_prepared_create` /
         // `ta_prepared` translates Rust's leak-soundness requirement:
         // the handle cannot be leaked past its tensors because
@@ -122,10 +116,7 @@ pub unsafe extern "C" fn ta_prepared_wait(
     stats: *mut ta_run_stats,
 ) -> c_int {
     ffi_status(|| {
-        if prepared.is_null() {
-            anyhow::bail!("ta_prepared_wait: prepared is null");
-        }
-        let prepared = unsafe { &mut *prepared };
+        let prepared = checked_mut(prepared, "ta_prepared_wait: prepared is null")?;
         write_stats(stats, prepared.prepared.wait()?);
         Ok(())
     })
