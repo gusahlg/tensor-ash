@@ -3,7 +3,7 @@
 use std::ffi::c_int;
 
 use anyhow::{Result, bail};
-use tensor_ash_core::{Activation, Epilogue, EpilogueBinary, MatmulOp};
+use tensor_ash_core::{Activation, Epilogue, EpilogueBinary, MatmulOp, MatmulStore};
 
 use crate::error::{checked_ref, checked_slice, ffi_status};
 use crate::handles::ta_executor;
@@ -64,6 +64,7 @@ pub(crate) fn checked_op<'a>(
         },
         // Not exposed through the C ABI yet.
         normed_a: None,
+        store: MatmulStore::None,
     })
 }
 

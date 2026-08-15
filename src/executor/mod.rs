@@ -235,16 +235,19 @@ impl Executor {
                 splitk2: None,
             };
         }
-        if op.normed_a.is_some()
-            && !self.pipeline.kernel_at(plan.kernel).supports_normed_a()
-            && self.pipeline.is_auto()
-        {
+        // Normed-A and store ops need a row route that implements
+        // their fusions (a tuned M=1 winner may not).
+        let fusions_fit = |kernel: &crate::pipeline::MatmulKernel| {
+            (op.normed_a.is_none() || kernel.supports_normed_a())
+                && (op.store.is_none() || kernel.supports_store())
+        };
+        if !fusions_fit(self.pipeline.kernel_at(plan.kernel)) && self.pipeline.is_auto() {
             // For M=1 the heuristic always picks a row kernel; other
             // shapes keep their plan and fail loudly at record time.
             let index = self
                 .pipeline
                 .heuristic_kernel_index(dims.batch, dims.m, dims.n, dims.k, dims.b_f16);
-            if self.pipeline.kernel_at(index).supports_normed_a() {
+            if fusions_fit(self.pipeline.kernel_at(index)) {
                 plan = OpPlan {
                     kernel: index,
                     splitk2: None,

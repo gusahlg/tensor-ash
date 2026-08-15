@@ -319,6 +319,7 @@ impl Executor {
                 ExecOp::Rope { desc, .. } | ExecOp::RopeScatter { desc, .. } => desc.pos_addr,
                 ExecOp::CopyStrided { desc, .. } => desc.pos_addr,
                 ExecOp::AttnDecode { desc, .. } => desc.pos_addr,
+                ExecOp::Matmul(op) => op.store.desc().pos_addr,
                 _ => 0,
             };
             if used != 0 && used != pos_addr {
@@ -367,10 +368,19 @@ impl Executor {
                         );
                     }
                     total_flops = total_flops.saturating_add(dims.total_flops);
-                    let mut access = Access::default()
-                        .read(op.call.a)
-                        .read(op.call.b)
-                        .write(op.call.c);
+                    let mut access = Access::default().read(op.call.a).read(op.call.b);
+                    // The scatter store modes redirect the C store into
+                    // the cache tensor; C itself is never touched, so
+                    // the hazard tracker must see the cache write (the
+                    // attention read of it barriers correctly) and not
+                    // a phantom C write.
+                    match op.store.dst() {
+                        Some(dst) => access = access.write(dst),
+                        None => access = access.write(op.call.c),
+                    }
+                    if let Some(table) = op.store.table() {
+                        access = access.read(table);
+                    }
                     if op.call.accumulate {
                         access = access.read(op.call.c);
                     }

@@ -109,8 +109,14 @@ pub(super) fn create_epilogue_pipeline(
     variant: KernelVariant,
     epilogue: EpilogueKey,
 ) -> Result<vk::Pipeline> {
-    let spec_count = if kernel.supports_epilogue() { 7 } else { 4 };
-    let spec_data: [u32; 7] = [
+    let spec_count = if kernel.supports_store() {
+        9
+    } else if kernel.supports_epilogue() {
+        7
+    } else {
+        4
+    };
+    let spec_data: [u32; 9] = [
         variant.accumulate as u32,
         variant.alpha_is_one as u32,
         variant.interior_only as u32,
@@ -118,6 +124,8 @@ pub(super) fn create_epilogue_pipeline(
         epilogue.bias as u32,
         epilogue.activation,
         epilogue.binary,
+        epilogue.store_mode,
+        epilogue.store_f16 as u32,
     ];
     create_specialized_pipeline(
         ctx,
