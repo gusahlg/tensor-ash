@@ -120,17 +120,13 @@ pub(super) fn create(
 
         let mut vulkan11_query = vk::PhysicalDeviceVulkan11Features::default();
         let mut vulkan12_query = vk::PhysicalDeviceVulkan12Features::default();
-        let mut atomic_float_query = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
         let mut coopmat_query = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
         let mut features_query = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut vulkan11_query)
             .push_next(&mut vulkan12_query)
-            .push_next(&mut atomic_float_query)
             .push_next(&mut coopmat_query);
         instance.get_physical_device_features2(physical_device, &mut features_query);
         let buffer_device_address_supported = vulkan12_query.buffer_device_address == vk::TRUE;
-        let atomic_float_supported =
-            atomic_float_query.shader_buffer_float32_atomic_add == vk::TRUE;
         // f16 storage kernels need both halves: `shaderFloat16` for the
         // arithmetic types and `storageBuffer16BitAccess` for 16-bit
         // access through physical-storage-buffer pointers (the SPIR-V
@@ -150,11 +146,6 @@ pub(super) fn create(
         let device_extensions = instance
             .enumerate_device_extension_properties(physical_device)
             .context("enumerate_device_extension_properties")?;
-        let atomic_float_name = ash::ext::shader_atomic_float::NAME;
-        let atomic_float_present = device_extensions
-            .iter()
-            .any(|ext| CStr::from_ptr(ext.extension_name.as_ptr()) == atomic_float_name);
-        let enable_atomic_float = atomic_float_supported && atomic_float_present;
         let coopmat_name = ash::khr::cooperative_matrix::NAME;
         let coopmat_present = device_extensions
             .iter()
@@ -231,10 +222,7 @@ pub(super) fn create(
             );
         }
 
-        let mut enabled_device_extensions = enable_atomic_float
-            .then_some(atomic_float_name.as_ptr())
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut enabled_device_extensions = Vec::new();
         if enable_coopmat {
             enabled_device_extensions.push(coopmat_name.as_ptr());
         }
@@ -253,8 +241,6 @@ pub(super) fn create(
             .buffer_device_address(buffer_device_address_supported)
             .shader_float16(f16_storage_supported)
             .vulkan_memory_model(enable_coopmat);
-        let mut atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default()
-            .shader_buffer_float32_atomic_add(enable_atomic_float);
         let mut coopmat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
             .cooperative_matrix(enable_coopmat);
         let mut device_ci = vk::DeviceCreateInfo::default()
@@ -266,9 +252,6 @@ pub(super) fn create(
         }
         if f16_storage_supported {
             device_ci = device_ci.push_next(&mut vulkan11);
-        }
-        if enable_atomic_float {
-            device_ci = device_ci.push_next(&mut atomic_float);
         }
         if enable_coopmat {
             device_ci = device_ci.push_next(&mut coopmat);
@@ -331,7 +314,6 @@ pub(super) fn create(
             timestamp_valid_bits,
             timestamps_supported,
             buffer_device_address_enabled: buffer_device_address_supported,
-            shader_buffer_float32_atomic_add_enabled: enable_atomic_float,
             f16_storage_enabled: f16_storage_supported,
             coopmat_enabled: enable_coopmat,
             coopmat2_enabled: enable_coopmat2,

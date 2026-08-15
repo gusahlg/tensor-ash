@@ -47,12 +47,6 @@ pub struct VulkanContext {
     /// `bufferDeviceAddress`) was successfully enabled.  Required for
     /// the buffer-reference GLSL path used by the LDG.128 kernels.
     pub buffer_device_address_enabled: bool,
-    /// Whether `VK_EXT_shader_atomic_float` was enabled with
-    /// `shaderBufferFloat32AtomicAdd`.  Required for the hardware
-    /// `atomicAdd(float, float)` path in the Stream-K kernel; absent
-    /// this, Stream-K pipeline creation is rejected and callers fall
-    /// back to the regular DP path.
-    pub shader_buffer_float32_atomic_add_enabled: bool,
     /// Whether `shaderFloat16` + `storageBuffer16BitAccess` were both
     /// enabled.  Required for the f16-storage kernel variants; without
     /// it f16 tensors are rejected at matmul time and the f16 kernels
