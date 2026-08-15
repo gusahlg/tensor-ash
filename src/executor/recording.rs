@@ -192,7 +192,36 @@ pub(super) fn record_one_matmul(
         pc.bias_ptr = norm_weight.device_address();
         pc.beta = eps;
     }
-    let variant_pipeline = pipeline.pipeline_for_epilogue(kernel, variant, epilogue.key())?;
+    let mut epilogue_key = epilogue.key();
+    if !op.store.is_none() {
+        // Same loud-failure contract as normed-A: a store op must not
+        // silently skip its rope/scatter on a route without it.
+        if !kernel.supports_store() {
+            bail!(
+                "kernel '{}' does not implement the fused store epilogue \
+                 (f16w row_bda-family kernels only; store requires an M=1 \
+                 f16-weights row route, got M={})",
+                kernel.name,
+                dims.m
+            );
+        }
+        let desc = op.store.desc();
+        pc.store_pos_base = desc.pos_base;
+        pc.store_pos_scale = desc.pos_scale;
+        pc.store_stride_head = desc.stride_head;
+        pc.store_stride_dim = desc.stride_dim;
+        pc.store_head_dim = desc.head_dim;
+        pc.store_pos_ptr = desc.pos_addr;
+        if let Some(table) = op.store.table() {
+            pc.store_table_ptr = table.device_address();
+        }
+        if let Some(dst) = op.store.dst() {
+            pc.store_dst_ptr = dst.device_address();
+            epilogue_key.store_f16 = dst.dtype() == crate::dtype::DType::F16;
+        }
+        epilogue_key.store_mode = op.store.mode();
+    }
+    let variant_pipeline = pipeline.pipeline_for_epilogue(kernel, variant, epilogue_key)?;
 
     let gx = dims.n.div_ceil(kernel.tile_n);
     let gy = dims.m.div_ceil(kernel.tile_m);

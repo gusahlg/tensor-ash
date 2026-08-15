@@ -37,6 +37,17 @@ impl Executor {
         if let Some((norm_weight, _)) = op.normed_a {
             self.validate_tensor_context(norm_weight, "normed-A weight")?;
         }
+        if let Some(table) = op.store.table() {
+            self.validate_tensor_context(table, "store rope table")?;
+        }
+        if let Some(dst) = op.store.dst() {
+            self.validate_tensor_context(dst, "store destination")?;
+            if dst.raw_buffer() == op.call.a.raw_buffer()
+                || dst.raw_buffer() == op.call.b.raw_buffer()
+            {
+                bail!("store destination must not alias A or B");
+            }
+        }
         Ok(())
     }
 }

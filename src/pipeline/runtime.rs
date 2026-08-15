@@ -56,4 +56,12 @@ impl MatmulKernel {
     pub fn supports_normed_a(&self) -> bool {
         self.name.contains("row_bda")
     }
+
+    /// Whether this kernel's shader body implements the fused store
+    /// epilogue (spec constants 7/8: RoPE-rotate and/or KV-cache
+    /// scatter at C-store time).  f16-weights row-GEMV family only.
+    #[inline]
+    pub fn supports_store(&self) -> bool {
+        self.weights_f16() && self.name.contains("row_bda")
+    }
 }

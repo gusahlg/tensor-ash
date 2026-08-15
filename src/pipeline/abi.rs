@@ -34,6 +34,22 @@ pub struct MatmulPushConstants {
     pub beta: f32,
     /// Bias elements between batches; zero means broadcast one `[N]` row.
     pub bias_batch_stride: u32,
+    /// Store-epilogue RoPE table `[T_max, head_dim/2, 2]` (cos, sin), or 0.
+    pub store_table_ptr: u64,
+    /// Store-epilogue scatter destination base (KV cache), or 0.
+    pub store_dst_ptr: u64,
+    /// Optional u32 position cell for the store epilogue, or 0.
+    pub store_pos_ptr: u64,
+    pub store_pos_base: u32,
+    /// Destination element advance per position (scatter modes).
+    pub store_pos_scale: u32,
+    /// Destination element stride per head (scatter modes).
+    pub store_stride_head: u32,
+    /// Destination element stride per head lane (scatter modes).
+    pub store_stride_dim: u32,
+    pub store_head_dim: u32,
+    /// Explicit tail padding (`bytemuck::Pod` forbids implicit padding).
+    pub _pad0: u32,
 }
 
 /// Per-call pipeline specialization. The eager fallbacks and lazily-built
@@ -99,12 +115,17 @@ pub struct EpilogueKey {
     pub activation: u32,
     /// `constant_id = 6`: 0=none, 1=`+beta*D`, 2=`*D`.
     pub binary: u32,
+    /// `constant_id = 7` (f16w row GEMVs only): fused store epilogue —
+    /// 0=none, 1=rope to C, 2=scatter to dst, 3=rope + scatter.
+    pub store_mode: u32,
+    /// `constant_id = 8`: the scatter destination stores IEEE half.
+    pub store_f16: bool,
 }
 
 impl EpilogueKey {
     #[inline]
     pub fn is_none(&self) -> bool {
-        !self.bias && self.activation == 0 && self.binary == 0
+        !self.bias && self.activation == 0 && self.binary == 0 && self.store_mode == 0
     }
 }
 

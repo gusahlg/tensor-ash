@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail, ensure};
 use tensor_ash::{
     ATTN_DECODE_MAX_CHUNKS, Activation, AttnDecodeDesc, BinaryOp, CopyDesc, Epilogue,
     EpilogueBinary, ExecOp, Executor, FlashAttentionDesc, HostU32Buffer, MatmulCall, MatmulOp,
-    PosBuffer, RopeDesc, RopeScatterDesc, SoftmaxMask, Tensor, VulkanContext,
+    MatmulStoreDesc, PosBuffer, RopeDesc, RopeScatterDesc, SoftmaxMask, Tensor, VulkanContext,
 };
 
 use crate::gguf::{GGML_TYPE_F32, GgufFile};
@@ -957,11 +957,15 @@ impl Model {
             dst_strides: [1, 0, 0],
             ..Default::default()
         };
-        let rope = |heads| RopeDesc {
-            heads,
+        // Store-epilogue geometry for the fused q/k/v projections; the
+        // scatter modes address element
+        // `(base + p) * pos_scale + head * stride_head + dim * stride_dim`.
+        let store = |pos_scale, stride_head, stride_dim| MatmulStoreDesc {
             head_dim: dh,
-            rot_dim: dh,
             pos_base: base,
+            pos_scale,
+            stride_head,
+            stride_dim,
             pos_addr,
         };
 
@@ -977,48 +981,42 @@ impl Model {
             // The attention RMSNorm is folded into the q/k/v row GEMVs
             // (each recomputes the K-length reduction, which is trivia
             // next to the weight traffic) — the standalone norm op and
-            // its xn round-trip are gone.
+            // its xn round-trip are gone.  The RoPE and KV appends fold
+            // into the same GEMVs' store epilogues: q ropes as it
+            // stores, and v scatters straight into its cache (the
+            // separate rope / copy dispatches are gone with them).
             ops.push(ExecOp::Matmul(
-                MatmulOp::new(mm(x_in, &layer.wq, &s.q)).with_normed_a(&layer.attn_norm, eps),
+                MatmulOp::new(mm(x_in, &layer.wq, &s.q))
+                    .with_normed_a(&layer.attn_norm, eps)
+                    .with_store_rope(&self.rope_table, store(0, 0, 0)),
             ));
             ops.push(ExecOp::Matmul(
                 MatmulOp::new(mm(x_in, &layer.wk, &s.k)).with_normed_a(&layer.attn_norm, eps),
             ));
             ops.push(ExecOp::Matmul(
-                MatmulOp::new(mm(x_in, &layer.wv, &s.v)).with_normed_a(&layer.attn_norm, eps),
+                MatmulOp::new(mm(x_in, &layer.wv, &s.v))
+                    .with_normed_a(&layer.attn_norm, eps)
+                    // V append: one dh-row per position.
+                    .with_store_scatter(&layer.v_cache, store(dh, t_max * dh, 1)),
             ));
-            ops.push(ExecOp::Rope {
-                input: &s.q,
-                table: &self.rope_table,
-                output: &s.q,
-                desc: rope(self.cfg.heads),
-            });
             // k-RoPE writes straight into the Kt cache (the k scratch
             // is never read again): rope + append as one dispatch.
             ops.push(ExecOp::RopeScatter {
                 input: &s.k,
                 table: &self.rope_table,
                 dst: &layer.kt_cache,
-                desc: rope(kv),
+                desc: RopeDesc {
+                    heads: kv,
+                    head_dim: dh,
+                    rot_dim: dh,
+                    pos_base: base,
+                    pos_addr,
+                },
                 scatter: RopeScatterDesc {
                     dst_offset: base,
                     dst_strides: [1, dh * t_max, t_max],
                     // Kt append: one column per position.
                     pos_scale: 1,
-                },
-            });
-            ops.push(ExecOp::CopyStrided {
-                src: &s.v,
-                dst: &layer.v_cache,
-                desc: CopyDesc {
-                    extent: [dh, kv, 1],
-                    src_offset: 0,
-                    src_strides: [1, dh, kv * dh],
-                    dst_offset: base * dh,
-                    dst_strides: [1, t_max * dh, dh],
-                    pos_addr,
-                    // V append: one dh-row per position.
-                    pos_scale: dh,
                 },
             });
             if self.fused_attn {

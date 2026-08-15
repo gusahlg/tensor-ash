@@ -48,7 +48,8 @@ pub use executor::{
     RopeScatterDesc, SoftmaxMask,
 };
 pub use matmul::{
-    Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, MatrixShape, RunStats,
+    Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, MatmulStore, MatmulStoreDesc,
+    MatrixShape, RunStats,
 };
 pub use pipeline::{
     EpilogueKey, KERNEL_SPECS, KernelSelection, KernelSpec, KernelVariant, MATMUL_FLAG_NORM_A,

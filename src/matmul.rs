@@ -6,7 +6,10 @@
 mod api;
 mod resolution;
 
-pub use api::{Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, RunStats};
+pub use api::{
+    Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, MatmulStore, MatmulStoreDesc,
+    RunStats,
+};
 pub use resolution::MatrixShape;
 pub(crate) use resolution::{ResolvedMatmul, ResolvedMatmulBatch, total_flops};
 

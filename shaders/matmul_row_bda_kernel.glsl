@@ -29,6 +29,22 @@
 // beta, so NORM_A excludes the bias epilogue and the AddScaled binary
 // (the host validates).  Redundant across the column workgroups of one
 // row, but K extra reads per workgroup are trivia next to B.
+//
+// STORE_MODE (spec constant 7, B_F16 only): fused store epilogue for
+// the decode q/k/v projections — RoPE-rotate the output row and/or
+// scatter it straight into a strided KV-cache layout at C-store time,
+// replacing the separate rope / append dispatch (and its hazard
+// barrier).  0 = plain C store, 1 = rotate + store to C (q, in
+// place), 2 = scatter to store_dst_ptr (v append), 3 = rotate +
+// scatter (k -> Kt cache).  Full rotary only (rot_dim == head_dim);
+// the host validates M == 1, batch == 1, head_dim | N, and excludes
+// ACCUMULATE and every EPI_* form.  The rope partner of column c is
+// c^1: the adjacent lane's slice sums for VCOLS=1 (reread from the
+// already-barriered shared partials, same fixed-order reduce), the
+// lane-local pair for VCOLS=2 — bit-exact either way with a
+// standalone rope over the unfused GEMV output.
+// STORE_DST_F16 (spec constant 8): scatter destination stores IEEE
+// half (RNE via the float16_t conversion), for f16 KV caches.
 
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_GOOGLE_include_directive : require
@@ -75,6 +91,9 @@ layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32
 layout(buffer_reference, std430, buffer_reference_align = 2) restrict readonly buffer F16ReadOnly {
     float16_t v[];
 };
+layout(buffer_reference, std430, buffer_reference_align = 2) restrict writeonly buffer F16WriteOut {
+    float16_t v[];
+};
 #if VCOLS == 2
 #define f16vec_load f16vec2
 layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F16VecReadOnly {
@@ -82,6 +101,9 @@ layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly b
 };
 #endif
 #endif
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer U32ReadOnly {
+    uint v[];
+};
 
 layout(push_constant) uniform PC {
     uint M;
@@ -99,9 +121,53 @@ layout(push_constant) uniform PC {
     F32ReadOnly bias_ptr;
     float beta;
     uint bias_batch_stride;
+    // Store-epilogue fields (STORE_MODE != 0 only; zero otherwise).
+    F32ReadOnly store_table_ptr; // [T_max, head_dim/2, 2] (cos, sin)
+    F32ReadWrite store_dst_ptr;  // scatter destination base
+    U32ReadOnly store_pos_ptr;   // optional indirect position (0 = unused)
+    uint store_pos_base;
+    uint store_pos_scale;    // dst element advance per position
+    uint store_stride_head;  // dst element stride per head
+    uint store_stride_dim;   // dst element stride per head lane
+    uint store_head_dim;
 } pc;
 
 #include "matmul_epilogue_common.glsl"
+
+#ifdef B_F16
+layout(constant_id = 7) const uint STORE_MODE = 0u;
+layout(constant_id = 8) const uint STORE_DST_F16 = 0u;
+
+uint store_position() {
+    const uint p = uint64_t(pc.store_pos_ptr) != 0ul ? pc.store_pos_ptr.v[0] : 0u;
+    return pc.store_pos_base + p;
+}
+
+void store_scatter(uint pos, uint c, float value) {
+    const uint index = pos * pc.store_pos_scale
+        + (c / pc.store_head_dim) * pc.store_stride_head
+        + (c % pc.store_head_dim) * pc.store_stride_dim;
+    if (STORE_DST_F16 != 0u) {
+        F16WriteOut dst = F16WriteOut(uint64_t(pc.store_dst_ptr));
+        dst.v[index] = float16_t(value);
+    } else {
+        pc.store_dst_ptr.v[index] = value;
+    }
+}
+
+// Rotate one element of the interleaved (even, odd) pair — identical
+// fma order to op_rope_body.glsl, so fused and standalone rope stay
+// bit-exact.
+float store_rope(uint pos, uint c, float value, float partner) {
+    const uint dim = c % pc.store_head_dim;
+    const uint angle = (pos * (pc.store_head_dim / 2u) + dim / 2u) * 2u;
+    const float cos_t = pc.store_table_ptr.v[angle];
+    const float sin_t = pc.store_table_ptr.v[angle + 1u];
+    return (dim & 1u) == 0u
+        ? fma(value, cos_t, -partner * sin_t)
+        : fma(partner, sin_t, value * cos_t);
+}
+#endif
 
 #if VCOLS == 1
 shared float partial[KSLICES][32];
@@ -184,7 +250,29 @@ void main() {
         float value = ALPHA_IS_ONE ? sum : pc.alpha * sum;
         if (ACCUMULATE) value += pc.c_ptr.v[c_index];
         if (EPI_ANY) value = epi_apply(value, c_index, col, batch);
+#ifdef B_F16
+        if (STORE_MODE != 0u) {
+            const uint pos = store_position();
+            if (STORE_MODE != 2u) {
+                // Rope partner (col^1 = lane^1): the adjacent lane's
+                // slice sums, reread from the shared partials (nothing
+                // writes them after the barrier above).
+                float partner = partial[0][lane ^ 1u];
+                [[unroll]] for (uint s = 1u; s < KSLICES_U; ++s) partner += partial[s][lane ^ 1u];
+                if (!ALPHA_IS_ONE) partner *= pc.alpha;
+                value = store_rope(pos, col, value, partner);
+            }
+            if (STORE_MODE == 1u) {
+                pc.c_ptr.v[c_index] = value;
+            } else {
+                store_scatter(pos, col, value);
+            }
+        } else {
+            pc.c_ptr.v[c_index] = value;
+        }
+#else
         pc.c_ptr.v[c_index] = value;
+#endif
     }
 #else
     float acc[VCOLS];
@@ -250,16 +338,32 @@ void main() {
     barrier();
 
     if (slice == 0u && live) {
+        // Both column sums up front: the rope store needs the pair.
+        float sums[VCOLS];
+        [[unroll]] for (uint v = 0u; v < VCOLS_U; ++v) {
+            float sum = partial[0][lane][v];
+            [[unroll]] for (uint s = 1u; s < KSLICES_U; ++s) sum += partial[s][lane][v];
+            sums[v] = ALPHA_IS_ONE ? sum : pc.alpha * sum;
+        }
         [[unroll]] for (uint v = 0u; v < VCOLS_U; ++v) {
             const uint c = col + v;
             if (!INTERIOR_ONLY && c >= pc.N) break;
-            float sum = partial[0][lane][v];
-            [[unroll]] for (uint s = 1u; s < KSLICES_U; ++s) sum += partial[s][lane][v];
             const uint c_index = batch * pc.batch_stride_c + row * pc.N + c;
-            float value = ALPHA_IS_ONE ? sum : pc.alpha * sum;
+            float value = sums[v];
             if (ACCUMULATE) value += pc.c_ptr.v[c_index];
             if (EPI_ANY) value = epi_apply(value, c_index, c, batch);
-            pc.c_ptr.v[c_index] = value;
+            if (STORE_MODE != 0u) {
+                const uint pos = store_position();
+                // Rope partner (c^1) is the lane-local other column.
+                if (STORE_MODE != 2u) value = store_rope(pos, c, value, sums[v ^ 1u]);
+                if (STORE_MODE == 1u) {
+                    pc.c_ptr.v[c_index] = value;
+                } else {
+                    store_scatter(pos, c, value);
+                }
+            } else {
+                pc.c_ptr.v[c_index] = value;
+            }
         }
     }
 #endif

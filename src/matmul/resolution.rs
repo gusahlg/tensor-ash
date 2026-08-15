@@ -143,6 +143,7 @@ impl ResolvedMatmul {
         let resolved = Self::from_call(&op.call)?;
         resolved.validate_epilogue(op)?;
         resolved.validate_normed_a(op)?;
+        resolved.validate_store(op)?;
         Ok(resolved)
     }
 
@@ -171,6 +172,79 @@ impl ResolvedMatmul {
             crate::matmul::EpilogueBinary::AddScaled { .. }
         ) {
             bail!("normed-A cannot combine with the AddScaled epilogue (both use beta)");
+        }
+        Ok(())
+    }
+
+    /// The fused store epilogue rewrites the row kernel's C store, so
+    /// it excludes every other consumer of the store site (accumulate
+    /// and the fused epilogue) and is restricted to the M=1 f16-weights
+    /// row routes that implement it.
+    fn validate_store(&self, op: &MatmulOp<'_>) -> Result<()> {
+        if op.store.is_none() {
+            return Ok(());
+        }
+        if self.m != 1 || self.batch != 1 {
+            bail!(
+                "fused store epilogue requires M == 1 and batch == 1 (got M={}, batch={})",
+                self.m,
+                self.batch
+            );
+        }
+        if !self.b_f16 {
+            bail!("fused store epilogue requires f16 weights (f16w row-GEMV routes only)");
+        }
+        if op.call.accumulate {
+            bail!("fused store epilogue cannot combine with accumulate");
+        }
+        if !op.epilogue.is_none() {
+            bail!("fused store epilogue cannot combine with a fused epilogue");
+        }
+        let desc = op.store.desc();
+        if desc.head_dim == 0 || !desc.head_dim.is_multiple_of(2) || !self.n.is_multiple_of(desc.head_dim)
+        {
+            bail!(
+                "store head_dim {} must be even and divide N = {}",
+                desc.head_dim,
+                self.n
+            );
+        }
+        if let Some(table) = op.store.table() {
+            if table.dtype() != DType::F32 {
+                bail!("store rope table must be f32 storage");
+            }
+            // Coverage sees only pos_base (the pos_addr indirection is
+            // runtime); one position row is head_dim (cos, sin) floats.
+            let needed = (desc.pos_base as u64 + 1) * desc.head_dim as u64;
+            if table.len() < needed {
+                bail!(
+                    "store rope table len {} does not cover pos_base {} (needs {needed})",
+                    table.len(),
+                    desc.pos_base
+                );
+            }
+        }
+        if let Some(dst) = op.store.dst() {
+            if !matches!(dst.dtype(), DType::F32 | DType::F16) {
+                bail!(
+                    "store destination must be f32 or f16 storage (got {})",
+                    dst.dtype().name()
+                );
+            }
+            let heads = self.n / desc.head_dim;
+            let last = desc.pos_base as u64 * desc.pos_scale as u64
+                + (heads as u64 - 1) * desc.stride_head as u64
+                + (desc.head_dim as u64 - 1) * desc.stride_dim as u64;
+            if last >= dst.len() {
+                bail!(
+                    "store destination access {last} out of bounds for len {} \
+                     (pos_base {}, N {}, head_dim {})",
+                    dst.len(),
+                    desc.pos_base,
+                    self.n,
+                    desc.head_dim
+                );
+            }
         }
         Ok(())
     }
@@ -234,6 +308,7 @@ impl ResolvedMatmul {
             bias_ptr: 0,
             beta: 0.0,
             bias_batch_stride: 0,
+            ..bytemuck::Zeroable::zeroed()
         }
     }
 
@@ -264,6 +339,7 @@ impl ResolvedMatmul {
             bias_ptr: 0,
             beta: 0.0,
             bias_batch_stride: 0,
+            ..bytemuck::Zeroable::zeroed()
         }
     }
 
