@@ -4,6 +4,22 @@
 
 ### Added
 
+- **Shared-memory budget gate**: every catalog kernel's workgroup
+  declaration is now read from its SPIR-V (`KernelSpec::
+  shared_memory_bytes`) and checked against `VulkanContext::
+  workgroup_shared_budget` at pipeline build. The BK=64 deep-K tiles
+  (49,664/49,408 B) exceed the 49,152 B `maxComputeSharedMemorySize`
+  every desktop driver reports — latent on NVIDIA proprietary, device-
+  lost (Xid 13 `SKEDCHECK18_L1_CONFIG_TOO_SMALL`) on NVK Turing. Over-
+  budget slots stay empty and routing demotes to the BK=32 sibling of
+  the same tile class; NVIDIA proprietary keeps a bounded allowance up
+  to the largest shipped tile (measured-good there), so RTX 3070
+  routing is unchanged. Fixes all 9 NVK/TU117 suite failures.
+- **`ML_DEVICE` honored at the library entry point**: `VulkanContext::
+  new` now parses `ML_DEVICE` (same semantics ml-bench used), so the
+  test suite and `llama_ash` can select a device on multi-GPU hosts;
+  unset remains `auto`. ml-bench delegates to the library parse.
+
 - **GPU token loop** (`run_argmax`, `run_embed_gather`, `HostU32Buffer`,
   `ExecOp::{Argmax, EmbedGather}`): one-workgroup argmax whose tie-break
   (largest index wins) exactly matches Rust's `max_by(f32::total_cmp)`,

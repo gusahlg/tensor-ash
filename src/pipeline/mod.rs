@@ -44,10 +44,12 @@ pub struct MatmulPipeline {
     pub pipeline_layout_bda: vk::PipelineLayout,
     /// One slot per entry in `KERNEL_SPECS`, in the same order. Index
     /// with `KernelSelection::index()` (after resolving `Auto`).
-    /// `None` marks a kernel gated off by missing device features
-    /// (today: the `f16w_*` family without f16 storage support);
-    /// routing, tuning, and explicit-selection validation all skip
-    /// empty slots, so `kernel_at` on a routed index cannot fail.
+    /// `None` marks a kernel gated off on this device: the `f16w_*`
+    /// family without f16 storage support, `coopmat` without the
+    /// feature, or a shared-memory tile over the device's
+    /// [`VulkanContext::workgroup_shared_budget`]; routing, tuning,
+    /// and explicit-selection validation all skip empty slots, so
+    /// `kernel_at` on a routed index cannot fail.
     kernels: Vec<Option<MatmulKernel>>,
     /// Lazily-built aligned and epilogue specializations, keyed by (kernel
     /// name, base-variant index, epilogue key). The eager `variants` arrays
@@ -152,13 +154,29 @@ impl MatmulPipeline {
                     destroy_kernel(ctx, kernel);
                 }
             });
+            let shared_budget = ctx.workgroup_shared_budget();
             for spec in KERNEL_SPECS {
                 // f16-storage kernels declare SPIR-V capabilities the
                 // device may not have; leave their registry slots empty
                 // instead of failing the whole pipeline. Routing and
                 // validation never select an empty slot.
                 let coopmat_gated = spec.name.contains("coopmat") && !ctx.coopmat_enabled;
-                if (spec.weights_f16() && !ctx.f16_storage_enabled) || coopmat_gated {
+                // Likewise for tiles whose shared declarations exceed
+                // the device budget: strict drivers reject or lose the
+                // device on them (see workgroup_shared_budget), so
+                // their slots stay empty and routing demotes to an
+                // in-budget sibling (`in_budget_index`).
+                let shared_gated = spec.shared_memory_bytes() > shared_budget;
+                if (spec.weights_f16() && !ctx.f16_storage_enabled) || coopmat_gated || shared_gated
+                {
+                    if shared_gated {
+                        log::info!(
+                            "tensor-ash: kernel '{}' gated off: {} B workgroup memory > {} B device budget",
+                            spec.name,
+                            spec.shared_memory_bytes(),
+                            shared_budget
+                        );
+                    }
                     kernels_guard.push(None);
                     continue;
                 }
@@ -174,16 +192,32 @@ impl MatmulPipeline {
             if let Some(index) = selection.index()
                 && kernels_guard[index].is_none()
             {
-                bail!(
-                    "ML_KERNEL selects '{}', which requires f16 storage support \
-                     (shaderFloat16 + storageBuffer16BitAccess) this device lacks",
-                    KERNEL_SPECS[index].name
-                );
+                let spec = &KERNEL_SPECS[index];
+                let reason = if spec.name.contains("coopmat") && !ctx.coopmat_enabled {
+                    "requires cooperative-matrix support this device lacks".to_string()
+                } else if spec.weights_f16() && !ctx.f16_storage_enabled {
+                    "requires f16 storage support (shaderFloat16 + \
+                     storageBuffer16BitAccess) this device lacks"
+                        .to_string()
+                } else {
+                    format!(
+                        "declares {} B of workgroup memory, over this device's {} B budget \
+                         (maxComputeSharedMemorySize)",
+                        spec.shared_memory_bytes(),
+                        shared_budget
+                    )
+                };
+                bail!("ML_KERNEL selects '{}', which {reason}", spec.name);
             }
             // Disarm the cleanup: kernels now belong to the pipeline.
             let kernels = ScopeGuard::into_inner(kernels_guard);
 
             let shader_hash = shader_registry_hash();
+            // A persisted winner recorded before its slot became gated
+            // (e.g. a store written by a pre-gate build on this device)
+            // must not route dispatches into an empty slot.
+            let mut tuned = load_tuned(ctx, shader_hash);
+            tuned.retain(|_, entry| kernels[entry.kernel].is_some());
             Ok(Self {
                 ctx: Arc::clone(ctx),
                 set_layout: ScopeGuard::into_inner(set_layout_guard),
@@ -193,7 +227,7 @@ impl MatmulPipeline {
                 epilogue_pipelines: Mutex::new(HashMap::new()),
                 selection,
                 auto_min_large_tiles: auto_min_large_tiles_for(ctx.device_kind()),
-                tuned: RwLock::new(load_tuned(ctx, shader_hash)),
+                tuned: RwLock::new(tuned),
                 tune_save: Mutex::new(()),
                 shader_hash,
             })
@@ -329,9 +363,47 @@ impl MatmulPipeline {
         // (validated on 768^3, 1024^3, 2048^3, 4096^3).  They
         // remain selectable via `ML_KERNEL=large_bda_v4_aligned`
         // for explicit experimentation.
-        selection
-            .index()
-            .expect("auto selection must resolve to a concrete kernel")
+        self.in_budget_index(selection)
+    }
+
+    /// Resolve `selection` to a registry index, demoting through
+    /// in-budget siblings when the shared-memory gate emptied its slot
+    /// (`workgroup_shared_budget`).  Chains terminate at the 64x64
+    /// small tile (16,640 B), which fits every device this library
+    /// realistically initializes on; a budget below that panics with
+    /// the kernel name rather than dispatching into an empty slot.
+    fn in_budget_index(&self, selection: KernelSelection) -> usize {
+        use KernelSelection as K;
+        let mut selection = selection;
+        loop {
+            let index = selection.index().expect("selection is concrete");
+            if self.kernels[index].is_some() {
+                return index;
+            }
+            selection = match selection {
+                // The BK=64 deep-K tiles (49,664 B) exceed the
+                // universal 49,152 B budget; the BK=32 sibling keeps
+                // the same 128x64 output tile, so dispatch geometry
+                // and edge handling are unchanged.
+                K::M128N64K64 => K::M128N64,
+                K::M128N64K64BdaV4 => K::M128N64BdaV4,
+                // No f16w m128n64 sibling exists; use the family's
+                // general 64x64 fallback (to_f16w's default arm).
+                K::F16wM128N64K64BdaV4 => K::F16wSmallBdaV4,
+                // Sub-floor budgets (software Vulkan reports
+                // 32,768 B): the >= 32 KiB tiles fall to their
+                // family's 64x64 tile.
+                K::Large | K::K64 | K::M128N64 | K::M64N128 => K::Small,
+                K::LargeBdaV4 | K::K64BdaV4Tm8Tn4 | K::M128N64BdaV4 | K::M64N128BdaV4 => {
+                    K::SmallBdaV4
+                }
+                K::F16wLargeBdaV4 | K::F16wK64BdaV4 => K::F16wSmallBdaV4,
+                other => panic!(
+                    "kernel '{}' is gated off on this device and has no in-budget fallback",
+                    KERNEL_SPECS[other.index().expect("selection is concrete")].name
+                ),
+            };
+        }
     }
 
     /// Epilogue-capable kernel for this shape: the normal heuristic
@@ -357,9 +429,7 @@ impl MatmulPipeline {
         } else {
             maybe_to_bda(tile)
         };
-        selection
-            .index()
-            .expect("epilogue fallback must resolve to a concrete kernel")
+        self.in_budget_index(selection)
     }
 
     /// True when the auto selector is active (no explicit `ML_KERNEL`)

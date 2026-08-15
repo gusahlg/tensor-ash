@@ -292,7 +292,16 @@ the strict-aligned kernels, and the shape-specialized `row_bda` (`M=1`),
 `col_bda` (`N=1`), and `outer_bda` (`K=1`) kernels. The authoritative names
 and aliases live together in `src/pipeline/catalog.rs`.
 `ML_DEVICE` accepts `auto`, `discrete`, `integrated`, `virtual`, `cpu`,
-`index:N`, `name:TEXT`, or a bare name substring.
+`index:N`, `name:TEXT`, or a bare name substring. It is honored by the
+library entry point (`VulkanContext::new`), so the test suite, `llama_ash`,
+and `ml_bench` all obey it on multi-GPU hosts; unset means `auto`
+(discrete first). The selected device is logged at init.
+
+Kernels whose workgroup (shared-memory) tiles exceed the device's
+`maxComputeSharedMemorySize` are gated off at pipeline build and routing
+demotes to an in-budget sibling; the NVIDIA proprietary driver keeps the
+49,664 B BK=64 tiles under a bounded, measured allowance (see
+`VulkanContext::workgroup_shared_budget`).
 
 ## Tests
 

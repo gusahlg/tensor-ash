@@ -98,6 +98,16 @@ pub(super) fn create(
         let device_summary = summaries[selected_index].clone();
         let device_properties = instance.get_physical_device_properties(physical_device);
         let memory_properties = instance.get_physical_device_memory_properties(physical_device);
+        // `VkPhysicalDeviceDriverProperties` is core in 1.2; on older
+        // devices the driver identity stays unknown and driver-scoped
+        // quirk handling (workgroup_shared_budget) falls back to the
+        // strict spec behavior.
+        let driver_id = (device_properties.api_version >= vk::API_VERSION_1_2).then(|| {
+            let mut driver_props = vk::PhysicalDeviceDriverProperties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut driver_props);
+            instance.get_physical_device_properties2(physical_device, &mut props2);
+            driver_props.driver_id
+        });
         log::info!(
             "tensor-ash: using device #{}: {} ({}, Vulkan {})",
             device_summary.index,
@@ -307,6 +317,7 @@ pub(super) fn create(
             device,
             device_summary,
             device_properties,
+            driver_id,
             memory_properties,
             compute_family,
             queue: Mutex::new(queue),

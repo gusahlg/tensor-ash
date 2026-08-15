@@ -52,7 +52,10 @@ fn strict_aligned_kernels_match_cpu_on_supported_shapes() {
         (KernelSelection::LargeBdaV4Aligned, 128, 128, 32),
         (KernelSelection::M128N64K64BdaV4Aligned, 128, 64, 64),
     ] {
-        let (ctx, exec) = make_setup_with_kernel(1, 4, selection);
+        // The BK=64 aligned tile is gated off on 48 KiB devices.
+        let Some((ctx, exec)) = make_setup_with_kernel_if_fits(1, 4, selection) else {
+            continue;
+        };
         let (gpu, cpu) = run_one(
             &ctx,
             &exec,
@@ -165,7 +168,11 @@ fn manual_m128n64_kernel_handles_tall_and_partial_tiles() {
 #[test]
 #[ignore]
 fn manual_m128n64k64_kernel_handles_deep_k_and_tail() {
-    let (ctx, exec) = make_setup_with_kernel(1, 4, KernelSelection::M128N64K64);
+    // The 49,664 B BK=64 tile is gated off on 48 KiB devices.
+    let Some((ctx, exec)) = make_setup_with_kernel_if_fits(1, 4, KernelSelection::M128N64K64)
+    else {
+        return;
+    };
     for (m, n, k, seed_a, seed_b) in [
         (512u32, 512u32, 512u32, 54u64, 56u64),
         (190u32, 70u32, 95u32, 58u64, 60u64),
@@ -277,7 +284,10 @@ fn v4_kernels_handle_n_not_multiple_of_4() {
         ),
     ];
     for (name, sel, tile_m, tile_n) in kernels {
-        let (ctx, exec) = make_setup_with_kernel(1, 4, sel);
+        // m128n64k64_bda_v4 (49,664 B) is gated off on 48 KiB devices.
+        let Some((ctx, exec)) = make_setup_with_kernel_if_fits(1, 4, sel) else {
+            continue;
+        };
         for (m, n, k, seed_a, seed_b) in [
             // M tile-aligned, N just past one tile -> the non-edge
             // workgroup (block_col = 0) hits the interior-of-edge

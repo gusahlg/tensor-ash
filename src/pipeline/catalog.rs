@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Result, bail};
 
 /// Static description of one matmul kernel.
@@ -27,6 +29,99 @@ impl KernelSpec {
     pub fn a_f16(&self) -> bool {
         self.name.contains("_a16_")
     }
+
+    /// Total workgroup (shared) memory the shader declares, in bytes —
+    /// the number drivers check against `maxComputeSharedMemorySize`
+    /// (VUID-RuntimeSpirv-Workgroup-06530).  Read from the embedded
+    /// SPIR-V so the budget gate stays exact for every kernel without
+    /// maintaining a per-family size formula next to the GLSL.
+    pub fn shared_memory_bytes(&self) -> u32 {
+        workgroup_shared_bytes(self.spv)
+    }
+}
+
+/// Sum the byte sizes of every `Workgroup`-storage-class variable in a
+/// SPIR-V module.  Sizes use natural (scalar/vector/array) layout,
+/// which matches how glslang emits shared declarations; no kernel puts
+/// structs in shared memory, so struct padding is not modeled.
+fn workgroup_shared_bytes(spv: &[u8]) -> u32 {
+    const OP_TYPE_INT: u32 = 21;
+    const OP_TYPE_FLOAT: u32 = 22;
+    const OP_TYPE_VECTOR: u32 = 23;
+    const OP_TYPE_ARRAY: u32 = 28;
+    const OP_TYPE_STRUCT: u32 = 30;
+    const OP_TYPE_POINTER: u32 = 32;
+    const OP_CONSTANT: u32 = 43;
+    const OP_SPEC_CONSTANT: u32 = 50;
+    const OP_VARIABLE: u32 = 59;
+    const STORAGE_CLASS_WORKGROUP: u32 = 4;
+
+    let words: Vec<u32> = spv
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("4-byte chunk")))
+        .collect();
+    // build.rs embeds glslc output, which is always little-endian.
+    assert_eq!(words[0], 0x0723_0203, "embedded SPIR-V has bad magic");
+
+    let mut type_sizes: HashMap<u32, u32> = HashMap::new(); // type id -> bytes
+    let mut constants: HashMap<u32, u32> = HashMap::new(); // constant id -> value
+    let mut workgroup_pointees: HashMap<u32, u32> = HashMap::new(); // pointer type id -> pointee
+    let mut total = 0u32;
+
+    // Instructions follow the 5-word header: each is
+    // (word_count << 16 | opcode) then operands.
+    let mut pc = 5usize;
+    while pc < words.len() {
+        let word_count = (words[pc] >> 16) as usize;
+        let opcode = words[pc] & 0xFFFF;
+        assert!(word_count > 0, "malformed SPIR-V instruction");
+        let operands = &words[pc + 1..pc + word_count];
+        match opcode {
+            // [result, width-in-bits, ...]
+            OP_TYPE_INT | OP_TYPE_FLOAT => {
+                type_sizes.insert(operands[0], operands[1] / 8);
+            }
+            // [result, component type, component count]
+            OP_TYPE_VECTOR => {
+                let component = type_sizes[&operands[1]];
+                type_sizes.insert(operands[0], component * operands[2]);
+            }
+            // [result, element type, length constant id]
+            OP_TYPE_ARRAY => {
+                // Shared arrays are sized by compile-time macros, so the
+                // length is a plain (or spec-default) constant.
+                if let (Some(&element), Some(&length)) =
+                    (type_sizes.get(&operands[1]), constants.get(&operands[2]))
+                {
+                    type_sizes.insert(operands[0], element * length);
+                }
+            }
+            // [result, member types...]; natural layout, no padding.
+            OP_TYPE_STRUCT => {
+                let sum = operands[1..]
+                    .iter()
+                    .map(|id| type_sizes.get(id).copied().unwrap_or(0))
+                    .sum();
+                type_sizes.insert(operands[0], sum);
+            }
+            // [result, storage class, pointee type]
+            OP_TYPE_POINTER if operands[1] == STORAGE_CLASS_WORKGROUP => {
+                workgroup_pointees.insert(operands[0], operands[2]);
+            }
+            // [result type, result, literal value...]
+            OP_CONSTANT | OP_SPEC_CONSTANT => {
+                constants.insert(operands[1], operands[2]);
+            }
+            // [result (pointer) type, result, storage class, ...]
+            OP_VARIABLE if operands[2] == STORAGE_CLASS_WORKGROUP => {
+                let pointee = workgroup_pointees[&operands[0]];
+                total += type_sizes[&pointee];
+            }
+            _ => {}
+        }
+        pc += word_count;
+    }
+    total
 }
 
 /// Defines kernel identity once and derives the public selection enum,
@@ -271,6 +366,67 @@ mod tests {
             );
         }
         assert!(KernelSelection::parse("wideish").is_err());
+    }
+
+    #[test]
+    fn shared_memory_reflection_matches_declared_tiles() {
+        let by_name = |name: &str| {
+            KERNEL_SPECS
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no kernel named {name}"))
+                .shared_memory_bytes()
+        };
+        // Hand-computed from the .glsl shared declarations:
+        // As[BM][BK+1] f32 + Bs[BK][BN] f32 (or the byte-identical
+        // uvec4 Bs[BK][BN/4] in the v4 family).
+        assert_eq!(by_name("large_128"), 33_280); // 128*33*4 + 32*128*4
+        assert_eq!(by_name("small_64"), 16_640); // 64*33*4 + 32*64*4
+        assert_eq!(by_name("m128n64k64_bda_v4"), 49_664); // 128*65*4 + 64*64*4
+        assert_eq!(by_name("m64n128k64"), 49_408); // 64*65*4 + 64*128*4
+        assert_eq!(by_name("v2_128x128_bk8"), 17_408); // double-buffered
+        assert_eq!(by_name("f16w_coopmat_aligned"), 18_944); // 128*5*16 + 32*17*16
+        assert_eq!(by_name("outer_bda"), 0); // register-only
+    }
+
+    #[test]
+    fn shared_memory_overage_is_exactly_the_deep_k_tiles() {
+        // Kernels above the 49,152 B limit that every desktop driver
+        // reports for maxComputeSharedMemorySize.  These are gated off
+        // at pipeline build wherever the driver enforces the limit
+        // (see MatmulPipeline::new / VulkanContext::workgroup_shared_budget);
+        // growing this set means another kernel became unroutable on
+        // 48 KiB devices, so it must be a deliberate change.
+        let over: Vec<&str> = KERNEL_SPECS
+            .iter()
+            .filter(|s| s.shared_memory_bytes() > 49_152)
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            over,
+            [
+                "m128n64k64",
+                "m64n128k64",
+                "m128n64k64_bda",
+                "m128n64k64_bda_v4",
+                "m128n64k64_bda_v4_tm8_tn8",
+                "m128n64k64_bda_v4_tm16_tn4",
+                "m128n64k64_bda_v4_aligned",
+                "f16w_m128n64k64_bda_v4",
+            ]
+        );
+        // The NVIDIA-proprietary allowance in workgroup_shared_budget
+        // is capped at the largest shipped declaration; a new, bigger
+        // tile must not silently ride the exception.
+        let max = KERNEL_SPECS
+            .iter()
+            .map(|s| s.shared_memory_bytes())
+            .max()
+            .unwrap();
+        assert_eq!(
+            max,
+            crate::context::VulkanContext::MAX_SHIPPED_WORKGROUP_BYTES
+        );
     }
 
     #[test]

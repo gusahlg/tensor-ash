@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use tensor_ash::{DevicePreference, Executor, KernelSelection, MatmulPipeline, VulkanContext};
+use tensor_ash::{Executor, KernelSelection, MatmulPipeline, VulkanContext};
 
 use model::Model;
 
@@ -65,7 +65,8 @@ fn parse_args(mut args: std::env::Args) -> Result<(String, Args)> {
 const USAGE: &str = "usage:\n  llama_ash bench -m <gguf> [--pp 512] [--tg 128] [--ctx 2048]\n  llama_ash generate -m <gguf> --ids \"1,15043,3186\" -n 24 [--ctx 2048]";
 
 fn make_model(path: &Path, ctx_len: u32) -> Result<Model> {
-    let ctx = VulkanContext::new_with_device_preference(false, DevicePreference::Auto)?;
+    // Honors ML_DEVICE so multi-GPU hosts can pick the device.
+    let ctx = VulkanContext::new(false)?;
     if !ctx.buffer_device_address_enabled || !ctx.f16_storage_enabled {
         bail!("device lacks buffer-device-address or f16 storage support");
     }
