@@ -1,5 +1,68 @@
 # Experiment branch log
 
+## Leg 17 — `experiment/cm2-gemm` (CM2 GEMM with fused store epilogues) — DRAFT, CPU-side prep only
+
+Coopmat-eligible f16w shapes with a fused epilogue currently DEMOTE to
+the SIMT family (`demote_for_op` → `epilogue_fallback_index`), because
+the KHR-coopmat1 kernel cannot run per-element code at store time.
+llama prefill therefore runs its three residual/gated projections as
+PLAIN coopmat matmuls plus 3 standalone `Binary` bandwidth passes per
+layer at T >= 256 (`push_mlp_ops`).  NV_cooperative_matrix2's
+`coopMatPerElementNV` runs an arbitrary callback over the accumulator
+before the store, so a CM2 GEMM keeps tensor-core speed WITH the fused
+bias/activation/binary epilogue — expected ≈0% raw-GEMM change (brief:
+cm2 ≈ parity with tuned cm1 for plain GEMM), real end-to-end win from
+un-demoting.
+
+What landed (all CPU-verifiable; NO GPU runs yet):
+
+- `shaders/matmul_cm2_kernel.glsl` + wrapper `matmul_f16w_cm2.comp`:
+  BM=128, BN=64, BK=64 on 128 threads (every matrix dim a multiple of
+  64 → inside the exact flexible-dims envelope the init gate already
+  validates for cm2 flash; acc = 64 regs/thread).  A f32 quantized to
+  f16 via tensor-load decode callback (same numerics as coopmat1's
+  staging), B f16, f32 accumulate.  Spec constants 0..3 (variant
+  machinery; interior/K flags inert — tensor-layout clamping handles
+  edges) + 4..6 shared epilogue via `matmul_epilogue_common.glsl`
+  include, applied in a `coopMatPerElementNV` store callback with
+  clamped edge-lane reads.  General-shape correct at batch=1 via
+  layout clamping; batched dispatches need 16B-aligned batch strides.
+- Catalog: `F16wCm2` appended (`f16w_cm2`, tile 128/64/64), slot
+  gated on `coopmat2_enabled`.
+- Routing: `epilogue_fallback_index` now prefers `f16w_cm2` for
+  b_f16 shapes matching the coopmat1 gate (M,N % 128, K % 32,
+  M,N >= 256) before falling back to SIMT.  Plain routes untouched.
+  Tuner measures `f16w_cm2` only on coopmat-aligned shapes.
+- Tests (`tests/correctness/cm2_gemm.rs`, all `#[ignore]`d): plain vs
+  dual-rounded reference (aligned/ragged/batched/alpha+accumulate),
+  8 epilogue forms + batched-bias vs composed references, the
+  un-demote integration case, NaN-poisoned-C overwrite coverage.
+  `f16.rs` demote regression updated for the cm2 route.
+
+### NOTES — GPU validation TODO (next session, RTX 3070)
+
+1. Run the suite: `cargo test --release --test correctness --
+   --ignored --test-threads=1` — new `cm2_*` tests + `f16_*` + full
+   sweep (routing change touches every fused f16w op).
+2. Verify route: `ML_LOG`/debug that a fused op on (512, 5632, 2048)-
+   class shapes actually dispatches `f16w_cm2` (no public
+   dispatch-info surface for fused routes).
+3. Bench A/B (burn-in ~300ms first, identical case order):
+   fused-epilogue op on cm2 vs plain-coopmat1 + separate Binary pass,
+   on the TinyLlama prefill shapes (T=512/1024/2048 × N=2048/5632,
+   K=2048/5632).  Break-even = Binary pass bandwidth saved minus any
+   cm2-vs-cm1 GEMM gap.
+4. Plain-GEMM parity check: `ML_KERNEL=f16w_cm2` vs
+   `f16w_coopmat_aligned` on 1024³/2048³/4096³ (expect ≈parity; if
+   cm2 loses badly, tighten the fallback constraint).
+5. Tile probe ONLY if parity fails: BM=128/BN=128 @ 256 threads
+   (needs a 256-invocation flexible-dims init check first), BK=32.
+6. If (3) wins: flip `push_mlp_ops` T >= 256 branch in
+   tools/llama-ash to the fused-epilogue forms (deletes 3 Binary
+   passes/layer), re-run `bench --pp 512/1920` interleaved A/B.
+7. Pipeline-compile latency: cm2 pipelines compile slowly; check
+   first-prefill latency, consider warming at load.
+
 ## Leg 16 — `experiment/prefill-graph` (prefill as ONE `run_exec_ops` submission)
 
 Prefill previously ran EVERY op as an individual synchronous Executor

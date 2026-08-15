@@ -519,8 +519,9 @@ fn coopmat_routes_and_matches_dual_rounded_reference() {
 
 /// Regression: TinyLlama prefill surfaced that aligned f16 shapes
 /// route to the coopmat kernel, which cannot fuse epilogues — fused
-/// ops must demote to the SIMT sibling while plain ops keep the
-/// tensor cores, and explicit selections keep their loud failure.
+/// ops must demote to the SIMT sibling (or, with coopmat2, reroute to
+/// the CM2 tensor-core GEMM) while plain ops keep the tensor cores,
+/// and explicit selections keep their loud failure.
 #[test]
 #[ignore]
 fn f16_epilogue_on_coopmat_shape_demotes_and_matches() {
@@ -537,9 +538,16 @@ fn f16_epilogue_on_coopmat_shape_demotes_and_matches() {
     // A fused bias+SiLU+gate op on the same shape must run (demoted)
     // and match the reference computed from f16-rounded inputs.
     let (a, b, mut host_a, host_b) = setup_f16_case(&ctx, &exec, &[m, k], &[k, n], 9800, 9801);
-    // The demoted SIMT kernel reads A as f32 (no rounding); keep the
-    // reference on the raw A.
-    let _ = &mut host_a;
+    // Without coopmat2 the op demotes to a SIMT kernel that reads A as
+    // f32 (no rounding).  With coopmat2 it reroutes to the CM2
+    // tensor-core GEMM instead, which quantizes A to f16 at load —
+    // mirror that in the reference.
+    if ctx.coopmat2_enabled {
+        for value in &mut host_a {
+            *value = round_f32_via_f16(*value);
+        }
+        exec.upload(&host_a, &a).unwrap();
+    }
     let c = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
     let (bias, host_bias) = upload_det(&ctx, &exec, &[n], 9802);
     let (gate, host_gate) = upload_det(&ctx, &exec, &[m, n], 9803);

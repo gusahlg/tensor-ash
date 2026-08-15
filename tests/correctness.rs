@@ -17,6 +17,8 @@ mod attn_decode;
 mod batch;
 #[path = "correctness/churn.rs"]
 mod churn;
+#[path = "correctness/cm2_gemm.rs"]
+mod cm2_gemm;
 #[path = "correctness/decoder.rs"]
 mod decoder;
 #[path = "correctness/elementwise.rs"]
