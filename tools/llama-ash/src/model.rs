@@ -91,10 +91,26 @@ impl Scratch {
     /// `decode` selects the GQA-batched shapes and split-K partials;
     /// it cannot be inferred from `t` — a 1-token *prefill* still needs
     /// the `[heads, t, dh]` flash layout, not the decode aliases.
-    fn new(ctx: &Arc<VulkanContext>, cfg: &Config, t: u32, decode: bool) -> Result<Self> {
+    ///
+    /// `act_f16` stores the layer-loop activations (x ping-pong, xn,
+    /// q/k/v, head-permuted q/attn, o/on, up/gate) as f16 — the
+    /// prefill-only fast path where every GEMM takes the a16 coopmat
+    /// route and attention the CM2 io16 kernel.  The LM-head tail
+    /// (`last`/`last_n`/`logits`) stays f32: post-norm LM-head inputs
+    /// and logits can exceed the activations' comfortable f16 range,
+    /// and the final matmul is one row.
+    fn new(ctx: &Arc<VulkanContext>, cfg: &Config, t: u32, decode: bool, act_f16: bool) -> Result<Self> {
         debug_assert!(!decode || t == 1, "decode scratch is single-token");
+        debug_assert!(!(decode && act_f16), "decode scratch stays f32");
         let (h, f, kv) = (cfg.embd, cfg.ffn, cfg.kv_heads * cfg.dh);
-        let dev = |shape: &[u32]| Tensor::uninit_device(ctx, shape);
+        let dev = |shape: &[u32]| {
+            if act_f16 {
+                Tensor::uninit_device_f16(ctx, shape)
+            } else {
+                Tensor::uninit_device(ctx, shape)
+            }
+        };
+        let dev32 = |shape: &[u32]| Tensor::uninit_device(ctx, shape);
         let q = dev(&[t, h])?;
         let attn_flat = dev(&[t, h])?;
         let (q_gqa, attn_gqa) = if decode {
@@ -148,9 +164,9 @@ impl Scratch {
             on: dev(&[t, h])?,
             up: dev(&[t, f])?,
             gate: dev(&[t, f])?,
-            last: dev(&[1, h])?,
-            last_n: dev(&[1, h])?,
-            logits: dev(&[1, cfg.vocab])?,
+            last: dev32(&[1, h])?,
+            last_n: dev32(&[1, h])?,
+            logits: dev32(&[1, cfg.vocab])?,
         })
     }
 }
@@ -187,6 +203,14 @@ pub struct Model {
     /// Fused split-K decode attention (default when dh == 64).
     /// `LLAMA_ASH_ATTN=composed` restores the scores/softmax/PV trio.
     fused_attn: bool,
+    /// The model/device half of the f16-prefill-activations gate:
+    /// every layer-loop op has an f16 route (a16 coopmat GEMMs need
+    /// embd/kv_dim/ffn % 128, the CM2 io16 flash kernel needs dh 64 +
+    /// f16 KV caches + coopmat2).  The per-call half lives in
+    /// [`prefill`](Self::prefill): `t >= 256` (the plain-matmul MLP
+    /// branch) and `t % 128 == 0` (a16 M alignment).
+    /// `LLAMA_ASH_ACT=f32` opts out.  Decode always stays f32.
+    prefill_act_f16: bool,
     /// Per-op-class GPU nanoseconds for the current perop decode step
     /// (diagnostics; filled when `LLAMA_ASH_BREAKDOWN=1`).
     pub breakdown: std::cell::RefCell<Vec<(&'static str, u64)>>,
@@ -449,9 +473,26 @@ impl Model {
         let rope_table = Tensor::uninit_device(ctx, &[t_max, dh / 2, 2])?;
         exec.upload(&table, &rope_table)?;
 
-        let decode_scratch = Scratch::new(ctx, &cfg, 1, true)?;
+        let decode_scratch = Scratch::new(ctx, &cfg, 1, true, false)?;
         let pos_buf = exec.create_pos_buffer()?;
         let token_buf = exec.create_host_u32_buffer()?;
+        let prefill_act_f16 = !kv_f32
+            && dh == 64
+            && ctx.coopmat_enabled
+            && ctx.coopmat2_enabled
+            && ctx.f16_storage_enabled
+            && embd.is_multiple_of(128)
+            && kv_dim.is_multiple_of(128)
+            && ffn.is_multiple_of(128)
+            && std::env::var("LLAMA_ASH_ACT").as_deref() != Ok("f32");
+        log::info!(
+            "f16 prefill activations: {}",
+            if prefill_act_f16 {
+                "eligible (T >= 256 with T % 128 == 0)"
+            } else {
+                "off"
+            }
+        );
         log::info!("model loaded in {:.2}s", start.elapsed().as_secs_f64());
         Ok(Self {
             ctx: ctx.clone(),
@@ -466,6 +507,7 @@ impl Model {
             pos: 0,
             decode_scratch,
             prefill_scratch: None,
+            prefill_act_f16,
             pos_buf,
             token_buf,
             breakdown: std::cell::RefCell::new(Vec::new()),
@@ -616,7 +658,11 @@ impl Model {
         let pos_base = self.pos;
         ensure!(pos_base + t <= self.cfg.t_max, "KV cache overflow");
         if self.prefill_scratch.as_ref().is_none_or(|s| s.t != t) {
-            self.prefill_scratch = Some(Scratch::new(&self.ctx, &self.cfg, t, false)?);
+            // f16 activations need the plain-matmul MLP branch
+            // (t >= 256) and a16 M alignment (t % 128 == 0); other
+            // widths keep the f32 scratch and match main exactly.
+            let act_f16 = self.prefill_act_f16 && t >= 256 && t.is_multiple_of(128);
+            self.prefill_scratch = Some(Scratch::new(&self.ctx, &self.cfg, t, false, act_f16)?);
         }
         let host_x = self.embed(tokens)?;
         let s = self.prefill_scratch.take().unwrap();
