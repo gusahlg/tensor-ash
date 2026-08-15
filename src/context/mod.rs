@@ -34,6 +34,12 @@ pub struct VulkanContext {
     pub device_summary: DeviceSummary,
     pub device: ash::Device,
     pub device_properties: vk::PhysicalDeviceProperties,
+    /// `VkPhysicalDeviceDriverProperties::driverID` (core in Vulkan
+    /// 1.2); `None` on pre-1.2 devices.  Distinguishes drivers that
+    /// share a vendor id (NVIDIA proprietary vs Mesa NVK) for
+    /// driver-scoped quirk handling — see
+    /// [`Self::workgroup_shared_budget`].
+    pub driver_id: Option<vk::DriverId>,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub compute_family: u32,
     /// Compute queue.  Vulkan requires external sync on a queue, hence the mutex.
@@ -73,8 +79,22 @@ pub struct VulkanContext {
 }
 
 impl VulkanContext {
+    /// Largest workgroup-memory declaration currently shipped in the
+    /// kernel catalog (the 128x64/BK=64 tiles: `As[128][65]` f32 +
+    /// `Bs[64][16]` uvec4).  Caps the NVIDIA-proprietary allowance in
+    /// [`Self::workgroup_shared_budget`] so a future, even larger tile
+    /// is still gated everywhere; `catalog.rs` tests pin the registry
+    /// maximum to this value.
+    pub const MAX_SHIPPED_WORKGROUP_BYTES: u32 = 49_664;
+
+    /// Create a context honoring `ML_DEVICE` (`auto`, `discrete`,
+    /// `integrated`, `virtual`, `cpu`, `index:N`, `name:TEXT`, or a
+    /// bare name substring; unset = auto).  Reading the variable here,
+    /// at the library entry point, lets the test suite and every tool
+    /// select a device on multi-GPU hosts without loader tricks.
     pub fn new(enable_validation: bool) -> Result<Arc<Self>> {
-        Self::new_with_device_preference(enable_validation, DevicePreference::Auto)
+        let preference = DevicePreference::parse(&std::env::var("ML_DEVICE").unwrap_or_default())?;
+        Self::new_with_device_preference(enable_validation, preference)
     }
 
     pub fn new_with_device_preference(
@@ -137,6 +157,30 @@ impl VulkanContext {
         unsafe {
             self.device
                 .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        }
+    }
+
+    /// Per-workgroup shared-memory budget the kernel registry gates
+    /// against.  Spec-wise this is `maxComputeSharedMemorySize`: a
+    /// shader declaring more is invalid
+    /// (VUID-RuntimeSpirv-Workgroup-06530), and NVK on Turing enforces
+    /// it the hard way — pipeline runs lose the device at dispatch
+    /// (Xid 13 `SKEDCHECK18_L1_CONFIG_TOO_SMALL`).
+    ///
+    /// Exception: the NVIDIA proprietary driver reports the universal
+    /// 49,152 B limit but demonstrably does not enforce it (the
+    /// hardware shared carveout is larger), and the measured tuning
+    /// corpus was built on it with the 49,664 B BK=64 tiles winning
+    /// their shape classes.  That driver therefore keeps a bounded
+    /// allowance up to the largest shipped declaration, preserving
+    /// measured routing.  Trimming those tiles under 49,152 B is the
+    /// real fix and would retire this exception.
+    pub fn workgroup_shared_budget(&self) -> u32 {
+        let limit = self.device_properties.limits.max_compute_shared_memory_size;
+        if self.driver_id == Some(vk::DriverId::NVIDIA_PROPRIETARY) {
+            limit.max(Self::MAX_SHIPPED_WORKGROUP_BYTES)
+        } else {
+            limit
         }
     }
 

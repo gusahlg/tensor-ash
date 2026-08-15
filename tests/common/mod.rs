@@ -104,6 +104,37 @@ pub fn make_setup_with_kernel(
     (ctx, exec)
 }
 
+/// Like `make_setup_with_kernel`, but returns `None` (with a note on
+/// stderr) when the requested kernel is gated off by the device's
+/// workgroup shared-memory budget — the 49,664 B BK=64 tiles do not
+/// build on 48 KiB devices (e.g. NVK on Turing).  Explicit-kernel
+/// tests use this to skip such kernels instead of failing.
+pub fn make_setup_with_kernel_if_fits(
+    n_slots: usize,
+    max_calls: u32,
+    selection: KernelSelection,
+) -> Option<(Arc<VulkanContext>, Executor)> {
+    let ctx = VulkanContext::new(validate_from_env()).expect("Vulkan init");
+    if let Some(index) = selection.index() {
+        let spec = &tensor_ash::KERNEL_SPECS[index];
+        let budget = ctx.workgroup_shared_budget();
+        if spec.shared_memory_bytes() > budget {
+            eprintln!(
+                "skipping kernel '{}': {} B workgroup memory > {} B device budget",
+                spec.name,
+                spec.shared_memory_bytes(),
+                budget
+            );
+            return None;
+        }
+    }
+    let pipe =
+        Arc::new(MatmulPipeline::new_with_kernel_selection(&ctx, selection).expect("pipeline"));
+    let exec = Executor::new_with_config(ctx.clone(), pipe, executor_config(n_slots, max_calls))
+        .expect("executor");
+    Some((ctx, exec))
+}
+
 /// Convenience: run one matmul and produce (gpu_result, cpu_reference).
 ///
 /// Both inputs are filled deterministically from `seed_a`/`seed_b`.  Pass

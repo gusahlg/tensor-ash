@@ -7,7 +7,7 @@ use std::env as std_env;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tensor_ash::{DevicePreference, Executor, KernelSelection, MatmulPipeline, VulkanContext};
+use tensor_ash::{Executor, KernelSelection, MatmulPipeline, VulkanContext};
 
 use env::{env_bool, env_string, env_usize};
 
@@ -18,10 +18,10 @@ pub fn run() -> Result<()> {
     let cmd = args.next().unwrap_or_else(|| "all".into());
     let validate = env_bool("ML_VALIDATE");
     let n_slots = env_usize("ML_SLOTS", 2);
-    let device_preference = DevicePreference::parse(&env_string("ML_DEVICE", "auto"))?;
     let raw_kernel = env_string("ML_KERNEL", "auto");
 
-    let ctx = VulkanContext::new_with_device_preference(validate, device_preference)?;
+    // `VulkanContext::new` reads ML_DEVICE itself.
+    let ctx = VulkanContext::new(validate)?;
     let pipe = Arc::new(MatmulPipeline::new_with_kernel_selection(
         &ctx,
         KernelSelection::from_env()?,
