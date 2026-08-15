@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Silent GPU loss under context churn** (loader pin in
+  `VulkanContext` init): the Vulkan loader dlcloses every ICD when the
+  last `VkInstance` dies and re-dlopens them on the next create. ICDs
+  with static-TLS dependencies (NVIDIA's `libnvidia-tls.so`,
+  initial-exec model) then bleed glibc's fixed static-TLS surplus one
+  dlopen at a time when fresh threads are involved — after ~15-20
+  create/destroy cycles on distinct threads (exactly what a
+  `--test-threads=1` test harness does) the ICD fails to load with
+  "cannot allocate memory in static TLS block", the GPU vanishes from
+  enumeration, and `Auto` selection silently falls back to llvmpipe
+  (whose JIT then segfaulted the monolithic suite on louise-pc/RTX
+  4060). tensor-ash now creates one bare pinned `VkInstance` on first
+  context creation and leaks it deliberately so ICDs stay resident and
+  their TLS is allocated exactly once. Opt out with
+  `ML_NO_LOADER_PIN=1`. New churn regression tests:
+  `churn::context_churn_across_threads_keeps_device` (reproduced the
+  fallback at cycle 21 pre-fix) and
+  `churn::context_churn_does_not_leak_fds`.
+
 ### Added
 
 - **Shared-memory budget gate**: every catalog kernel's workgroup
