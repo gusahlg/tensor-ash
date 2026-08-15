@@ -270,6 +270,18 @@ impl Access {
         self.writes.push(cell.buffer().raw_buffer());
         self
     }
+
+    /// RAW/WAW/WAR test against the work recorded since the last
+    /// barrier — the single hazard definition shared by recording
+    /// ([`Executor::run_exec_ops`]) and the plan-only census
+    /// ([`Executor::exec_ops_barrier_count`]).
+    fn hazard_with(&self, pending_writes: &[vk::Buffer], pending_reads: &[vk::Buffer]) -> bool {
+        self.reads
+            .iter()
+            .chain(&self.writes)
+            .any(|b| pending_writes.contains(b))
+            || self.writes.iter().any(|b| pending_reads.contains(b))
+    }
 }
 
 impl Executor {
@@ -344,6 +356,40 @@ impl Executor {
         self.prepare_recorded(ops.len(), total_flops, |cb| {
             self.record_exec_ops(cb, &planned, &accesses)
         })
+    }
+
+    /// Plan a mixed graph WITHOUT executing it and report its dispatch
+    /// census: `(dispatches, barriers)` — the op count after
+    /// multi-dispatch expansion (`AttnDecode` plans as two) and the
+    /// number of compute barriers the hazard tracker would record
+    /// between them.  Nothing touches the queue.
+    ///
+    /// Diagnostics for performance accounting: a full compute barrier
+    /// drains the GPU (~7.7 µs measured on GA104), so pricing a graph
+    /// requires knowing how many the hazard tracker will emit.  The
+    /// perf-thesis harness (`ml_bench thesis`) uses this to separate
+    /// barrier drain from kernel time.
+    pub fn exec_ops_barrier_count(&self, ops: &[ExecOp<'_>]) -> Result<(usize, usize)> {
+        if ops.is_empty() {
+            bail!("exec_ops_barrier_count: empty op list");
+        }
+        if !self.ctx.buffer_device_address_enabled {
+            bail!("exec_ops_barrier_count: requires bufferDeviceAddress");
+        }
+        let (planned, accesses, _total_flops) = self.plan_exec_ops(ops)?;
+        let mut pending_writes: Vec<vk::Buffer> = Vec::new();
+        let mut pending_reads: Vec<vk::Buffer> = Vec::new();
+        let mut barriers = 0usize;
+        for (index, access) in accesses.iter().enumerate() {
+            if index > 0 && access.hazard_with(&pending_writes, &pending_reads) {
+                barriers += 1;
+                pending_writes.clear();
+                pending_reads.clear();
+            }
+            pending_reads.extend(&access.reads);
+            pending_writes.extend(&access.writes);
+        }
+        Ok((planned.len(), barriers))
     }
 
     /// Validate and plan every op of a mixed graph; nothing touches the
@@ -539,13 +585,7 @@ impl Executor {
         let mut pending_reads: Vec<vk::Buffer> = Vec::new();
         for (index, step) in planned.iter().enumerate() {
             let access = &accesses[index];
-            let hazard = access
-                .reads
-                .iter()
-                .chain(&access.writes)
-                .any(|b| pending_writes.contains(b))
-                || access.writes.iter().any(|b| pending_reads.contains(b));
-            if index > 0 && hazard {
+            if index > 0 && access.hazard_with(&pending_writes, &pending_reads) {
                 record_compute_to_compute_barrier(&self.ctx, cb);
                 pending_writes.clear();
                 pending_reads.clear();

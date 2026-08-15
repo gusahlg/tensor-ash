@@ -222,8 +222,8 @@ pub struct Model {
     pub breakdown: std::cell::RefCell<Vec<(&'static str, u64)>>,
 }
 
-#[derive(Copy, Clone, PartialEq)]
-enum DecodeMode {
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DecodeMode {
     /// Record the whole token ONCE, replay per token (default): the
     /// position-dependent values are read from a device-side position
     /// buffer, so a decode step costs one `vkQueueSubmit` with zero
@@ -238,6 +238,30 @@ enum DecodeMode {
     /// decode attention (`AttnDecode`) at every probed context length
     /// (see benchmarks/experiment-branch.md).
     Flash,
+}
+
+/// Programmatic overrides for the environment knobs [`Model::load`]
+/// reads (`LLAMA_ASH_DECODE`, `LLAMA_ASH_KV`).  `None` keeps the
+/// environment-derived behaviour; `Some` wins over the environment.
+/// The thesis harness uses this to sweep decode modes and KV dtypes
+/// in one process without mutating the environment.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct LoadOverrides {
+    /// Decode strategy (see [`DecodeMode`]).
+    pub decode_mode: Option<DecodeMode>,
+    /// `true` = f32 KV caches (the `LLAMA_ASH_KV=f32` opt-out),
+    /// `false` = f16 caches (the default).
+    pub kv_f32: Option<bool>,
+}
+
+/// Dispatch/barrier census of one recorded graph (see
+/// [`tensor_ash::Executor::exec_ops_barrier_count`]): how many
+/// dispatches one submission records and how many full compute
+/// barriers the hazard tracker emits between them.
+#[derive(Copy, Clone, Debug)]
+pub struct GraphStats {
+    pub dispatches: usize,
+    pub barriers: usize,
 }
 
 /// Greedy sampling: index of the largest logit.
@@ -288,6 +312,18 @@ impl Model {
         exec: &Arc<Executor>,
         path: &Path,
         t_max: u32,
+    ) -> Result<Self> {
+        Self::load_with(ctx, exec, path, t_max, LoadOverrides::default())
+    }
+
+    /// [`load`](Self::load) with programmatic [`LoadOverrides`] for the
+    /// decode-mode and KV-dtype environment knobs.
+    pub fn load_with(
+        ctx: &Arc<VulkanContext>,
+        exec: &Arc<Executor>,
+        path: &Path,
+        t_max: u32,
+        overrides: LoadOverrides,
     ) -> Result<Self> {
         let start = Instant::now();
         let mut gguf = GgufFile::open(path)?;
@@ -395,7 +431,9 @@ impl Model {
         // the composed decode matmuls pick up the f16w routes
         // automatically, and prefill uses the kv16 flash variants.
         // LLAMA_ASH_KV=f32 restores full precision.
-        let kv_f32 = std::env::var("LLAMA_ASH_KV").as_deref() == Ok("f32");
+        let kv_f32 = overrides
+            .kv_f32
+            .unwrap_or_else(|| std::env::var("LLAMA_ASH_KV").as_deref() == Ok("f32"));
         let mut checksum_logged = false;
         for i in 0..n_layers {
             let p = |suffix: &str| format!("blk.{i}.{suffix}");
@@ -517,14 +555,19 @@ impl Model {
             pos_buf,
             token_buf,
             breakdown: std::cell::RefCell::new(Vec::new()),
-            decode_mode: match std::env::var("LLAMA_ASH_DECODE").as_deref() {
-                Ok("flash") => DecodeMode::Flash,
-                Ok("composed") | Ok("perop") => DecodeMode::PerOp,
-                Ok("graph") => DecodeMode::Graph,
-                Ok("prepared") | Err(_) => DecodeMode::Prepared,
-                Ok(other) => {
-                    bail!("LLAMA_ASH_DECODE must be prepared, graph, perop, or flash, got {other}")
-                }
+            decode_mode: match overrides.decode_mode {
+                Some(mode) => mode,
+                None => match std::env::var("LLAMA_ASH_DECODE").as_deref() {
+                    Ok("flash") => DecodeMode::Flash,
+                    Ok("composed") | Ok("perop") => DecodeMode::PerOp,
+                    Ok("graph") => DecodeMode::Graph,
+                    Ok("prepared") | Err(_) => DecodeMode::Prepared,
+                    Ok(other) => {
+                        bail!(
+                            "LLAMA_ASH_DECODE must be prepared, graph, perop, or flash, got {other}"
+                        )
+                    }
+                },
             },
             // The fused split-K decode-attention op ships a dh64
             // kernel only; dh128 models keep the composed trio.
@@ -1080,6 +1123,63 @@ impl Model {
         }
         self.pos = start_pos + n;
         Ok(generated)
+    }
+
+    /// Plan-only census of the prefill graph at width `t` (see
+    /// [`GraphStats`]): the same op chain [`prefill`](Self::prefill)
+    /// would submit at the current position, counted instead of
+    /// executed.  Nothing touches the queue or the KV caches.
+    pub fn prefill_graph_stats(&mut self, t: u32) -> Result<GraphStats> {
+        ensure!(t > 0, "prefill graph needs at least one token");
+        ensure!(self.pos + t <= self.cfg.t_max, "KV cache overflow");
+        if self.prefill_scratch.as_ref().is_none_or(|s| s.t != t) {
+            // Mirror prefill()'s f16-activation eligibility so the
+            // census counts the graph prefill would actually submit.
+            let act_f16 = self.prefill_act_f16 && t >= 256 && t.is_multiple_of(128);
+            self.prefill_scratch = Some(Scratch::new(&self.ctx, &self.cfg, t, false, act_f16)?);
+        }
+        let s = self.prefill_scratch.take().unwrap();
+        let ops = self.prefill_ops(&s, t, self.pos);
+        let counted = self.exec.exec_ops_barrier_count(&ops);
+        drop(ops);
+        self.prefill_scratch = Some(s);
+        let (dispatches, barriers) = counted?;
+        Ok(GraphStats {
+            dispatches,
+            barriers,
+        })
+    }
+
+    /// Plan-only census of one decode step's graph (see
+    /// [`GraphStats`]).  Prepared mode counts the exact replayed chain
+    /// (pos-relative ops plus the GPU argmax + embed-gather tail);
+    /// every other mode counts the re-recorded graph at the current
+    /// position, which is also the dispatch chain the per-op path
+    /// submits one by one.
+    pub fn decode_graph_stats(&self) -> Result<GraphStats> {
+        let s = &self.decode_scratch;
+        let (dispatches, barriers) = if self.decode_mode == DecodeMode::Prepared && self.fused_attn
+        {
+            let mut ops = self.decode_ops(s, 0, self.pos_buf.device_address());
+            ops.push(ExecOp::Argmax {
+                input: &s.logits,
+                result: &self.token_buf,
+            });
+            ops.push(ExecOp::EmbedGather {
+                token: &self.token_buf,
+                table: &self.embd_gpu,
+                out: &s.x_a,
+            });
+            self.exec.exec_ops_barrier_count(&ops)?
+        } else {
+            let pos = self.pos.min(self.cfg.t_max.saturating_sub(1));
+            self.exec
+                .exec_ops_barrier_count(&self.decode_ops(s, pos, 0))?
+        };
+        Ok(GraphStats {
+            dispatches,
+            barriers,
+        })
     }
 
     /// Build the decode step's full op chain against `s`.

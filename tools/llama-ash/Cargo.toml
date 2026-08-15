@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[lib]
+name = "llama_ash"
+path = "src/lib.rs"
+
 [[bin]]
 name = "llama_ash"
 path = "src/main.rs"

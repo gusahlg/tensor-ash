@@ -220,6 +220,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "env_logger",
+ "llama-ash",
  "log",
  "tensor-ash",
  "tensor-ash-test-support",

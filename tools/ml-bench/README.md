@@ -14,9 +14,17 @@ cargo run --release -p ml-bench -- correctness
 cargo run --release -p ml-bench -- sweep
 ```
 
-Other subcommands are `single`, `cases`, `concurrent`, `transfer`, and
+Other subcommands are `single`, `cases`, `concurrent`, `transfer`,
 `prepared` (which compares synchronous dispatch, prepared replay, and
-pipelined prepared submission for one repeated shape). `cases`
+pipelined prepared submission for one repeated shape), and `thesis` —
+the performance-thesis harness: it re-measures the campaign's explicit
+performance model (T1-T7, documented in `benchmarks/THESES.md`) against
+per-GPU expectations checked in at `benchmarks/thesis-expectations.toml`,
+prints a prediction-vs-measured table, and exits nonzero on any
+regression. `ML_MODEL=<gguf> ml_bench thesis --all` runs everything (the
+model-level theses T1/T5/T7 load a llama-family GGUF through the
+`llama-ash` library); `ml_bench thesis t2 t3 t4 t6` runs the
+kernel-level subset without a model. `cases`
 runs multiple `label,b,m,n,k[,f16w]` arguments in one process, avoiding repeated
 pipeline startup and GPU clock perturbation in automation. The environment
 knobs are documented in the workspace `README.md`; `ML_DEVICE`, `ML_KERNEL`,
