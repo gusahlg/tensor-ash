@@ -130,15 +130,21 @@ fn f16_routes_pick_f16w_kernels_and_skip_splitk2() {
         return;
     }
     // Big aligned shapes take the tensor cores when available; the
-    // SIMT large tile handles the unaligned siblings.
+    // SIMT large tile handles the unaligned siblings.  Route names are
+    // asserted budget-aware: the exact measured winner wherever the
+    // shared-memory gate admits its slot, and the documented in-budget
+    // demotion (`in_budget_index`) where it stays empty.
     let large = exec.dispatch_info_for(1, 2048, 2048, 2048, true);
     if ctx.coopmat_enabled {
         assert_eq!(
             large.kernel, "f16w_coopmat_aligned",
             "large route: {large:?}"
         );
-    } else {
+    } else if kernel_in_budget(&ctx, KernelSelection::F16wLargeBdaV4) {
         assert_eq!(large.kernel, "f16w_large_bda_v4", "large route: {large:?}");
+    } else {
+        // Sub-floor budget (software Vulkan): the family's 64x64 tile.
+        assert_eq!(large.kernel, "f16w_small_bda_v4", "large route: {large:?}");
     }
     let unaligned = exec.dispatch_info_for(1, 2048, 2040, 2048, true);
     assert!(
@@ -146,12 +152,16 @@ fn f16_routes_pick_f16w_kernels_and_skip_splitk2() {
         "unaligned route: {unaligned:?}"
     );
     // 1024^3: tensor cores when available, else the f32 route class
-    // mirror (m128n64k64).
+    // mirror (m128n64k64) — a 49,664 B BK=64 tile the shared-memory
+    // gate empties on 48 KiB devices (e.g. NVK on Turing), where the
+    // route demotes to the family's 64x64 fallback.
     let mid = exec.dispatch_info_for(1, 1024, 1024, 1024, true);
     if ctx.coopmat_enabled {
         assert_eq!(mid.kernel, "f16w_coopmat_aligned", "mid route: {mid:?}");
-    } else {
+    } else if kernel_in_budget(&ctx, KernelSelection::F16wM128N64K64BdaV4) {
         assert_eq!(mid.kernel, "f16w_m128n64k64_bda_v4", "mid route: {mid:?}");
+    } else {
+        assert_eq!(mid.kernel, "f16w_small_bda_v4", "mid route: {mid:?}");
     }
     let row = exec.dispatch_info_for(1, 1, 4096, 4096, true);
     assert_eq!(row.kernel, "f16w_row_bda_k16", "row route: {row:?}");

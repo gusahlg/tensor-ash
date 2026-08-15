@@ -104,6 +104,17 @@ pub fn make_setup_with_kernel(
     (ctx, exec)
 }
 
+/// True when `selection`'s workgroup shared-memory declaration fits
+/// this device's budget, i.e. the shared-memory gate leaves its
+/// pipeline slot built and heuristic routing may pick it.  Route
+/// assertions use this to demand the exact measured-winner kernel on
+/// devices that admit it and the documented in-budget fallback
+/// elsewhere.
+pub fn kernel_in_budget(ctx: &VulkanContext, selection: KernelSelection) -> bool {
+    let index = selection.index().expect("concrete kernel selection");
+    tensor_ash::KERNEL_SPECS[index].shared_memory_bytes() <= ctx.workgroup_shared_budget()
+}
+
 /// Like `make_setup_with_kernel`, but returns `None` (with a note on
 /// stderr) when the requested kernel is gated off by the device's
 /// workgroup shared-memory budget — the 49,664 B BK=64 tiles do not
@@ -115,18 +126,17 @@ pub fn make_setup_with_kernel_if_fits(
     selection: KernelSelection,
 ) -> Option<(Arc<VulkanContext>, Executor)> {
     let ctx = VulkanContext::new(validate_from_env()).expect("Vulkan init");
-    if let Some(index) = selection.index() {
+    if let Some(index) = selection.index()
+        && !kernel_in_budget(&ctx, selection)
+    {
         let spec = &tensor_ash::KERNEL_SPECS[index];
-        let budget = ctx.workgroup_shared_budget();
-        if spec.shared_memory_bytes() > budget {
-            eprintln!(
-                "skipping kernel '{}': {} B workgroup memory > {} B device budget",
-                spec.name,
-                spec.shared_memory_bytes(),
-                budget
-            );
-            return None;
-        }
+        eprintln!(
+            "skipping kernel '{}': {} B workgroup memory > {} B device budget",
+            spec.name,
+            spec.shared_memory_bytes(),
+            ctx.workgroup_shared_budget()
+        );
+        return None;
     }
     let pipe =
         Arc::new(MatmulPipeline::new_with_kernel_selection(&ctx, selection).expect("pipeline"));
