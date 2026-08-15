@@ -9,11 +9,13 @@
 // Compile-time inputs (set by the .comp wrapper):
 //     B_F16 (optional): B is stored as IEEE half; loads convert to f32
 //     before the FMA, halving global B traffic (the GEMV bottleneck).
-//     VCOLS (optional, B_F16 only, 2 or 4): each lane owns VCOLS
-//     adjacent output columns and reads B as f16vec2/f16vec4, widening
-//     the per-warp B transaction from 64B to 128B/256B per k-step.
-//     The workgroup covers 32*VCOLS columns, so the grid shrinks by
-//     VCOLS (the .comp wrapper's catalog tile_n must be 32*VCOLS).
+//     VCOLS (optional, B_F16 only, 2): each lane owns VCOLS adjacent
+//     output columns and reads B as f16vec2, widening the per-warp B
+//     transaction from 64B to 128B per k-step.  The workgroup covers
+//     32*VCOLS columns, so the grid shrinks by VCOLS (the .comp
+//     wrapper's catalog tile_n must be 32*VCOLS).  (VCOLS=4 via
+//     f16vec4 was measured neutral-to-losing on every decode shape
+//     and removed.)
 //     Per output column the K-order and the fixed-order slice reduce
 //     are identical to VCOLS=1, so results stay bit-exact across
 //     variants.  Ragged N (or an unaligned B base) falls back to an
@@ -48,8 +50,8 @@ const uint KSLICES_U = uint(KSLICES);
 #if VCOLS != 1 && !defined(B_F16)
 #error "VCOLS > 1 is implemented for the B_F16 path only"
 #endif
-#if VCOLS != 1 && VCOLS != 2 && VCOLS != 4
-#error "VCOLS must be 1, 2, or 4"
+#if VCOLS != 1 && VCOLS != 2
+#error "VCOLS must be 1 or 2"
 #endif
 const uint VCOLS_U = uint(VCOLS);
 
@@ -77,11 +79,6 @@ layout(buffer_reference, std430, buffer_reference_align = 2) restrict readonly b
 #define f16vec_load f16vec2
 layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F16VecReadOnly {
     f16vec2 v[];
-};
-#elif VCOLS == 4
-#define f16vec_load f16vec4
-layout(buffer_reference, std430, buffer_reference_align = 8) restrict readonly buffer F16VecReadOnly {
-    f16vec4 v[];
 };
 #endif
 #endif

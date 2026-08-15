@@ -1,5 +1,56 @@
 # Experiment branch log
 
+## Leg 13 — `experiment/gemv-vec-loads` (VCOLS packed-load row GEMVs)
+
+Parameterized `matmul_row_bda_kernel.glsl` with VCOLS (each lane owns
+VCOLS adjacent output columns, B read as `f16vec2`/`f16vec4`, widening
+the per-warp B transaction from 64B to 128B/256B per k-step; ragged-N /
+unaligned bases fall back to an in-shader scalar path; results bit-exact
+across variants). Probed 2/4-column variants of both the 8-slice and the
+16-slice f16-weights row GEMVs on the decode-critical shapes.
+
+Per-shape A/B (RTX 3070, `ml_bench cases`, ML_ITERS=500 after a
+GEMM burn-in case, identical order, two full cycles — repeatable to
+<1 µs; gpu-timestamp median, µs):
+
+| shape (M=1) | row_bda | k16 | v2 | v4 | k16_v2 | k16_v4 |
+|---|---|---|---|---|---|---|
+| K=2048 N=2048 (q/o_proj) | 31 | 23 | 30 | 30 | **23** | 23 |
+| K=5632 N=2048 (ffn_down) | 76 | 58 | 75 | 76 | **58** | 58 |
+| K=2048 N=5632 (gate/up) | 58 | 61 | 58 | 57 | **56** | 57 |
+| K=2048 N=256 (kv proj) | 16 | **8** | 14 | — | 9 | 12 |
+| K=256 N=2048 | 3.7 | 3.5 | 3.7 | 3.7 | 3.5 | 3.7 |
+| K=2048 N=32000 (lm_head) | 310 | 319 | 306 | — | **307** | 307 |
+
+Reading: the k16 kernel is already at 81-89% of the 448 GB/s bandwidth
+floor on its routed shapes, so packed loads are neutral there. The one
+real win is wide-N moderate-K (gate/up), where 16 slices alone regress
+~5% vs 8 slices but 16 slices + VCOLS=2 win ~3.3% (58 -> 56 µs).
+VCOLS=4 lost or tied everywhere (N=256: 12 vs 8 µs — occupancy
+starvation at 128 columns/workgroup); 8-slice v2 never beat its
+16-slice sibling.
+
+**Route change**: the m==1 b_f16 wide-N branch (the `else` of the k16
+rule) now routes to `f16w_row_bda_k16_v2`; the deep/narrow branch stays
+on plain `f16w_row_bda_k16`. **Deleted** (losers, no dead code):
+`f16w_row_bda_v2`, `f16w_row_bda_v4`, `f16w_row_bda_k16_v4` wrappers +
+catalog entries, and the f16vec4 path in the shared shader. Also fixed
+the tuner's m>1 row-kernel exclusion (`ends_with("row_bda")` ->
+`contains("row_bda")`, which the k16 names had been slipping past).
+
+**End-to-end** (same session, interleaved base/branch, 8 reps each,
+warm-up run discarded): tg128 base 164.8-169.0 (mean 167.1), branch
+167.4-171.0 (mean 169.4) — **+1.3%**, branch faster in 7/8 pairs;
+pp128 neutral. Below the 175 t/s CUDA-parity goal and below the 2%
+branch-level gate; the per-shape gate/up win (+3.3%) is real but only
+~90 µs/token of a ~5.9 ms token. Greedy generation stays byte-identical
+(24/24 reference ids). 105/105 GPU tests.
+
+Negative result recorded: packed B loads are NOT the remaining decode
+gap — the row GEMVs already run at 81-89% of bandwidth. The residual
+~8 t/s to CUDA parity lives in barrier drain + non-GEMV kernel work,
+not GEMV load width.
+
 ## Legs 6-12 — decode/prefill optimization sweep (summary)
 
 TinyLlama-1.1B f16, RTX 3070, llama.cpp CUDA (fa=1) as reference.

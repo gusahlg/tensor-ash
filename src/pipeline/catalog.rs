@@ -197,19 +197,15 @@ kernel_catalog! {
     // matmuls leave half the device idle at eight).
     F16wRowBdaK16 => ("f16w_row_bda_k16", 1, 32, 1, "matmul_f16w_row_bda_k16.spv", false,
         ["f16w_row_bda_k16", "f16w_row_k16"]),
-    // VCOLS variants: each lane owns 2/4 adjacent output columns and
-    // loads B as f16vec2/f16vec4, widening the per-warp B transaction
-    // (64B -> 128B/256B per k-step).  tile_n = 32 * VCOLS.
-    F16wRowBdaV2 => ("f16w_row_bda_v2", 1, 64, 1, "matmul_f16w_row_bda_v2.spv", false,
-        ["f16w_row_bda_v2", "f16w_row_v2"]),
-    F16wRowBdaV4 => ("f16w_row_bda_v4", 1, 128, 1, "matmul_f16w_row_bda_v4.spv", false,
-        ["f16w_row_bda_v4", "f16w_row_v4"]),
+    // VCOLS=2 sibling: each lane owns two adjacent output columns and
+    // loads B as f16vec2, widening the per-warp B transaction (64B ->
+    // 128B per k-step); tile_n = 64.  Wins ~3% on wide-N moderate-K
+    // GEMVs (gate/up-shaped), where sixteen slices alone regress.
+    // The 8-slice v2, the k16 v4, and the 8-slice v4 all measured
+    // neutral-to-losing on every probed decode shape and were deleted.
     F16wRowBdaK16V2 => ("f16w_row_bda_k16_v2", 1, 64, 1,
         "matmul_f16w_row_bda_k16_v2.spv", false,
         ["f16w_row_bda_k16_v2", "f16w_row_k16_v2"]),
-    F16wRowBdaK16V4 => ("f16w_row_bda_k16_v4", 1, 128, 1,
-        "matmul_f16w_row_bda_k16_v4.spv", false,
-        ["f16w_row_bda_k16_v4", "f16w_row_k16_v4"]),
     // Tensor-core GEMM (KHR cooperative matrix): A f32 converted to
     // f16 at staging, B f16 storage, f32 accumulate.  Strictly aligned
     // (the suffix drives the host-side M/N/K % tile check) because
