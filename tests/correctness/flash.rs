@@ -6,7 +6,7 @@
 use crate::common::*;
 
 use tensor_ash::dtype::round_f32_via_f16;
-use tensor_ash::{FlashAttentionDesc, MatmulCall, SoftmaxMask, Tensor};
+use tensor_ash::{ExecOp, FlashAttentionDesc, MatmulCall, SoftmaxMask, Tensor};
 
 /// f64 reference: causal attention where query row `i` attends to
 /// positions `< min(kv_len, pos_base + i + 1)`.
@@ -345,6 +345,63 @@ fn flash_rejects_bad_geometry() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("exceeds cache T_max"), "unexpected: {err}");
+}
+
+/// `ExecOp::FlashAttn` must be the standalone dispatch verbatim
+/// (same routing, same kernel, same grid), so a graph containing only
+/// it matches `run_flash_attention` BITWISE.  Warm-cache GQA geometry
+/// with a poisoned tail keeps the desc plumbing honest.
+#[test]
+#[ignore]
+fn flash_in_graph_matches_standalone_bitwise() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !ctx.buffer_device_address_enabled {
+        eprintln!("skipping: no BDA");
+        return;
+    }
+    let case = FlashCase {
+        heads: 8,
+        kv_heads: 2,
+        t_q: 100,
+        t_max: 256,
+        dh: 64,
+        kv_len: 60 + 100,
+        pos_base: 60,
+    };
+    let (q, _) = upload_det(&ctx, &exec, &[case.heads, case.t_q, case.dh], 5400);
+    let kt = Tensor::uninit_device(&ctx, &[case.kv_heads, case.dh, case.t_max]).unwrap();
+    let v = Tensor::uninit_device(&ctx, &[case.kv_heads, case.t_max, case.dh]).unwrap();
+    let (host_kt, host_v) = fill_kv(&case, Some(1.0e30));
+    exec.upload(&host_kt, &kt).unwrap();
+    exec.upload(&host_v, &v).unwrap();
+
+    let desc = FlashAttentionDesc {
+        kv_len: case.kv_len,
+        pos_base: case.pos_base,
+        scale: 1.0 / (case.dh as f32).sqrt(),
+    };
+    let out_standalone = Tensor::uninit_device(&ctx, &[case.heads, case.t_q, case.dh]).unwrap();
+    let out_graph = Tensor::uninit_device(&ctx, &[case.heads, case.t_q, case.dh]).unwrap();
+    exec.run_flash_attention(&q, &kt, &v, &out_standalone, desc)
+        .unwrap();
+    exec.run_exec_ops(&[ExecOp::FlashAttn {
+        q: &q,
+        kt: &kt,
+        v: &v,
+        out: &out_graph,
+        desc,
+    }])
+    .unwrap();
+
+    let mut a = vec![0.0; (case.heads * case.t_q * case.dh) as usize];
+    let mut b = vec![0.0; a.len()];
+    exec.download(&out_standalone, &mut a).unwrap();
+    exec.download(&out_graph, &mut b).unwrap();
+    assert_eq!(
+        a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "graph flash vs standalone (bitwise)"
+    );
 }
 
 /// A/B one geometry across the NV_cooperative_matrix2 route (the

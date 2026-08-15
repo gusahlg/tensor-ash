@@ -18,7 +18,8 @@ use super::elementwise::ElementwiseDispatch;
 use super::prepared::PreparedOps;
 use super::recording::{record_compute_to_compute_barrier, record_one_matmul};
 use super::{
-    AttnDecodeDesc, BinaryOp, CopyDesc, Executor, OpPlan, RopeDesc, RopeScatterDesc, SoftmaxMask,
+    AttnDecodeDesc, BinaryOp, CopyDesc, Executor, FlashAttentionDesc, OpPlan, RopeDesc,
+    RopeScatterDesc, SoftmaxMask,
 };
 
 /// A 4-byte host-visible, device-readable position cell for replayable
@@ -206,6 +207,16 @@ pub enum ExecOp<'t> {
         scratch: &'t Tensor,
         out: &'t Tensor,
         desc: AttnDecodeDesc,
+    },
+    /// Fused causal prefill attention (see
+    /// [`Executor::run_flash_attention`]): one dispatch, CM2-first
+    /// routing exactly like the standalone call.
+    FlashAttn {
+        q: &'t Tensor,
+        kt: &'t Tensor,
+        v: &'t Tensor,
+        out: &'t Tensor,
+        desc: FlashAttentionDesc,
     },
     /// Greedy argmax (see [`Executor::run_argmax`]): writes the index
     /// of `input`'s largest element into the host-readable `result`
@@ -469,6 +480,16 @@ impl Executor {
                 ExecOp::Binary { a, b, out, op } => (
                     Planned::Elementwise(self.plan_binary(a, b, out, *op)?),
                     Access::default().read(a).read(b).write(out),
+                ),
+                ExecOp::FlashAttn {
+                    q,
+                    kt,
+                    v,
+                    out,
+                    desc,
+                } => (
+                    Planned::Elementwise(self.plan_flash_attention(q, kt, v, out, *desc, false)?),
+                    Access::default().read(q).read(kt).read(v).write(out),
                 ),
                 ExecOp::Argmax { input, result } => (
                     Planned::Elementwise(self.plan_argmax(input, result)?),

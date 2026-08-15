@@ -579,17 +579,6 @@ impl Executor {
         })
     }
 
-    fn run_elementwise_2d<T: bytemuck::Pod>(
-        &self,
-        pipeline: vk::Pipeline,
-        pc: &T,
-        groups_x: u32,
-        groups_y: u32,
-    ) -> Result<RunStats> {
-        let dispatch = self.plan_elementwise(pipeline, pc, groups_x, groups_y)?;
-        self.submit_one_elementwise(dispatch)
-    }
-
     /// Numerically stable softmax over the last dimension, with
     /// optional valid-length masking (see [`SoftmaxMask`]).  `scale`
     /// multiplies inputs before the max/exp passes (pass `1.0`, or
@@ -929,6 +918,21 @@ impl Executor {
         desc: FlashAttentionDesc,
         force_simt: bool,
     ) -> Result<RunStats> {
+        let dispatch = self.plan_flash_attention(q, kt, v, out, desc, force_simt)?;
+        self.submit_one_elementwise(dispatch)
+    }
+
+    /// Validate and plan one flash-attention dispatch (CM2-first
+    /// routing, exactly like [`Self::run_flash_attention`]).
+    pub(super) fn plan_flash_attention(
+        &self,
+        q: &Tensor,
+        kt: &Tensor,
+        v: &Tensor,
+        out: &Tensor,
+        desc: FlashAttentionDesc,
+        force_simt: bool,
+    ) -> Result<ElementwiseDispatch> {
         self.ensure_f32(q, "run_flash_attention", "q")?;
         self.validate_tensor_context(kt, "kt")?;
         self.validate_tensor_context(v, "v")?;
@@ -1004,7 +1008,7 @@ impl Executor {
             Some(pipeline) => (pipeline, 64),
             None => (pipes.pipeline(simt_kernel), 128),
         };
-        self.run_elementwise_2d(
+        self.plan_elementwise(
             pipeline,
             &FlashPc {
                 t_q,

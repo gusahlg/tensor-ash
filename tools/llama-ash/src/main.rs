@@ -107,8 +107,28 @@ fn bench(args: &Args) -> Result<()> {
     model.reset()?;
 
     let t0 = Instant::now();
+    model.breakdown.borrow_mut().clear();
     let (next, _) = model.prefill(&prompt)?;
     let prefill_s = t0.elapsed().as_secs_f64();
+
+    // GPU-timestamped prefill graph time vs wall time: the difference
+    // is host overhead (embed + upload, graph validate/plan/record,
+    // logits download).
+    let prefill_gpu_ns: u64 = model
+        .breakdown
+        .borrow()
+        .iter()
+        .filter(|(class, _)| *class == "prefill_total")
+        .map(|(_, ns)| ns)
+        .sum();
+    if prefill_gpu_ns > 0 {
+        log::info!(
+            "prefill timing: {:.3} ms GPU vs {:.3} ms wall ({:.3} ms host)",
+            prefill_gpu_ns as f64 / 1e6,
+            prefill_s * 1e3,
+            prefill_s * 1e3 - prefill_gpu_ns as f64 / 1e6,
+        );
+    }
 
     model.breakdown.borrow_mut().clear();
     let t1 = Instant::now();

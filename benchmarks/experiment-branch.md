@@ -1,5 +1,73 @@
 # Experiment branch log
 
+## Leg 16 — `experiment/prefill-graph` (prefill as ONE `run_exec_ops` submission)
+
+Prefill previously ran EVERY op as an individual synchronous Executor
+call — rms_norm, three qkv matmuls, two ropes, two KV appends, two
+head-permute copies, flash attention, and the MLP block, ~14
+submit + fence-wait round-trips per layer x 22 layers ≈ 300 per
+prefill.  Decode solved this exact problem with the `ExecOp` mixed
+graph; this leg gives prefill the same treatment:
+
+- **`ExecOp::FlashAttn`** (the only op prefill needed that the graph
+  lacked): wraps the planned flash dispatch verbatim — CM2-first
+  routing exactly like standalone `run_flash_attention`, access set
+  reads {q, kt, v} writes {out}.  `run_flash_attention_impl` was
+  split into `plan_flash_attention` + `submit_one_elementwise`, so
+  the immediate and graph paths share one plan.
+- **`prefill_with` builds the whole prefill** (all layers + LM-head
+  tail) as one `Vec<ExecOp>` and runs it with ONE `run_exec_ops`
+  call.  Scratch reuse (xn, q/k/v, q_heads, attn_heads), the x
+  ping-pong, and append-then-flash cache dependencies serialize
+  through the existing hazard tracker; independent neighbours (the
+  three qkv matmuls, the two KV appends) now overlap where the
+  per-op path forced full drains.
+- **Dedupe/deletions**: MLP emission (`push_mlp_ops`: T>=256 unfused
+  coopmat branch / fused-epilogue branch / T==1 normed-GEMV branch)
+  and the LM-head tail (`push_lm_head_ops`) are shared between
+  `decode_ops` and `prefill_ops`.  Deleted outright: the per-op
+  prefill path (`qkv`, `append_kv`, `mlp_block_unfused`, the T>1
+  branches of `mlp_block_into`) and the lib's now-unused
+  `run_elementwise_2d`.  `mlp_block_into` survives decode-only
+  (perop/flash diagnostics modes).  No per-op prefill breakdown
+  remains (same convention as decode graph mode); `bench` now logs
+  prefill GPU-vs-wall from the graph timestamps instead.
+
+Interleaved A/B (RTX 3070, `bench --pp 512 --tg 128`, alternating
+binaries in one session, both orderings; pairs 1-4 of the first run
+were invalidated — the B binary was stale [cargo root build had not
+relinked the tool], caught and re-run).  8 valid pairs, new wins 8/8:
+
+| pair | order | main pp512 | branch pp512 | main tg128 | branch tg128 |
+|---|---|---|---|---|---|
+| 1 | A,B | 8559 | 11467 | 170.24 | 168.57 |
+| 2 | A,B | 8730 | 11174 | 170.26 | 170.12 |
+| 3 | B,A | 9386 | 11147 | 170.40 | 168.64 |
+| 4 | B,A | 9713 | 10839 | 169.93 | 170.00 |
+| 5 | B,A | 9257 | 11219 | 168.57 | 170.35 |
+| 6 | B,A | 8508 | 11169 | 170.80 | 169.63 |
+| 7 | B,A | 9693 | 11242 | 169.84 | 169.74 |
+| 8 | B,A | 9417 | 11138 | 169.67 | 170.13 |
+| mean | | 9158 | **11175 (+22.0%)** | 169.96 | 169.65 (−0.2%, neutral) |
+
+Shape sanity (one run each side): pp128 3494 -> 4346 (+24%);
+pp1920 11024 -> 12578 (+14%; TinyLlama's GGUF context_length caps
+t_max at 2048, so pp2048+tg is not runnable).
+
+Forensics confirm the submission-overhead theory: graph-mode prefill
+is 42.3 ms GPU vs 43.9 ms wall (1.6 ms host: embed/upload, ~360-op
+validate+plan+record, logits download); main's per-op wall was
+~53-56 ms for the same dispatch chain, i.e. ~10-12 ms of pure
+submit + fence-wait overhead now gone.  The GPU-busy 42 ms is the
+new floor — reaching CUDA's 16.7k t/s (30.6 ms) from 11.2-11.7k
+needs kernel-level wins (flash + GEMM), not submission plumbing.
+
+Correctness: new GPU test `flash_in_graph_matches_standalone_bitwise`
+(ExecOp::FlashAttn vs `run_flash_attention`, bitwise).  Suite 114/114
+GPU + 45 + 1 unit, clippy/fmt clean on touched files.  Token gate
+24/24 byte-identical; T=64 (fused MLP) and T=300 (unfused MLP)
+prompts generate identically to main.
+
 ## Leg 15 — `experiment/decode-store-fusion` (rope/copy fused into q/k/v GEMV stores)
 
 A fused **store epilogue** on the f16-weights row GEMVs (`STORE_MODE`
