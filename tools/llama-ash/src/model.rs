@@ -934,12 +934,7 @@ impl Model {
     /// fixed chunk grid — and the shaders add the buffered position at
     /// execution time, which is what makes the recording replayable.
     fn decode_ops<'a>(&'a self, s: &'a Scratch, pos: u32, pos_addr: u64) -> Vec<ExecOp<'a>> {
-        let (h, dh, kv, t_max) = (
-            self.cfg.embd,
-            self.cfg.dh,
-            self.cfg.kv_heads,
-            self.cfg.t_max,
-        );
+        let (h, dh, t_max) = (self.cfg.embd, self.cfg.dh, self.cfg.t_max);
         let eps = self.cfg.rms_eps;
         assert!(
             pos_addr == 0 || self.fused_attn,
@@ -983,15 +978,24 @@ impl Model {
             // next to the weight traffic) — the standalone norm op and
             // its xn round-trip are gone.  The RoPE and KV appends fold
             // into the same GEMVs' store epilogues: q ropes as it
-            // stores, and v scatters straight into its cache (the
-            // separate rope / copy dispatches are gone with them).
+            // stores, k ropes and scatters straight into the Kt cache,
+            // v scatters into its cache — the separate rope /
+            // rope-scatter / copy dispatches (and the k-append's
+            // hazard barrier) are gone with them.
             ops.push(ExecOp::Matmul(
                 MatmulOp::new(mm(x_in, &layer.wq, &s.q))
                     .with_normed_a(&layer.attn_norm, eps)
                     .with_store_rope(&self.rope_table, store(0, 0, 0)),
             ));
             ops.push(ExecOp::Matmul(
-                MatmulOp::new(mm(x_in, &layer.wk, &s.k)).with_normed_a(&layer.attn_norm, eps),
+                MatmulOp::new(mm(x_in, &layer.wk, &s.k))
+                    .with_normed_a(&layer.attn_norm, eps)
+                    // Kt append: one column per position.
+                    .with_store_rope_scatter(
+                        &self.rope_table,
+                        &layer.kt_cache,
+                        store(1, dh * t_max, t_max),
+                    ),
             ));
             ops.push(ExecOp::Matmul(
                 MatmulOp::new(mm(x_in, &layer.wv, &s.v))
@@ -999,26 +1003,6 @@ impl Model {
                     // V append: one dh-row per position.
                     .with_store_scatter(&layer.v_cache, store(dh, t_max * dh, 1)),
             ));
-            // k-RoPE writes straight into the Kt cache (the k scratch
-            // is never read again): rope + append as one dispatch.
-            ops.push(ExecOp::RopeScatter {
-                input: &s.k,
-                table: &self.rope_table,
-                dst: &layer.kt_cache,
-                desc: RopeDesc {
-                    heads: kv,
-                    head_dim: dh,
-                    rot_dim: dh,
-                    pos_base: base,
-                    pos_addr,
-                },
-                scatter: RopeScatterDesc {
-                    dst_offset: base,
-                    dst_strides: [1, dh * t_max, t_max],
-                    // Kt append: one column per position.
-                    pos_scale: 1,
-                },
-            });
             if self.fused_attn {
                 // 2 dispatches instead of 3, no scores round-trip, and
                 // only the valid cache prefix is read.
