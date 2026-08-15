@@ -4,8 +4,23 @@ use anyhow::{Context, Result};
 use ash::vk;
 use scopeguard::ScopeGuard;
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, BufferLocation};
 use crate::context::VulkanContext;
+
+/// Fetch a slot-owned lazily allocated buffer, replacing it when it is
+/// missing or smaller than `size` (grow-only; slots never shrink).
+pub(super) fn ensure_slot_buffer<'a>(
+    ctx: &Arc<VulkanContext>,
+    cache: &'a mut Option<Buffer>,
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+    location: BufferLocation,
+) -> Result<&'a Buffer> {
+    if cache.as_ref().is_none_or(|buffer| buffer.size < size) {
+        *cache = Some(Buffer::new(ctx, size, usage, location)?);
+    }
+    Ok(cache.as_ref().expect("slot buffer initialized above"))
+}
 
 pub(super) struct Slot {
     pub(super) cmd_pool: vk::CommandPool,
