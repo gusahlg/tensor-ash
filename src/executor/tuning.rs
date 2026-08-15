@@ -8,7 +8,7 @@ use crate::pipeline::{TuneEntry, TuneKey};
 use crate::tensor::Tensor;
 
 use super::recording::record_one_matmul;
-use super::{Executor, MatmulCall, Slot};
+use super::{Executor, MatmulCall, Slot, splitk2};
 
 impl Executor {
     /// Explicitly tune one GEMM shape against scratch tensors (both
@@ -214,30 +214,18 @@ impl Executor {
         if dims.b_f16 || dims.k < 1024 || tiles > 48 {
             return Ok(None);
         }
-        let mn = dims.m as u64 * dims.n as u64 * dims.batch as u64;
         let max_groups = self
             .ctx
             .device_properties
             .limits
             .max_compute_work_group_count;
-        let (tile_m, tile_n) = if dims.m >= 128 && dims.n >= 128 {
-            (128, 128)
-        } else {
-            (64, 64)
-        };
         let mut best: Option<(u64, u32)> = None;
         for splits in [4u32, 8, 16, 32, 64] {
-            // Each split needs enough K to amortize its tile loads,
-            // and the scratch must stay modest.
+            // Each split needs enough K to amortize its tile loads; the
+            // grid/addressing/scratch limits are the same checks the
+            // automatic route applies.
             if dims.k / splits < 128
-                || mn * splits as u64 * 4 > 256 << 20
-                || dims.n.div_ceil(tile_n) > max_groups[0]
-                || dims.m.div_ceil(tile_m) > max_groups[1]
-                || dims
-                    .batch
-                    .checked_mul(splits)
-                    .is_none_or(|z| z > max_groups[2])
-                || mn.div_ceil(4 * 256) > max_groups[0] as u64
+                || !splitk2::auto_route_fits(max_groups, dims.batch, dims.m, dims.n, dims.k, splits)
             {
                 continue;
             }
