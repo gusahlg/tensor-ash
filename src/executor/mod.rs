@@ -245,7 +245,9 @@ impl Executor {
     /// Reroute an op whose planned kernel cannot honor its fusions:
     /// fused-epilogue ops off kernels without the epilogue constants
     /// (heuristic coopmat, or a tuned winner measured for the plain
-    /// shape) onto the epilogue-capable SIMT sibling, and normed-A ops
+    /// shape) onto the epilogue-capable CM2 tensor-core GEMM when the
+    /// device and shape allow it (see `epilogue_fallback_index`) or
+    /// else the SIMT sibling, and normed-A ops
     /// off any non-row route (e.g. a tuned M=1 winner) back onto the
     /// row-GEMV heuristic pick.  No-op for plain ops and for routes
     /// that already fuse.

@@ -1,0 +1,9 @@
+#version 460
+// Tensor-core GEMM (NV_cooperative_matrix2) with fused store epilogues:
+// A f32 (f16-quantized at load), B f16 storage, f32 accumulate.
+
+#define BM 128u
+#define BN  64u
+#define BK  64u
+
+#include "matmul_cm2_kernel.glsl"

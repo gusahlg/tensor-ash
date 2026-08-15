@@ -161,13 +161,20 @@ impl MatmulPipeline {
                 // instead of failing the whole pipeline. Routing and
                 // validation never select an empty slot.
                 let coopmat_gated = spec.name.contains("coopmat") && !ctx.coopmat_enabled;
+                // The NV_cooperative_matrix2 GEMM ships SPIR-V 1.6 and
+                // workgroup-scope matrices; its slot stays empty
+                // without the full coopmat2 feature gate.
+                let cm2_gated = spec.name.contains("cm2") && !ctx.coopmat2_enabled;
                 // Likewise for tiles whose shared declarations exceed
                 // the device budget: strict drivers reject or lose the
                 // device on them (see workgroup_shared_budget), so
                 // their slots stay empty and routing demotes to an
                 // in-budget sibling (`in_budget_index`).
                 let shared_gated = spec.shared_memory_bytes() > shared_budget;
-                if (spec.weights_f16() && !ctx.f16_storage_enabled) || coopmat_gated || shared_gated
+                if (spec.weights_f16() && !ctx.f16_storage_enabled)
+                    || coopmat_gated
+                    || cm2_gated
+                    || shared_gated
                 {
                     if shared_gated {
                         log::info!(
@@ -193,7 +200,9 @@ impl MatmulPipeline {
                 && kernels_guard[index].is_none()
             {
                 let spec = &KERNEL_SPECS[index];
-                let reason = if spec.name.contains("coopmat") && !ctx.coopmat_enabled {
+                let reason = if spec.name.contains("cm2") && !ctx.coopmat2_enabled {
+                    "requires NV cooperative matrix 2 support this device lacks".to_string()
+                } else if spec.name.contains("coopmat") && !ctx.coopmat_enabled {
                     "requires cooperative-matrix support this device lacks".to_string()
                 } else if spec.weights_f16() && !ctx.f16_storage_enabled {
                     "requires f16 storage support (shaderFloat16 + \
@@ -407,9 +416,10 @@ impl MatmulPipeline {
     }
 
     /// Epilogue-capable kernel for this shape: the normal heuristic
-    /// pick when it fuses, else the SIMT BDA_V4 sibling of the tile
-    /// class.  Used to demote routes (heuristic coopmat, or a tuned
-    /// winner recorded for the plain shape) that land on kernels
+    /// pick when it fuses, else the CM2 tensor-core GEMM when the
+    /// device and shape allow it, else the SIMT BDA_V4 sibling of the
+    /// tile class.  Used to demote routes (heuristic coopmat, or a
+    /// tuned winner recorded for the plain shape) that land on kernels
     /// without the fused-epilogue specialization.
     pub(crate) fn epilogue_fallback_index(
         &self,
@@ -422,6 +432,34 @@ impl MatmulPipeline {
         let index = self.heuristic_kernel_index(batch, m, n, k, b_f16);
         if self.kernel_at(index).supports_epilogue() {
             return index;
+        }
+        // NV_cooperative_matrix2 GEMM: keeps the tensor cores AND
+        // fuses the epilogue via its `coopMatPerElementNV` store
+        // callback, so coopmat-eligible fused ops no longer demote to
+        // the SIMT family.  Constraint mirrors the coopmat1 heuristic
+        // gate exactly (M, N % 128 == 0, K % 32 == 0, M, N >= 256):
+        // the kernel body is general-shape correct via tensor-layout
+        // clamping, but batched tensor base addresses must stay
+        // 16-byte aligned (guaranteed by the alignment), and small
+        // shapes are better served by the low-occupancy-friendly SIMT
+        // epilogue kernels.  Only this fused path reroutes — plain
+        // shapes keep the measured coopmat1 winner (CM2 plain GEMM
+        // measured 18-35% behind coopmat1 on GA104, but fused-on-cm2
+        // is ~2x the SIMT demote it replaces).
+        if b_f16
+            && m.is_multiple_of(128)
+            && n.is_multiple_of(128)
+            && k.is_multiple_of(32)
+            && m >= 256
+            && n >= 256
+        {
+            let cm2 = KernelSelection::F16wCm2
+                .index()
+                .expect("F16wCm2 is concrete");
+            // Slot presence implies `coopmat2_enabled`.
+            if self.kernels[cm2].is_some() {
+                return cm2;
+            }
         }
         let tile = auto_select_kernel(batch, m, n, k, self.auto_min_large_tiles);
         let selection = if b_f16 {
@@ -459,12 +497,19 @@ impl MatmulPipeline {
             .enumerate()
             .filter_map(|(idx, kernel)| kernel.as_ref().map(|kernel| (idx, kernel)))
             .filter(|(_, kernel)| {
-                let coopmat_fits = kernel.name.contains("coopmat")
+                // Tensor-core kernels only measure on coopmat-aligned
+                // shapes: coopmat1 is strictly `_aligned`, and the CM2
+                // kernel — though general-shape correct via clamping —
+                // needs 16-byte-aligned batched tensor bases, which the
+                // alignment guarantees.
+                let tensor_core = kernel.name.contains("coopmat") || kernel.name.contains("cm2");
+                let coopmat_fits = tensor_core
                     && m.is_multiple_of(128)
                     && n.is_multiple_of(128)
                     && k.is_multiple_of(32);
                 !kernel.uses_descriptors
                     && (!kernel.name.ends_with("_aligned") || coopmat_fits)
+                    && (!tensor_core || coopmat_fits)
                     && kernel.weights_f16() == b_f16
                     // The a16 kernel reads f16 A; the tuner's ops are
                     // always f32-A, and f16-A routes are fixed picks.

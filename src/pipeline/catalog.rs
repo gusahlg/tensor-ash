@@ -325,6 +325,20 @@ kernel_catalog! {
     F16wA16Coopmat => ("f16w_a16_coopmat_aligned", 128, 128, 32,
         "matmul_f16w_a16_coopmat_aligned.spv", false,
         ["f16w_a16_coopmat_aligned", "f16w_a16_coopmat", "a16_coopmat"]),
+    // Tensor-core GEMM via NV_cooperative_matrix2 (workgroup-scope
+    // matrices + tensor addressing) with the fused store epilogue the
+    // coopmat1 kernel cannot implement (`coopMatPerElementNV` at
+    // C-store time).  A f32 quantized to f16 in a load decode
+    // callback, B f16 storage, f32 accumulate.  General-shape correct
+    // via tensor-layout clamping (no `_aligned` suffix — that would
+    // also disable `supports_epilogue`), but auto routing and tuning
+    // keep it on coopmat-aligned shapes: batched tensor bases must be
+    // 16-byte aligned, and measured plain-GEMM throughput trails
+    // coopmat1 by 18-35% on GA104 (its value is the fused epilogue,
+    // ~2x the old SIMT demote).  Registry slot is empty unless
+    // `VulkanContext::coopmat2_enabled`.
+    F16wCm2 => ("f16w_cm2", 128, 64, 64, "matmul_f16w_cm2.spv", false,
+        ["f16w_cm2", "cm2", "cm2_gemm"]),
 }
 
 #[cfg(test)]
