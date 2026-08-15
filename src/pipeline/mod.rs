@@ -396,6 +396,9 @@ impl MatmulPipeline {
                 !kernel.uses_descriptors
                     && (!kernel.name.ends_with("_aligned") || coopmat_fits)
                     && kernel.weights_f16() == b_f16
+                    // The a16 kernel reads f16 A; the tuner's ops are
+                    // always f32-A, and f16-A routes are fixed picks.
+                    && !kernel.a_f16()
                     && (m == 1 || !kernel.name.contains("row_bda"))
                     && (n == 1 || kernel.name != "col_bda")
                     && (k == 1 || kernel.name != "outer_bda")

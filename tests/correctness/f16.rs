@@ -257,7 +257,7 @@ fn f16_b_with_explicit_f32_kernel_is_rejected() {
         "unexpected error: {err}"
     );
 
-    // And A/C in f16 are rejected outright.
+    // And f16 A with an f32 C is rejected (a16 needs f16 end to end).
     let a16 = Tensor::uninit_device_f16(&ctx, &[64, 64]).unwrap();
     let err = exec
         .run_matmuls(&[MatmulCall {
@@ -269,7 +269,201 @@ fn f16_b_with_explicit_f32_kernel_is_rejected() {
         }])
         .unwrap_err()
         .to_string();
-    assert!(err.contains("A must be f32"), "unexpected error: {err}");
+    assert!(err.contains("requires f16 C"), "unexpected error: {err}");
+}
+
+/// Upload helper for the f16-activations route: A, B, and C all f16.
+fn setup_a16_case(
+    ctx: &std::sync::Arc<tensor_ash::VulkanContext>,
+    exec: &tensor_ash::Executor,
+    a_shape: &[u32],
+    b_shape: &[u32],
+    seed_a: u64,
+    seed_b: u64,
+) -> (Tensor, Tensor, Vec<f32>, Vec<f32>) {
+    let mut host_a = vec![0.0; Tensor::numel(a_shape) as usize];
+    fill_det(&mut host_a, seed_a);
+    let a = Tensor::uninit_device_f16(ctx, a_shape).unwrap();
+    exec.upload(&host_a, &a).unwrap();
+    let mut host_b = vec![0.0; Tensor::numel(b_shape) as usize];
+    fill_det(&mut host_b, seed_b);
+    let b = Tensor::uninit_device_f16(ctx, b_shape).unwrap();
+    exec.upload(&host_b, &b).unwrap();
+    for value in host_a.iter_mut().chain(host_b.iter_mut()) {
+        *value = round_f32_via_f16(*value);
+    }
+    (a, b, host_a, host_b)
+}
+
+/// f16-C tolerance: the K-scaled GEMM bound plus the store's RNE
+/// narrowing (half an f16 ulp of the largest reference magnitude).
+fn a16_tolerance(cpu: &[f32], k: u32) -> f32 {
+    let max_mag = cpu.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+    tolerance(k) + max_mag * (0.5 / 1024.0)
+}
+
+#[test]
+#[ignore]
+fn a16_activations_coopmat_matches_rounded_reference() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !f16_available(&ctx) || !ctx.coopmat_enabled {
+        eprintln!("skipping: no coopmat support");
+        return;
+    }
+    // Aligned shapes across the prefill projection classes (batched
+    // included); dual-rounded inputs make every product exact in f32,
+    // so only the accumulation order and the f16 C store differ.
+    let cases: &[(u32, u32, u32, u32)] = &[
+        (1, 256, 384, 256),
+        (1, 128, 128, 64),
+        (1, 512, 256, 2048),
+        (2, 128, 256, 96),
+    ];
+    for &(batch, m, n, k) in cases {
+        let shape = |rows: u32, cols: u32| -> Vec<u32> {
+            if batch == 1 {
+                vec![rows, cols]
+            } else {
+                vec![batch, rows, cols]
+            }
+        };
+        let (a, b, host_a, host_b) = setup_a16_case(
+            &ctx,
+            &exec,
+            &shape(m, k),
+            &shape(k, n),
+            9900 + k as u64,
+            9910 + n as u64,
+        );
+        let c = Tensor::uninit_device_f16(&ctx, &shape(m, n)).unwrap();
+        exec.run_matmuls(&[MatmulCall {
+            a: &a,
+            b: &b,
+            c: &c,
+            alpha: 1.0,
+            accumulate: false,
+        }])
+        .unwrap();
+        let mut gpu = vec![0.0; Tensor::numel(&shape(m, n)) as usize];
+        exec.download(&c, &mut gpu).unwrap();
+        let cpu = cpu_bmm(&host_a, &host_b, None, batch, m, n, k, 1.0, false);
+        assert_close_tol(
+            &gpu,
+            &cpu,
+            a16_tolerance(&cpu, k),
+            &format!("B={batch} {m}x{n}x{k} a16"),
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn a16_alpha_accumulate_and_graph_path_match() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !f16_available(&ctx) || !ctx.coopmat_enabled {
+        eprintln!("skipping: no coopmat support");
+        return;
+    }
+    // Alpha + accumulate onto an existing f16 C.
+    let (m, n, k) = (128_u32, 256_u32, 128_u32);
+    let (a, b, host_a, host_b) = setup_a16_case(&ctx, &exec, &[m, k], &[k, n], 9920, 9921);
+    let c = Tensor::uninit_device_f16(&ctx, &[m, n]).unwrap();
+    let mut host_c = vec![0.0; (m * n) as usize];
+    fill_det(&mut host_c, 9922);
+    exec.upload(&host_c, &c).unwrap();
+    for value in &mut host_c {
+        *value = round_f32_via_f16(*value);
+    }
+    let alpha = 0.75;
+    exec.run_matmuls(&[MatmulCall {
+        a: &a,
+        b: &b,
+        c: &c,
+        alpha,
+        accumulate: true,
+    }])
+    .unwrap();
+    let mut gpu = vec![0.0; (m * n) as usize];
+    exec.download(&c, &mut gpu).unwrap();
+    let cpu = cpu_bmm(&host_a, &host_b, Some(&host_c), 1, m, n, k, alpha, true);
+    assert_close_tol(&gpu, &cpu, a16_tolerance(&cpu, k), "a16 alpha+accumulate");
+
+    // The same op through the mixed-graph path (what prefill uses).
+    let c2 = Tensor::uninit_device_f16(&ctx, &[m, n]).unwrap();
+    exec.run_exec_ops(&[tensor_ash::ExecOp::Matmul(MatmulOp::new(MatmulCall {
+        a: &a,
+        b: &b,
+        c: &c2,
+        alpha: 1.0,
+        accumulate: false,
+    }))])
+    .unwrap();
+    let mut gpu2 = vec![0.0; (m * n) as usize];
+    exec.download(&c2, &mut gpu2).unwrap();
+    let cpu2 = cpu_bmm(&host_a, &host_b, None, 1, m, n, k, 1.0, false);
+    assert_close_tol(&gpu2, &cpu2, a16_tolerance(&cpu2, k), "a16 graph path");
+}
+
+#[test]
+#[ignore]
+fn a16_invalid_combinations_are_rejected() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !f16_available(&ctx) || !ctx.coopmat_enabled {
+        eprintln!("skipping: no coopmat support");
+        return;
+    }
+    let a = Tensor::uninit_device_f16(&ctx, &[128, 128]).unwrap();
+    let b32 = Tensor::uninit_device(&ctx, &[128, 128]).unwrap();
+    let c = Tensor::uninit_device_f16(&ctx, &[128, 128]).unwrap();
+    // f16 A with f32 B.
+    let err = exec
+        .run_matmuls(&[MatmulCall {
+            a: &a,
+            b: &b32,
+            c: &c,
+            alpha: 1.0,
+            accumulate: false,
+        }])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("requires f16 B"), "unexpected error: {err}");
+    // Misaligned shape has no a16 route.
+    let a_ragged = Tensor::uninit_device_f16(&ctx, &[100, 128]).unwrap();
+    let b16 = Tensor::uninit_device_f16(&ctx, &[128, 128]).unwrap();
+    let c_ragged = Tensor::uninit_device_f16(&ctx, &[100, 128]).unwrap();
+    let err = exec
+        .run_matmuls(&[MatmulCall {
+            a: &a_ragged,
+            b: &b16,
+            c: &c_ragged,
+            alpha: 1.0,
+            accumulate: false,
+        }])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("multiples of (128, 128, 32)"),
+        "unexpected error: {err}"
+    );
+    // Fusions cannot ride the a16 route.
+    let err = exec
+        .run_ops(&[MatmulOp::with_epilogue(
+            MatmulCall {
+                a: &a,
+                b: &b16,
+                c: &c,
+                alpha: 1.0,
+                accumulate: false,
+            },
+            Epilogue {
+                bias: None,
+                activation: Activation::Silu,
+                binary: EpilogueBinary::None,
+            },
+        )])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("cannot fuse"), "unexpected error: {err}");
 }
 
 #[test]

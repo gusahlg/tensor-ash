@@ -124,6 +124,7 @@ impl Executor {
             && op.epilogue.is_none()
             && op.normed_a.is_none()
             && op.store.is_none()
+            && !resolved[0].a_f16
         {
             let dims = &resolved[0];
             let key = TuneKey {
@@ -160,11 +161,10 @@ impl Executor {
                     && op.normed_a.is_none()
                     && op.store.is_none()
                     && (with_dependency_barriers || ops.len() == 1);
-                let plan =
-                    self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, eligible);
-                self.demote_for_op(op, dims, plan)
+                let plan = self.plan_matmul(dims, eligible)?;
+                Ok(self.demote_for_op(op, dims, plan))
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         // Measured reduction routing: a lone plain op whose route says
         // two-stage split-K goes through the dedicated entry point.

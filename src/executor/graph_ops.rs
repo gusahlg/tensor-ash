@@ -364,11 +364,7 @@ impl Executor {
                 ExecOp::Matmul(op) => {
                     self.validate_op_context(op)?;
                     let dims = ResolvedMatmul::from_op(op)?;
-                    let plan = self.demote_for_op(
-                        op,
-                        &dims,
-                        self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, false),
-                    );
+                    let plan = self.demote_for_op(op, &dims, self.plan_matmul(&dims, false)?);
                     let kernel = self.pipeline.kernel_at(plan.kernel);
                     if kernel.uses_descriptors {
                         bail!(
