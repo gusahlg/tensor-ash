@@ -443,8 +443,9 @@ impl MatmulPipeline {
         // 16-byte aligned (guaranteed by the alignment), and small
         // shapes are better served by the low-occupancy-friendly SIMT
         // epilogue kernels.  Only this fused path reroutes — plain
-        // shapes keep the measured coopmat1 winner (CM2 plain GEMM is
-        // expected parity, not a win).
+        // shapes keep the measured coopmat1 winner (CM2 plain GEMM
+        // measured 18-35% behind coopmat1 on GA104, but fused-on-cm2
+        // is ~2x the SIMT demote it replaces).
         if b_f16
             && m.is_multiple_of(128)
             && n.is_multiple_of(128)

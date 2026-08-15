@@ -143,12 +143,10 @@ pub(super) fn run_case(
         for value in &mut h_b {
             *value = tensor_ash::dtype::round_f32_via_f16(*value);
         }
-        // The tensor-core route also quantizes A while staging.
-        if exec
-            .dispatch_info_for(bsz, m, n, k, true)
-            .kernel
-            .contains("coopmat")
-        {
+        // The tensor-core routes also quantize A (coopmat1 while
+        // staging, cm2 in its tensor-load decode callback).
+        let kernel = exec.dispatch_info_for(bsz, m, n, k, true).kernel;
+        if kernel.contains("coopmat") || kernel.contains("cm2") {
             for value in &mut h_a {
                 *value = tensor_ash::dtype::round_f32_via_f16(*value);
             }

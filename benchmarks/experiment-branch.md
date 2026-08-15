@@ -1,6 +1,6 @@
 # Experiment branch log
 
-## Leg 17 — `experiment/cm2-gemm` (CM2 GEMM with fused store epilogues) — DRAFT, CPU-side prep only
+## Leg 17 — `experiment/cm2-gemm` (CM2 GEMM with fused store epilogues) — MEASURED (RTX 3070): plain CM2 loses 18-35%, un-demote kept
 
 Coopmat-eligible f16w shapes with a fused epilogue currently DEMOTE to
 the SIMT family (`demote_for_op` → `epilogue_fallback_index`), because
@@ -39,29 +39,88 @@ What landed (all CPU-verifiable; NO GPU runs yet):
   un-demote integration case, NaN-poisoned-C overwrite coverage.
   `f16.rs` demote regression updated for the cm2 route.
 
-### NOTES — GPU validation TODO (next session, RTX 3070)
+### GPU validation results (RTX 3070, this session)
 
-1. Run the suite: `cargo test --release --test correctness --
-   --ignored --test-threads=1` — new `cm2_*` tests + `f16_*` + full
-   sweep (routing change touches every fused f16w op).
-2. Verify route: `ML_LOG`/debug that a fused op on (512, 5632, 2048)-
-   class shapes actually dispatches `f16w_cm2` (no public
-   dispatch-info surface for fused routes).
-3. Bench A/B (burn-in ~300ms first, identical case order):
-   fused-epilogue op on cm2 vs plain-coopmat1 + separate Binary pass,
-   on the TinyLlama prefill shapes (T=512/1024/2048 × N=2048/5632,
-   K=2048/5632).  Break-even = Binary pass bandwidth saved minus any
-   cm2-vs-cm1 GEMM gap.
-4. Plain-GEMM parity check: `ML_KERNEL=f16w_cm2` vs
-   `f16w_coopmat_aligned` on 1024³/2048³/4096³ (expect ≈parity; if
-   cm2 loses badly, tighten the fallback constraint).
-5. Tile probe ONLY if parity fails: BM=128/BN=128 @ 256 threads
-   (needs a 256-invocation flexible-dims init check first), BK=32.
-6. If (3) wins: flip `push_mlp_ops` T >= 256 branch in
-   tools/llama-ash to the fused-epilogue forms (deletes 3 Binary
-   passes/layer), re-run `bench --pp 512/1920` interleaved A/B.
-7. Pipeline-compile latency: cm2 pipelines compile slowly; check
-   first-prefill latency, consider warming at load.
+Suite: full ignored correctness suite green post-rebase onto
+eb81b28 — **129 passed / 0 failed** (all 4 new `cm2_*` tests passed
+first run, including ragged clamped-edge stores, the poisoned-C
+overwrite, and the un-demote integration case).
+
+**A-load fix (the one real shader change this session)**: the
+per-element f32→f16 decode callback forced scalar single-float block
+loads and cost ~2x — replaced with a straight f32 tensor load + the
+KHR conversion constructor to f16 (identical RNE numerics; callback
+kept `#if`-ed out for reference).  4096³ went 15.8 → 22.7 TF/s.
+
+**Plain-GEMM parity check: FAILED — cm2 loses 18-35% everywhere.**
+`ml_bench cases` forced-kernel runs, GPU timestamps, burn-in case
+(4096³) first, identical case order, both process orderings (stable
+to ±0.1 TF/s):
+
+| shape (f16w)      | cm1 TF/s | cm2 TF/s | cm2/cm1 |
+|-------------------|---------:|---------:|--------:|
+| 512×2048×2048     |    24.3  |    19.9  |   0.82  |
+| 512×5632×2048     |    32.2  |    23.2  |   0.72  |
+| 512×2048×5632     |    24.8  |    19.2  |   0.78  |
+| 4096×4096×4096    |    35.1  |    22.7  |   0.65  |
+
+Tile probes (2, per plan; both reverted): BM128/BN128/BK64 @ 128
+threads → 11-12 TF/s (accumulator register blowup at 128
+invocations); BM128/BN64/BK128 → 16.5-18.6 TF/s.  BM128/BN64/BK64
+stands.  The Bolz cm1≈cm2 parity claim does not reproduce on
+GA104/driver 570-class — workgroup-scope coopmat2 GEMM leaves ~1/3
+of the KHR-coopmat1 throughput on the floor at every probed shape.
+
+**Fused-epilogue A/B** (`examples/bench_cm2_epilogue.rs`, one
+session, burn-in first, single-submission `run_exec_ops` chains):
+
+| case (512-row prefill shape) | fused cm2 | composed cm1+Binary | old SIMT demote |
+|------------------------------|----------:|--------------------:|----------------:|
+| gate Silu+Mul 512×5632×2048  | 0.620 ms (19.1 TF/s) | 0.494 ms (23.9) | 1.267 ms (9.3) |
+| down AddScaled 512×2048×5632 | 0.698 ms (17.0 TF/s) | 0.562 ms (21.0) | 1.141 ms (10.4) |
+
+Two-sided verdict:
+
+- **Un-demote KEPT**: a fused-epilogue op on a coopmat-eligible shape
+  now costs ~half of the old SIMT demote (2.0-2.6x faster).  That is
+  a real library win for any caller issuing fused ops on these
+  shapes.
+- **llama-ash NOT rewired**: the composed plain-cm1 + Binary pattern
+  it already uses beats fused-cm2 by ~25% (the Binary pass costs far
+  less than the cm2-vs-cm1 GEMM gap), so `push_mlp_ops` keeps its
+  T >= 256 branch (measured-wins-only).  Plain routes stay on the
+  measured coopmat1 winner everywhere; the tuner measures `f16w_cm2`
+  on aligned shapes and correctly never picks it.
+
+**Prefill-parity implication (the leg's primary question)**: cm2
+GEMM does NOT lift the ~24 TF/s M=512 K-heavy blocker shapes — it
+sits 5 TF/s BELOW them.  The remaining path to CUDA-parity pp512
+(~16k t/s needs ~33 TF/s average real-shape GEMM) is coopmat1-side:
+tile retuning for M=512 K-heavy geometry (512×2048×2048 and
+512×2048×5632 run at 69-71% of the 4096³ ceiling on the SAME
+kernel — CTA count/wave quantization, not tensor-core limits),
+subgroup-scope coopmat tile variants, or K-split forms of cm1.
+
+E2E sanity (llama routing untouched by design — prefill emits plain
+matmuls at T >= 256, decode GEMV epilogues never demoted):
+interleaved main-vs-branch `bench --pp 512 --tg 128`, 6 pairs both
+orderings — see table below; neutral within noise, token gate exact
+(`--ids "1,450,7483,310,3444,338" -n 24` reproduces the pinned 24
+ids).
+
+| pair | order | main pp512 | branch pp512 | main tg128 | branch tg128 |
+|---|---|---|---|---|---|
+| 1 | A,B | 12246.90 | 11725.22 | 166.89 | 167.67 |
+| 2 | A,B | 11645.29 | 12098.89 | 165.90 | 167.82 |
+| 3 | A,B | 12014.04 | 11922.57 | 164.80 | 167.33 |
+| 4 | B,A | 11716.82 | 11699.49 | 167.31 | 167.19 |
+| 5 | B,A | 11710.66 | 12202.93 | 166.39 | 164.95 |
+| 6 | B,A | 11764.22 | 11856.18 | 166.88 | 167.80 |
+
+Medians: pp512 main 11740 vs branch 11890 (+1.3%, noise), tg128
+main 166.6 vs branch 167.3 (+0.4%, noise).  Merge-safe: keeps the
+un-demote + the cm2 GEMM kernel for fused callers, changes nothing
+llama-ash routes through.
 
 ## Leg 16 — `experiment/prefill-graph` (prefill as ONE `run_exec_ops` submission)
 

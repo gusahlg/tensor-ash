@@ -11,16 +11,19 @@
 // f16 storage (`f16w_`), C f32, all accumulation f32.
 //
 // Why this exists next to `f16w_coopmat_aligned`: plain-GEMM
-// throughput is expected parity with coopmat1 (Bolz, Vulkanised 2025:
-// tuned cm1 98 vs cm2 97 TF/s), but `coopMatPerElementNV` runs an
-// arbitrary per-element callback over the accumulator before the
-// store, so the bias/activation/binary epilogues fuse here — the
-// exact ops that previously demoted coopmat-eligible shapes to the
-// SIMT family (3 extra bandwidth passes per layer in llama prefill at
-// T >= 256).
+// throughput MEASURED 18-35% behind coopmat1 on GA104 (22.7 vs 35.1
+// TF/s at 4096^3 — the Bolz cm1~cm2 parity claim does not reproduce
+// here), so plain routes never pick this kernel.  Its value is
+// `coopMatPerElementNV`: an arbitrary per-element callback over the
+// accumulator before the store, so the bias/activation/binary
+// epilogues fuse here — a fused op on a coopmat-eligible shape costs
+// ~half of the old SIMT demote (0.62 vs 1.27 ms on the 512x5632x2048
+// gate case).  Note the composed plain-cm1 + Binary pattern is still
+// ~25% faster than fused-cm2, which is why llama-ash keeps composing.
 //
-// Tile geometry (single conservative geometry; probing deferred to
-// GPU validation): BM=128, BN=64, BK=64 on 128 threads.  Every
+// Tile geometry: BM=128, BN=64, BK=64 on 128 threads (measured best;
+// BN=128 collapses to ~12 TF/s on accumulator pressure at 128
+// invocations, BK=128 loses ~15%).  Every
 // declared matrix dimension is a multiple of 64, so this stays inside
 // the exact flexible-dimensions envelope the context init validates
 // for the cm2 flash kernels (f16 x f16 -> f32, 128 invocations,
@@ -114,6 +117,12 @@ float16_t decodeAF32(const in ABlockF32 blk, const in uint32_t blockCoords[2],
     return float16_t(blk.v);
 }
 
+// A-load strategy: a straight f32 tensor load (vectorizable) followed
+// by the KHR conversion constructor to f16 — the per-element decode
+// callback above forces scalar single-float block loads and measured
+// ~2x slower end-to-end (kept for reference).
+#define A_LOAD_CONVERT 1
+
 // coopMatPerElementNV store callback: the fused epilogue, applied to
 // the accumulator right before the (bounds-clamped) tensor store.
 // Row/col arrive as arguments, so global bias/D indices are exact.
@@ -165,9 +174,17 @@ void main() {
     [[dont_unroll]]
     for (uint kt = 0u; kt < num_k; ++kt) {
         const uint k0 = kt * BK;
+#if A_LOAD_CONVERT
+        coopmat<float, gl_ScopeWorkgroup, BM, BK, gl_MatrixUseA> a_raw;
+        coopMatLoadTensorNV(a_raw, pc.a_ptr.v, a_base,
+            sliceTensorLayoutNV(tlA, row0, BM, k0, BK));
+        const coopmat<float16_t, gl_ScopeWorkgroup, BM, BK, gl_MatrixUseA> a_mat =
+            coopmat<float16_t, gl_ScopeWorkgroup, BM, BK, gl_MatrixUseA>(a_raw);
+#else
         coopmat<float16_t, gl_ScopeWorkgroup, BM, BK, gl_MatrixUseA> a_mat;
         coopMatLoadTensorNV(a_mat, pc.a_ptr.v, a_base,
             sliceTensorLayoutNV(tlA, row0, BM, k0, BK), decodeAF32);
+#endif
         coopmat<float16_t, gl_ScopeWorkgroup, BK, BN, gl_MatrixUseB> b_mat;
         coopMatLoadTensorNV(b_mat, pc.b_ptr.v, b_base,
             sliceTensorLayoutNV(tlB, k0, BK, col0, BN));

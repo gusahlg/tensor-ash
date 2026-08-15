@@ -333,9 +333,10 @@ kernel_catalog! {
     // via tensor-layout clamping (no `_aligned` suffix — that would
     // also disable `supports_epilogue`), but auto routing and tuning
     // keep it on coopmat-aligned shapes: batched tensor bases must be
-    // 16-byte aligned, and expected plain-GEMM throughput is only
-    // parity with coopmat1 (its value is the fused epilogue).
-    // Registry slot is empty unless `VulkanContext::coopmat2_enabled`.
+    // 16-byte aligned, and measured plain-GEMM throughput trails
+    // coopmat1 by 18-35% on GA104 (its value is the fused epilogue,
+    // ~2x the old SIMT demote).  Registry slot is empty unless
+    // `VulkanContext::coopmat2_enabled`.
     F16wCm2 => ("f16w_cm2", 128, 64, 64, "matmul_f16w_cm2.spv", false,
         ["f16w_cm2", "cm2", "cm2_gemm"]),
 }
