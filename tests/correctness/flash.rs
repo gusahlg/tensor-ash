@@ -591,8 +591,10 @@ fn run_cm2_io16_case(label: &str, case: &FlashCase) {
     };
     let out16 = Tensor::uninit_device_f16(&ctx, &[heads, t_q, dh]).unwrap();
     let out32 = Tensor::uninit_device(&ctx, &[heads, t_q, dh]).unwrap();
-    exec.run_flash_attention(&q16, &kt, &v, &out16, desc).unwrap();
-    exec.run_flash_attention(&q32, &kt, &v, &out32, desc).unwrap();
+    exec.run_flash_attention(&q16, &kt, &v, &out16, desc)
+        .unwrap();
+    exec.run_flash_attention(&q32, &kt, &v, &out32, desc)
+        .unwrap();
     let mut gpu16 = vec![0.0; (heads * t_q * dh) as usize];
     let mut gpu32 = vec![0.0; gpu16.len()];
     exec.download(&out16, &mut gpu16).unwrap();

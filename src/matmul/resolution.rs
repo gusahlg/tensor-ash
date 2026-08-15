@@ -172,7 +172,8 @@ impl ResolvedMatmul {
         // The a16 coopmat kernel is the ONLY f16-A route and has no
         // fused-epilogue / normed-A / store specializations; callers
         // apply combines as standalone elementwise passes instead.
-        if resolved.a_f16 && (!op.epilogue.is_none() || op.normed_a.is_some() || !op.store.is_none())
+        if resolved.a_f16
+            && (!op.epilogue.is_none() || op.normed_a.is_some() || !op.store.is_none())
         {
             bail!(
                 "matmul with f16 A storage cannot fuse epilogues, normed-A, or store ops \
@@ -239,7 +240,9 @@ impl ResolvedMatmul {
             bail!("fused store epilogue cannot combine with a fused epilogue");
         }
         let desc = op.store.desc();
-        if desc.head_dim == 0 || !desc.head_dim.is_multiple_of(2) || !self.n.is_multiple_of(desc.head_dim)
+        if desc.head_dim == 0
+            || !desc.head_dim.is_multiple_of(2)
+            || !self.n.is_multiple_of(desc.head_dim)
         {
             bail!(
                 "store head_dim {} must be even and divide N = {}",

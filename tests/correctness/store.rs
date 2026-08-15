@@ -316,11 +316,13 @@ fn store_pos_indirection_offsets_position() {
         pos_addr,
     };
 
-    exec.run_ops(&[MatmulOp::new(mm(&a, &b, &c_scratch)).with_store_rope_scatter(
-        &table,
-        &cache_direct,
-        desc(base + p, 0),
-    )])
+    exec.run_ops(&[
+        MatmulOp::new(mm(&a, &b, &c_scratch)).with_store_rope_scatter(
+            &table,
+            &cache_direct,
+            desc(base + p, 0),
+        ),
+    ])
     .unwrap();
 
     let pos_buf = exec.create_pos_buffer().unwrap();

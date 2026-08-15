@@ -1364,12 +1364,14 @@ impl Executor {
         }
         let total = u32::try_from(extent_product)
             .map_err(|_| anyhow::anyhow!("run_copy_strided: extent product exceeds u32"))?;
-        let pipeline = self.elementwise()?.pipeline(match (src.dtype(), dst.dtype()) {
-            (DType::F32, DType::F32) => Op::Copy,
-            (DType::F32, DType::F16) => Op::CopyToF16,
-            (DType::F16, DType::F16) => Op::CopyF16,
-            (DType::F16, DType::F32) => Op::CopyF16ToF32,
-        });
+        let pipeline = self
+            .elementwise()?
+            .pipeline(match (src.dtype(), dst.dtype()) {
+                (DType::F32, DType::F32) => Op::Copy,
+                (DType::F32, DType::F16) => Op::CopyToF16,
+                (DType::F16, DType::F16) => Op::CopyF16,
+                (DType::F16, DType::F32) => Op::CopyF16ToF32,
+            });
         self.plan_elementwise(
             pipeline,
             &CopyPc {

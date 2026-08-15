@@ -232,7 +232,14 @@ impl Executor {
                 splitk2: None,
             });
         }
-        Ok(self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, splitk2_eligible))
+        Ok(self.plan_shape(
+            dims.batch,
+            dims.m,
+            dims.n,
+            dims.k,
+            dims.b_f16,
+            splitk2_eligible,
+        ))
     }
 
     /// Reroute an op whose planned kernel cannot honor its fusions:

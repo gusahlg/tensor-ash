@@ -99,7 +99,13 @@ impl Scratch {
     /// (`last`/`last_n`/`logits`) stays f32: post-norm LM-head inputs
     /// and logits can exceed the activations' comfortable f16 range,
     /// and the final matmul is one row.
-    fn new(ctx: &Arc<VulkanContext>, cfg: &Config, t: u32, decode: bool, act_f16: bool) -> Result<Self> {
+    fn new(
+        ctx: &Arc<VulkanContext>,
+        cfg: &Config,
+        t: u32,
+        decode: bool,
+        act_f16: bool,
+    ) -> Result<Self> {
         debug_assert!(!decode || t == 1, "decode scratch is single-token");
         debug_assert!(!(decode && act_f16), "decode scratch stays f32");
         let (h, f, kv) = (cfg.embd, cfg.ffn, cfg.kv_heads * cfg.dh);
