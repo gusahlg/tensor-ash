@@ -5,9 +5,6 @@
 //!   bench    -m <gguf> [--pp 512] [--tg 128] [--ctx 2048]
 //!   generate -m <gguf> --ids "1,15043,3186" -n 24 [--ctx 2048]
 
-mod gguf;
-mod model;
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,7 +12,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use tensor_ash::{Executor, KernelSelection, MatmulPipeline, VulkanContext};
 
-use model::Model;
+use llama_ash::model::Model;
 
 struct Args {
     model: PathBuf,
