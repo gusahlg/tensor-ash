@@ -184,6 +184,23 @@ impl VulkanContext {
         }
     }
 
+    /// True when this driver is known to compile identical shader
+    /// arithmetic into identical instruction sequences across the
+    /// spec-constant variants of a pipeline, so a fused store epilogue
+    /// reproduces its composed reference bit-for-bit (the row-GEMV
+    /// RoPE/scatter store contract).  Verified to hold on the NVIDIA
+    /// proprietary driver and Mesa RADV.  Mesa NVK's backend currently
+    /// applies value-changing transforms non-uniformly between
+    /// variants (~1 ULP into the rotation inputs, persisting even
+    /// under `precise`-qualified arithmetic), so bitwise
+    /// fused-vs-composed comparisons must relax to tolerance there.
+    /// Unknown drivers report true: the shaders pin the reduce and
+    /// rotation orders with explicit fma, so any backend that refrains
+    /// from value-changing transforms reproduces them exactly.
+    pub fn fused_store_bit_reproducible(&self) -> bool {
+        self.driver_id != Some(vk::DriverId::MESA_NVK)
+    }
+
     pub fn device_name(&self) -> &str {
         &self.device_summary.name
     }

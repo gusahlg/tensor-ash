@@ -4,7 +4,13 @@
 //! against the composed reference (same GEMV route, then the
 //! standalone rope / copy / rope-scatter op): the reduce order and the
 //! rotation fma order are identical, so even f16 narrowing rounds
-//! identically.
+//! identically.  The bitwise form holds only where the driver compiles
+//! that identical arithmetic identically across the STORE_MODE
+//! pipeline variants ([`VulkanContext::fused_store_bit_reproducible`]);
+//! on drivers that do not (Mesa NVK today) the fused-vs-composed
+//! comparison relaxes to the suite's standard k-scaled tolerance.
+//! Same-pipeline comparisons (pos indirection) stay bitwise
+//! everywhere.
 
 use crate::common::*;
 
@@ -54,6 +60,29 @@ fn assert_bits_eq(expected: &[f32], actual: &[f32], label: &str) {
             got.to_bits(),
             "{label}: element {index}: ref {want}, fused {got}"
         );
+    }
+}
+
+/// Fused-vs-composed comparison: bitwise wherever the driver keeps
+/// spec-constant pipeline variants bit-reproducible (see module doc),
+/// the standard `tolerance(k)` where it does not.  Only the assertion
+/// form changes — both branches compare the same fused result against
+/// the same composed reference.
+fn assert_fused_matches(
+    ctx: &std::sync::Arc<VulkanContext>,
+    expected: &[f32],
+    actual: &[f32],
+    k: u32,
+    label: &str,
+) {
+    if ctx.fused_store_bit_reproducible() {
+        assert_bits_eq(expected, actual, label);
+    } else {
+        eprintln!(
+            "{label}: driver lacks cross-variant bit reproducibility; \
+             comparing within tolerance instead of bitwise"
+        );
+        assert_close(actual, expected, k, label);
     }
 }
 
@@ -116,7 +145,13 @@ fn store_rope_matches_gemv_plus_standalone_rope() {
         let mut actual = vec![0.0; n as usize];
         exec.download(&c_ref, &mut expected).unwrap();
         exec.download(&c_fused, &mut actual).unwrap();
-        assert_bits_eq(&expected, &actual, &format!("store rope {kernel:?} n={n}"));
+        assert_fused_matches(
+            &ctx,
+            &expected,
+            &actual,
+            k,
+            &format!("store rope {kernel:?} n={n}"),
+        );
     }
 }
 
@@ -179,7 +214,13 @@ fn store_scatter_case(kv_f16: bool) {
     let mut actual = vec![0.0; poison.len()];
     exec.download(&cache_ref, &mut expected).unwrap();
     exec.download(&cache_fused, &mut actual).unwrap();
-    assert_bits_eq(&expected, &actual, &format!("store scatter f16={kv_f16}"));
+    assert_fused_matches(
+        &ctx,
+        &expected,
+        &actual,
+        k,
+        &format!("store scatter f16={kv_f16}"),
+    );
 }
 
 #[test]
@@ -263,9 +304,11 @@ fn store_rope_scatter_case(kv_f16: bool) {
     let mut actual = vec![0.0; poison.len()];
     exec.download(&cache_ref, &mut expected).unwrap();
     exec.download(&cache_fused, &mut actual).unwrap();
-    assert_bits_eq(
+    assert_fused_matches(
+        &ctx,
         &expected,
         &actual,
+        k,
         &format!("store rope-scatter f16={kv_f16}"),
     );
 }
