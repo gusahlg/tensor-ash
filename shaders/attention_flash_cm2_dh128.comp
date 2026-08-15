@@ -1,0 +1,6 @@
+#version 460
+// Tensor-core (NV_cooperative_matrix2) fused causal prefill attention, head dimension 128.
+
+#define DH 128u
+
+#include "attention_flash_cm2_kernel.glsl"

@@ -5,7 +5,7 @@
 //! error during device discovery or creation from leaking the instance (and,
 //! when enabled, its debug messenger).
 
-use std::ffi::CStr;
+use std::ffi::{CStr, c_void};
 
 use anyhow::{Context, Result, anyhow};
 use ash::vk;
@@ -25,10 +25,15 @@ pub(super) fn create(
         let entry =
             ash::Entry::load().map_err(|err| anyhow!("failed to load Vulkan loader: {err}"))?;
 
+        // 1.3 rather than 1.2 so the NV_cooperative_matrix2 shaders
+        // (SPIR-V 1.6) are loadable; the 1.1/1.2 feature-struct chains
+        // below are version-agnostic and unaffected.  Requesting a
+        // higher apiVersion than the loader supports is not an error
+        // on Vulkan >= 1.1 loaders.
         let app_info = vk::ApplicationInfo::default()
             .application_name(c"tensor-ash")
             .engine_name(c"tensor-ash")
-            .api_version(vk::API_VERSION_1_2);
+            .api_version(vk::API_VERSION_1_3);
         let validation_name = c"VK_LAYER_KHRONOS_validation";
         let have_validation = enable_validation
             && entry
@@ -159,12 +164,82 @@ pub(super) fn create(
             && coopmat_present
             && coopmat_query.cooperative_matrix == vk::TRUE
             && vulkan12_query.vulkan_memory_model == vk::TRUE;
+        // VK_NV_cooperative_matrix2 (workgroup-scope matrices, tensor
+        // addressing, reductions, per-element ops) for the cm2 flash
+        // kernels.  Unknown to ash 0.38, so the feature/property
+        // structs are hand-rolled below and chained by raw pointer.
+        // Gate: coopmat1 gate + Vulkan 1.3 device (the shaders are
+        // SPIR-V 1.6) + all seven feature bits (llama.cpp's proven
+        // envelope; the f32-KV decode callback needs BlockLoads) + a
+        // flexible-dimensions config compatible with the 128-thread
+        // Br=Bc=64 f16xf16->f32 kernels.  `ML_NO_COOPMAT2=1` is the
+        // kill-switch.
+        let coopmat2_disabled = std::env::var("ML_NO_COOPMAT2")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let coopmat2_present = device_extensions
+            .iter()
+            .any(|ext| CStr::from_ptr(ext.extension_name.as_ptr()) == COOPMAT2_EXTENSION_NAME);
+        let mut enable_coopmat2 = false;
+        if !coopmat2_disabled
+            && enable_coopmat
+            && coopmat2_present
+            && device_properties.api_version >= vk::API_VERSION_1_3
+        {
+            let mut coopmat2_query = PhysicalDeviceCooperativeMatrix2FeaturesNV::default();
+            let mut features2_query = vk::PhysicalDeviceFeatures2 {
+                p_next: (&raw mut coopmat2_query).cast::<c_void>(),
+                ..Default::default()
+            };
+            instance.get_physical_device_features2(physical_device, &mut features2_query);
+            let features_ok = [
+                coopmat2_query.cooperative_matrix_workgroup_scope,
+                coopmat2_query.cooperative_matrix_flexible_dimensions,
+                coopmat2_query.cooperative_matrix_reductions,
+                coopmat2_query.cooperative_matrix_conversions,
+                coopmat2_query.cooperative_matrix_per_element_operations,
+                coopmat2_query.cooperative_matrix_tensor_addressing,
+                coopmat2_query.cooperative_matrix_block_loads,
+            ]
+            .iter()
+            .all(|&bit| bit == vk::TRUE);
+
+            let mut coopmat2_props = PhysicalDeviceCooperativeMatrix2PropertiesNV::default();
+            let mut props2_query = vk::PhysicalDeviceProperties2 {
+                p_next: (&raw mut coopmat2_props).cast::<c_void>(),
+                ..Default::default()
+            };
+            instance.get_physical_device_properties2(physical_device, &mut props2_query);
+            // The flash kernels declare dimensions up to 128 (dh128).
+            let dims_ok =
+                coopmat2_props.cooperative_matrix_flexible_dimensions_max_dimension >= 128;
+
+            let config_ok = coopmat2_flash_config_supported(&entry, &instance, physical_device);
+            enable_coopmat2 = features_ok && dims_ok && config_ok;
+            log::info!(
+                "tensor-ash: VK_NV_cooperative_matrix2: features_ok={features_ok} \
+                 (ws={} fd={} red={} conv={} pe={} ta={} bl={}), max_dim={}, \
+                 reserved_shmem={}, flash_config_ok={config_ok} -> enabled={enable_coopmat2}",
+                coopmat2_query.cooperative_matrix_workgroup_scope,
+                coopmat2_query.cooperative_matrix_flexible_dimensions,
+                coopmat2_query.cooperative_matrix_reductions,
+                coopmat2_query.cooperative_matrix_conversions,
+                coopmat2_query.cooperative_matrix_per_element_operations,
+                coopmat2_query.cooperative_matrix_tensor_addressing,
+                coopmat2_query.cooperative_matrix_block_loads,
+                coopmat2_props.cooperative_matrix_flexible_dimensions_max_dimension,
+                coopmat2_props.cooperative_matrix_workgroup_scope_reserved_shared_memory,
+            );
+        }
+
         let mut enabled_device_extensions = enable_atomic_float
             .then_some(atomic_float_name.as_ptr())
             .into_iter()
             .collect::<Vec<_>>();
         if enable_coopmat {
             enabled_device_extensions.push(coopmat_name.as_ptr());
+        }
+        if enable_coopmat2 {
+            enabled_device_extensions.push(COOPMAT2_EXTENSION_NAME.as_ptr());
         }
 
         let priorities = [1.0];
@@ -197,6 +272,23 @@ pub(super) fn create(
         }
         if enable_coopmat {
             device_ci = device_ci.push_next(&mut coopmat);
+        }
+        // ash's typed `push_next` cannot chain a struct it does not
+        // know, so the coopmat2 features link in by raw pointer (same
+        // p_next contract, hand-managed).
+        let mut coopmat2_features = PhysicalDeviceCooperativeMatrix2FeaturesNV {
+            cooperative_matrix_workgroup_scope: vk::TRUE,
+            cooperative_matrix_flexible_dimensions: vk::TRUE,
+            cooperative_matrix_reductions: vk::TRUE,
+            cooperative_matrix_conversions: vk::TRUE,
+            cooperative_matrix_per_element_operations: vk::TRUE,
+            cooperative_matrix_tensor_addressing: vk::TRUE,
+            cooperative_matrix_block_loads: vk::TRUE,
+            ..Default::default()
+        };
+        if enable_coopmat2 {
+            coopmat2_features.p_next = device_ci.p_next.cast_mut();
+            device_ci.p_next = (&raw const coopmat2_features).cast::<c_void>();
         }
         let device = instance
             .create_device(physical_device, &device_ci, None)
@@ -242,10 +334,173 @@ pub(super) fn create(
             shader_buffer_float32_atomic_add_enabled: enable_atomic_float,
             f16_storage_enabled: f16_storage_supported,
             coopmat_enabled: enable_coopmat,
+            coopmat2_enabled: enable_coopmat2,
             pipeline_cache,
             pipeline_cache_path,
             debug_loader,
             debug_messenger,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VK_NV_cooperative_matrix2 (extension #594) definitions.
+//
+// ash 0.38 is generated from Vulkan-Headers 1.3.281; this extension
+// entered the headers at 1.3.300, so nothing below exists in `ash::vk`.
+// Layouts hand-rolled to match `vulkan_core.h` (sTypes
+// 1000593000/1000593001/1000593002 from the extension's block).
+
+const COOPMAT2_EXTENSION_NAME: &CStr = c"VK_NV_cooperative_matrix2";
+
+/// `VkPhysicalDeviceCooperativeMatrix2FeaturesNV`. Exactly seven
+/// feature bits — this is the full struct.
+#[repr(C)]
+struct PhysicalDeviceCooperativeMatrix2FeaturesNV {
+    s_type: vk::StructureType,
+    p_next: *mut c_void,
+    cooperative_matrix_workgroup_scope: vk::Bool32,
+    cooperative_matrix_flexible_dimensions: vk::Bool32,
+    cooperative_matrix_reductions: vk::Bool32,
+    cooperative_matrix_conversions: vk::Bool32,
+    cooperative_matrix_per_element_operations: vk::Bool32,
+    cooperative_matrix_tensor_addressing: vk::Bool32,
+    cooperative_matrix_block_loads: vk::Bool32,
+}
+
+impl Default for PhysicalDeviceCooperativeMatrix2FeaturesNV {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1000593000),
+            p_next: std::ptr::null_mut(),
+            cooperative_matrix_workgroup_scope: vk::FALSE,
+            cooperative_matrix_flexible_dimensions: vk::FALSE,
+            cooperative_matrix_reductions: vk::FALSE,
+            cooperative_matrix_conversions: vk::FALSE,
+            cooperative_matrix_per_element_operations: vk::FALSE,
+            cooperative_matrix_tensor_addressing: vk::FALSE,
+            cooperative_matrix_block_loads: vk::FALSE,
+        }
+    }
+}
+
+/// `VkPhysicalDeviceCooperativeMatrix2PropertiesNV`.
+#[repr(C)]
+struct PhysicalDeviceCooperativeMatrix2PropertiesNV {
+    s_type: vk::StructureType,
+    p_next: *mut c_void,
+    cooperative_matrix_workgroup_scope_max_workgroup_size: u32,
+    cooperative_matrix_flexible_dimensions_max_dimension: u32,
+    /// Subtract from the per-workgroup shared-memory budget: the
+    /// driver reserves this much for compiler-managed matrix staging.
+    cooperative_matrix_workgroup_scope_reserved_shared_memory: u32,
+}
+
+impl Default for PhysicalDeviceCooperativeMatrix2PropertiesNV {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1000593002),
+            p_next: std::ptr::null_mut(),
+            cooperative_matrix_workgroup_scope_max_workgroup_size: 0,
+            cooperative_matrix_flexible_dimensions_max_dimension: 0,
+            cooperative_matrix_workgroup_scope_reserved_shared_memory: 0,
+        }
+    }
+}
+
+/// `VkCooperativeMatrixFlexibleDimensionsPropertiesNV`.
+#[derive(Clone)]
+#[repr(C)]
+struct CooperativeMatrixFlexibleDimensionsPropertiesNV {
+    s_type: vk::StructureType,
+    p_next: *mut c_void,
+    m_granularity: u32,
+    n_granularity: u32,
+    k_granularity: u32,
+    a_type: vk::ComponentTypeKHR,
+    b_type: vk::ComponentTypeKHR,
+    c_type: vk::ComponentTypeKHR,
+    result_type: vk::ComponentTypeKHR,
+    saturating_accumulation: vk::Bool32,
+    scope: vk::ScopeKHR,
+    workgroup_invocations: u32,
+}
+
+impl Default for CooperativeMatrixFlexibleDimensionsPropertiesNV {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1000593001),
+            p_next: std::ptr::null_mut(),
+            m_granularity: 0,
+            n_granularity: 0,
+            k_granularity: 0,
+            a_type: vk::ComponentTypeKHR::FLOAT16,
+            b_type: vk::ComponentTypeKHR::FLOAT16,
+            c_type: vk::ComponentTypeKHR::FLOAT16,
+            result_type: vk::ComponentTypeKHR::FLOAT16,
+            saturating_accumulation: vk::FALSE,
+            scope: vk::ScopeKHR::WORKGROUP,
+            workgroup_invocations: 0,
+        }
+    }
+}
+
+type PfnGetFlexibleDimensionsProperties = unsafe extern "system" fn(
+    vk::PhysicalDevice,
+    *mut u32,
+    *mut CooperativeMatrixFlexibleDimensionsPropertiesNV,
+) -> vk::Result;
+
+/// Whether a workgroup-scope flexible-dimensions config exists that
+/// the cm2 flash kernels can use: f16 A/B with f32 accumulate at 128
+/// invocations, granularities dividing the Br=Bc=64 tiles (dh 64/128
+/// are multiples of 64's divisors too).  NVIDIA reports 32x16x16@128
+/// on RTX, which passes.
+unsafe fn coopmat2_flash_config_supported(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> bool {
+    unsafe {
+        let Some(raw) = (entry.static_fn().get_instance_proc_addr)(
+            instance.handle(),
+            c"vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV".as_ptr(),
+        ) else {
+            log::warn!(
+                "tensor-ash: vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV \
+                 missing despite VK_NV_cooperative_matrix2"
+            );
+            return false;
+        };
+        let get_props: PfnGetFlexibleDimensionsProperties = std::mem::transmute(raw);
+
+        let mut count = 0u32;
+        if get_props(physical_device, &mut count, std::ptr::null_mut()) != vk::Result::SUCCESS {
+            return false;
+        }
+        // Output structs must carry their sType in (two-call pattern).
+        let mut configs =
+            vec![CooperativeMatrixFlexibleDimensionsPropertiesNV::default(); count as usize];
+        let result = get_props(physical_device, &mut count, configs.as_mut_ptr());
+        if result != vk::Result::SUCCESS && result != vk::Result::INCOMPLETE {
+            return false;
+        }
+        configs.truncate(count as usize);
+        configs.iter().any(|config| {
+            config.scope == vk::ScopeKHR::WORKGROUP
+                && config.workgroup_invocations == 128
+                && config.a_type == vk::ComponentTypeKHR::FLOAT16
+                && config.b_type == vk::ComponentTypeKHR::FLOAT16
+                && config.c_type == vk::ComponentTypeKHR::FLOAT32
+                && config.result_type == vk::ComponentTypeKHR::FLOAT32
+                && config.saturating_accumulation == vk::FALSE
+                && [
+                    config.m_granularity,
+                    config.n_granularity,
+                    config.k_granularity,
+                ]
+                .iter()
+                .all(|&granularity| granularity != 0 && 64 % granularity == 0)
         })
     }
 }

@@ -5,6 +5,7 @@
 
 use crate::common::*;
 
+use tensor_ash::dtype::round_f32_via_f16;
 use tensor_ash::{FlashAttentionDesc, MatmulCall, SoftmaxMask, Tensor};
 
 /// f64 reference: causal attention where query row `i` attends to
@@ -70,6 +71,39 @@ struct FlashCase {
     pos_base: u32,
 }
 
+/// Deterministic K/V cache fill for `case`: valid positions from
+/// `fill_det`, everything past `kv_len` optionally poisoned with
+/// values that would blow up the result if masking ever leaked.
+fn fill_kv(case: &FlashCase, poison: Option<f32>) -> (Vec<f32>, Vec<f32>) {
+    let FlashCase {
+        kv_heads,
+        t_max,
+        dh,
+        kv_len,
+        ..
+    } = *case;
+    let mut host_kt = vec![0.0_f32; (kv_heads * dh * t_max) as usize];
+    let mut host_v = vec![0.0_f32; (kv_heads * t_max * dh) as usize];
+    let mut fill = vec![0.0_f32; host_kt.len().max(host_v.len())];
+    fill_det(&mut fill, 5101);
+    for kv_head in 0..kv_heads as usize {
+        for d in 0..dh as usize {
+            for pos in 0..t_max as usize {
+                let kt_index = (kv_head * dh as usize + d) * t_max as usize + pos;
+                let v_index = (kv_head * t_max as usize + pos) * dh as usize + d;
+                if pos < kv_len as usize {
+                    host_kt[kt_index] = fill[kt_index % fill.len()];
+                    host_v[v_index] = fill[(v_index * 7 + 3) % fill.len()];
+                } else if let Some(poison) = poison {
+                    host_kt[kt_index] = poison;
+                    host_v[v_index] = poison;
+                }
+            }
+        }
+    }
+    (host_kt, host_v)
+}
+
 fn run_case(label: &str, case: &FlashCase, poison_tail: bool) {
     let (ctx, exec) = make_setup(2, 8);
     if !ctx.buffer_device_address_enabled {
@@ -90,33 +124,14 @@ fn run_case(label: &str, case: &FlashCase, poison_tail: bool) {
     let v = Tensor::uninit_device(&ctx, &[kv_heads, t_max, dh]).unwrap();
     let out = Tensor::uninit_device(&ctx, &[heads, t_q, dh]).unwrap();
 
-    // Fill valid cache positions deterministically; optionally poison
-    // everything past kv_len with huge values that would blow up the
-    // result if masking ever leaked.
-    let mut host_kt = vec![0.0_f32; (kv_heads * dh * t_max) as usize];
-    let mut host_v = vec![0.0_f32; (kv_heads * t_max * dh) as usize];
-    let mut fill = vec![0.0_f32; host_kt.len().max(host_v.len())];
-    fill_det(&mut fill, 5101);
-    for kv_head in 0..kv_heads as usize {
-        for d in 0..dh as usize {
-            for pos in 0..t_max as usize {
-                let kt_index = (kv_head * dh as usize + d) * t_max as usize + pos;
-                let v_index = (kv_head * t_max as usize + pos) * dh as usize + d;
-                if pos < kv_len as usize {
-                    host_kt[kt_index] = fill[kt_index % fill.len()];
-                    host_v[v_index] = fill[(v_index * 7 + 3) % fill.len()];
-                } else if poison_tail {
-                    host_kt[kt_index] = 1.0e30;
-                    host_v[v_index] = 1.0e30;
-                }
-            }
-        }
-    }
+    let (host_kt, host_v) = fill_kv(case, poison_tail.then_some(1.0e30));
     exec.upload(&host_kt, &kt).unwrap();
     exec.upload(&host_v, &v).unwrap();
 
     let scale = 1.0 / (dh as f32).sqrt();
-    exec.run_flash_attention(
+    // Pinned to the SIMT kernels: this test asserts f32-path
+    // tolerances; the coopmat2 route gets its own A/B cases below.
+    exec.run_flash_attention_simt(
         &q,
         &kt,
         &v,
@@ -237,7 +252,9 @@ fn flash_matches_composed_path() {
     let scale = 1.0 / (dh as f32).sqrt();
 
     let fused = Tensor::uninit_device(&ctx, &[heads, t, dh]).unwrap();
-    exec.run_flash_attention(
+    // SIMT-pinned for the same reason as `run_case`: 1e-5 is an
+    // f32-vs-f32 tolerance the f16-operand coopmat2 kernels cannot hit.
+    exec.run_flash_attention_simt(
         &q,
         &kt,
         &v,
@@ -328,4 +345,148 @@ fn flash_rejects_bad_geometry() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("exceeds cache T_max"), "unexpected: {err}");
+}
+
+/// A/B one geometry across the NV_cooperative_matrix2 route (the
+/// default `run_flash_attention` dispatch where supported), the SIMT
+/// kernels, and the f64 CPU reference.  Skips on devices without the
+/// coopmat2 path.
+fn run_cm2_case(label: &str, case: &FlashCase, kv_f16: bool) {
+    let (ctx, exec) = make_setup(2, 8);
+    if !ctx.coopmat2_enabled {
+        eprintln!("skipping: no NV_cooperative_matrix2");
+        return;
+    }
+    let FlashCase {
+        heads,
+        kv_heads,
+        t_q,
+        t_max,
+        dh,
+        kv_len,
+        pos_base,
+    } = *case;
+    let (q, host_q) = upload_det(&ctx, &exec, &[heads, t_q, dh], 5300);
+    // Poison the cache tail past kv_len: masking leaks blow up both
+    // GPU outputs against the reference.  For f16 caches stay finite
+    // (1e30 would round to inf; 6e4 still wrecks any leaked softmax).
+    let poison = if kv_f16 { 6.0e4 } else { 1.0e30 };
+    let (mut host_kt, mut host_v) = fill_kv(case, Some(poison));
+    let (kt, v) = if kv_f16 {
+        (
+            Tensor::uninit_device_f16(&ctx, &[kv_heads, dh, t_max]).unwrap(),
+            Tensor::uninit_device_f16(&ctx, &[kv_heads, t_max, dh]).unwrap(),
+        )
+    } else {
+        (
+            Tensor::uninit_device(&ctx, &[kv_heads, dh, t_max]).unwrap(),
+            Tensor::uninit_device(&ctx, &[kv_heads, t_max, dh]).unwrap(),
+        )
+    };
+    exec.upload(&host_kt, &kt).unwrap();
+    exec.upload(&host_v, &v).unwrap();
+    if kv_f16 {
+        // The CPU reference sees exactly what the GPU stores.
+        for value in host_kt.iter_mut().chain(host_v.iter_mut()) {
+            *value = round_f32_via_f16(*value);
+        }
+    }
+
+    let scale = 1.0 / (dh as f32).sqrt();
+    let desc = FlashAttentionDesc {
+        kv_len,
+        pos_base,
+        scale,
+    };
+    let out_cm2 = Tensor::uninit_device(&ctx, &[heads, t_q, dh]).unwrap();
+    let out_simt = Tensor::uninit_device(&ctx, &[heads, t_q, dh]).unwrap();
+    exec.run_flash_attention(&q, &kt, &v, &out_cm2, desc)
+        .unwrap();
+    exec.run_flash_attention_simt(&q, &kt, &v, &out_simt, desc)
+        .unwrap();
+    let mut gpu_cm2 = vec![0.0; (heads * t_q * dh) as usize];
+    let mut gpu_simt = vec![0.0; gpu_cm2.len()];
+    exec.download(&out_cm2, &mut gpu_cm2).unwrap();
+    exec.download(&out_simt, &mut gpu_simt).unwrap();
+
+    // The cm2 kernels round Q*scale, K, V, and the softmax weights
+    // through f16 (accumulation stays f32), so f16-operand headroom
+    // applies against both references; weights summing to 1 keep the
+    // error absolute-bounded.  Provisional until measured on hardware.
+    const CM2_TOL: f32 = 2.0e-2;
+    assert_close_tol(
+        &gpu_cm2,
+        &gpu_simt,
+        CM2_TOL,
+        &format!("{label} (cm2 vs simt)"),
+    );
+    let cpu = cpu_flash(
+        &host_q,
+        &host_kt,
+        &host_v,
+        heads as usize,
+        kv_heads as usize,
+        t_q as usize,
+        t_max as usize,
+        dh as usize,
+        kv_len as usize,
+        pos_base as usize,
+        scale as f64,
+    );
+    assert_close_tol(&gpu_cm2, &cpu, CM2_TOL, &format!("{label} (cm2 vs f64)"));
+}
+
+#[test]
+#[ignore]
+fn flash_cm2_matches_simt_and_cpu() {
+    let t512 = FlashCase {
+        heads: 4,
+        kv_heads: 4,
+        t_q: 512,
+        t_max: 512,
+        dh: 64,
+        kv_len: 512,
+        pos_base: 0,
+    };
+    run_cm2_case("cm2 dh64 T512", &t512, false);
+    run_cm2_case("cm2 dh64 T512 kv16", &t512, true);
+
+    // Few heads: the f64 reference dominates the runtime at T=2048.
+    let t2048 = FlashCase {
+        heads: 2,
+        kv_heads: 2,
+        t_q: 2048,
+        t_max: 2048,
+        dh: 64,
+        kv_len: 2048,
+        pos_base: 0,
+    };
+    run_cm2_case("cm2 dh64 T2048", &t2048, false);
+    run_cm2_case("cm2 dh64 T2048 kv16", &t2048, true);
+
+    let dh128 = FlashCase {
+        heads: 2,
+        kv_heads: 2,
+        t_q: 512,
+        t_max: 512,
+        dh: 128,
+        kv_len: 512,
+        pos_base: 0,
+    };
+    run_cm2_case("cm2 dh128 T512", &dh128, false);
+    run_cm2_case("cm2 dh128 T512 kv16", &dh128, true);
+
+    // GQA group of 4, warm cache, ragged t_q (not a Br multiple):
+    // exercises the per-element causal/ragged mask and the clamped
+    // edge loads/stores in one go.
+    let ragged = FlashCase {
+        heads: 8,
+        kv_heads: 2,
+        t_q: 333,
+        t_max: 1024,
+        dh: 64,
+        kv_len: 200 + 333,
+        pos_base: 200,
+    };
+    run_cm2_case("cm2 gqa warm ragged", &ragged, true);
 }

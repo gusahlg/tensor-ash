@@ -23,21 +23,22 @@ use crate::tensor::Tensor;
 use super::Executor;
 use super::splitk2::create_pc_only_layout;
 
-/// Declares the elementwise kernel set ONCE: the [`Op`] index enum and
-/// the same-order `(spirv, spec constants, debug label)` build table.
+/// Declares one elementwise kernel set ONCE: an index enum and the
+/// same-order `(spirv, spec constants, debug label)` build table.
 /// Adding a kernel is one line here plus its dispatch site.
 macro_rules! op_kernels {
-    ($($variant:ident => ($file:literal, $spec:expr, $label:literal)),+ $(,)?) => {
-        /// Index of one compiled elementwise kernel (see `KERNELS`).
+    ($op:ident / $table:ident: $($variant:ident => ($file:literal, $spec:expr, $label:literal)),+ $(,)?) => {
+        /// Index of one compiled elementwise kernel (see the paired
+        /// build table).
         #[derive(Copy, Clone)]
-        enum Op { $($variant),+ }
+        enum $op { $($variant),+ }
 
-        impl Op {
-            const COUNT: usize = [$(Op::$variant),+].len();
+        impl $op {
+            const COUNT: usize = [$($op::$variant),+].len();
         }
 
-        /// Build inputs per [`Op`] variant, in declaration order.
-        const KERNELS: [(&[u8], &[u32], &str); Op::COUNT] = [
+        /// Build inputs per index variant, in declaration order.
+        const $table: [(&[u8], &[u32], &str); $op::COUNT] = [
             $((
                 include_bytes!(concat!(env!("OUT_DIR"), "/", $file, ".spv")),
                 $spec,
@@ -47,7 +48,7 @@ macro_rules! op_kernels {
     };
 }
 
-op_kernels! {
+op_kernels! { Op / KERNELS:
     Softmax => ("op_softmax_f32_row", &[], "op softmax"),
     RmsNorm => ("op_rmsnorm_f32", &[0], "op rmsnorm"),
     LayerNorm => ("op_rmsnorm_f32", &[1], "op layernorm"),
@@ -66,6 +67,18 @@ op_kernels! {
     AttnDecodeCombine => ("op_attn_decode_combine", &[], "op attn_decode combine"),
     Argmax => ("op_argmax_f32", &[], "op argmax"),
     EmbedGather => ("op_embed_gather", &[], "op embed_gather"),
+}
+
+// Tensor-core flash-attention kernels (`VK_NV_cooperative_matrix2`),
+// built only when [`VulkanContext::coopmat2_enabled`] — their SPIR-V
+// 1.6 modules only validate where the extension is live.  Same push
+// constants and semantics as the SIMT flash variants; Br=64 query rows
+// per workgroup instead of 128.
+op_kernels! { Cm2Op / CM2_KERNELS:
+    FlashDh64 => ("attention_flash_cm2_dh64", &[], "op flash_attention cm2 dh64"),
+    FlashDh128 => ("attention_flash_cm2_dh128", &[], "op flash_attention cm2 dh128"),
+    FlashKv16Dh64 => ("attention_flash_cm2_kv16_dh64", &[], "op flash_attention cm2 kv16 dh64"),
+    FlashKv16Dh128 => ("attention_flash_cm2_kv16_dh128", &[], "op flash_attention cm2 kv16 dh128"),
 }
 
 /// Threads per workgroup in every op shader.
@@ -384,11 +397,19 @@ pub(super) struct ElementwisePipeline {
     ctx: Arc<VulkanContext>,
     layout: vk::PipelineLayout,
     kernels: [OpKernel; Op::COUNT],
+    /// `Some` iff [`VulkanContext::coopmat2_enabled`].
+    cm2_kernels: Option<[OpKernel; Cm2Op::COUNT]>,
 }
 
 impl ElementwisePipeline {
     fn pipeline(&self, op: Op) -> vk::Pipeline {
         self.kernels[op as usize].pipeline
+    }
+
+    fn cm2_pipeline(&self, op: Cm2Op) -> Option<vk::Pipeline> {
+        self.cm2_kernels
+            .as_ref()
+            .map(|kernels| kernels[op as usize].pipeline)
     }
 
     pub(super) fn new(ctx: &Arc<VulkanContext>) -> Result<Self> {
@@ -414,13 +435,23 @@ impl ElementwisePipeline {
                 crate::pipeline::build_compute_pipeline(ctx, layout, spec, spv, label)?;
             built_guard.push(OpKernel { module, pipeline });
         }
-        let kernels = scopeguard::ScopeGuard::into_inner(built_guard)
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("KERNELS has Op::COUNT entries"));
+        if ctx.coopmat2_enabled {
+            for (spv, spec, label) in CM2_KERNELS {
+                let (module, pipeline) =
+                    crate::pipeline::build_compute_pipeline(ctx, layout, spec, spv, label)?;
+                built_guard.push(OpKernel { module, pipeline });
+            }
+        }
+        let mut built = scopeguard::ScopeGuard::into_inner(built_guard).into_iter();
+        let kernels = std::array::from_fn(|_| built.next().expect("KERNELS has Op::COUNT entries"));
+        let cm2_kernels = ctx.coopmat2_enabled.then(|| {
+            std::array::from_fn(|_| built.next().expect("CM2_KERNELS has Cm2Op::COUNT entries"))
+        });
         Ok(Self {
             ctx: Arc::clone(ctx),
             layout: scopeguard::ScopeGuard::into_inner(layout_guard),
             kernels,
+            cm2_kernels,
         })
     }
 }
@@ -429,7 +460,7 @@ impl Drop for ElementwisePipeline {
     fn drop(&mut self) {
         unsafe {
             let _ = self.ctx.device.device_wait_idle();
-            for kernel in &self.kernels {
+            for kernel in self.kernels.iter().chain(self.cm2_kernels.iter().flatten()) {
                 self.ctx.device.destroy_pipeline(kernel.pipeline, None);
                 self.ctx.device.destroy_shader_module(kernel.module, None);
             }
@@ -858,6 +889,11 @@ impl Executor {
     /// `[H_kv, dh, T_max]`, `v` is `[H_kv, T_max, dh]`; GQA works when
     /// `H` is a multiple of `H_kv`.  `dh` must be 64 or 128 (the
     /// compiled head-dimension variants).
+    ///
+    /// On devices where [`VulkanContext::coopmat2_enabled`] is set the
+    /// dispatch routes to the tensor-core `NV_cooperative_matrix2`
+    /// kernels (f16 operands, f32 accumulate — expect f16-level
+    /// rounding vs the f32 SIMT path); otherwise the SIMT kernels run.
     pub fn run_flash_attention(
         &self,
         q: &Tensor,
@@ -865,6 +901,33 @@ impl Executor {
         v: &Tensor,
         out: &Tensor,
         desc: FlashAttentionDesc,
+    ) -> Result<RunStats> {
+        self.run_flash_attention_impl(q, kt, v, out, desc, false)
+    }
+
+    /// [`Self::run_flash_attention`] pinned to the SIMT kernels even
+    /// when the `NV_cooperative_matrix2` path is available.  A/B hook
+    /// for the GPU validation tests; not part of the stable API.
+    #[doc(hidden)]
+    pub fn run_flash_attention_simt(
+        &self,
+        q: &Tensor,
+        kt: &Tensor,
+        v: &Tensor,
+        out: &Tensor,
+        desc: FlashAttentionDesc,
+    ) -> Result<RunStats> {
+        self.run_flash_attention_impl(q, kt, v, out, desc, true)
+    }
+
+    fn run_flash_attention_impl(
+        &self,
+        q: &Tensor,
+        kt: &Tensor,
+        v: &Tensor,
+        out: &Tensor,
+        desc: FlashAttentionDesc,
+        force_simt: bool,
     ) -> Result<RunStats> {
         self.ensure_f32(q, "run_flash_attention", "q")?;
         self.validate_tensor_context(kt, "kt")?;
@@ -920,17 +983,29 @@ impl Executor {
                 desc.kv_len
             );
         }
-        let (kernel, rows_per_wg) = match (dh, kv_f16) {
-            (64, false) => (Op::FlashDh64, 128),
-            (128, false) => (Op::FlashDh128, 128),
-            (64, true) => (Op::FlashKv16Dh64, 128),
-            (128, true) => (Op::FlashKv16Dh128, 128),
+        let (simt_kernel, cm2_kernel) = match (dh, kv_f16) {
+            (64, false) => (Op::FlashDh64, Cm2Op::FlashDh64),
+            (128, false) => (Op::FlashDh128, Cm2Op::FlashDh128),
+            (64, true) => (Op::FlashKv16Dh64, Cm2Op::FlashKv16Dh64),
+            (128, true) => (Op::FlashKv16Dh128, Cm2Op::FlashKv16Dh128),
             (other, _) => bail!(
                 "run_flash_attention: head dimension {other} unsupported (compiled variants: 64, 128)"
             ),
         };
+        let pipes = self.elementwise()?;
+        // Query rows per workgroup: the cm2 kernels tile Br=64 rows
+        // across 128 threads; the SIMT kernels take 128 rows.
+        let cm2 = if force_simt {
+            None
+        } else {
+            pipes.cm2_pipeline(cm2_kernel)
+        };
+        let (pipeline, rows_per_wg) = match cm2 {
+            Some(pipeline) => (pipeline, 64),
+            None => (pipes.pipeline(simt_kernel), 128),
+        };
         self.run_elementwise_2d(
-            self.elementwise()?.pipeline(kernel),
+            pipeline,
             &FlashPc {
                 t_q,
                 t_max,

@@ -1,5 +1,62 @@
 # Experiment branch log
 
+## Leg 14 — `experiment/cm2-flash` (NV_cooperative_matrix2 flash attention)
+
+Tensor-core flash-attention prefill via `GL_NV_cooperative_matrix2`
+(the predicted fix for the KHR-coopmat1 flash dead end: workgroup-scope
+matrices + `coopMatReduceNV`/`coopMatPerElementNV` keep the
+online-softmax M/L/O state matrix-resident, no shared-memory O round
+trip). Br=Bc=64 @ 128 threads, f16 operands / f32 accumulate,
+tensor-layout dims clamped to the valid KV extent so poisoned cache
+tails are never loaded; f32 KV decodes through a per-element callback.
+Kernels build only when the extension probe passes
+(`VulkanContext::coopmat2_enabled`, `ML_NO_COOPMAT2=1` kill-switch);
+`run_flash_attention` routes to them with the SIMT kernels as fallback
+and `run_flash_attention_simt` as the A/B hook.
+
+Enablement on RTX 3070 (driver 595.80): all 7 feature bits, max
+flexible dim 1024, reserved shmem 8192, flash config supported ->
+`enabled=true`.
+
+Kernel A/B (`examples/bench_flash_cm2`, same session, >=300 ms burn-in
+per case, SIMT/cm2 iterations interleaved, gpu-timestamp median of 50,
+µs):
+
+| case (H=32) | SIMT | cm2 | speedup |
+|---|---|---|---|
+| dh64 T512 kv_f32 | 458.8 | 81.8 | 5.61x |
+| dh64 T512 kv_f16 | 458.6 | 66.1 | 6.93x |
+| dh64 T2048 kv_f32 | 4153.2 | 735.4 | 5.65x |
+| dh64 T2048 kv_f16 | 4108.4 | 631.1 | 6.51x |
+| dh128 T512 kv_f32 | 888.8 | 147.2 | 6.04x |
+| dh128 T512 kv_f16 | 883.9 | 114.1 | 7.75x |
+
+The leg-2 reference case (dh64 T2048) drops 4.15 ms -> 0.74 ms, far
+past the 2.5 ms target; dh128 — where SIMT was register-bound and only
+reached parity with the composed path — now wins 6-7.8x.
+
+**End-to-end** (TinyLlama-1.1B f16, main@1ab581c vs branch, same
+session, interleaved main/branch, 6 pairs, `llama_ash bench --pp 512
+--tg 128`):
+
+| run | main pp512 | cm2 pp512 | main tg128 | cm2 tg128 |
+|---|---|---|---|---|
+| 1 | 7079 | 9573 | 165.2 | 167.6 |
+| 2 | 8220 | 8584 | 165.0 | 167.1 |
+| 3 | 8354 | 9581 | 161.3 | 168.6 |
+| 4 | 8144 | 8694 | 165.5 | 168.2 |
+| 5 | 7780 | 9404 | 164.5 | 167.8 |
+| 6 | 7528 | 9019 | 166.0 | 167.8 |
+| median | 7962 | **9211** | 165.1 | 167.8 |
+
+pp512 **+15.7%** (branch faster in 6/6 pairs; ~0.55x CUDA's 16.7k, up
+from 0.48x); tg128 +1.6% (decode uses the split-K path, so this is
+noise-level positive, not a flash effect). Greedy generation stays
+byte-identical (24/24 reference ids). Full GPU suite 106/106 (incl.
+the new cm2-vs-SIMT-vs-f64 A/B: dh64 T512/T2048, dh128 T512, f32+f16
+KV, GQA/warm-cache/ragged, poisoned tails — all within the provisional
+2e-2 f16-operand tolerance on first run, no fixes needed).
+
 ## Leg 13 — `experiment/gemv-vec-loads` (VCOLS packed-load row GEMVs)
 
 Parameterized `matmul_row_bda_kernel.glsl` with VCOLS (each lane owns
