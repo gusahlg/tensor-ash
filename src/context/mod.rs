@@ -62,6 +62,13 @@ pub struct VulkanContext {
     /// Vulkan memory model).  Required for the tensor-core `coopmat`
     /// kernels; `ML_NO_COOPMAT=1` forces it off.
     pub coopmat_enabled: bool,
+    /// Whether `VK_NV_cooperative_matrix2` was enabled with every
+    /// feature bit the cm2 flash kernels need (workgroup scope,
+    /// flexible dimensions, reductions, conversions, per-element ops,
+    /// tensor addressing, block loads) on a Vulkan 1.3+ device.
+    /// Requires [`Self::coopmat_enabled`]; `ML_NO_COOPMAT2=1` forces
+    /// it off.
+    pub coopmat2_enabled: bool,
     /// Pipeline cache, seeded from disk on init and flushed back on drop.
     /// Persisting it avoids the SPIR-V -> ISA recompile (50-200 ms on
     /// NVIDIA) on every cold start.

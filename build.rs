@@ -34,8 +34,16 @@ fn main() {
         let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
         let out = out_dir.join(format!("{stem}.spv"));
 
+        // NV_cooperative_matrix2 shaders need SPIR-V 1.6, which glslang
+        // only emits at vulkan1.3+; everything else stays at 1.2 (the
+        // same split llama.cpp's shader generator makes for `_cm2`).
+        let target_env = if stem.contains("_cm2") {
+            "--target-env=vulkan1.3"
+        } else {
+            "--target-env=vulkan1.2"
+        };
         let status = Command::new("glslc")
-            .args(["--target-env=vulkan1.2", "-O"])
+            .args([target_env, "-O"])
             .arg(&path)
             .arg("-o")
             .arg(&out)
