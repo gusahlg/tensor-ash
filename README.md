@@ -385,7 +385,7 @@ reports `llvmpipe`, results are software-renderer numbers; use
 
 ```
 src/
-  context/         Vulkan instance/device setup, BDA + atomic-float feature
+  context/         Vulkan instance/device setup, BDA/f16/coopmat feature
                    wiring, cache paths
   matmul.rs        Public facade over operation types and shape resolution
   matmul/          API types, checked shape/batch resolution, unit tests
