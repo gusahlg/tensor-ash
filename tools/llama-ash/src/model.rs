@@ -88,10 +88,13 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(ctx: &Arc<VulkanContext>, cfg: &Config, t: u32) -> Result<Self> {
+    /// `decode` selects the GQA-batched shapes and split-K partials;
+    /// it cannot be inferred from `t` — a 1-token *prefill* still needs
+    /// the `[heads, t, dh]` flash layout, not the decode aliases.
+    fn new(ctx: &Arc<VulkanContext>, cfg: &Config, t: u32, decode: bool) -> Result<Self> {
+        debug_assert!(!decode || t == 1, "decode scratch is single-token");
         let (h, f, kv) = (cfg.embd, cfg.ffn, cfg.kv_heads * cfg.dh);
         let dev = |shape: &[u32]| Tensor::uninit_device(ctx, shape);
-        let decode = t == 1;
         let q = dev(&[t, h])?;
         let attn_flat = dev(&[t, h])?;
         let (q_gqa, attn_gqa) = if decode {
@@ -446,7 +449,7 @@ impl Model {
         let rope_table = Tensor::uninit_device(ctx, &[t_max, dh / 2, 2])?;
         exec.upload(&table, &rope_table)?;
 
-        let decode_scratch = Scratch::new(ctx, &cfg, 1)?;
+        let decode_scratch = Scratch::new(ctx, &cfg, 1, true)?;
         let pos_buf = exec.create_pos_buffer()?;
         let token_buf = exec.create_host_u32_buffer()?;
         log::info!("model loaded in {:.2}s", start.elapsed().as_secs_f64());
@@ -613,7 +616,7 @@ impl Model {
         let pos_base = self.pos;
         ensure!(pos_base + t <= self.cfg.t_max, "KV cache overflow");
         if self.prefill_scratch.as_ref().is_none_or(|s| s.t != t) {
-            self.prefill_scratch = Some(Scratch::new(&self.ctx, &self.cfg, t)?);
+            self.prefill_scratch = Some(Scratch::new(&self.ctx, &self.cfg, t, false)?);
         }
         let host_x = self.embed(tokens)?;
         let s = self.prefill_scratch.take().unwrap();
