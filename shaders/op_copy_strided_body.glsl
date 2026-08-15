@@ -14,8 +14,12 @@
 // `pos_ptr != 0` it points at one u32 position `p` and the effective
 // dst_offset becomes `dst_offset + p * pos_scale`, so a recorded
 // KV-append dispatch replays correctly as the host bumps `p`.
+//
+// Storage variants (set by the .comp wrapper): SRC_F16 reads IEEE
+// half sources (widening exactly), DST_F16 narrows the destination
+// with RNE; the four wrappers cover every f32/f16 pairing.
 
-#ifdef DST_F16
+#if defined(DST_F16) || defined(SRC_F16)
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
 #extension GL_EXT_buffer_reference : require
@@ -32,6 +36,11 @@ layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32
 };
 #ifdef DST_F16
 layout(buffer_reference, std430, buffer_reference_align = 2) restrict buffer F16WriteOut {
+    float16_t v[];
+};
+#endif
+#ifdef SRC_F16
+layout(buffer_reference, std430, buffer_reference_align = 2) restrict readonly buffer F16ReadIn {
     float16_t v[];
 };
 #endif
@@ -74,10 +83,16 @@ void main() {
     const uint src = pc.src_offset + x * pc.src_stride_x + y * pc.src_stride_y + z * pc.src_stride_z;
     const uint dst = pc.dst_offset + p * pc.pos_scale
         + x * pc.dst_stride_x + y * pc.dst_stride_y + z * pc.dst_stride_z;
+#ifdef SRC_F16
+    F16ReadIn in16 = F16ReadIn(uint64_t(pc.src_ptr));
+    const float value = float(in16.v[src]);
+#else
+    const float value = pc.src_ptr.v[src];
+#endif
 #ifdef DST_F16
     F16WriteOut out16 = F16WriteOut(uint64_t(pc.dst_ptr));
-    out16.v[dst] = float16_t(pc.src_ptr.v[src]);
+    out16.v[dst] = float16_t(value);
 #else
-    pc.dst_ptr.v[dst] = pc.src_ptr.v[src];
+    pc.dst_ptr.v[dst] = value;
 #endif
 }
