@@ -547,3 +547,124 @@ fn flash_cm2_matches_simt_and_cpu() {
     };
     run_cm2_case("cm2 gqa warm ragged", &ragged, true);
 }
+
+/// f16 q/out (f16 activations) through the CM2 kv16 io16 kernel: the
+/// f32-q CM2 path on identical (pre-rounded) inputs is the reference —
+/// both kernels run the same f16-operand/f32-accumulate pipeline, so
+/// the io16 output must equal the f32 output narrowed through f16
+/// (compared with a whisker of tolerance for any scheduling-order
+/// difference between the two compiled pipelines).
+fn run_cm2_io16_case(label: &str, case: &FlashCase) {
+    let (ctx, exec) = make_setup(2, 8);
+    if !ctx.coopmat2_enabled || !ctx.f16_storage_enabled {
+        eprintln!("skipping: no NV_cooperative_matrix2 / f16 storage");
+        return;
+    }
+    let FlashCase {
+        heads,
+        kv_heads,
+        t_q,
+        t_max,
+        dh,
+        kv_len,
+        pos_base,
+    } = *case;
+    let mut host_q = vec![0.0_f32; (heads * t_q * dh) as usize];
+    fill_det(&mut host_q, 5400);
+    for value in &mut host_q {
+        *value = round_f32_via_f16(*value);
+    }
+    let q16 = Tensor::uninit_device_f16(&ctx, &[heads, t_q, dh]).unwrap();
+    let q32 = Tensor::uninit_device(&ctx, &[heads, t_q, dh]).unwrap();
+    exec.upload(&host_q, &q16).unwrap();
+    exec.upload(&host_q, &q32).unwrap();
+    let (host_kt, host_v) = fill_kv(case, Some(6.0e4));
+    let kt = Tensor::uninit_device_f16(&ctx, &[kv_heads, dh, t_max]).unwrap();
+    let v = Tensor::uninit_device_f16(&ctx, &[kv_heads, t_max, dh]).unwrap();
+    exec.upload(&host_kt, &kt).unwrap();
+    exec.upload(&host_v, &v).unwrap();
+
+    let desc = FlashAttentionDesc {
+        kv_len,
+        pos_base,
+        scale: 1.0 / (dh as f32).sqrt(),
+    };
+    let out16 = Tensor::uninit_device_f16(&ctx, &[heads, t_q, dh]).unwrap();
+    let out32 = Tensor::uninit_device(&ctx, &[heads, t_q, dh]).unwrap();
+    exec.run_flash_attention(&q16, &kt, &v, &out16, desc)
+        .unwrap();
+    exec.run_flash_attention(&q32, &kt, &v, &out32, desc)
+        .unwrap();
+    let mut gpu16 = vec![0.0; (heads * t_q * dh) as usize];
+    let mut gpu32 = vec![0.0; gpu16.len()];
+    exec.download(&out16, &mut gpu16).unwrap();
+    exec.download(&out32, &mut gpu32).unwrap();
+    // Attention outputs are convex combinations of f16 V rows, so
+    // |out| <= max|V| ~ 3; one f16 ulp there is ~2^-9.
+    assert_close_tol(&gpu16, &gpu32, 4.0e-3, label);
+}
+
+#[test]
+#[ignore]
+fn flash_cm2_io16_matches_f32_io_route() {
+    run_cm2_io16_case(
+        "cm2 io16 T512",
+        &FlashCase {
+            heads: 4,
+            kv_heads: 4,
+            t_q: 512,
+            t_max: 512,
+            dh: 64,
+            kv_len: 512,
+            pos_base: 0,
+        },
+    );
+    // GQA + warm cache + ragged t_q.
+    run_cm2_io16_case(
+        "cm2 io16 gqa warm ragged",
+        &FlashCase {
+            heads: 8,
+            kv_heads: 2,
+            t_q: 333,
+            t_max: 1024,
+            dh: 64,
+            kv_len: 200 + 333,
+            pos_base: 200,
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn flash_io16_invalid_combinations_are_rejected() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !ctx.coopmat2_enabled || !ctx.f16_storage_enabled {
+        eprintln!("skipping: no NV_cooperative_matrix2 / f16 storage");
+        return;
+    }
+    let (heads, t_q, t_max, dh) = (2_u32, 64_u32, 64_u32, 64_u32);
+    let q16 = Tensor::uninit_device_f16(&ctx, &[heads, t_q, dh]).unwrap();
+    let out16 = Tensor::uninit_device_f16(&ctx, &[heads, t_q, dh]).unwrap();
+    let out32 = Tensor::uninit_device(&ctx, &[heads, t_q, dh]).unwrap();
+    let kt32 = Tensor::uninit_device(&ctx, &[heads, dh, t_max]).unwrap();
+    let v32 = Tensor::uninit_device(&ctx, &[heads, t_max, dh]).unwrap();
+    let desc = FlashAttentionDesc {
+        kv_len: t_max,
+        pos_base: 0,
+        scale: 0.125,
+    };
+    // f16 q with f32 KV caches has no compiled kernel.
+    let err = exec
+        .run_flash_attention(&q16, &kt32, &v32, &out16, desc)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("f16 KV caches"), "unexpected: {err}");
+    // Mixed q/out storage is rejected.
+    let kt16 = Tensor::uninit_device_f16(&ctx, &[heads, dh, t_max]).unwrap();
+    let v16 = Tensor::uninit_device_f16(&ctx, &[heads, t_max, dh]).unwrap();
+    let err = exec
+        .run_flash_attention(&q16, &kt16, &v16, &out32, desc)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("share a storage type"), "unexpected: {err}");
+}

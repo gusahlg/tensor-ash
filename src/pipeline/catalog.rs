@@ -20,6 +20,13 @@ impl KernelSpec {
     pub fn weights_f16(&self) -> bool {
         self.name.starts_with("f16w_")
     }
+
+    /// Whether the shader reads A and writes C as f16 storage (the
+    /// `*_a16_*` f16-activations family).
+    #[inline]
+    pub fn a_f16(&self) -> bool {
+        self.name.contains("_a16_")
+    }
 }
 
 /// Defines kernel identity once and derives the public selection enum,
@@ -215,6 +222,14 @@ kernel_catalog! {
     F16wCoopmat => ("f16w_coopmat_aligned", 128, 128, 32,
         "matmul_f16w_coopmat_aligned.spv", false,
         ["f16w_coopmat_aligned", "f16w_coopmat", "coopmat"]),
+    // f16-activations sibling: A and C are f16 storage too (straight
+    // uvec4 A staging, RNE-narrowed C store; f32 accumulate).  The
+    // ONLY f16-A route — resolution enforces its tile alignment, so
+    // routing is a fixed pick rather than a heuristic.  Same gating
+    // as the plain coopmat kernel.
+    F16wA16Coopmat => ("f16w_a16_coopmat_aligned", 128, 128, 32,
+        "matmul_f16w_a16_coopmat_aligned.spv", false,
+        ["f16w_a16_coopmat_aligned", "f16w_a16_coopmat", "a16_coopmat"]),
 }
 
 #[cfg(test)]

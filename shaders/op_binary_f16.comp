@@ -1,0 +1,7 @@
+#version 460
+// Binary elementwise combine over f16-storage tensors: reads widen to
+// f32, the combine stays f32, the store narrows with RNE.
+
+#define IO_F16 1
+
+#include "op_binary_body.glsl"

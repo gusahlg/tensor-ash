@@ -555,3 +555,192 @@ fn binary_add_scaled_and_silu_mul_match_reference() {
         .collect();
     assert_close_tol(&gpu, &cpu, 1e-5, "silu_mul in-place");
 }
+
+/// Shared setup for the f16-IO variants: an f16 tensor and an f32
+/// tensor holding IDENTICAL values (the f32 copy pre-rounded through
+/// f16), so the f32-path result narrowed to f16 must be bit-equal to
+/// the f16-path result — both kernels run the same f32 arithmetic in
+/// the same deterministic order.
+fn upload_f16_and_f32_twin(
+    ctx: &std::sync::Arc<tensor_ash::VulkanContext>,
+    exec: &tensor_ash::Executor,
+    shape: &[u32],
+    seed: u64,
+) -> (Tensor, Tensor, Vec<f32>) {
+    use tensor_ash::dtype::round_f32_via_f16;
+    let mut host = vec![0.0_f32; Tensor::numel(shape) as usize];
+    fill_det(&mut host, seed);
+    for value in &mut host {
+        *value = round_f32_via_f16(*value);
+    }
+    let t16 = Tensor::uninit_device_f16(ctx, shape).unwrap();
+    let t32 = Tensor::uninit_device(ctx, shape).unwrap();
+    exec.upload(&host, &t16).unwrap();
+    exec.upload(&host, &t32).unwrap();
+    (t16, t32, host)
+}
+
+/// Bit-exact comparison of an f16-path result against the f32-path
+/// result narrowed through f16.
+fn assert_matches_narrowed(gpu16: &[f32], gpu32: &[f32], label: &str) {
+    use tensor_ash::dtype::round_f32_via_f16;
+    for (index, (&got, &full)) in gpu16.iter().zip(gpu32).enumerate() {
+        let expect = round_f32_via_f16(full);
+        assert_eq!(
+            got.to_bits(),
+            expect.to_bits(),
+            "{label}: element {index}: f16 path {got}, narrowed f32 path {expect}"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn rms_norm_f16_io_matches_narrowed_f32_path() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !ops_available(&ctx) || !ctx.f16_storage_enabled {
+        eprintln!("skipping: no BDA/f16 support");
+        return;
+    }
+    let (rows, cols) = (7_u32, 2048_u32);
+    let (in16, in32, _) = upload_f16_and_f32_twin(&ctx, &exec, &[rows, cols], 6100);
+    let (weight, _) = upload_det(&ctx, &exec, &[cols], 6101);
+    let out16 = Tensor::uninit_device_f16(&ctx, &[rows, cols]).unwrap();
+    let out32 = Tensor::uninit_device(&ctx, &[rows, cols]).unwrap();
+    exec.run_rms_norm(&in16, &weight, &out16, 1e-5).unwrap();
+    exec.run_rms_norm(&in32, &weight, &out32, 1e-5).unwrap();
+    let mut gpu16 = vec![0.0; (rows * cols) as usize];
+    let mut gpu32 = vec![0.0; gpu16.len()];
+    exec.download(&out16, &mut gpu16).unwrap();
+    exec.download(&out32, &mut gpu32).unwrap();
+    assert_matches_narrowed(&gpu16, &gpu32, "rmsnorm f16");
+
+    // Mixed f16 input / f32 output is rejected.
+    let err = exec
+        .run_rms_norm(&in16, &weight, &out32, 1e-5)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("share a storage type"), "unexpected: {err}");
+}
+
+#[test]
+#[ignore]
+fn rope_f16_io_matches_narrowed_f32_path() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !ops_available(&ctx) || !ctx.f16_storage_enabled {
+        eprintln!("skipping: no BDA/f16 support");
+        return;
+    }
+    let (tokens, heads, dh) = (12_u32, 4_u32, 64_u32);
+    let t_max = 64_u32;
+    let (in16, in32, _) = upload_f16_and_f32_twin(&ctx, &exec, &[tokens, heads * dh], 6200);
+    // Real cos/sin table (f32 both paths).
+    let half = (dh / 2) as usize;
+    let mut table_host = vec![0.0_f32; t_max as usize * half * 2];
+    for pos in 0..t_max as usize {
+        for pair in 0..half {
+            let theta = pos as f64 / 10000_f64.powf(2.0 * pair as f64 / dh as f64);
+            table_host[(pos * half + pair) * 2] = theta.cos() as f32;
+            table_host[(pos * half + pair) * 2 + 1] = theta.sin() as f32;
+        }
+    }
+    let table = Tensor::uninit_device(&ctx, &[t_max, dh / 2, 2]).unwrap();
+    exec.upload(&table_host, &table).unwrap();
+    let desc = RopeDesc {
+        heads,
+        head_dim: dh,
+        rot_dim: dh,
+        pos_base: 3,
+        ..Default::default()
+    };
+    // In-place on both (the prefill usage).
+    exec.run_rope(&in16, &table, &in16, desc).unwrap();
+    exec.run_rope(&in32, &table, &in32, desc).unwrap();
+    let mut gpu16 = vec![0.0; (tokens * heads * dh) as usize];
+    let mut gpu32 = vec![0.0; gpu16.len()];
+    exec.download(&in16, &mut gpu16).unwrap();
+    exec.download(&in32, &mut gpu32).unwrap();
+    assert_matches_narrowed(&gpu16, &gpu32, "rope f16");
+}
+
+#[test]
+#[ignore]
+fn binary_f16_io_matches_narrowed_f32_path() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !ops_available(&ctx) || !ctx.f16_storage_enabled {
+        eprintln!("skipping: no BDA/f16 support");
+        return;
+    }
+    let n = 4099_u32;
+    let (a16, a32, _) = upload_f16_and_f32_twin(&ctx, &exec, &[n], 6300);
+    let (b16, b32, _) = upload_f16_and_f32_twin(&ctx, &exec, &[n], 6301);
+    for op in [BinaryOp::AddScaled { beta: 0.5 }, BinaryOp::SiluMul] {
+        let out16 = Tensor::uninit_device_f16(&ctx, &[n]).unwrap();
+        let out32 = Tensor::uninit_device(&ctx, &[n]).unwrap();
+        exec.run_binary(&a16, &b16, &out16, op).unwrap();
+        exec.run_binary(&a32, &b32, &out32, op).unwrap();
+        let mut gpu16 = vec![0.0; n as usize];
+        let mut gpu32 = vec![0.0; n as usize];
+        exec.download(&out16, &mut gpu16).unwrap();
+        exec.download(&out32, &mut gpu32).unwrap();
+        assert_matches_narrowed(&gpu16, &gpu32, &format!("binary f16 {op:?}"));
+    }
+    // Mixed storage is rejected.
+    let out16 = Tensor::uninit_device_f16(&ctx, &[n]).unwrap();
+    let err = exec
+        .run_binary(&a16, &b32, &out16, BinaryOp::SiluMul)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("must match a"), "unexpected: {err}");
+}
+
+#[test]
+#[ignore]
+fn copy_strided_f16_pairings_roundtrip() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !ops_available(&ctx) || !ctx.f16_storage_enabled {
+        eprintln!("skipping: no BDA/f16 support");
+        return;
+    }
+    let (rows, cols) = (24_u32, 96_u32);
+    let (src16, _, host) = upload_f16_and_f32_twin(&ctx, &exec, &[rows, cols], 6400);
+    // f16 -> f16 transpose, then f16 -> f32 transpose back: the double
+    // permute must reproduce the (pre-rounded) source exactly.
+    let mid16 = Tensor::uninit_device_f16(&ctx, &[cols, rows]).unwrap();
+    exec.run_copy_strided(
+        &src16,
+        &mid16,
+        CopyDesc {
+            extent: [cols, rows, 1],
+            src_offset: 0,
+            src_strides: [1, cols, 0],
+            dst_offset: 0,
+            dst_strides: [rows, 1, 0],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let back32 = Tensor::uninit_device(&ctx, &[rows, cols]).unwrap();
+    exec.run_copy_strided(
+        &mid16,
+        &back32,
+        CopyDesc {
+            extent: [rows, cols, 1],
+            src_offset: 0,
+            src_strides: [1, rows, 0],
+            dst_offset: 0,
+            dst_strides: [cols, 1, 0],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut gpu = vec![0.0; (rows * cols) as usize];
+    exec.download(&back32, &mut gpu).unwrap();
+    for (index, (&got, &sent)) in gpu.iter().zip(&host).enumerate() {
+        assert_eq!(
+            got.to_bits(),
+            sent.to_bits(),
+            "copy roundtrip element {index}: got {got}, sent {sent}"
+        );
+    }
+}

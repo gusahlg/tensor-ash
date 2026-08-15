@@ -88,6 +88,10 @@ pub(crate) struct ResolvedMatmul {
     pub total_flops: u64,
     /// B is stored as f16; routes must pick an `f16w_*` kernel.
     pub b_f16: bool,
+    /// A and C are stored as f16 (f16 activations); the only route is
+    /// the strictly-aligned `*_a16_*` coopmat kernel, so resolution
+    /// also enforces its tile alignment and f16 B.
+    pub a_f16: bool,
 }
 
 pub(crate) enum ResolvedMatmulBatch {
@@ -116,15 +120,25 @@ impl ResolvedMatmulBatch {
 
 impl ResolvedMatmul {
     pub(crate) fn from_call(call: &MatmulCall<'_>) -> Result<Self> {
-        // Storage types: A and C must be f32; B may be f16 (weights).
-        // The f16 kernels convert B on load and accumulate in f32.
-        if call.a.dtype() != DType::F32 {
-            bail!(
-                "matmul A must be f32 storage (got {})",
-                call.a.dtype().name()
-            );
-        }
-        if call.c.dtype() != DType::F32 {
+        // Storage types: B may be f16 (weights); A/C are f32 by
+        // default, or BOTH f16 (f16 activations — the tensor-core
+        // a16 route, which also requires f16 B).  All kernels
+        // accumulate in f32 regardless of storage.
+        let a_f16 = call.a.dtype() == DType::F16;
+        if a_f16 {
+            if call.b.dtype() != DType::F16 {
+                bail!(
+                    "matmul with f16 A storage requires f16 B (got {})",
+                    call.b.dtype().name()
+                );
+            }
+            if call.c.dtype() != DType::F16 {
+                bail!(
+                    "matmul with f16 A storage requires f16 C (got {})",
+                    call.c.dtype().name()
+                );
+            }
+        } else if call.c.dtype() != DType::F32 {
             bail!(
                 "matmul C must be f32 storage (got {})",
                 call.c.dtype().name()
@@ -136,11 +150,36 @@ impl ResolvedMatmul {
             MatrixShape::from_tensor(call.c)?,
         )?;
         resolved.b_f16 = call.b.dtype() == DType::F16;
+        resolved.a_f16 = a_f16;
+        if a_f16
+            && (!resolved.m.is_multiple_of(128)
+                || !resolved.n.is_multiple_of(128)
+                || !resolved.k.is_multiple_of(32))
+        {
+            bail!(
+                "matmul with f16 A storage routes to the aligned coopmat kernel only: \
+                 M/N/K must be multiples of (128, 128, 32), got ({}, {}, {})",
+                resolved.m,
+                resolved.n,
+                resolved.k
+            );
+        }
         Ok(resolved)
     }
 
     pub(crate) fn from_op(op: &MatmulOp<'_>) -> Result<Self> {
         let resolved = Self::from_call(&op.call)?;
+        // The a16 coopmat kernel is the ONLY f16-A route and has no
+        // fused-epilogue / normed-A / store specializations; callers
+        // apply combines as standalone elementwise passes instead.
+        if resolved.a_f16
+            && (!op.epilogue.is_none() || op.normed_a.is_some() || !op.store.is_none())
+        {
+            bail!(
+                "matmul with f16 A storage cannot fuse epilogues, normed-A, or store ops \
+                 (the coopmat route has no fused specializations)"
+            );
+        }
         resolved.validate_epilogue(op)?;
         resolved.validate_normed_a(op)?;
         resolved.validate_store(op)?;
@@ -201,7 +240,9 @@ impl ResolvedMatmul {
             bail!("fused store epilogue cannot combine with a fused epilogue");
         }
         let desc = op.store.desc();
-        if desc.head_dim == 0 || !desc.head_dim.is_multiple_of(2) || !self.n.is_multiple_of(desc.head_dim)
+        if desc.head_dim == 0
+            || !desc.head_dim.is_multiple_of(2)
+            || !self.n.is_multiple_of(desc.head_dim)
         {
             bail!(
                 "store head_dim {} must be even and divide N = {}",
@@ -369,6 +410,7 @@ impl ResolvedMatmul {
             batch_stride_c: c.batch_stride("C")?,
             total_flops: checked_flops(c.batch, a.rows, b.cols, a.cols)?,
             b_f16: false,
+            a_f16: false,
         })
     }
 }

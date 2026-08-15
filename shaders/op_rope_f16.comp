@@ -1,0 +1,10 @@
+#version 460
+// Rotary position embedding over f16-storage [T, H, dh] activations,
+// output mirroring the input layout: reads widen to f32, the rotation
+// runs in f32 against the f32 cos/sin table, stores narrow with RNE.
+
+#extension GL_GOOGLE_include_directive : require
+
+#define IO_F16 1
+
+#include "op_rope_body.glsl"

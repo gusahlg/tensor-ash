@@ -18,6 +18,9 @@
 //     Kt-cache layout.  Input and destination must not overlap.
 //     DST_F16 (ROPE_SCATTER only): destination stores IEEE half (RNE
 //     via the float16_t conversion), for f16 KV caches.
+//     IO_F16 (mirror layout only): input and output are stored as
+//     IEEE half (f16 activations); reads widen to f32, the rotation
+//     stays f32 (f32 cos/sin table), and stores narrow with RNE.
 //
 // Position indirection (replayable command buffers): when
 // `pos_ptr != 0` it points at one u32 position `p`; the effective
@@ -25,7 +28,10 @@
 // dst_offset becomes `pc.dst_offset + p * pc.pos_scale`, so a recorded
 // dispatch replays correctly as the host bumps `p` between tokens.
 
-#ifdef DST_F16
+#if defined(IO_F16) && defined(ROPE_SCATTER)
+#error "IO_F16 is implemented for the mirror-layout rope only"
+#endif
+#if defined(DST_F16) || defined(IO_F16)
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
 #extension GL_EXT_buffer_reference : require
@@ -44,6 +50,19 @@ layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32
 layout(buffer_reference, std430, buffer_reference_align = 2) restrict buffer F16WriteOut {
     float16_t v[];
 };
+#endif
+#ifdef IO_F16
+layout(buffer_reference, std430, buffer_reference_align = 2) restrict readonly buffer F16ReadOnly {
+    float16_t v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 2) restrict buffer F16ReadWrite {
+    float16_t v[];
+};
+#define IO_READER F16ReadOnly
+#define IO_WRITER F16ReadWrite
+#else
+#define IO_READER F32ReadOnly
+#define IO_WRITER F32ReadWrite
 #endif
 layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer U32ReadOnly {
     uint v[];
@@ -83,8 +102,8 @@ layout(push_constant) uniform PC {
     uint rot_dim;   // even, <= head_dim
     uint pos_base;  // absolute position of token 0 (decode step offset)
     uint _pad;
-    F32ReadOnly in_ptr;
-    F32ReadWrite out_ptr;
+    IO_READER in_ptr;
+    IO_WRITER out_ptr;
     F32ReadOnly table_ptr; // [T_max, rot_dim/2, 2] = (cos, sin) pairs
     U32ReadOnly pos_ptr;   // optional indirect position (0 = unused)
 } pc;
@@ -104,8 +123,8 @@ void main() {
 
     const uint vec_base = (token * pc.heads + head) * pc.head_dim;
     const uint i0 = vec_base + pair * 2u;
-    const float x0 = pc.in_ptr.v[i0];
-    const float x1 = pc.in_ptr.v[i0 + 1u];
+    const float x0 = float(pc.in_ptr.v[i0]);
+    const float x1 = float(pc.in_ptr.v[i0 + 1u]);
 
     const uint angle = ((pc.pos_base + p + token) * half_rot + pair) * 2u;
     const float c = pc.table_ptr.v[angle];
@@ -120,6 +139,9 @@ void main() {
     const uint d0 = dst_base + (pair * 2u) * pc.dst_stride_dim;
     store_dst(d0, r0);
     store_dst(d0 + pc.dst_stride_dim, r1);
+#elif defined(IO_F16)
+    pc.out_ptr.v[i0] = float16_t(r0);
+    pc.out_ptr.v[i0 + 1u] = float16_t(r1);
 #else
     pc.out_ptr.v[i0] = r0;
     pc.out_ptr.v[i0 + 1u] = r1;

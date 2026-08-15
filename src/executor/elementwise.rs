@@ -52,12 +52,17 @@ op_kernels! { Op / KERNELS:
     Softmax => ("op_softmax_f32_row", &[], "op softmax"),
     RmsNorm => ("op_rmsnorm_f32", &[0], "op rmsnorm"),
     LayerNorm => ("op_rmsnorm_f32", &[1], "op layernorm"),
+    RmsNormF16 => ("op_rmsnorm_f16", &[0], "op rmsnorm f16"),
     Rope => ("op_rope_f32", &[], "op rope"),
+    RopeF16 => ("op_rope_f16", &[], "op rope f16"),
     RopeScatter => ("op_rope_scatter_f32", &[], "op rope_scatter"),
     RopeScatterToF16 => ("op_rope_scatter_f32_to_f16", &[], "op rope_scatter f32->f16"),
     Copy => ("op_copy_strided_f32", &[], "op copy_strided"),
     Binary => ("op_binary_f32", &[], "op binary"),
+    BinaryF16 => ("op_binary_f16", &[], "op binary f16"),
     CopyToF16 => ("op_copy_strided_f32_to_f16", &[], "op copy_strided f32->f16"),
+    CopyF16 => ("op_copy_strided_f16", &[], "op copy_strided f16->f16"),
+    CopyF16ToF32 => ("op_copy_strided_f16_to_f32", &[], "op copy_strided f16->f32"),
     FlashDh64 => ("op_flash_attention_dh64", &[], "op flash_attention dh64"),
     FlashDh128 => ("op_flash_attention_dh128", &[], "op flash_attention dh128"),
     FlashKv16Dh64 => ("op_flash_attention_kv16_dh64", &[], "op flash_attention kv16 dh64"),
@@ -79,6 +84,8 @@ op_kernels! { Cm2Op / CM2_KERNELS:
     FlashDh128 => ("attention_flash_cm2_dh128", &[], "op flash_attention cm2 dh128"),
     FlashKv16Dh64 => ("attention_flash_cm2_kv16_dh64", &[], "op flash_attention cm2 kv16 dh64"),
     FlashKv16Dh128 => ("attention_flash_cm2_kv16_dh128", &[], "op flash_attention cm2 kv16 dh128"),
+    FlashKv16Io16Dh64 => ("attention_flash_cm2_kv16_io16_dh64", &[],
+        "op flash_attention cm2 kv16 io16 dh64"),
 }
 
 /// Threads per workgroup in every op shader.
@@ -500,6 +507,23 @@ impl Executor {
         Ok(())
     }
 
+    /// Shared f16-capable IO check: `input` and `output` (validated
+    /// against this context) must share a storage type; returns `true`
+    /// when both are f16.  For the ops with an IO_F16 kernel sibling —
+    /// mixed pairs must go through the strided-copy converters.
+    fn io_dtype_f16(&self, op: &str, input: &Tensor, output: &Tensor) -> Result<bool> {
+        self.validate_tensor_context(input, "input")?;
+        self.validate_tensor_context(output, "output")?;
+        if input.dtype() != output.dtype() {
+            bail!(
+                "{op}: input ({}) and output ({}) must share a storage type",
+                input.dtype().name(),
+                output.dtype().name()
+            );
+        }
+        Ok(input.dtype() == DType::F16)
+    }
+
     /// Shared in-place-capable shape check: `output` must match `input`.
     fn ensure_same_shape(op: &str, input: &Tensor, output: &Tensor) -> Result<()> {
         if input.shape() != output.shape() {
@@ -678,11 +702,15 @@ impl Executor {
         output: &Tensor,
         eps: f32,
     ) -> Result<ElementwiseDispatch> {
-        self.ensure_f32(input, op, "input")?;
+        // Activations may be f16 (RMSNorm only); the weight (and
+        // LayerNorm bias) stay f32 in every variant.
+        let io_f16 = self.io_dtype_f16(op, input, output)?;
         self.ensure_f32(weight, op, "weight")?;
-        self.ensure_f32(output, op, "output")?;
         if let Some(bias) = bias {
             self.ensure_f32(bias, op, "bias")?;
+        }
+        if io_f16 && bias.is_some() {
+            bail!("{op}: f16 activations are supported for RMSNorm only (no f16 LayerNorm kernel)");
         }
         Self::ensure_same_shape(op, input, output)?;
         let (rows, cols) = rows_cols(input, op)?;
@@ -694,10 +722,10 @@ impl Executor {
         {
             bail!("{op}: bias length {} != row length {cols}", bias.len());
         }
-        let kernel = if bias.is_some() {
-            Op::LayerNorm
-        } else {
-            Op::RmsNorm
+        let kernel = match (bias.is_some(), io_f16) {
+            (true, _) => Op::LayerNorm,
+            (false, false) => Op::RmsNorm,
+            (false, true) => Op::RmsNormF16,
         };
         self.plan_elementwise(
             self.elementwise()?.pipeline(kernel),
@@ -772,13 +800,15 @@ impl Executor {
         output: &Tensor,
         desc: RopeDesc,
     ) -> Result<ElementwiseDispatch> {
-        self.ensure_f32(input, "run_rope", "input")?;
+        // f16 activations rotate through the IO_F16 variant (f32
+        // math, RNE store); the cos/sin table stays f32 either way.
+        let io_f16 = self.io_dtype_f16("run_rope", input, output)?;
         self.ensure_f32(table, "run_rope", "table")?;
-        self.ensure_f32(output, "run_rope", "output")?;
         Self::ensure_same_shape("run_rope", input, output)?;
         let tokens = Self::rope_tokens("run_rope", input, table, desc)?;
         let pairs = tokens * desc.heads * (desc.rot_dim / 2);
-        let pipeline = self.elementwise()?.pipeline(Op::Rope);
+        let kernel = if io_f16 { Op::RopeF16 } else { Op::Rope };
+        let pipeline = self.elementwise()?.pipeline(kernel);
         self.plan_elementwise(
             pipeline,
             &RopePc {
@@ -933,10 +963,11 @@ impl Executor {
         desc: FlashAttentionDesc,
         force_simt: bool,
     ) -> Result<ElementwiseDispatch> {
-        self.ensure_f32(q, "run_flash_attention", "q")?;
+        // q/out may both be f16 (f16 activations): the CM2 kv16 io16
+        // kernel loads halves directly and narrows the output store.
+        let io_f16 = self.io_dtype_f16("run_flash_attention", q, out)?;
         self.validate_tensor_context(kt, "kt")?;
         self.validate_tensor_context(v, "v")?;
-        self.ensure_f32(out, "run_flash_attention", "out")?;
         if kt.dtype() != v.dtype() {
             bail!(
                 "run_flash_attention: kt ({}) and v ({}) must share a storage type",
@@ -987,26 +1018,46 @@ impl Executor {
                 desc.kv_len
             );
         }
-        let (simt_kernel, cm2_kernel) = match (dh, kv_f16) {
-            (64, false) => (Op::FlashDh64, Cm2Op::FlashDh64),
-            (128, false) => (Op::FlashDh128, Cm2Op::FlashDh128),
-            (64, true) => (Op::FlashKv16Dh64, Cm2Op::FlashKv16Dh64),
-            (128, true) => (Op::FlashKv16Dh128, Cm2Op::FlashKv16Dh128),
-            (other, _) => bail!(
-                "run_flash_attention: head dimension {other} unsupported (compiled variants: 64, 128)"
-            ),
-        };
         let pipes = self.elementwise()?;
         // Query rows per workgroup: the cm2 kernels tile Br=64 rows
         // across 128 threads; the SIMT kernels take 128 rows.
-        let cm2 = if force_simt {
-            None
+        let (pipeline, rows_per_wg) = if io_f16 {
+            // No SIMT sibling reads f16 q — the compiled variant is
+            // the CM2 kv16 io16 dh64 kernel only.
+            if kv_f16 && dh == 64 && !force_simt {
+                match pipes.cm2_pipeline(Cm2Op::FlashKv16Io16Dh64) {
+                    Some(pipeline) => (pipeline, 64),
+                    None => bail!(
+                        "run_flash_attention: f16 q/out require NV_cooperative_matrix2 \
+                         support, which this device lacks"
+                    ),
+                }
+            } else {
+                bail!(
+                    "run_flash_attention: f16 q/out are compiled for f16 KV caches with \
+                     head dimension 64 on the CM2 route only (kv {}, dh {dh})",
+                    kt.dtype().name()
+                )
+            }
         } else {
-            pipes.cm2_pipeline(cm2_kernel)
-        };
-        let (pipeline, rows_per_wg) = match cm2 {
-            Some(pipeline) => (pipeline, 64),
-            None => (pipes.pipeline(simt_kernel), 128),
+            let (simt_kernel, cm2_kernel) = match (dh, kv_f16) {
+                (64, false) => (Op::FlashDh64, Cm2Op::FlashDh64),
+                (128, false) => (Op::FlashDh128, Cm2Op::FlashDh128),
+                (64, true) => (Op::FlashKv16Dh64, Cm2Op::FlashKv16Dh64),
+                (128, true) => (Op::FlashKv16Dh128, Cm2Op::FlashKv16Dh128),
+                (other, _) => bail!(
+                    "run_flash_attention: head dimension {other} unsupported (compiled variants: 64, 128)"
+                ),
+            };
+            let cm2 = if force_simt {
+                None
+            } else {
+                pipes.cm2_pipeline(cm2_kernel)
+            };
+            match cm2 {
+                Some(pipeline) => (pipeline, 64),
+                None => (pipes.pipeline(simt_kernel), 128),
+            }
         };
         self.plan_elementwise(
             pipeline,
@@ -1219,9 +1270,17 @@ impl Executor {
         out: &Tensor,
         op: BinaryOp,
     ) -> Result<ElementwiseDispatch> {
-        self.ensure_f32(a, "run_binary", "a")?;
-        self.ensure_f32(b, "run_binary", "b")?;
-        self.ensure_f32(out, "run_binary", "out")?;
+        // All three operands share a storage type; f16 combines run
+        // through the IO_F16 variant (f32 math, RNE store).
+        let io_f16 = self.io_dtype_f16("run_binary", a, out)?;
+        self.validate_tensor_context(b, "b")?;
+        if b.dtype() != a.dtype() {
+            bail!(
+                "run_binary: b ({}) must match a ({}) storage",
+                b.dtype().name(),
+                a.dtype().name()
+            );
+        }
         if a.len() != b.len() || a.len() != out.len() {
             bail!(
                 "run_binary: element counts differ (a {}, b {}, out {})",
@@ -1235,7 +1294,8 @@ impl Executor {
             BinaryOp::AddScaled { beta } => (0, beta),
             BinaryOp::SiluMul => (1, 0.0),
         };
-        let pipeline = self.elementwise()?.pipeline(Op::Binary);
+        let kernel = if io_f16 { Op::BinaryF16 } else { Op::Binary };
+        let pipeline = self.elementwise()?.pipeline(kernel);
         self.plan_elementwise(
             pipeline,
             &BinaryPc {
@@ -1267,10 +1327,11 @@ impl Executor {
         dst: &Tensor,
         desc: CopyDesc,
     ) -> Result<ElementwiseDispatch> {
-        self.ensure_f32(src, "run_copy_strided", "src")?;
+        self.validate_tensor_context(src, "src")?;
         self.validate_tensor_context(dst, "dst")?;
-        // f16 destinations narrow through a dedicated variant; strides
-        // and offsets are in elements either way.
+        // Four storage pairings, one variant each: f16 destinations
+        // narrow (RNE), f16 sources widen (exactly); strides and
+        // offsets are in elements either way.
         if src.raw_buffer() == dst.raw_buffer() {
             bail!("run_copy_strided: src and dst must be different tensors");
         }
@@ -1303,10 +1364,14 @@ impl Executor {
         }
         let total = u32::try_from(extent_product)
             .map_err(|_| anyhow::anyhow!("run_copy_strided: extent product exceeds u32"))?;
-        let pipeline = self.elementwise()?.pipeline(match dst.dtype() {
-            DType::F32 => Op::Copy,
-            DType::F16 => Op::CopyToF16,
-        });
+        let pipeline = self
+            .elementwise()?
+            .pipeline(match (src.dtype(), dst.dtype()) {
+                (DType::F32, DType::F32) => Op::Copy,
+                (DType::F32, DType::F16) => Op::CopyToF16,
+                (DType::F16, DType::F16) => Op::CopyF16,
+                (DType::F16, DType::F32) => Op::CopyF16ToF32,
+            });
         self.plan_elementwise(
             pipeline,
             &CopyPc {

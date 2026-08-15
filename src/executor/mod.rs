@@ -207,6 +207,41 @@ impl Executor {
         OpPlan { kernel, splitk2 }
     }
 
+    /// Resolve the complete route for one resolved matmul, including
+    /// the f16-activations short-circuit: f16-A ops have exactly one
+    /// kernel (the aligned a16 coopmat), so they bypass tuning, the
+    /// shape heuristic, and split-K entirely — but only on devices
+    /// with the cooperative-matrix + f16-storage features that kernel
+    /// needs.
+    pub(super) fn plan_matmul(
+        &self,
+        dims: &crate::matmul::ResolvedMatmul,
+        splitk2_eligible: bool,
+    ) -> anyhow::Result<OpPlan> {
+        if dims.a_f16 {
+            if !(self.ctx.coopmat_enabled && self.ctx.f16_storage_enabled) {
+                anyhow::bail!(
+                    "matmul with f16 A storage requires cooperative-matrix and f16-storage \
+                     support, which this device lacks"
+                );
+            }
+            return Ok(OpPlan {
+                kernel: crate::pipeline::KernelSelection::F16wA16Coopmat
+                    .index()
+                    .expect("a16 coopmat selection is concrete"),
+                splitk2: None,
+            });
+        }
+        Ok(self.plan_shape(
+            dims.batch,
+            dims.m,
+            dims.n,
+            dims.k,
+            dims.b_f16,
+            splitk2_eligible,
+        ))
+    }
+
     /// Reroute an op whose planned kernel cannot honor its fusions:
     /// fused-epilogue ops off kernels without the epilogue constants
     /// (heuristic coopmat, or a tuned winner measured for the plain

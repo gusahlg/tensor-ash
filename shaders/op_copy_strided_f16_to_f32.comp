@@ -1,0 +1,8 @@
+#version 460
+// Strided copy with f16 sources widening (exactly) to an f32
+// destination — e.g. the last-row extraction that hands f16 layer
+// activations to the f32 LM-head tail.
+
+#define SRC_F16 1
+
+#include "op_copy_strided_body.glsl"

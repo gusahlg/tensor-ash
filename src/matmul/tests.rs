@@ -15,6 +15,7 @@ fn resolves_rank2_matmul() {
             batch_stride_c: 0,
             total_flops: 48,
             b_f16: false,
+            a_f16: false,
         }
     );
 }

@@ -1,0 +1,8 @@
+#version 460
+// Row normalization over f16-storage activations: reads widen to f32,
+// the reductions and normalization stay f32, the store narrows with
+// RNE.  Weight (and LayerNorm bias) remain f32.
+
+#define IO_F16 1
+
+#include "op_rmsnorm_body.glsl"

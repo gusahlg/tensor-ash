@@ -49,6 +49,14 @@ impl MatmulKernel {
         self.name.starts_with("f16w_")
     }
 
+    /// Whether the shader reads A and writes C as f16 storage (the
+    /// `*_a16_*` f16-activations family).  Same dispatch-agreement
+    /// contract as [`Self::weights_f16`].
+    #[inline]
+    pub fn a_f16(&self) -> bool {
+        self.name.contains("_a16_")
+    }
+
     /// Whether this kernel's shader body implements the fused normed-A
     /// GEMV (`flags` bit 1: RMSNorm of the A row folded before the
     /// product).  True for the row-GEMV family only.

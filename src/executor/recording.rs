@@ -119,6 +119,15 @@ pub(super) fn record_one_matmul(
             if dims.b_f16 { "f16w_*" } else { "f32" },
         );
     }
+    if kernel.a_f16() != dims.a_f16 {
+        bail!(
+            "kernel '{}' expects {} A/C storage but A is {} (pick an *_a16_* kernel or \
+             unset ML_KERNEL)",
+            kernel.name,
+            if kernel.a_f16() { "f16" } else { "f32" },
+            if dims.a_f16 { "f16" } else { "f32" },
+        );
+    }
     if dims.b_f16 && !ctx.buffer_device_address_enabled {
         bail!("f16-weight matmuls require bufferDeviceAddress, which this device lacks");
     }

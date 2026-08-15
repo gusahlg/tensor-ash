@@ -106,10 +106,10 @@ impl Executor {
             .iter()
             .zip(resolved.iter())
             .map(|(op, dims)| {
-                let plan = self.plan_shape(dims.batch, dims.m, dims.n, dims.k, dims.b_f16, false);
-                self.demote_for_op(op, dims, plan)
+                let plan = self.plan_matmul(dims, false)?;
+                Ok(self.demote_for_op(op, dims, plan))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         if let Some(plan) = plans
             .iter()
             .find(|plan| self.pipeline.kernel_at(plan.kernel).uses_descriptors)

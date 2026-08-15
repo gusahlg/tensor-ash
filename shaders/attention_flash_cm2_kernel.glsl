@@ -27,8 +27,12 @@
 // can never produce NaN (llama.cpp's precaution).
 //
 // Compile-time inputs (set by the .comp wrapper): DH (head dimension,
-// multiple of 16) and optionally KV_F16 (f16 K/V caches: direct
-// tensor loads instead of the f32 decode callback).  Requires
+// multiple of 16), optionally KV_F16 (f16 K/V caches: direct tensor
+// loads instead of the f32 decode callback), and optionally IO_F16
+// (f16 q and out — f16 activations: q loads as halves and converts to
+// f32 before the scale, out narrows the f32 O accumulator with RNE at
+// store time; every intermediate stays exactly as in the f32-IO
+// variant).  Requires
 // --target-env=vulkan1.3 (SPIR-V 1.6) and the
 // VK_NV_cooperative_matrix2 device features.
 
@@ -52,6 +56,19 @@ layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly 
 layout(buffer_reference, std430, buffer_reference_align = 16) restrict buffer F32ReadWrite {
     float v[];
 };
+#ifdef IO_F16
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer F16IoReadOnly {
+    float16_t v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict buffer F16IoReadWrite {
+    float16_t v[];
+};
+#define IO_READER F16IoReadOnly
+#define IO_WRITER F16IoReadWrite
+#else
+#define IO_READER F32ReadOnly
+#define IO_WRITER F32ReadWrite
+#endif
 #ifdef KV_F16
 layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer F16ReadOnly {
     float16_t v[];
@@ -77,10 +94,10 @@ layout(push_constant) uniform PC {
     float scale;
     uint _pad0;
     uint _pad1;
-    F32ReadOnly q_ptr;
+    IO_READER q_ptr;
     KV_READER kt_ptr;
     KV_READER v_ptr;
-    F32ReadWrite out_ptr;
+    IO_WRITER out_ptr;
 } pc;
 
 // -FLT_MAX/2: large enough to never win a row max, finite enough that
@@ -153,11 +170,21 @@ void main() {
     tlV = setTensorLayoutStrideNV(tlV, DH, 1);
     tlV = setTensorLayoutClampValueNV(tlV, 0u);
 
-    // Q: load f32, scale, convert to the f16 A operand (post-scale
-    // logits are safely in f16 range).
+    // Q: load (f16 storage widens to f32 first), scale in f32,
+    // convert to the f16 A operand (post-scale logits are safely in
+    // f16 range).
     coopmat<float, gl_ScopeWorkgroup, Br, DH, gl_MatrixUseAccumulator> Q;
+#ifdef IO_F16
+    {
+        coopmat<float16_t, gl_ScopeWorkgroup, Br, DH, gl_MatrixUseAccumulator> Qh;
+        coopMatLoadTensorNV(Qh, pc.q_ptr.v, head * pc.t_q * DH,
+            sliceTensorLayoutNV(tlQ, q0, Br, 0, DH));
+        Q = coopmat<float, gl_ScopeWorkgroup, Br, DH, gl_MatrixUseAccumulator>(Qh);
+    }
+#else
     coopMatLoadTensorNV(Q, pc.q_ptr.v, head * pc.t_q * DH,
         sliceTensorLayoutNV(tlQ, q0, Br, 0, DH));
+#endif
     Q *= pc.scale;
     coopmat<float16_t, gl_ScopeWorkgroup, Br, DH, gl_MatrixUseA> Qf16 =
         coopmat<float16_t, gl_ScopeWorkgroup, Br, DH, gl_MatrixUseA>(Q);
@@ -255,6 +282,13 @@ void main() {
         createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
     tlO = setTensorLayoutDimensionNV(tlO, pc.t_q, DH);
     tlO = setTensorLayoutStrideNV(tlO, DH, 1);
+#ifdef IO_F16
+    coopmat<float16_t, gl_ScopeWorkgroup, Br, DH, gl_MatrixUseAccumulator> O16 =
+        coopmat<float16_t, gl_ScopeWorkgroup, Br, DH, gl_MatrixUseAccumulator>(O);
+    coopMatStoreTensorNV(O16, pc.out_ptr.v, head * pc.t_q * DH,
+        sliceTensorLayoutNV(tlO, q0, Br, 0, DH));
+#else
     coopMatStoreTensorNV(O, pc.out_ptr.v, head * pc.t_q * DH,
         sliceTensorLayoutNV(tlO, q0, Br, 0, DH));
+#endif
 }

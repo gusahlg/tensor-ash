@@ -1,0 +1,9 @@
+#version 460
+// Tensor-core (NV_cooperative_matrix2) fused causal prefill attention,
+// head dimension 64, f16 KV caches AND f16 q/out (f16 activations).
+
+#define DH 64u
+#define KV_F16 1
+#define IO_F16 1
+
+#include "attention_flash_cm2_kernel.glsl"

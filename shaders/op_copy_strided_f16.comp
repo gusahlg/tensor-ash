@@ -1,0 +1,9 @@
+#version 460
+// Strided copy between f16-storage tensors (bit-exact: the f16 -> f32
+// -> f16 round trip is the identity) — the KV-append and head-permute
+// path when activations AND caches are half precision.
+
+#define SRC_F16 1
+#define DST_F16 1
+
+#include "op_copy_strided_body.glsl"

@@ -1,0 +1,11 @@
+#version 460
+// Tensor-core GEMM (KHR cooperative matrix) with f16 ACTIVATIONS:
+// A, B, and C all f16 storage, f32 accumulate.  The A staging load
+// becomes a straight uvec4 copy (no packHalf2x16 conversion) and the
+// C store narrows the f32 accumulator fragments to halves — the
+// layer-loop route when a transformer keeps its activations in f16.
+
+#define A_F16 1
+#define C_F16 1
+
+#include "matmul_coopmat_kernel.glsl"

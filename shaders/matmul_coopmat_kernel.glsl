@@ -1,0 +1,236 @@
+#pragma use_vulkan_memory_model
+// Tensor-core GEMM via KHR cooperative matrix: A f32 storage
+// (converted to f16 while staging into shared memory), B f16 storage,
+// f32 accumulate on 16x16x16 subgroup fragments.
+//
+// Strictly aligned (the "_aligned" suffix is load-bearing: the host
+// rejects dispatches unless M % 128 == 0, N % 128 == 0, K % 32 == 0),
+// because cooperative-matrix ops require subgroup-uniform control flow
+// — the divergent bounds tricks of the SIMT kernels are invalid here,
+// and `cooperativeMatrixRobustBufferAccess` is not required by this
+// device, so out-of-bounds loads would be UB rather than zeros.
+//
+// Compile-time inputs (set by the .comp wrapper):
+//     A_F16 (optional): A is stored as IEEE half; staging becomes a
+//     straight uvec4 copy (the f32 path's packHalf2x16 conversion
+//     disappears).  Compute is unchanged — the shared tile holds
+//     halves either way.
+//     C_F16 (optional): C is stored as IEEE half; the f32 accumulator
+//     fragments convert (RNE) at store time, and ACCUMULATE reloads
+//     prior C through the same half view.
+//
+// Layout: 256 threads = 8 subgroups of 32.  Workgroup tile 128x128,
+// BK = 32.  Subgroups tile the output 2 rows x 4 cols, each owning a
+// 64x32 slice = 4x2 fragments of 16x16.  Shared tiles are staged as
+// uvec4 (8 halves) with a 16-byte row skew, per NVIDIA's
+// vk_cooperative_matrix_perf shmem kernel.
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const bool ACCUMULATE = false;
+layout(constant_id = 1) const bool ALPHA_IS_ONE = true;
+// Alignment is a host-checked precondition, so these two are inert;
+// they exist to keep the shared KernelVariant machinery uniform.
+layout(constant_id = 2) const bool INTERIOR_ONLY = false;
+layout(constant_id = 3) const bool K_MULTIPLE = false;
+
+const uint BM = 128u;
+const uint BN = 128u;
+const uint BK = 32u;
+const uint LM = 16u;
+const uint LN = 16u;
+const uint LK = 16u;
+const uint WM = 64u;  // subgroup output rows
+const uint WN = 32u;  // subgroup output cols
+const uint FRAG_M = WM / LM; // 4
+const uint FRAG_N = WN / LN; // 2
+const uint THREADS = 256u;
+
+// Shared rows carry a 16-byte (one uvec4 / 8 halves) skew to dodge
+// bank conflicts on the fragment loads.
+const uint A_ROW_V4 = BK / 8u + 1u; // 5 uvec4 per A row
+const uint B_ROW_V4 = BN / 8u + 1u; // 17 uvec4 per B row
+
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer F32V4ReadOnly {
+    vec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer H8ReadOnly {
+    uvec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict buffer F32V4ReadWrite {
+    vec4 v[];
+};
+#ifdef C_F16
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict buffer F16CReadWrite {
+    float16_t v[];
+};
+#endif
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict buffer F32ReadWrite {
+    float v[];
+};
+
+layout(push_constant) uniform PC {
+    uint  M;
+    uint  N;
+    uint  K;
+    uint  batch_stride_a;
+    uint  batch_stride_b;
+    uint  batch_stride_c;
+    uint  flags;
+    float alpha;
+    F32ReadOnly  a_ptr;
+    F32ReadOnly  b_ptr;
+    F32ReadWrite c_ptr;
+    F32ReadOnly  d_ptr;
+    F32ReadOnly  bias_ptr;
+    float beta;
+    uint bias_batch_stride;
+} pc;
+
+shared uvec4 Ash[BM * A_ROW_V4];
+shared uvec4 Bsh[BK * B_ROW_V4];
+
+// A tile: BM x BK halves = 512 uvec4 slots, 2 per thread.  f32 A
+// packs 8 K-consecutive loads (two vec4) into 8 halves; f16 A is a
+// straight 16-byte copy (row starts stay uvec4-aligned because
+// K % 32 == 0 is a host-checked precondition).
+void load_a_tile(uint a_base, uint block_row, uint k_base, uint tid) {
+#ifdef A_F16
+    H8ReadOnly a_v8 = H8ReadOnly(uint64_t(pc.a_ptr));
+#else
+    F32V4ReadOnly a_v4 = F32V4ReadOnly(uint64_t(pc.a_ptr));
+#endif
+    const uint slots = BM * (BK / 8u);
+    [[unroll]] for (uint i = 0u; i < slots / THREADS; ++i) {
+        const uint slot = tid + i * THREADS;
+        const uint row = slot / (BK / 8u);
+        const uint col8 = slot % (BK / 8u);
+        const uint g_index = a_base + (block_row * BM + row) * pc.K + k_base + col8 * 8u;
+#ifdef A_F16
+        Ash[row * A_ROW_V4 + col8] = a_v8.v[g_index >> 3u];
+#else
+        const vec4 lo = a_v4.v[g_index >> 2u];
+        const vec4 hi = a_v4.v[(g_index >> 2u) + 1u];
+        Ash[row * A_ROW_V4 + col8] = uvec4(
+            packHalf2x16(lo.xy), packHalf2x16(lo.zw),
+            packHalf2x16(hi.xy), packHalf2x16(hi.zw));
+#endif
+    }
+}
+
+// B tile: BK x BN halves = 512 uvec4 slots, 2 per thread, straight
+// 16-byte copies.
+void load_b_tile(uint b_base, uint block_col, uint k_base, uint tid) {
+    H8ReadOnly b_v8 = H8ReadOnly(uint64_t(pc.b_ptr));
+    const uint slots = BK * (BN / 8u);
+    [[unroll]] for (uint i = 0u; i < slots / THREADS; ++i) {
+        const uint slot = tid + i * THREADS;
+        const uint row = slot / (BN / 8u);
+        const uint col8 = slot % (BN / 8u);
+        const uint g_index = b_base + (k_base + row) * pc.N + block_col * BN + col8 * 8u;
+        Bsh[row * B_ROW_V4 + col8] = b_v8.v[g_index >> 3u];
+    }
+}
+
+void main() {
+    const uint batch = gl_WorkGroupID.z;
+    const uint block_row = gl_WorkGroupID.y;
+    const uint block_col = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint sg = gl_SubgroupID;
+
+    const uint a_base = batch * pc.batch_stride_a;
+    const uint b_base = batch * pc.batch_stride_b;
+    const uint c_base = batch * pc.batch_stride_c;
+
+    // Subgroup slice of the 128x128 tile: 2 x 4 grid of 64x32.
+    const uint warp_row0 = (sg / 4u) * WM;
+    const uint warp_col0 = (sg % 4u) * WN;
+
+    coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator> acc[FRAG_M][FRAG_N];
+    [[unroll]] for (uint i = 0u; i < FRAG_M; ++i)
+        [[unroll]] for (uint j = 0u; j < FRAG_N; ++j)
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator>(0.0);
+
+    const uint num_k = pc.K / BK;
+    for (uint kt = 0u; kt < num_k; ++kt) {
+        const uint k_base = kt * BK;
+        load_a_tile(a_base, block_row, k_base, tid);
+        load_b_tile(b_base, block_col, k_base, tid);
+        barrier();
+
+        [[unroll]] for (uint ks = 0u; ks < BK / LK; ++ks) {
+            coopmat<float16_t, gl_ScopeSubgroup, LM, LK, gl_MatrixUseA> a_frag[FRAG_M];
+            [[unroll]] for (uint i = 0u; i < FRAG_M; ++i) {
+                coopMatLoad(
+                    a_frag[i],
+                    Ash,
+                    (warp_row0 + i * LM) * A_ROW_V4 + ks * (LK / 8u),
+                    A_ROW_V4,
+                    gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0u; j < FRAG_N; ++j) {
+                coopmat<float16_t, gl_ScopeSubgroup, LK, LN, gl_MatrixUseB> b_frag;
+                coopMatLoad(
+                    b_frag,
+                    Bsh,
+                    (ks * LK) * B_ROW_V4 + (warp_col0 + j * LN) / 8u,
+                    B_ROW_V4,
+                    gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint i = 0u; i < FRAG_M; ++i)
+                    acc[i][j] = coopMatMulAdd(a_frag[i], b_frag, acc[i][j]);
+            }
+        }
+        barrier();
+    }
+
+    // Store: fragment rows are 16 floats = 4 vec4 (or 16 halves),
+    // N % 128 == 0 keeps every row start 16-byte aligned.  Alpha and
+    // accumulate act on fragment elements before the store; with
+    // C_F16 the f32 accumulator converts (RNE) as the last step.
+#ifdef C_F16
+    F16CReadWrite c_h = F16CReadWrite(uint64_t(pc.c_ptr));
+#else
+    F32V4ReadWrite c_v4 = F32V4ReadWrite(uint64_t(pc.c_ptr));
+#endif
+    const uint row0 = block_row * BM + warp_row0;
+    const uint col0 = block_col * BN + warp_col0;
+    [[unroll]] for (uint i = 0u; i < FRAG_M; ++i) {
+        [[unroll]] for (uint j = 0u; j < FRAG_N; ++j) {
+            if (!ALPHA_IS_ONE) {
+                for (uint e = 0u; e < acc[i][j].length(); ++e) acc[i][j][e] *= pc.alpha;
+            }
+#ifdef C_F16
+            const uint element = c_base + (row0 + i * LM) * pc.N + col0 + j * LN;
+            if (ACCUMULATE) {
+                coopmat<float16_t, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator> prior16;
+                coopMatLoad(prior16, c_h.v, element, pc.N, gl_CooperativeMatrixLayoutRowMajor);
+                acc[i][j] += coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator>(prior16);
+            }
+            coopmat<float16_t, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator> out16 =
+                coopmat<float16_t, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator>(acc[i][j]);
+            coopMatStore(out16, c_h.v, element, pc.N, gl_CooperativeMatrixLayoutRowMajor);
+#else
+            const uint element = (c_base + (row0 + i * LM) * pc.N + col0 + j * LN) / 4u;
+            if (ACCUMULATE) {
+                coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator> prior;
+                coopMatLoad(prior, c_v4.v, element, pc.N / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                acc[i][j] += prior;
+            }
+            coopMatStore(acc[i][j], c_v4.v, element, pc.N / 4u, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+        }
+    }
+}
