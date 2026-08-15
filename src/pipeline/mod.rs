@@ -265,7 +265,14 @@ impl MatmulPipeline {
                     if k >= 4096 || n <= 512 || (k >= 2048 && n <= 2048) {
                         KernelSelection::F16wRowBdaK16
                     } else {
-                        KernelSelection::F16wRowBda
+                        // Wide-N moderate-K: sixteen slices alone lose
+                        // ~5% to the eight-slice kernel here, but with
+                        // two packed columns per lane (f16vec2 loads)
+                        // they win ~3% instead (K=2048/N=5632: 58 ->
+                        // 56 µs); VCOLS=2 is measured-neutral on the
+                        // k16-routed shapes and -12% on N=256, so the
+                        // narrow/deep branch stays on plain k16.
+                        KernelSelection::F16wRowBdaK16V2
                     }
                 } else {
                     KernelSelection::RowBda
@@ -389,7 +396,7 @@ impl MatmulPipeline {
                 !kernel.uses_descriptors
                     && (!kernel.name.ends_with("_aligned") || coopmat_fits)
                     && kernel.weights_f16() == b_f16
-                    && (m == 1 || !kernel.name.ends_with("row_bda"))
+                    && (m == 1 || !kernel.name.contains("row_bda"))
                     && (n == 1 || kernel.name != "col_bda")
                     && (k == 1 || kernel.name != "outer_bda")
             })

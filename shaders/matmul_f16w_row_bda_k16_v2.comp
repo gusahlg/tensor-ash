@@ -1,0 +1,9 @@
+#version 460
+// K-cooperative M=1 GEMV, f16 B, sixteen K-slice warps and two
+// adjacent columns per lane (f16vec2 loads).
+
+#define B_F16 1
+#define KSLICES 16
+#define VCOLS 2
+
+#include "matmul_row_bda_kernel.glsl"

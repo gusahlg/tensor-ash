@@ -157,7 +157,7 @@ fn f16_routes_pick_f16w_kernels_and_skip_splitk2() {
     assert_eq!(row.kernel, "f16w_row_bda_k16", "row route: {row:?}");
     let row_shallow = exec.dispatch_info_for(1, 1, 4096, 2048, true);
     assert_eq!(
-        row_shallow.kernel, "f16w_row_bda",
+        row_shallow.kernel, "f16w_row_bda_k16_v2",
         "row route: {row_shallow:?}"
     );
     // Deep-K would tempt split-K2 on f32; f16 must stay data-parallel
