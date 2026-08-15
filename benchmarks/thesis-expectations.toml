@@ -1,0 +1,55 @@
+# Per-GPU expectations for the performance-thesis harness
+# (`ml_bench thesis`, see benchmarks/THESES.md).
+#
+# Sections are keyed by the EXACT Vulkan device name the harness logs
+# (`VulkanContext::device_name`).  A device without a section still
+# runs every measurement but reports `info` instead of PASS/FAIL —
+# add a section (copying this one and re-recording the numbers from a
+# clean run) to arm the regression gate for that GPU.  This is a
+# strict TOML subset: quoted-or-bare section headers, `key = <float>`,
+# `#` comments (parser: tools/ml-bench/src/bench/thesis/expect.rs).
+
+["NVIDIA GeForce RTX 3070"]
+# GA104 spec-sheet memory bandwidth; every bandwidth floor divides by
+# this, so per-GPU sections MUST re-record it (e.g. the 4060 is 272).
+mem_bw_gbps = 448.0
+
+# T1: decode achieved weight bandwidth >= this fraction of mem_bw_gbps
+# (leg 15 forensics: decode GEMVs ran 81-89% of bandwidth; the whole
+# token, barriers included, held above 80%).
+t1_min_bw_frac = 0.80
+
+# T2: every decode GEMV class >= this fraction of its bandwidth floor
+# (leg 13/15: row GEMVs measured 81-89% of floor; the tiny k/v
+# 2048x256 class is the one to watch — launch overhead bites first).
+t2_min_bw_frac = 0.80
+
+# T3: full compute-barrier drain on a trivial kernel, in microseconds
+# (leg 15 accounting: ~7.7 us/barrier on GA104), with a relative
+# tolerance — the microbench definition (chain-slope difference) is
+# noisy at the +-1-2 us level, so the gate is deliberately wide.
+t3_barrier_us = 7.7
+t3_rel_tol = 0.50
+
+# T4: one vkQueueSubmit + fence-wait round-trip, in microseconds
+# (campaign ledger: ~30-60 us per synchronous submission on this
+# host; v1.5's 50 us spin-wait sits inside this band).  Measured
+# value must land in [lo*(1-tol), hi*(1+tol)].
+t4_submit_us_lo = 30.0
+t4_submit_us_hi = 60.0
+t4_edge_tol = 0.20
+
+# T5: |piecewise sum - whole pp512 graph| as a fraction of the whole.
+# The sum is expected to slightly OVERestimate (standalone runs cannot
+# overlap independent neighbours the way the graph does).
+t5_rel_gap = 0.10
+
+# T6: f16w coopmat GEMM on real aligned 512-row prefill shapes (TF/s),
+# plus the 4096^3 reference figure from the model-inference leg
+# (34.6 TF/s) with its own regression floor.
+t6_min_tflops = 30.0
+t6_ref_tflops = 34.6
+t6_ref_rel_tol = 0.15
+
+# T7 (token exactness) is a correctness invariant: it needs no
+# recorded numbers and FAILs unconditionally on any divergence.
