@@ -1133,7 +1133,10 @@ impl Model {
         ensure!(t > 0, "prefill graph needs at least one token");
         ensure!(self.pos + t <= self.cfg.t_max, "KV cache overflow");
         if self.prefill_scratch.as_ref().is_none_or(|s| s.t != t) {
-            self.prefill_scratch = Some(Scratch::new(&self.ctx, &self.cfg, t, false)?);
+            // Mirror prefill()'s f16-activation eligibility so the
+            // census counts the graph prefill would actually submit.
+            let act_f16 = self.prefill_act_f16 && t >= 256 && t.is_multiple_of(128);
+            self.prefill_scratch = Some(Scratch::new(&self.ctx, &self.cfg, t, false, act_f16)?);
         }
         let s = self.prefill_scratch.take().unwrap();
         let ops = self.prefill_ops(&s, t, self.pos);
