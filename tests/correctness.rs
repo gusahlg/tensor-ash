@@ -15,6 +15,8 @@ mod common;
 mod attn_decode;
 #[path = "correctness/batch.rs"]
 mod batch;
+#[path = "correctness/churn.rs"]
+mod churn;
 #[path = "correctness/decoder.rs"]
 mod decoder;
 #[path = "correctness/elementwise.rs"]

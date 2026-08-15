@@ -17,6 +17,48 @@ use super::cache::{create_pipeline_cache, pipeline_cache_path_for};
 use super::debug::debug_callback;
 use super::device::{DevicePreference, device_summaries, select_physical_device};
 
+/// Keep one bare `VkInstance` (and the loader library itself) alive for
+/// the remaining lifetime of the process.
+///
+/// The Vulkan loader dlcloses every ICD shared library when the last
+/// `VkInstance` is destroyed and re-dlopens them all on the next
+/// `vkCreateInstance`.  Some ICDs carry static-TLS dependencies (the
+/// NVIDIA proprietary driver's `libnvidia-tls.so` uses the initial-exec
+/// TLS model), and glibc's fixed static-TLS surplus is consumed a slice
+/// at a time by repeated dlopen cycles when fresh threads are involved.
+/// After roughly 15-20 context create/destroy cycles on different
+/// threads (e.g. one per test in a test harness), the surplus runs out,
+/// the ICD fails to load with "cannot allocate memory in static TLS
+/// block", and the GPU silently vanishes from enumeration — device
+/// selection then falls back to a CPU driver, or fails outright.
+///
+/// Pinning a single instance keeps every ICD resident so its TLS block
+/// is allocated exactly once.  The pin instance and the cloned entry
+/// are leaked deliberately; the OS reclaims them at process exit.
+/// `ML_NO_LOADER_PIN=1` disables the pin.
+fn pin_loader(entry: &ash::Entry) {
+    use std::sync::OnceLock;
+    static LOADER_PIN: OnceLock<()> = OnceLock::new();
+    if std::env::var("ML_NO_LOADER_PIN").is_ok_and(|v| v == "1") {
+        return;
+    }
+    LOADER_PIN.get_or_init(|| {
+        let instance_ci = vk::InstanceCreateInfo::default();
+        match unsafe { entry.create_instance(&instance_ci, None) } {
+            Ok(_pin) => {
+                // `ash::Instance` does not destroy on drop; dropping the
+                // wrapper leaks the VkInstance handle, which is exactly
+                // what we want.  Keep libvulkan itself loaded too, so
+                // the pinned instance can never dangle.
+                std::mem::forget(entry.clone());
+            }
+            Err(err) => {
+                log::warn!("tensor-ash: loader pin instance creation failed: {err}");
+            }
+        }
+    });
+}
+
 pub(super) fn create(
     enable_validation: bool,
     preference: DevicePreference,
@@ -24,6 +66,7 @@ pub(super) fn create(
     unsafe {
         let entry =
             ash::Entry::load().map_err(|err| anyhow!("failed to load Vulkan loader: {err}"))?;
+        pin_loader(&entry);
 
         // 1.3 rather than 1.2 so the NV_cooperative_matrix2 shaders
         // (SPIR-V 1.6) are loadable; the 1.1/1.2 feature-struct chains
