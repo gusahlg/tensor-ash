@@ -1,0 +1,13 @@
+#version 460
+// Asymmetric wave-fill: 64x128x32 on 128 threads.  More N-reuse than
+// 64x64, more CTAs than 128x128 — candidate for wide M=512 prefill
+// (gate/up 512x5632).
+
+#define BM 64u
+#define BN 128u
+#define THREADS 128u
+#define WM 32u
+#define WN 64u
+#define SG_N 2u
+
+#include "matmul_coopmat_kernel.glsl"

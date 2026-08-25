@@ -49,6 +49,10 @@
   has fewer than 96 tiles (or the shape is 64-aligned but not
   128-aligned).  RTX 4060: 512x2048x2048 22.2 TF/s on m64, 2048³
   22.7 TF/s on 128x128.
+- **Asymmetric coopmat 64x128 / 128x64**: 128-thread siblings.
+  Auto picks 128x64 for M=512 shapes strictly wider than 4:1
+  (concat QKV, gate/up).  RTX 4060 gate/up 512x5632x2048 21.2 →
+  24.2 TF/s (+14%).  Large squares stay on 128x128.
 - **Concatenated QKV + fused prefill pack** (`w_qkv`,
   `Executor::run_prefill_qkv_pack`, `ExecOp::PrefillQkvPack`): one GEMM
   over `[embd, embd+2*kv]` plus a single dispatch that RoPE-writes

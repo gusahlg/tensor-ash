@@ -1,5 +1,29 @@
 # Experiment branch log
 
+## Leg 19 — asymmetric coopmat tiles 64x128 / 128x64 — MEASURED (RTX 4060)
+
+128x128 vs 64x64 A/B on AD107 showed 64x64 winning every 512-row
+prefill shape, including gate/up where auto still picked 128x128
+(`tiles_128=176 >= 96`).  Two asymmetric siblings (64x128, 128x64,
+128 threads, same KHR fragments) were then measured with `ML_KERNEL`.
+
+GPU median TF/s, 12 iters / 4 warmup:
+
+| shape | 128x128 | 64x64 | 64x128 | 128x64 |
+|---|---:|---:|---:|---:|
+| 512x2048x2048 | 18.6 | **22.3** | 20.5 | 21.0 |
+| 512x2560x2048 | 19.7 | 21.6 | 21.9 | **22.8** |
+| 512x5632x2048 | 21.2 | 22.7 | 23.1 | **24.1** |
+| 512x2048x5632 | 18.7 | **22.9** | 21.2 | 21.7 |
+| 1024³ | 16.8 | **21.4** | 19.3 | 19.8 |
+| 2048³ | 22.7 | 23.2 | 23.6 | 24.5 |
+
+Heuristic (kept 128x128 for large squares — 3070 4096³ winner, not
+re-benched here): M<=512 uses 64x64 unless M=512 and N>4M, then
+128x64.  Auto after the change: gate/up 21.2 → **24.2 TF/s** (+14%),
+concat QKV 21.7 → **23.0**.  q/o and down stay on 64x64.  Correctness:
+asymmetric tiles vs dual-rounded reference, a16 suite, 1024 route.
+
 ## Leg 18 — packed decode GEMVs, 64x64 wave-fill coopmat, fused prefill QKV pack — MEASURED (RTX 4060)
 
 Uncommitted session work finalized on `experiment/pack-and-wavefill`.

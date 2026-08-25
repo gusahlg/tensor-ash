@@ -344,6 +344,21 @@ kernel_catalog! {
     F16wA16CoopmatM64 => ("f16w_a16_coopmat_m64n64", 64, 64, 32,
         "matmul_f16w_a16_coopmat_m64n64.spv", false,
         ["f16w_a16_coopmat_m64n64", "a16_coopmat_m64"]),
+    // Asymmetric wave-fill: 64x128 (wide) and 128x64 (tall).  Same
+    // KHR fragments, 128 threads.  Auto: 128x64 on M<=512 shapes
+    // strictly wider than 4:1 (4060: concat QKV / gate/up).
+    F16wCoopmatM64N128 => ("f16w_coopmat_m64n128", 64, 128, 32,
+        "matmul_f16w_coopmat_m64n128.spv", false,
+        ["f16w_coopmat_m64n128", "coopmat_m64n128"]),
+    F16wA16CoopmatM64N128 => ("f16w_a16_coopmat_m64n128", 64, 128, 32,
+        "matmul_f16w_a16_coopmat_m64n128.spv", false,
+        ["f16w_a16_coopmat_m64n128", "a16_coopmat_m64n128"]),
+    F16wCoopmatM128N64 => ("f16w_coopmat_m128n64", 128, 64, 32,
+        "matmul_f16w_coopmat_m128n64.spv", false,
+        ["f16w_coopmat_m128n64", "coopmat_m128n64"]),
+    F16wA16CoopmatM128N64 => ("f16w_a16_coopmat_m128n64", 128, 64, 32,
+        "matmul_f16w_a16_coopmat_m128n64.spv", false,
+        ["f16w_a16_coopmat_m128n64", "a16_coopmat_m128n64"]),
     // Tensor-core GEMM via NV_cooperative_matrix2 (workgroup-scope
     // matrices + tensor addressing) with the fused store epilogue the
     // coopmat1 kernel cannot implement (`coopMatPerElementNV` at
@@ -420,6 +435,8 @@ mod tests {
         assert_eq!(by_name("v2_128x128_bk8"), 17_408); // double-buffered
         assert_eq!(by_name("f16w_coopmat_aligned"), 18_944); // 128*5*16 + 32*17*16
         assert_eq!(by_name("f16w_coopmat_m64n64"), 9_728); // 64*5*16 + 32*9*16
+        assert_eq!(by_name("f16w_coopmat_m64n128"), 13_824); // 64*5*16 + 32*17*16
+        assert_eq!(by_name("f16w_coopmat_m128n64"), 14_848); // 128*5*16 + 32*9*16
         assert_eq!(by_name("outer_bda"), 0); // register-only
     }
 

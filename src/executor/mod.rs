@@ -235,11 +235,8 @@ impl Executor {
                      support, which this device lacks"
                 );
             }
-            let selection = if crate::pipeline::coopmat_prefers_m64(dims.batch, dims.m, dims.n) {
-                crate::pipeline::KernelSelection::F16wA16CoopmatM64
-            } else {
-                crate::pipeline::KernelSelection::F16wA16Coopmat
-            };
+            let selection = crate::pipeline::coopmat_selection(dims.batch, dims.m, dims.n, true)
+                .expect("a16 resolution already requires 64-aligned M/N");
             return Ok(OpPlan {
                 kernel: selection
                     .index()

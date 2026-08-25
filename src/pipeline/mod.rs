@@ -67,20 +67,98 @@ pub(crate) fn f16w_row_packed_selection(k: u32, n: u32) -> KernelSelection {
     }
 }
 
-/// Prefer the 64x64 coopmat tile when a 128x128 grid cannot fill two
-/// waves on a mid-range discrete GPU (~46 SMs).  512x2048 is 64
-/// 128-tiles (one short wave + a 18-SM tail) vs 256 64-tiles.
-pub(crate) fn coopmat_prefers_m64(batch: u32, m: u32, n: u32) -> bool {
+/// Coopmat1 tile pick for an f16w (or a16) shape that is already
+/// known to be 64-aligned in M/N and 32-aligned in K.
+///
+/// RTX 4060 (24 SM) A/B, GPU median TF/s:
+///
+/// | shape | 128x128 | 64x64 | 64x128 | 128x64 |
+/// | 512x2048x2048 | 18.6 | **22.3** | 20.5 | 21.0 |
+/// | 512x2560x2048 | 19.7 | 21.6 | 21.9 | **22.8** |
+/// | 512x5632x2048 | 21.2 | 22.7 | 23.1 | **24.1** |
+/// | 512x2048x5632 | 18.7 | **22.9** | 21.2 | 21.7 |
+/// | 1024³ | 16.8 | **21.4** | 19.3 | 19.8 |
+/// | 2048³ | 22.7 | 23.2 | 23.6 | 24.5 |
+///
+/// 128x128 stays the large-square default (tiles_128 >= 96) because
+/// that is the measured 3070 4096³ winner and this machine cannot
+/// re-bench it.  Short-M prefill (M<=512) uses 64x64 unless N is
+/// strictly wider than 4:1, where 128x64 won.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoopmatTile {
+    T128,
+    T64,
+    T64x128,
+    T128x64,
+}
+
+pub(crate) fn coopmat_tile(batch: u32, m: u32, n: u32) -> Option<CoopmatTile> {
     if !m.is_multiple_of(64) || !n.is_multiple_of(64) {
-        return false;
+        return None;
     }
-    if !m.is_multiple_of(128) || !n.is_multiple_of(128) {
-        return true;
+    let m128 = m.is_multiple_of(128);
+    let n128 = n.is_multiple_of(128);
+    if m <= 512 {
+        // Wide prefill (gate/up, concat QKV): 128x64 won on AD107
+        // at M=512.  Narrower M stays on 64x64 (unmeasured for 128x64).
+        if m == 512 && m128 && n > 4 * m {
+            return Some(CoopmatTile::T128x64);
+        }
+        if m == 512 && n128 && m > 4 * n {
+            return Some(CoopmatTile::T64x128);
+        }
+        return Some(CoopmatTile::T64);
+    }
+    if !m128 || !n128 {
+        return Some(if m128 {
+            CoopmatTile::T128x64
+        } else if n128 {
+            CoopmatTile::T64x128
+        } else {
+            CoopmatTile::T64
+        });
     }
     let tiles_128 = u64::from(batch)
         .saturating_mul(u64::from(m / 128))
         .saturating_mul(u64::from(n / 128));
-    tiles_128 < 96
+    Some(if tiles_128 < 96 {
+        CoopmatTile::T64
+    } else {
+        CoopmatTile::T128
+    })
+}
+
+pub(crate) fn coopmat_selection(batch: u32, m: u32, n: u32, a16: bool) -> Option<KernelSelection> {
+    Some(match coopmat_tile(batch, m, n)? {
+        CoopmatTile::T128 => {
+            if a16 {
+                KernelSelection::F16wA16Coopmat
+            } else {
+                KernelSelection::F16wCoopmat
+            }
+        }
+        CoopmatTile::T64 => {
+            if a16 {
+                KernelSelection::F16wA16CoopmatM64
+            } else {
+                KernelSelection::F16wCoopmatM64
+            }
+        }
+        CoopmatTile::T64x128 => {
+            if a16 {
+                KernelSelection::F16wA16CoopmatM64N128
+            } else {
+                KernelSelection::F16wCoopmatM64N128
+            }
+        }
+        CoopmatTile::T128x64 => {
+            if a16 {
+                KernelSelection::F16wA16CoopmatM128N64
+            } else {
+                KernelSelection::F16wCoopmatM128N64
+            }
+        }
+    })
 }
 
 pub struct MatmulPipeline {
@@ -391,11 +469,7 @@ impl MatmulPipeline {
                 && m.is_multiple_of(64)
                 && n.is_multiple_of(64)
             {
-                if coopmat_prefers_m64(batch, m, n) {
-                    KernelSelection::F16wCoopmatM64
-                } else {
-                    KernelSelection::F16wCoopmat
-                }
+                coopmat_selection(batch, m, n, false).expect("M/N are 64-aligned")
             } else {
                 // f16-storage B is validated as BDA-capable upstream;
                 // map the tile class onto the nearest f16w sibling.
@@ -450,8 +524,10 @@ impl MatmulPipeline {
                 // Wave-fill tiles are ~9.7 KiB; if a future budget
                 // gate empties them, fall back to the 128x128 sibling
                 // (same family, same alignment).
-                K::F16wCoopmatM64 => K::F16wCoopmat,
-                K::F16wA16CoopmatM64 => K::F16wA16Coopmat,
+                K::F16wCoopmatM64 | K::F16wCoopmatM64N128 | K::F16wCoopmatM128N64 => K::F16wCoopmat,
+                K::F16wA16CoopmatM64 | K::F16wA16CoopmatM64N128 | K::F16wA16CoopmatM128N64 => {
+                    K::F16wA16Coopmat
+                }
                 // Packed B is a different layout; falling back to the
                 // unpacked row kernel would silently read garbage.
                 K::F16wRowBdaK16Packed | K::F16wRowBdaK16V2Packed => {
@@ -561,7 +637,12 @@ impl MatmulPipeline {
                 // would let a measured 128x128 winner override the
                 // wave-fill pick and flake tests that assert the
                 // static route.  Prefill uses the a16 fixed pick.
-                if kernel.name.contains("m64n64") || kernel.name.contains("packed") {
+                // Wave-fill coopmat tiles are heuristic-only: a measured
+                // 128x128 winner must not override them.  Packed B is a
+                // different layout.  Do not match SIMT `m128n64k64`.
+                if (kernel.name.contains("coopmat") && !kernel.name.ends_with("_aligned"))
+                    || kernel.name.contains("packed")
+                {
                     return false;
                 }
                 let coopmat_fits = tensor_core
@@ -743,18 +824,21 @@ mod bda_tests {
     }
 
     #[test]
-    fn coopmat_m64_tracks_wave_fill() {
-        // TinyLlama prefill projections: 512x2048 is 64 128-tiles.
-        assert!(coopmat_prefers_m64(1, 512, 2048));
-        assert!(coopmat_prefers_m64(1, 128, 2048));
-        assert!(coopmat_prefers_m64(1, 256, 384));
-        // Gate/up 512x5632 fills more than two waves; 64x64 measured
-        // slower (lower arithmetic intensity).
-        assert!(!coopmat_prefers_m64(1, 512, 5632));
-        assert!(!coopmat_prefers_m64(1, 2048, 2048));
+    fn coopmat_tile_tracks_4060_prefill_ab() {
+        use CoopmatTile::*;
+        // q/o 512x2048: 4:1 is not strictly wider than 4:1 → 64x64.
+        assert_eq!(coopmat_tile(1, 512, 2048), Some(T64));
+        assert_eq!(coopmat_tile(1, 128, 2048), Some(T64));
+        assert_eq!(coopmat_tile(1, 256, 384), Some(T64));
+        // Concat QKV 512x2560 and gate/up 512x5632: 128x64 won.
+        assert_eq!(coopmat_tile(1, 512, 2560), Some(T128x64));
+        assert_eq!(coopmat_tile(1, 512, 5632), Some(T128x64));
+        // Large squares keep 128x128 (3070 4096³ winner, untested here).
+        assert_eq!(coopmat_tile(1, 2048, 2048), Some(T128));
+        assert_eq!(coopmat_tile(1, 1024, 1024), Some(T64));
         // 64-aligned but not 128-aligned has no 128-tile route.
-        assert!(coopmat_prefers_m64(1, 192, 320));
-        assert!(!coopmat_prefers_m64(1, 192, 300));
+        assert_eq!(coopmat_tile(1, 192, 320), Some(T64));
+        assert_eq!(coopmat_tile(1, 192, 300), None);
     }
 
     #[test]

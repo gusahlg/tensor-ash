@@ -812,6 +812,85 @@ fn coopmat_routes_and_matches_dual_rounded_reference() {
     assert_close(&gpu, &cpu, k, "coopmat");
 }
 
+/// The asymmetric wave-fill tiles (64x128 / 128x64) are explicit-only
+/// until a heuristic A/B lands; this pins they match the dual-rounded
+/// reference on a shape both tiles cover.
+#[test]
+#[ignore]
+fn coopmat_asymmetric_tiles_match_dual_rounded_reference() {
+    let selections = [
+        KernelSelection::F16wCoopmatM64N128,
+        KernelSelection::F16wCoopmatM128N64,
+        KernelSelection::F16wA16CoopmatM64N128,
+        KernelSelection::F16wA16CoopmatM128N64,
+    ];
+    let (batch, m, n, k) = (1_u32, 256, 384, 256);
+    for selection in selections {
+        let Some((ctx, exec)) = make_setup_with_kernel_if_fits(2, 8, selection) else {
+            continue;
+        };
+        if !f16_available(&ctx) || !ctx.coopmat_enabled {
+            continue;
+        }
+        let a16 = selection_is_a16(selection);
+        let (a, b, host_a, host_b) = if a16 {
+            setup_a16_case(&ctx, &exec, &[m, k], &[k, n], 9800, 9801)
+        } else {
+            let (a, b, mut host_a, host_b) =
+                setup_f16_case(&ctx, &exec, &[m, k], &[k, n], 9800, 9801);
+            for value in &mut host_a {
+                *value = round_f32_via_f16(*value);
+            }
+            exec.upload(&host_a, &a).unwrap();
+            (a, b, host_a, host_b)
+        };
+        let c = if a16 {
+            Tensor::uninit_device_f16(&ctx, &[m, n]).unwrap()
+        } else {
+            Tensor::uninit_device(&ctx, &[m, n]).unwrap()
+        };
+        exec.run_matmuls(&[MatmulCall {
+            a: &a,
+            b: &b,
+            c: &c,
+            alpha: 1.0,
+            accumulate: false,
+        }])
+        .unwrap();
+        let mut gpu = vec![0.0; (m * n) as usize];
+        exec.download(&c, &mut gpu).unwrap();
+        let cpu = cpu_bmm(&host_a, &host_b, None, batch, m, n, k, 1.0, false);
+        if a16 {
+            assert_close_tol(
+                &gpu,
+                &cpu,
+                a16_tolerance(&cpu, k),
+                &format!("asymmetric {}", kernel_sel_name(selection)),
+            );
+        } else {
+            assert_close(
+                &gpu,
+                &cpu,
+                k,
+                &format!("asymmetric {}", kernel_sel_name(selection)),
+            );
+        }
+    }
+}
+
+fn selection_is_a16(selection: KernelSelection) -> bool {
+    selection
+        .index()
+        .is_some_and(|i| tensor_ash::KERNEL_SPECS[i].a_f16())
+}
+
+fn kernel_sel_name(selection: KernelSelection) -> &'static str {
+    selection
+        .index()
+        .map(|i| tensor_ash::KERNEL_SPECS[i].name)
+        .unwrap_or("?")
+}
+
 /// Regression: TinyLlama prefill surfaced that aligned f16 shapes
 /// route to the coopmat kernel, which cannot fuse epilogues — fused
 /// ops must demote to the SIMT sibling (or, with coopmat2, reroute to
