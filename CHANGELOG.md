@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Module splits, no new crates**: `elementwise.rs` (2116) and
+  `llama-ash` `model.rs` (1667) are directories; coopmat/packed-row
+  routing lives in `pipeline/routing.rs`; host u32 cells
+  (`PosBuffer` / `HostU32Buffer` / `TokenIdBuffer`) share one buffer
+  type in `executor/cells.rs`; GLSL push-constant mirrors share a
+  `pc_block!` in `elementwise/pc.rs`; census and recording share one
+  `HazardCursor`; split-K2 SPIR-V is hashed and loaded from one
+  `SPLITK2_SPIRV` blob; push-constant-only pipeline layouts are
+  `pipeline::create_pc_only_layout`.  Crate-split evaluation is in
+  `benchmarks/process.md` / `benchmarks/NEXT.md` — elementwise, flash,
+  GGUF, and the shader catalog are not autonomous.  No kernel or
+  routing-heuristic changes.
+
 ### Fixed
 
 - **RMSNorm/LayerNorm vec4 path on ragged widths**: the f32/f16 vec4

@@ -22,6 +22,7 @@
 //! captures the real benefit (CPU-side recording parallelism, CPU/GPU
 //! overlap of consecutive submissions).
 
+mod cells;
 mod dispatch;
 mod elementwise;
 mod graph_ops;
@@ -49,11 +50,12 @@ use slot::Slot;
 use splitk2::SplitK2Pipeline;
 
 pub use crate::matmul::{MatmulCall, RunStats};
+pub use cells::{HostU32Buffer, PosBuffer, TokenIdBuffer};
 pub use elementwise::{
     ATTN_DECODE_MAX_CHUNKS, AttnDecodeDesc, BinaryOp, CopyDesc, FlashAttentionDesc,
     GEMV_CHAIN_MAX_JOBS, PrefillQkvPackDesc, RopeDesc, RopeScatterDesc, SoftmaxMask,
 };
-pub use graph_ops::{ExecOp, HostU32Buffer, PosBuffer, TokenIdBuffer};
+pub use graph_ops::ExecOp;
 pub use prepared::PreparedOps;
 
 /// Read-only description of the route selected for a plain matmul shape.

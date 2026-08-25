@@ -81,6 +81,26 @@ pub(crate) fn create_specialized_pipeline(
     }
 }
 
+/// Push-constant-only pipeline layout (no descriptor set).  Shared by
+/// BDA matmuls, split-K2, and the elementwise family.
+pub(crate) fn create_pc_only_layout(
+    ctx: &VulkanContext,
+    pc_size: u32,
+) -> Result<vk::PipelineLayout> {
+    let pc_ranges = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        .offset(0)
+        .size(pc_size)];
+    unsafe {
+        ctx.device
+            .create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc_ranges),
+                None,
+            )
+            .context("create_pipeline_layout (push-constant only)")
+    }
+}
+
 /// SPIR-V bytes straight to a fully specialized compute pipeline.  On
 /// pipeline-creation failure the freshly created module is destroyed
 /// before returning; on success the caller owns both handles.

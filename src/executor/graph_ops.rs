@@ -7,10 +7,9 @@
 //! ~10 µs each.  One submission amortizes that to a single wait; the
 //! ops still serialize on the GPU exactly as the per-op path would.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use ash::vk;
 
-use crate::buffer::{Buffer, BufferLocation};
 use crate::matmul::{MatmulOp, ResolvedMatmul, RunStats};
 use crate::tensor::Tensor;
 
@@ -18,176 +17,9 @@ use super::elementwise::{ElementwiseDispatch, GEMV_CHAIN_MAX_JOBS};
 use super::prepared::PreparedOps;
 use super::recording::{record_compute_to_compute_barrier, record_one_matmul};
 use super::{
-    AttnDecodeDesc, BinaryOp, CopyDesc, Executor, FlashAttentionDesc, OpPlan, PrefillQkvPackDesc,
-    RopeDesc, RopeScatterDesc, SoftmaxMask,
+    AttnDecodeDesc, BinaryOp, CopyDesc, Executor, FlashAttentionDesc, HostU32Buffer, OpPlan,
+    PosBuffer, PrefillQkvPackDesc, RopeDesc, RopeScatterDesc, SoftmaxMask, TokenIdBuffer,
 };
-
-/// A 4-byte host-visible, device-readable position cell for replayable
-/// decode graphs (see [`Executor::prepare_exec_ops`]).  The ops that
-/// depend on the token position take its [`device_address`]
-/// (`RopeDesc::pos_addr`, `CopyDesc::pos_addr`,
-/// `AttnDecodeDesc::pos_addr`); the recorded shaders read the current
-/// value each execution, so the host just [`set`]s the new position
-/// between replays instead of re-recording push constants.
-///
-/// Host writes made before a `vkQueueSubmit` are visible to that
-/// submission (the submit performs the domain operation; `set` flushes
-/// non-coherent memory), so no barrier is needed — only the usual
-/// "don't write while a replay is in flight" discipline, which
-/// [`PreparedOps::run`]'s fence wait already enforces.
-///
-/// [`device_address`]: Self::device_address
-/// [`set`]: Self::set
-pub struct PosBuffer {
-    buffer: Buffer,
-}
-
-impl PosBuffer {
-    /// Write a new position for the next submission.
-    pub fn set(&self, value: u32) -> Result<()> {
-        self.buffer.write_pod_slice(&[value])
-    }
-
-    /// GPU pointer for the shaders' position indirection; store it in
-    /// the descs' `pos_addr` fields.  The buffer must outlive every
-    /// execution of any op that captured this address.
-    pub fn device_address(&self) -> u64 {
-        self.buffer.device_address()
-    }
-}
-
-/// A 4-byte u32 cell that is BOTH device-writable and host-readable —
-/// the [`PosBuffer`] machinery pointed the other way.  The GPU-argmax
-/// decode loop writes the chosen token id here
-/// ([`ExecOp::Argmax`] / [`Executor::run_argmax`]), a chained
-/// [`ExecOp::EmbedGather`] reads it back on-device for the next token's
-/// embedding, and the host [`read`]s ONE u32 after the fence instead of
-/// downloading the logits.
-///
-/// Device writes become visible to the host once the submission's fence
-/// wait returns (the fence signal is the domain operation; `read`
-/// invalidates non-coherent memory), so the usual "wait before you
-/// read" discipline — which [`super::PreparedOps::run`]'s fence already
-/// enforces — is the only requirement.
-///
-/// [`read`]: Self::read
-pub struct HostU32Buffer {
-    buffer: Buffer,
-}
-
-impl HostU32Buffer {
-    /// Read the current value (call only after the writing submission's
-    /// fence wait has returned).
-    pub fn read(&self) -> Result<u32> {
-        let mut value = [0u32];
-        self.buffer.read_pod_slice(&mut value)?;
-        Ok(value[0])
-    }
-
-    /// Host-side write, for seeding the cell before a submission that
-    /// only reads it (e.g. a standalone embed-gather).
-    pub fn set(&self, value: u32) -> Result<()> {
-        self.buffer.write_pod_slice(&[value])
-    }
-
-    /// GPU pointer for the shaders' indirection.  The buffer must
-    /// outlive every execution of any op that captured this address.
-    pub fn device_address(&self) -> u64 {
-        self.buffer.device_address()
-    }
-
-    pub(crate) fn buffer(&self) -> &Buffer {
-        &self.buffer
-    }
-}
-
-fn create_u32_cell(exec: &Executor, label: &str) -> Result<Buffer> {
-    if !exec.ctx.buffer_device_address_enabled {
-        bail!("{label}: requires bufferDeviceAddress");
-    }
-    Buffer::new(
-        &exec.ctx,
-        std::mem::size_of::<u32>() as u64,
-        vk::BufferUsageFlags::STORAGE_BUFFER,
-        BufferLocation::Host,
-    )
-    .context(label.to_string())
-}
-
-impl Executor {
-    /// Allocate a [`PosBuffer`] on this executor's device.
-    pub fn create_pos_buffer(&self) -> Result<PosBuffer> {
-        Ok(PosBuffer {
-            buffer: create_u32_cell(self, "create_pos_buffer")?,
-        })
-    }
-
-    /// Allocate a [`HostU32Buffer`] on this executor's device.
-    pub fn create_host_u32_buffer(&self) -> Result<HostU32Buffer> {
-        Ok(HostU32Buffer {
-            buffer: create_u32_cell(self, "create_host_u32_buffer")?,
-        })
-    }
-
-    /// Host-visible u32 list (prefill token ids).  `write` is a
-    /// coherent/flushed CPU store — no staging submit — so a 512-token
-    /// prompt is 2 KiB instead of a 4 MiB embedding upload.
-    pub fn create_token_id_buffer(&self, cap: u32) -> Result<TokenIdBuffer> {
-        if cap == 0 {
-            bail!("create_token_id_buffer: cap must be non-zero");
-        }
-        if !self.ctx.buffer_device_address_enabled {
-            bail!("create_token_id_buffer: requires bufferDeviceAddress");
-        }
-        let bytes = match (cap as u64).checked_mul(std::mem::size_of::<u32>() as u64) {
-            Some(bytes) => bytes,
-            None => bail!("create_token_id_buffer: cap overflows"),
-        };
-        Ok(TokenIdBuffer {
-            buffer: Buffer::new(
-                &self.ctx,
-                bytes,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-                BufferLocation::Host,
-            )
-            .context("create_token_id_buffer")?,
-            cap,
-        })
-    }
-}
-
-/// Host-visible list of token ids for [`ExecOp::EmbedGatherRows`].
-pub struct TokenIdBuffer {
-    buffer: Buffer,
-    cap: u32,
-}
-
-impl TokenIdBuffer {
-    /// Overwrite the first `ids.len()` slots.  The gather shader reads
-    /// `n_tokens` entries, so the caller must pass the same count.
-    pub fn write(&self, ids: &[u32]) -> Result<()> {
-        if ids.len() as u32 > self.cap {
-            bail!(
-                "TokenIdBuffer::write: {} ids exceeds cap {}",
-                ids.len(),
-                self.cap
-            );
-        }
-        self.buffer.write_pod_slice(ids)
-    }
-
-    pub fn device_address(&self) -> u64 {
-        self.buffer.device_address()
-    }
-
-    pub fn cap(&self) -> u32 {
-        self.cap
-    }
-
-    pub(crate) fn buffer(&self) -> &Buffer {
-        &self.buffer
-    }
-}
 
 /// One step of a mixed-op graph.  All variants execute in submission
 /// order with a full compute barrier between consecutive steps, so a
@@ -379,6 +211,37 @@ impl Access {
     }
 }
 
+/// Walks a planned graph's access list, emitting a barrier whenever
+/// the next op RAW/WAW/WARs against work since the last barrier.
+/// Shared by recording and the plan-only census so the two cannot
+/// disagree on how many barriers a graph pays.
+struct HazardCursor {
+    pending_writes: Vec<vk::Buffer>,
+    pending_reads: Vec<vk::Buffer>,
+}
+
+impl HazardCursor {
+    fn new() -> Self {
+        Self {
+            pending_writes: Vec::new(),
+            pending_reads: Vec::new(),
+        }
+    }
+
+    /// True when a compute barrier must precede `access` (never for
+    /// the first dispatch).
+    fn barrier_before(&mut self, index: usize, access: &Access) -> bool {
+        let needed = index > 0 && access.hazard_with(&self.pending_writes, &self.pending_reads);
+        if needed {
+            self.pending_writes.clear();
+            self.pending_reads.clear();
+        }
+        self.pending_reads.extend(&access.reads);
+        self.pending_writes.extend(&access.writes);
+        needed
+    }
+}
+
 impl Executor {
     /// Run a dependent chain of mixed ops as one submission.  Every op
     /// is fully validated and planned before anything is recorded, so
@@ -467,10 +330,11 @@ impl Executor {
     /// between them.  Nothing touches the queue.
     ///
     /// Diagnostics for performance accounting: a full compute barrier
-    /// drains the GPU (~7.7 µs measured on GA104), so pricing a graph
-    /// requires knowing how many the hazard tracker will emit.  The
-    /// perf-thesis harness (`ml_bench thesis`) uses this to separate
-    /// barrier drain from kernel time.
+    /// drains ~0.9 µs on GA104 (T3's original 7.7 µs inference was
+    /// falsified), so pricing a graph requires knowing how many the
+    /// hazard tracker will emit.  The perf-thesis harness
+    /// (`ml_bench thesis`) uses this to separate barrier drain from
+    /// kernel time.
     pub fn exec_ops_barrier_count(&self, ops: &[ExecOp<'_>]) -> Result<(usize, usize)> {
         if ops.is_empty() {
             bail!("exec_ops_barrier_count: empty op list");
@@ -479,18 +343,12 @@ impl Executor {
             bail!("exec_ops_barrier_count: requires bufferDeviceAddress");
         }
         let (planned, accesses, _total_flops) = self.plan_exec_ops(ops)?;
-        let mut pending_writes: Vec<vk::Buffer> = Vec::new();
-        let mut pending_reads: Vec<vk::Buffer> = Vec::new();
-        let mut barriers = 0usize;
-        for (index, access) in accesses.iter().enumerate() {
-            if index > 0 && access.hazard_with(&pending_writes, &pending_reads) {
-                barriers += 1;
-                pending_writes.clear();
-                pending_reads.clear();
-            }
-            pending_reads.extend(&access.reads);
-            pending_writes.extend(&access.writes);
-        }
+        let mut cursor = HazardCursor::new();
+        let barriers = accesses
+            .iter()
+            .enumerate()
+            .filter(|(index, access)| cursor.barrier_before(*index, access))
+            .count();
         Ok((planned.len(), barriers))
     }
 
@@ -733,23 +591,14 @@ impl Executor {
         accesses: &[Access],
     ) -> Result<()> {
         let mut bound = vk::Pipeline::null();
-        // Hazard tracking: barrier only when this op reads or
-        // overwrites something written since the last barrier
-        // (RAW/WAW), or writes something read since (WAR).
         // Independent neighbours overlap on the GPU, which both
-        // removes ~7 us of drain per avoided barrier and lets tiny
+        // removes ~0.9 µs of drain per avoided barrier and lets tiny
         // dispatches fill idle SMs.
-        let mut pending_writes: Vec<vk::Buffer> = Vec::new();
-        let mut pending_reads: Vec<vk::Buffer> = Vec::new();
+        let mut cursor = HazardCursor::new();
         for (index, step) in planned.iter().enumerate() {
-            let access = &accesses[index];
-            if index > 0 && access.hazard_with(&pending_writes, &pending_reads) {
+            if cursor.barrier_before(index, &accesses[index]) {
                 record_compute_to_compute_barrier(&self.ctx, cb);
-                pending_writes.clear();
-                pending_reads.clear();
             }
-            pending_reads.extend(&access.reads);
-            pending_writes.extend(&access.writes);
             match step {
                 Planned::Matmul { op, dims, plan } => {
                     record_one_matmul(
