@@ -1,0 +1,141 @@
+#version 460
+// Fused wide-prefill QKV pack (f16 activations + f16 KV caches).
+//
+// Input is the concatenated GEMM output [T, n_qkv] =
+// [Q (H*dh) | K (H_kv*dh) | V (H_kv*dh)] per token.  One dispatch:
+//   * RoPE-rotates Q into head-major [H, T, dh] (contiguous query
+//     rows for CM2 flash)
+//   * RoPE-rotates K into the Kt cache [H_kv, dh, T_max] at pos_base
+//   * copies V into the V cache [H_kv, T_max, dh] at pos_base
+//
+// Work is partitioned (Q pairs | K pairs | V vec4s) so each thread
+// does one job.  Math matches `op_rope_body.glsl` (f32 rotate against
+// the f32 cos/sin table, RNE store).
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F16V2Read {
+    f16vec2 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict writeonly buffer F16V2Write {
+    f16vec2 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 8) restrict readonly buffer F16V4Read {
+    f16vec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 8) restrict writeonly buffer F16V4Write {
+    f16vec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 2) restrict readonly buffer F16Read {
+    float16_t v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 2) restrict writeonly buffer F16Write {
+    float16_t v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) restrict readonly buffer F32ReadOnly {
+    float v[];
+};
+
+layout(push_constant) uniform PC {
+    uint tokens;
+    uint heads;
+    uint kv_heads;
+    uint head_dim;
+    uint rot_dim;     // even, <= head_dim
+    uint pos_base;
+    uint qkv_stride;  // n_qkv = embd + 2*kv_dim
+    uint t_max;
+    uint k_offset;    // embd
+    uint v_offset;    // embd + kv_dim
+    uint64_t qkv_ptr;
+    uint64_t q_ptr;
+    uint64_t kt_ptr;
+    uint64_t v_ptr;
+    uint64_t table_ptr; // [T_max, rot_dim/2, 2]
+} pc;
+
+f16vec2 rope_pair(float x0, float x1, uint angle) {
+    F32ReadOnly table = F32ReadOnly(pc.table_ptr);
+    const float c = table.v[angle];
+    const float s = table.v[angle + 1u];
+    return f16vec2(float16_t(fma(x0, c, -x1 * s)), float16_t(fma(x0, s, x1 * c)));
+}
+
+void main() {
+    const uint half_rot = pc.rot_dim / 2u;
+    const uint q_pairs = pc.tokens * pc.heads * half_rot;
+    const uint k_pairs = pc.tokens * pc.kv_heads * half_rot;
+    const uint v_vec4s = pc.tokens * pc.kv_heads * (pc.head_dim / 4u);
+    const uint id = gl_GlobalInvocationID.x;
+    F16V2Read qkv2 = F16V2Read(pc.qkv_ptr);
+    F16V2Write q2 = F16V2Write(pc.q_ptr);
+    F16Write kt = F16Write(pc.kt_ptr);
+
+    if (id < q_pairs) {
+        const uint pair = id % half_rot;
+        const uint head = (id / half_rot) % pc.heads;
+        const uint token = id / (half_rot * pc.heads);
+        const uint src2 = (token * pc.qkv_stride + head * pc.head_dim) >> 1u;
+        const f16vec2 x = qkv2.v[src2 + pair];
+        const uint angle = ((pc.pos_base + token) * half_rot + pair) * 2u;
+        // Head-major [H, T, dh] so flash loads contiguous query rows.
+        const uint dst2 = ((head * pc.tokens + token) * pc.head_dim) >> 1u;
+        q2.v[dst2 + pair] = rope_pair(float(x.x), float(x.y), angle);
+        if (pc.rot_dim < pc.head_dim) {
+            F16Read qkv = F16Read(pc.qkv_ptr);
+            F16Write q = F16Write(pc.q_ptr);
+            const uint tail = pc.head_dim - pc.rot_dim;
+            const uint vec_src = token * pc.qkv_stride + head * pc.head_dim;
+            const uint vec_dst = (head * pc.tokens + token) * pc.head_dim;
+            for (uint lane = pair; lane < tail; lane += half_rot) {
+                q.v[vec_dst + pc.rot_dim + lane] = qkv.v[vec_src + pc.rot_dim + lane];
+            }
+        }
+        return;
+    }
+
+    const uint kid = id - q_pairs;
+    if (kid < k_pairs) {
+        const uint pair = kid % half_rot;
+        const uint head = (kid / half_rot) % pc.kv_heads;
+        const uint token = kid / (half_rot * pc.kv_heads);
+        const uint src2 = (token * pc.qkv_stride + pc.k_offset + head * pc.head_dim) >> 1u;
+        const f16vec2 x = qkv2.v[src2 + pair];
+        const uint angle = ((pc.pos_base + token) * half_rot + pair) * 2u;
+        const f16vec2 y = rope_pair(float(x.x), float(x.y), angle);
+        const uint pos = pc.pos_base + token;
+        const uint d0 = pair * 2u;
+        // Kt [H_kv, dh, T_max]: ((head * dh + d) * t_max + pos)
+        kt.v[(head * pc.head_dim + d0) * pc.t_max + pos] = y.x;
+        kt.v[(head * pc.head_dim + d0 + 1u) * pc.t_max + pos] = y.y;
+        if (pc.rot_dim < pc.head_dim) {
+            F16Read qkv = F16Read(pc.qkv_ptr);
+            const uint tail = pc.head_dim - pc.rot_dim;
+            const uint vec_src = token * pc.qkv_stride + pc.k_offset + head * pc.head_dim;
+            for (uint lane = pair; lane < tail; lane += half_rot) {
+                const uint d = pc.rot_dim + lane;
+                kt.v[(head * pc.head_dim + d) * pc.t_max + pos] = qkv.v[vec_src + d];
+            }
+        }
+        return;
+    }
+
+    const uint vid = kid - k_pairs;
+    if (vid < v_vec4s) {
+        const uint n4 = pc.head_dim >> 2u;
+        const uint d4 = vid % n4;
+        const uint head = (vid / n4) % pc.kv_heads;
+        const uint token = vid / (n4 * pc.kv_heads);
+        const uint src4 = (token * pc.qkv_stride + pc.v_offset + head * pc.head_dim) >> 2u;
+        const uint pos = pc.pos_base + token;
+        const uint dst4 = ((head * pc.t_max + pos) * pc.head_dim) >> 2u;
+        F16V4Read qkv4 = F16V4Read(pc.qkv_ptr);
+        F16V4Write v4 = F16V4Write(pc.v_ptr);
+        v4.v[dst4 + d4] = qkv4.v[src4 + d4];
+    }
+}

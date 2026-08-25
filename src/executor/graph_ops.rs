@@ -14,12 +14,12 @@ use crate::buffer::{Buffer, BufferLocation};
 use crate::matmul::{MatmulOp, ResolvedMatmul, RunStats};
 use crate::tensor::Tensor;
 
-use super::elementwise::ElementwiseDispatch;
+use super::elementwise::{ElementwiseDispatch, GEMV_CHAIN_MAX_JOBS};
 use super::prepared::PreparedOps;
 use super::recording::{record_compute_to_compute_barrier, record_one_matmul};
 use super::{
-    AttnDecodeDesc, BinaryOp, CopyDesc, Executor, FlashAttentionDesc, OpPlan, RopeDesc,
-    RopeScatterDesc, SoftmaxMask,
+    AttnDecodeDesc, BinaryOp, CopyDesc, Executor, FlashAttentionDesc, OpPlan, PrefillQkvPackDesc,
+    RopeDesc, RopeScatterDesc, SoftmaxMask,
 };
 
 /// A 4-byte host-visible, device-readable position cell for replayable
@@ -96,7 +96,7 @@ impl HostU32Buffer {
         self.buffer.device_address()
     }
 
-    pub(super) fn buffer(&self) -> &Buffer {
+    pub(crate) fn buffer(&self) -> &Buffer {
         &self.buffer
     }
 }
@@ -127,6 +127,65 @@ impl Executor {
         Ok(HostU32Buffer {
             buffer: create_u32_cell(self, "create_host_u32_buffer")?,
         })
+    }
+
+    /// Host-visible u32 list (prefill token ids).  `write` is a
+    /// coherent/flushed CPU store — no staging submit — so a 512-token
+    /// prompt is 2 KiB instead of a 4 MiB embedding upload.
+    pub fn create_token_id_buffer(&self, cap: u32) -> Result<TokenIdBuffer> {
+        if cap == 0 {
+            bail!("create_token_id_buffer: cap must be non-zero");
+        }
+        if !self.ctx.buffer_device_address_enabled {
+            bail!("create_token_id_buffer: requires bufferDeviceAddress");
+        }
+        let bytes = match (cap as u64).checked_mul(std::mem::size_of::<u32>() as u64) {
+            Some(bytes) => bytes,
+            None => bail!("create_token_id_buffer: cap overflows"),
+        };
+        Ok(TokenIdBuffer {
+            buffer: Buffer::new(
+                &self.ctx,
+                bytes,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                BufferLocation::Host,
+            )
+            .context("create_token_id_buffer")?,
+            cap,
+        })
+    }
+}
+
+/// Host-visible list of token ids for [`ExecOp::EmbedGatherRows`].
+pub struct TokenIdBuffer {
+    buffer: Buffer,
+    cap: u32,
+}
+
+impl TokenIdBuffer {
+    /// Overwrite the first `ids.len()` slots.  The gather shader reads
+    /// `n_tokens` entries, so the caller must pass the same count.
+    pub fn write(&self, ids: &[u32]) -> Result<()> {
+        if ids.len() as u32 > self.cap {
+            bail!(
+                "TokenIdBuffer::write: {} ids exceeds cap {}",
+                ids.len(),
+                self.cap
+            );
+        }
+        self.buffer.write_pod_slice(ids)
+    }
+
+    pub fn device_address(&self) -> u64 {
+        self.buffer.device_address()
+    }
+
+    pub fn cap(&self) -> u32 {
+        self.cap
+    }
+
+    pub(crate) fn buffer(&self) -> &Buffer {
+        &self.buffer
     }
 }
 
@@ -218,6 +277,18 @@ pub enum ExecOp<'t> {
         out: &'t Tensor,
         desc: FlashAttentionDesc,
     },
+    /// Fused wide-prefill QKV pack (see
+    /// [`Executor::run_prefill_qkv_pack`]): RoPE Q to head-major
+    /// `[H, T, dh]`, RoPE-scatter K into the Kt cache, copy V into
+    /// the V cache.
+    PrefillQkvPack {
+        qkv: &'t Tensor,
+        table: &'t Tensor,
+        q: &'t Tensor,
+        kt: &'t Tensor,
+        v: &'t Tensor,
+        desc: PrefillQkvPackDesc,
+    },
     /// Greedy argmax (see [`Executor::run_argmax`]): writes the index
     /// of `input`'s largest element into the host-readable `result`
     /// cell (ties keep the largest index, matching Rust's
@@ -234,6 +305,26 @@ pub enum ExecOp<'t> {
         token: &'t HostU32Buffer,
         table: &'t Tensor,
         out: &'t Tensor,
+    },
+    /// Multi-row embedding gather: `tokens[0..n]` indexes rows of
+    /// `table` into `out` shaped `[n, embd]` (f16 or f32).  Prefill
+    /// uses this so the 512-token prompt is a 2 KiB id write plus a
+    /// gather, matching CUDA's on-device embedding table.
+    EmbedGatherRows {
+        tokens: &'t TokenIdBuffer,
+        table: &'t Tensor,
+        out: &'t Tensor,
+    },
+    /// Persistent GEMV chain: up to [`GEMV_CHAIN_MAX_JOBS`] M=1
+    /// f16-weight row GEMVs in ONE dispatch. Dependent groups wait on
+    /// an in-kernel device-scope quorum; independent neighbours share
+    /// a flattened tile space and stay concurrent.  Requires
+    /// `ML_DEVICE_SCOPE=1`.  llama-ash decode stays on packed row
+    /// GEMVs by default — enabling the chain globally scrambled CM2
+    /// flash numerics.
+    GemvChain {
+        jobs: Box<[MatmulOp<'t>; GEMV_CHAIN_MAX_JOBS]>,
+        n: u32,
     },
 }
 
@@ -264,6 +355,10 @@ impl Access {
     }
     fn read_cell(mut self, cell: &HostU32Buffer) -> Self {
         self.reads.push(cell.buffer().raw_buffer());
+        self
+    }
+    fn read_raw(mut self, buffer: vk::Buffer) -> Self {
+        self.reads.push(buffer);
         self
     }
     fn write_cell(mut self, cell: &HostU32Buffer) -> Self {
@@ -353,7 +448,14 @@ impl Executor {
             }
         }
         let (planned, accesses, total_flops) = self.plan_exec_ops(ops)?;
-        self.prepare_recorded(ops.len(), total_flops, |cb| {
+        let retain: Vec<std::sync::Arc<crate::buffer::Buffer>> = planned
+            .iter()
+            .filter_map(|step| match step {
+                Planned::Elementwise(dispatch) => dispatch.retain.clone(),
+                Planned::Matmul { .. } => None,
+            })
+            .collect();
+        self.prepare_recorded_retain(ops.len(), total_flops, retain, |cb| {
             self.record_exec_ops(cb, &planned, &accesses)
         })
     }
@@ -533,13 +635,46 @@ impl Executor {
                     Planned::Elementwise(self.plan_flash_attention(q, kt, v, out, *desc, false)?),
                     Access::default().read(q).read(kt).read(v).write(out),
                 ),
+                ExecOp::PrefillQkvPack {
+                    qkv,
+                    table,
+                    q,
+                    kt,
+                    v,
+                    desc,
+                } => (
+                    Planned::Elementwise(self.plan_prefill_qkv_pack(qkv, table, q, kt, v, *desc)?),
+                    Access::default()
+                        .read(qkv)
+                        .read(table)
+                        .write(q)
+                        .write(kt)
+                        .write(v),
+                ),
                 ExecOp::Argmax { input, result } => (
                     Planned::Elementwise(self.plan_argmax(input, result)?),
                     Access::default().read(input).write_cell(result),
                 ),
                 ExecOp::EmbedGather { token, table, out } => (
-                    Planned::Elementwise(self.plan_embed_gather(token, table, out)?),
+                    Planned::Elementwise(self.plan_embed_gather(
+                        token.device_address(),
+                        token.buffer(),
+                        table,
+                        out,
+                    )?),
                     Access::default().read_cell(token).read(table).write(out),
+                ),
+                ExecOp::EmbedGatherRows { tokens, table, out } => (
+                    Planned::Elementwise(self.plan_embed_gather(
+                        tokens.device_address(),
+                        tokens.buffer(),
+                        table,
+                        out,
+                    )?),
+                    Access::default()
+                        .read_raw(tokens.buffer().raw_buffer())
+                        .read(table)
+                        .write(out),
                 ),
                 ExecOp::AttnDecode {
                     q,
@@ -556,6 +691,29 @@ impl Executor {
                         Planned::Elementwise(combine),
                         Access::default().read(scratch).write(out),
                     )
+                }
+                ExecOp::GemvChain { jobs, n } => {
+                    let n = *n as usize;
+                    if n == 0 || n > GEMV_CHAIN_MAX_JOBS {
+                        bail!("run_exec_ops: GemvChain n={n} out of range");
+                    }
+                    let slice = &jobs[..n];
+                    let dispatch = self.plan_gemv_chain(slice)?;
+                    let mut access = Access::default();
+                    let mut flops = 0u64;
+                    for op in slice {
+                        let dims = ResolvedMatmul::from_op(op)?;
+                        flops = flops.saturating_add(dims.total_flops);
+                        access = access.read(op.call.a).read(op.call.b).write(op.call.c);
+                        if let Some(d) = op.epilogue.d_tensor() {
+                            access = access.read(d);
+                        }
+                        if let Some((w, _)) = op.normed_a {
+                            access = access.read(w);
+                        }
+                    }
+                    total_flops = total_flops.saturating_add(flops);
+                    (Planned::Elementwise(dispatch), access)
                 }
             };
             planned.push(step);

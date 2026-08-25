@@ -102,41 +102,43 @@ fn rms_and_layer_norm_match_reference() {
         eprintln!("skipping: no BDA");
         return;
     }
-    let (rows, cols) = (5_u32, 771_u32);
     let eps = 1e-5_f32;
-    let (input, host_in) = upload_det(&ctx, &exec, &[rows, cols], 2200);
-    let (weight, host_w) = upload_det(&ctx, &exec, &[cols], 2201);
-    let (bias, host_b) = upload_det(&ctx, &exec, &[cols], 2202);
-    let output = Tensor::uninit_device(&ctx, &[rows, cols]).unwrap();
-    let mut gpu = vec![0.0; (rows * cols) as usize];
+    // 771: scalar tail (cols % 4 != 0). 768: vec4 row walk.
+    for (rows, cols, seed) in [(5_u32, 771_u32, 2200_u64), (4_u32, 768_u32, 2210_u64)] {
+        let (input, host_in) = upload_det(&ctx, &exec, &[rows, cols], seed);
+        let (weight, host_w) = upload_det(&ctx, &exec, &[cols], seed + 1);
+        let (bias, host_b) = upload_det(&ctx, &exec, &[cols], seed + 2);
+        let output = Tensor::uninit_device(&ctx, &[rows, cols]).unwrap();
+        let mut gpu = vec![0.0; (rows * cols) as usize];
 
-    exec.run_rms_norm(&input, &weight, &output, eps).unwrap();
-    exec.download(&output, &mut gpu).unwrap();
-    let mut cpu = vec![0.0; gpu.len()];
-    for row in 0..rows as usize {
-        let data = &host_in[row * cols as usize..][..cols as usize];
-        let mean_sq = data.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / cols as f64;
-        let inv = 1.0 / (mean_sq + eps as f64).sqrt();
-        for col in 0..cols as usize {
-            cpu[row * cols as usize + col] = (data[col] as f64 * inv) as f32 * host_w[col];
+        exec.run_rms_norm(&input, &weight, &output, eps).unwrap();
+        exec.download(&output, &mut gpu).unwrap();
+        let mut cpu = vec![0.0; gpu.len()];
+        for row in 0..rows as usize {
+            let data = &host_in[row * cols as usize..][..cols as usize];
+            let mean_sq = data.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / cols as f64;
+            let inv = 1.0 / (mean_sq + eps as f64).sqrt();
+            for col in 0..cols as usize {
+                cpu[row * cols as usize + col] = (data[col] as f64 * inv) as f32 * host_w[col];
+            }
         }
-    }
-    assert_close_tol(&gpu, &cpu, 1e-4, "rmsnorm");
+        assert_close_tol(&gpu, &cpu, 1e-4, &format!("rmsnorm cols={cols}"));
 
-    exec.run_layer_norm(&input, &weight, &bias, &output, eps)
-        .unwrap();
-    exec.download(&output, &mut gpu).unwrap();
-    for row in 0..rows as usize {
-        let data = &host_in[row * cols as usize..][..cols as usize];
-        let mean = data.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
-        let var = data.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / cols as f64;
-        let inv = 1.0 / (var + eps as f64).sqrt();
-        for col in 0..cols as usize {
-            cpu[row * cols as usize + col] =
-                ((data[col] as f64 - mean) * inv) as f32 * host_w[col] + host_b[col];
+        exec.run_layer_norm(&input, &weight, &bias, &output, eps)
+            .unwrap();
+        exec.download(&output, &mut gpu).unwrap();
+        for row in 0..rows as usize {
+            let data = &host_in[row * cols as usize..][..cols as usize];
+            let mean = data.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
+            let var = data.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / cols as f64;
+            let inv = 1.0 / (var + eps as f64).sqrt();
+            for col in 0..cols as usize {
+                cpu[row * cols as usize + col] =
+                    ((data[col] as f64 - mean) * inv) as f32 * host_w[col] + host_b[col];
+            }
         }
+        assert_close_tol(&gpu, &cpu, 1e-4, &format!("layernorm cols={cols}"));
     }
-    assert_close_tol(&gpu, &cpu, 1e-4, "layernorm");
 }
 
 #[test]

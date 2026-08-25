@@ -8,7 +8,7 @@
 //! independently measured op-class terms (GEMM + flash attention +
 //! elementwise + barrier drain) whose sum lands within tolerance of
 //! the measured whole.  The piecewise inventory mirrors
-//! `llama-ash/src/model.rs::prefill_ops` (T >= 256 branch); if that
+//! `llama-ash/src/model.rs::prefill_ops` (wide T >= 128 branch); if that
 //! structure drifts, THIS THESIS FAILING IS THE ALARM.
 //!
 //! T7 (token exactness): every decode mode x KV dtype x prefill width
@@ -356,6 +356,8 @@ pub(crate) fn t5_prefill_accounting(
                 kv_len: T,
                 pos_base: 0,
                 scale: 1.0 / (dh as f32).sqrt(),
+                token_major_heads: None,
+                out_token_major_heads: None,
             },
         )
     })?);
@@ -385,13 +387,19 @@ pub(crate) fn t5_prefill_accounting(
         return Ok(skip("T5", ITEM, "device reports no GPU timestamps"));
     }
 
-    // Per-layer inventory of prefill_ops' T >= 256 branch: 1 attn
-    // rmsnorm + 3 qkv matmuls + 2 ropes + 2 KV appends + q permute +
-    // flash + attn permute + [o matmul + residual add + ffn rmsnorm +
+    // Per-layer inventory of prefill_ops' wide (T >= 128) branch:
+    // 1 attn rmsnorm + 1 concatenated QKV GEMM + fused QKV pack +
+    // flash (token-major O) + [o matmul + residual add + ffn rmsnorm +
     // up/gate matmuls + silu-mul + down matmul + residual add].
+    // Standalone piece timings still use the older 3-projection +
+    // permute decomposition; the concat QKV GEMM is approximated as
+    // q/o + 2×k/v (same FLOPs, one dispatch).
     let layers = cfg.n_layers as f64;
     let gemm_total = (2.0 * qo + 2.0 * kvp + 2.0 * upgate + down) * layers + lm_head;
     let flash_total = flash * layers;
+    // Pack replaces 2 ropes + 2 KV copies + 2 permutes on the f16
+    // wide path; keep the measured copies as an upper bound on that
+    // fused kernel (same bytes moved, one dispatch).
     let elem_per_layer =
         2.0 * rms + rope_q + rope_k + copy_kt + copy_v + copy_qh + copy_attn + 2.0 * add + silu;
     let elem_total = elem_per_layer * layers + tail_copy + tail_rms;

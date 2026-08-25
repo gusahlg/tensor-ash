@@ -33,11 +33,27 @@ layout(buffer_reference, std430, buffer_reference_align = 2) restrict readonly b
 layout(buffer_reference, std430, buffer_reference_align = 2) restrict buffer F16ReadWrite {
     float16_t v[];
 };
+layout(buffer_reference, std430, buffer_reference_align = 8) restrict readonly buffer F16V4ReadOnly {
+    f16vec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 8) restrict buffer F16V4ReadWrite {
+    f16vec4 v[];
+};
 #define IO_READER F16ReadOnly
 #define IO_WRITER F16ReadWrite
+#define IO_V4_READER F16V4ReadOnly
+#define IO_V4_WRITER F16V4ReadWrite
 #else
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer F32V4ReadOnly {
+    vec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict buffer F32V4ReadWrite {
+    vec4 v[];
+};
 #define IO_READER F32ReadOnly
 #define IO_WRITER F32ReadWrite
+#define IO_V4_READER F32V4ReadOnly
+#define IO_V4_WRITER F32V4ReadWrite
 #endif
 
 layout(push_constant) uniform PC {
@@ -50,17 +66,35 @@ layout(push_constant) uniform PC {
     IO_WRITER out_ptr;
 } pc;
 
+float combine(float a, float b) {
+    return pc.mode == 0u ? a + pc.beta * b : (a / (1.0 + exp(-a))) * b;
+}
+
 void main() {
     const uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.n) return;
-    const float a = float(pc.a_ptr.v[i]);
-    const float b = float(pc.b_ptr.v[i]);
-    const float value = pc.mode == 0u
-        ? a + pc.beta * b
-        : (a / (1.0 + exp(-a))) * b;
+    const uint base = i * 4u;
+    if (base + 4u <= pc.n) {
+        const vec4 a = vec4(IO_V4_READER(uint64_t(pc.a_ptr)).v[i]);
+        const vec4 b = vec4(IO_V4_READER(uint64_t(pc.b_ptr)).v[i]);
+        const vec4 value = vec4(
+            combine(a.x, b.x), combine(a.y, b.y),
+            combine(a.z, b.z), combine(a.w, b.w));
 #ifdef IO_F16
-    pc.out_ptr.v[i] = float16_t(value);
+        IO_V4_WRITER(uint64_t(pc.out_ptr)).v[i] = f16vec4(value);
 #else
-    pc.out_ptr.v[i] = value;
+        IO_V4_WRITER(uint64_t(pc.out_ptr)).v[i] = value;
 #endif
+        return;
+    }
+    if (base >= pc.n) return;
+    for (uint k = 0u; k < 4u; ++k) {
+        const uint j = base + k;
+        if (j >= pc.n) break;
+        const float value = combine(float(pc.a_ptr.v[j]), float(pc.b_ptr.v[j]));
+#ifdef IO_F16
+        pc.out_ptr.v[j] = float16_t(value);
+#else
+        pc.out_ptr.v[j] = value;
+#endif
+    }
 }

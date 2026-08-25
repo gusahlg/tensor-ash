@@ -50,10 +50,10 @@ use splitk2::SplitK2Pipeline;
 
 pub use crate::matmul::{MatmulCall, RunStats};
 pub use elementwise::{
-    ATTN_DECODE_MAX_CHUNKS, AttnDecodeDesc, BinaryOp, CopyDesc, FlashAttentionDesc, RopeDesc,
-    RopeScatterDesc, SoftmaxMask,
+    ATTN_DECODE_MAX_CHUNKS, AttnDecodeDesc, BinaryOp, CopyDesc, FlashAttentionDesc,
+    GEMV_CHAIN_MAX_JOBS, PrefillQkvPackDesc, RopeDesc, RopeScatterDesc, SoftmaxMask,
 };
-pub use graph_ops::{ExecOp, HostU32Buffer, PosBuffer};
+pub use graph_ops::{ExecOp, HostU32Buffer, PosBuffer, TokenIdBuffer};
 pub use prepared::PreparedOps;
 
 /// Read-only description of the route selected for a plain matmul shape.
@@ -208,16 +208,26 @@ impl Executor {
     }
 
     /// Resolve the complete route for one resolved matmul, including
-    /// the f16-activations short-circuit: f16-A ops have exactly one
-    /// kernel (the aligned a16 coopmat), so they bypass tuning, the
-    /// shape heuristic, and split-K entirely — but only on devices
-    /// with the cooperative-matrix + f16-storage features that kernel
-    /// needs.
+    /// the f16-activations short-circuit: f16-A ops pick one of the
+    /// two aligned a16 coopmat tiles (128x128 or wave-fill 64x64), so
+    /// they bypass tuning, the shape heuristic, and split-K entirely
+    /// — but only on devices with the cooperative-matrix + f16-storage
+    /// features those kernels need.
     pub(super) fn plan_matmul(
         &self,
         dims: &crate::matmul::ResolvedMatmul,
         splitk2_eligible: bool,
     ) -> anyhow::Result<OpPlan> {
+        if dims.packed_b {
+            // Fail-closed through the budget gate: an empty packed
+            // slot panics rather than falling back to a row-major
+            // sibling that would misread B.
+            let selection = crate::pipeline::f16w_row_packed_selection(dims.k, dims.n);
+            return Ok(OpPlan {
+                kernel: self.pipeline.in_budget_index(selection),
+                splitk2: None,
+            });
+        }
         if dims.a_f16 {
             if !(self.ctx.coopmat_enabled && self.ctx.f16_storage_enabled) {
                 anyhow::bail!(
@@ -225,8 +235,13 @@ impl Executor {
                      support, which this device lacks"
                 );
             }
+            let selection = if crate::pipeline::coopmat_prefers_m64(dims.batch, dims.m, dims.n) {
+                crate::pipeline::KernelSelection::F16wA16CoopmatM64
+            } else {
+                crate::pipeline::KernelSelection::F16wA16Coopmat
+            };
             return Ok(OpPlan {
-                kernel: crate::pipeline::KernelSelection::F16wA16Coopmat
+                kernel: selection
                     .index()
                     .expect("a16 coopmat selection is concrete"),
                 splitk2: None,
@@ -257,6 +272,12 @@ impl Executor {
         dims: &crate::matmul::ResolvedMatmul,
         plan: OpPlan,
     ) -> OpPlan {
+        // Packed B is a different layout; falling back to any unpacked
+        // sibling would silently misread weights.  Record-time already
+        // rejects a packed/unpacked mismatch.
+        if dims.packed_b {
+            return plan;
+        }
         // Only auto routes demote.  An explicit ML_KERNEL selection of
         // a non-fusing kernel keeps its documented loud failure at
         // record time rather than being silently overridden.

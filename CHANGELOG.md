@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- **RMSNorm/LayerNorm vec4 path on ragged widths**: the f32/f16 vec4
+  row walk required `cols % 4 == 0` so each row start stayed aligned
+  in the vec4 view.  Odd widths (the 771-col reference test) now keep
+  the scalar path; 768-col is pinned too.  Embed-gather vec4 loads are
+  gated the same way on `embd % 4`.
+- **Coopmat LDS double-buffering reverted**: ping-ponging K tiles in
+  shared memory doubled 128x128 working set to 37.9 KiB and collapsed
+  occupancy.  RTX 4060 2048³ fell to 6.4 TF/s; single-buffer restored
+  22.7 TF/s.  Same dead-end class as register-prefetch (leg 14 era).
 - **Silent GPU loss under context churn** (loader pin in
   `VulkanContext` init): the Vulkan loader dlcloses every ICD when the
   last `VkInstance` dies and re-dlopens them on the next create. ICDs
@@ -25,6 +34,37 @@
 
 ### Added
 
+- **Packed-B decode GEMVs** (`pack_f16w_row_tiles`,
+  `MatmulOp::with_packed_b`, `f16w_row_bda_k16_packed` /
+  `k16_v2_packed`): B is stored `[N/tile_n][K][tile_n]` so the K-walk
+  is sequential at stride `tile_n` instead of `N`.  Same inner-product
+  order as the unpacked row kernels.  llama-ash packs every decode
+  weight at load.  Packed routing is fail-closed (no unpacked fallback:
+  the layouts do not alias).
+- **Wave-fill 64x64 coopmat** (`f16w_coopmat_m64n64` /
+  `f16w_a16_coopmat_m64n64`): 4x the CTA count of 128x128 on M=512
+  prefill projections.  Heuristic: prefer 64x64 when a 128x128 grid
+  has fewer than 96 tiles (or the shape is 64-aligned but not
+  128-aligned).  RTX 4060: 512x2048x2048 22.2 TF/s on m64, 2048³
+  22.7 TF/s on 128x128.
+- **Concatenated QKV + fused prefill pack** (`w_qkv`,
+  `Executor::run_prefill_qkv_pack`, `ExecOp::PrefillQkvPack`): one GEMM
+  over `[embd, embd+2*kv]` plus a single dispatch that RoPE-writes
+  head-major Q, scatters K into Kt, and copies V.  Flash can then
+  write token-major O (`out_token_major_heads`) so the Q/O permutes
+  go away on the f16 T≥128 path.  Short prompts share the concat
+  weights (no second QKV copy).
+- **Token-major flash addressing**: `FlashAttentionDesc` carries
+  independent Q/O head and row strides.  CM2 flash row-sums via
+  `coopMatReduceNV` instead of a 64x64x64 P@ones product.
+- **Multi-row embedding gather** (`TokenIdBuffer`,
+  `ExecOp::EmbedGatherRows`): prefill prompt embed is a 2 KiB id
+  write plus one gather.
+- **Persistent GEMV chain** (`ExecOp::GemvChain`, `ML_DEVICE_SCOPE=1`):
+  up to 8 M=1 f16-weight row GEMVs in one dispatch with in-kernel
+  device-scope quorum.  Default off — enabling the memory model
+  globally scrambled CM2 flash numerics; llama-ash stays on packed
+  row GEMVs.  Chain does not accept packed B.
 - **Shared-memory budget gate**: every catalog kernel's workgroup
   declaration is now read from its SPIR-V (`KernelSpec::
   shared_memory_bytes`) and checked against `VulkanContext::

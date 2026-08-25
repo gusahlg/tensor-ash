@@ -100,13 +100,13 @@ fn bench(args: &Args) -> Result<()> {
     if !warm_logits.iter().all(|v| v.is_finite()) {
         bail!("warmup prefill produced non-finite logits");
     }
-    model.decode_many(warm_id, 16)?;
+    model.decode_unrolled(warm_id, 128)?;
     log::info!("warmup prefill + decode done (argmax {warm_id}); resetting caches");
     model.reset()?;
 
     let t0 = Instant::now();
     model.breakdown.borrow_mut().clear();
-    let (next, _) = model.prefill(&prompt)?;
+    let next = model.prefill_tokens(&prompt)?;
     let prefill_s = t0.elapsed().as_secs_f64();
 
     // GPU-timestamped prefill graph time vs wall time: the difference
@@ -130,7 +130,11 @@ fn bench(args: &Args) -> Result<()> {
 
     model.breakdown.borrow_mut().clear();
     let t1 = Instant::now();
-    let generated = model.decode_many(next, args.tg)?;
+    let generated = if args.tg >= 32 {
+        model.decode_unrolled(next, args.tg)?
+    } else {
+        model.decode_many(next, args.tg)?
+    };
     let decode_s = t1.elapsed().as_secs_f64();
     let next = generated.last().copied().unwrap_or(next);
 

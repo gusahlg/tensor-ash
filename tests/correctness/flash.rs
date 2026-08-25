@@ -140,6 +140,8 @@ fn run_case(label: &str, case: &FlashCase, poison_tail: bool) {
             kv_len,
             pos_base,
             scale,
+            token_major_heads: None,
+            out_token_major_heads: None,
         },
     )
     .unwrap();
@@ -263,6 +265,8 @@ fn flash_matches_composed_path() {
             kv_len: t,
             pos_base: 0,
             scale,
+            token_major_heads: None,
+            out_token_major_heads: None,
         },
     )
     .unwrap();
@@ -319,6 +323,8 @@ fn flash_rejects_bad_geometry() {
         kv_len: 32,
         pos_base: 0,
         scale: 1.0,
+        token_major_heads: None,
+        out_token_major_heads: None,
     };
     let err = exec
         .run_flash_attention(&q, &kt, &v, &out, desc)
@@ -340,6 +346,8 @@ fn flash_rejects_bad_geometry() {
                 kv_len: 65,
                 pos_base: 0,
                 scale: 1.0,
+                token_major_heads: None,
+                out_token_major_heads: None,
             },
         )
         .unwrap_err()
@@ -379,6 +387,8 @@ fn flash_in_graph_matches_standalone_bitwise() {
         kv_len: case.kv_len,
         pos_base: case.pos_base,
         scale: 1.0 / (case.dh as f32).sqrt(),
+        token_major_heads: None,
+        out_token_major_heads: None,
     };
     let out_standalone = Tensor::uninit_device(&ctx, &[case.heads, case.t_q, case.dh]).unwrap();
     let out_graph = Tensor::uninit_device(&ctx, &[case.heads, case.t_q, case.dh]).unwrap();
@@ -454,6 +464,8 @@ fn run_cm2_case(label: &str, case: &FlashCase, kv_f16: bool) {
         kv_len,
         pos_base,
         scale,
+        token_major_heads: None,
+        out_token_major_heads: None,
     };
     let out_cm2 = Tensor::uninit_device(&ctx, &[heads, t_q, dh]).unwrap();
     let out_simt = Tensor::uninit_device(&ctx, &[heads, t_q, dh]).unwrap();
@@ -588,6 +600,8 @@ fn run_cm2_io16_case(label: &str, case: &FlashCase) {
         kv_len,
         pos_base,
         scale: 1.0 / (dh as f32).sqrt(),
+        token_major_heads: None,
+        out_token_major_heads: None,
     };
     let out16 = Tensor::uninit_device_f16(&ctx, &[heads, t_q, dh]).unwrap();
     let out32 = Tensor::uninit_device(&ctx, &[heads, t_q, dh]).unwrap();
@@ -652,6 +666,8 @@ fn flash_io16_invalid_combinations_are_rejected() {
         kv_len: t_max,
         pos_base: 0,
         scale: 0.125,
+        token_major_heads: None,
+        out_token_major_heads: None,
     };
     // f16 q with f32 KV caches has no compiled kernel.
     let err = exec
@@ -667,4 +683,181 @@ fn flash_io16_invalid_combinations_are_rejected() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("share a storage type"), "unexpected: {err}");
+}
+
+fn permute_head_major_to_token_major(q: &[f32], heads: usize, t: usize, dh: usize) -> Vec<f32> {
+    let mut out = vec![0.0; heads * t * dh];
+    for head in 0..heads {
+        for row in 0..t {
+            for d in 0..dh {
+                out[(row * heads + head) * dh + d] = q[(head * t + row) * dh + d];
+            }
+        }
+    }
+    out
+}
+
+fn permute_token_major_to_head_major(q: &[f32], heads: usize, t: usize, dh: usize) -> Vec<f32> {
+    let mut out = vec![0.0; heads * t * dh];
+    for head in 0..heads {
+        for row in 0..t {
+            for d in 0..dh {
+                out[(head * t + row) * dh + d] = q[(row * heads + head) * dh + d];
+            }
+        }
+    }
+    out
+}
+
+/// Token-major `[T, H*dh]` Q/out must match the default `[H, T, dh]`
+/// layout after a host permute — this is the wide-prefill addressing
+/// that drops the two head-permute copies.
+#[test]
+#[ignore]
+fn flash_token_major_matches_head_major() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !ctx.buffer_device_address_enabled {
+        eprintln!("skipping: no BDA");
+        return;
+    }
+    let (heads, kv_heads, t_q, t_max, dh) = (8_u32, 2_u32, 128_u32, 256_u32, 64_u32);
+    let case = FlashCase {
+        heads,
+        kv_heads,
+        t_q,
+        t_max,
+        dh,
+        kv_len: t_q,
+        pos_base: 0,
+    };
+    let (q_hm, host_q) = upload_det(&ctx, &exec, &[heads, t_q, dh], 5500);
+    let (host_kt, host_v) = fill_kv(&case, None);
+    let kt = Tensor::uninit_device(&ctx, &[kv_heads, dh, t_max]).unwrap();
+    let v = Tensor::uninit_device(&ctx, &[kv_heads, t_max, dh]).unwrap();
+    exec.upload(&host_kt, &kt).unwrap();
+    exec.upload(&host_v, &v).unwrap();
+    let scale = 1.0 / (dh as f32).sqrt();
+    let out_hm = Tensor::uninit_device(&ctx, &[heads, t_q, dh]).unwrap();
+    exec.run_flash_attention_simt(
+        &q_hm,
+        &kt,
+        &v,
+        &out_hm,
+        FlashAttentionDesc {
+            kv_len: t_q,
+            pos_base: 0,
+            scale,
+            token_major_heads: None,
+            out_token_major_heads: None,
+        },
+    )
+    .unwrap();
+    let host_q_tm =
+        permute_head_major_to_token_major(&host_q, heads as usize, t_q as usize, dh as usize);
+    let q_tm = Tensor::uninit_device(&ctx, &[t_q, heads * dh]).unwrap();
+    exec.upload(&host_q_tm, &q_tm).unwrap();
+    let out_tm = Tensor::uninit_device(&ctx, &[t_q, heads * dh]).unwrap();
+    exec.run_flash_attention_simt(
+        &q_tm,
+        &kt,
+        &v,
+        &out_tm,
+        FlashAttentionDesc {
+            kv_len: t_q,
+            pos_base: 0,
+            scale,
+            token_major_heads: Some(heads),
+            out_token_major_heads: None,
+        },
+    )
+    .unwrap();
+    let mut gpu_hm = vec![0.0; host_q.len()];
+    let mut gpu_tm = vec![0.0; host_q.len()];
+    exec.download(&out_hm, &mut gpu_hm).unwrap();
+    exec.download(&out_tm, &mut gpu_tm).unwrap();
+    let gpu_tm_hm =
+        permute_token_major_to_head_major(&gpu_tm, heads as usize, t_q as usize, dh as usize);
+    assert_close_tol(&gpu_tm_hm, &gpu_hm, 1e-5, "token-major vs head-major SIMT");
+
+    if !ctx.coopmat2_enabled || !ctx.f16_storage_enabled {
+        return;
+    }
+    let mut host_q16 = host_q.clone();
+    for value in &mut host_q16 {
+        *value = round_f32_via_f16(*value);
+    }
+    let q16_hm = Tensor::uninit_device_f16(&ctx, &[heads, t_q, dh]).unwrap();
+    exec.upload(&host_q16, &q16_hm).unwrap();
+    let kt16 = Tensor::uninit_device_f16(&ctx, &[kv_heads, dh, t_max]).unwrap();
+    let v16 = Tensor::uninit_device_f16(&ctx, &[kv_heads, t_max, dh]).unwrap();
+    exec.upload(&host_kt, &kt16).unwrap();
+    exec.upload(&host_v, &v16).unwrap();
+    let out16_hm = Tensor::uninit_device_f16(&ctx, &[heads, t_q, dh]).unwrap();
+    let desc_hm = FlashAttentionDesc {
+        kv_len: t_q,
+        pos_base: 0,
+        scale,
+        token_major_heads: None,
+        out_token_major_heads: None,
+    };
+    exec.run_flash_attention(&q16_hm, &kt16, &v16, &out16_hm, desc_hm)
+        .unwrap();
+    let host_q16_tm =
+        permute_head_major_to_token_major(&host_q16, heads as usize, t_q as usize, dh as usize);
+    let q16_tm = Tensor::uninit_device_f16(&ctx, &[t_q, heads * dh]).unwrap();
+    exec.upload(&host_q16_tm, &q16_tm).unwrap();
+    let out16_tm = Tensor::uninit_device_f16(&ctx, &[t_q, heads * dh]).unwrap();
+    exec.run_flash_attention(
+        &q16_tm,
+        &kt16,
+        &v16,
+        &out16_tm,
+        FlashAttentionDesc {
+            kv_len: t_q,
+            pos_base: 0,
+            scale,
+            token_major_heads: Some(heads),
+            out_token_major_heads: None,
+        },
+    )
+    .unwrap();
+    let mut gpu16_hm = vec![0.0; host_q.len()];
+    let mut gpu16_tm = vec![0.0; host_q.len()];
+    exec.download(&out16_hm, &mut gpu16_hm).unwrap();
+    exec.download(&out16_tm, &mut gpu16_tm).unwrap();
+    let gpu16_tm_hm =
+        permute_token_major_to_head_major(&gpu16_tm, heads as usize, t_q as usize, dh as usize);
+    assert_close_tol(
+        &gpu16_tm_hm,
+        &gpu16_hm,
+        4.0e-3,
+        "token-major vs head-major io16",
+    );
+
+    // Mixed: head-major Q, token-major O — the wide-prefill addressing.
+    let out16_mixed = Tensor::uninit_device_f16(&ctx, &[t_q, heads * dh]).unwrap();
+    exec.run_flash_attention(
+        &q16_hm,
+        &kt16,
+        &v16,
+        &out16_mixed,
+        FlashAttentionDesc {
+            kv_len: t_q,
+            pos_base: 0,
+            scale,
+            token_major_heads: None,
+            out_token_major_heads: Some(heads),
+        },
+    )
+    .unwrap();
+    let mut gpu16_mixed = vec![0.0; host_q.len()];
+    exec.download(&out16_mixed, &mut gpu16_mixed).unwrap();
+    let gpu16_mixed_hm =
+        permute_token_major_to_head_major(&gpu16_mixed, heads as usize, t_q as usize, dh as usize);
+    assert_close_tol(
+        &gpu16_mixed_hm,
+        &gpu16_hm,
+        4.0e-3,
+        "mixed head-Q/token-O vs head-major io16",
+    );
 }

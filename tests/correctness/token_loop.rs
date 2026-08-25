@@ -126,6 +126,45 @@ fn embed_gather_matches_cpu_f32_and_f16() {
     assert_close_tol(&got, last, 0.0, "gather clamp");
 }
 
+/// Prefill gather: T rows from a token-id list, f32 and f16 destinations,
+/// must match the CPU table rows (f16 dest matches the narrowed store).
+#[test]
+#[ignore]
+fn embed_gather_rows_matches_cpu() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !ctx.buffer_device_address_enabled || !ctx.f16_storage_enabled {
+        eprintln!("skipping: no BDA/f16");
+        return;
+    }
+    let (vocab, embd, t) = (64_u32, 128_u32, 8_u32);
+    let (table, host_table) = upload_det(&ctx, &exec, &[vocab, embd], 7601);
+    let table_f16 = Tensor::uninit_device_f16(&ctx, &[vocab, embd]).unwrap();
+    exec.upload(&host_table, &table_f16).unwrap();
+    let ids: Vec<u32> = (0..t).map(|i| (i * 7 + 3) % vocab).collect();
+    let tokens = exec.create_token_id_buffer(t).unwrap();
+    tokens.write(&ids).unwrap();
+
+    let out32 = Tensor::uninit_device(&ctx, &[t, embd]).unwrap();
+    exec.run_embed_gather_rows(&tokens, &table, &out32).unwrap();
+    let mut got = vec![0.0; (t * embd) as usize];
+    exec.download(&out32, &mut got).unwrap();
+    let mut cpu = Vec::with_capacity(got.len());
+    for &id in &ids {
+        cpu.extend_from_slice(&host_table[(id * embd) as usize..((id + 1) * embd) as usize]);
+    }
+    assert_close_tol(&got, &cpu, 0.0, "gather rows f32");
+
+    let out16 = Tensor::uninit_device_f16(&ctx, &[t, embd]).unwrap();
+    exec.run_embed_gather_rows(&tokens, &table_f16, &out16)
+        .unwrap();
+    exec.download(&out16, &mut got).unwrap();
+    let cpu16: Vec<f32> = cpu
+        .iter()
+        .map(|&v| f16_bits_to_f32(f32_to_f16_bits(v)))
+        .collect();
+    assert_close_tol(&got, &cpu16, 0.0, "gather rows f16 table -> f16 out");
+}
+
 /// The decode-tail chain as one graph submission — lm-head matmul,
 /// argmax, embedding gather — must match the stepwise ops (and the CPU
 /// sampler + gather) bitwise: same kernels, only the submission shape

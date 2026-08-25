@@ -290,10 +290,27 @@ pub(super) fn create(
         let features = vk::PhysicalDeviceFeatures::default();
         let mut vulkan11 = vk::PhysicalDeviceVulkan11Features::default()
             .storage_buffer16_bit_access(f16_storage_supported);
+        // Device-scope memory model is opt-in (`ML_DEVICE_SCOPE=1`):
+        // enabling it globally was measured to scramble CM2 flash
+        // numerics (T=6 greedy generate drifted off the CUDA token
+        // ids).  The persistent GEMV-chain kernel needs it and stays
+        // off in the default llama path.
+        let want_device_scope = std::env::var("ML_DEVICE_SCOPE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let memory_model_device_scope = want_device_scope
+            && vulkan12_query.vulkan_memory_model == vk::TRUE
+            && vulkan12_query.vulkan_memory_model_device_scope == vk::TRUE;
+        if want_device_scope && !memory_model_device_scope {
+            log::warn!(
+                "tensor-ash: ML_DEVICE_SCOPE=1 but the device does not expose \
+                 vulkanMemoryModelDeviceScope; GEMV-chain stays off"
+            );
+        }
         let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(buffer_device_address_supported)
             .shader_float16(f16_storage_supported)
-            .vulkan_memory_model(enable_coopmat);
+            .vulkan_memory_model(enable_coopmat || memory_model_device_scope)
+            .vulkan_memory_model_device_scope(memory_model_device_scope);
         let mut coopmat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
             .cooperative_matrix(enable_coopmat);
         let mut device_ci = vk::DeviceCreateInfo::default()
@@ -371,6 +388,7 @@ pub(super) fn create(
             f16_storage_enabled: f16_storage_supported,
             coopmat_enabled: enable_coopmat,
             coopmat2_enabled: enable_coopmat2,
+            memory_model_device_scope_enabled: memory_model_device_scope,
             pipeline_cache,
             pipeline_cache_path,
             debug_loader,

@@ -15,9 +15,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use ash::vk;
 
+use crate::buffer::{Buffer, BufferLocation};
 use crate::context::VulkanContext;
 use crate::dtype::DType;
-use crate::matmul::RunStats;
+use crate::matmul::{Activation, EpilogueBinary, MatmulOp, ResolvedMatmul, RunStats};
 use crate::tensor::Tensor;
 
 use super::Executor;
@@ -72,6 +73,7 @@ op_kernels! { Op / KERNELS:
     AttnDecodeCombine => ("op_attn_decode_combine", &[], "op attn_decode combine"),
     Argmax => ("op_argmax_f32", &[], "op argmax"),
     EmbedGather => ("op_embed_gather", &[], "op embed_gather"),
+    PrefillQkvPack => ("op_prefill_qkv_pack", &[], "op prefill_qkv_pack"),
 }
 
 // Tensor-core flash-attention kernels (`VK_NV_cooperative_matrix2`),
@@ -90,6 +92,15 @@ op_kernels! { Cm2Op / CM2_KERNELS:
 
 /// Threads per workgroup in every op shader.
 const WG: u32 = 256;
+
+/// Maximum jobs in one [`super::ExecOp::GemvChain`] dispatch.
+pub const GEMV_CHAIN_MAX_JOBS: usize = 8;
+
+/// Cap on the persistent grid.  64 × 16-warp blocks fill a 46-SM
+/// Ampere (and still fit a 24-SM Ada occupancy budget); leftover
+/// tiles are looped.  Launching only 32 WGs left 14 SMs idle on the
+/// 3070 and serialized ~3 tiles/WG on the 88-tile gate/up GEMVs.
+const GEMV_CHAIN_MAX_WG: u32 = 64;
 
 /// Row-softmax masking mode.  Masked columns store exactly `0.0`, so
 /// attention over a zero-padded KV cache stays correct end to end: the
@@ -159,6 +170,31 @@ pub struct FlashAttentionDesc {
     pub pos_base: u32,
     /// `1/sqrt(dh)` for standard attention.
     pub scale: f32,
+    /// `Some(H)` means `q` is token-major: rank-2 `[T, H*dh]` or
+    /// rank-3 `[T, H, dh]`.  `None` is the default head-major `[H, T, dh]`.
+    /// `out` follows `q` unless [`out_token_major_heads`](Self::out_token_major_heads)
+    /// is set.
+    pub token_major_heads: Option<u32>,
+    /// Independent `out` layout.  `Some(H)` writes token-major
+    /// `[T, H*dh]` even when `q` is head-major — the wide-prefill
+    /// path (contiguous Q loads, Wo-ready O, no permutes).
+    pub out_token_major_heads: Option<u32>,
+}
+
+/// Geometry for [`Executor::run_prefill_qkv_pack`]: RoPE Q into
+/// head-major `[H, T, dh]` (contiguous query rows for flash),
+/// RoPE-scatter K into `[H_kv, dh, T_max]`, and copy V into
+/// `[H_kv, T_max, dh]`, all from one concatenated
+/// `[T, H*dh + 2*H_kv*dh]` QKV row.
+#[derive(Copy, Clone, Debug)]
+pub struct PrefillQkvPackDesc {
+    pub heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    /// Even, `<= head_dim`; lanes past it pass through (partial rotary).
+    pub rot_dim: u32,
+    /// Absolute position of token 0.
+    pub pos_base: u32,
 }
 
 /// Fused split-K decode-attention geometry for
@@ -324,12 +360,34 @@ struct FlashPc {
     pos_base: u32,
     group_size: u32,
     scale: f32,
-    _pad0: u32,
-    _pad1: u32,
+    q_head_stride: u32,
+    q_row_stride: u32,
+    o_head_stride: u32,
+    o_row_stride: u32,
     q_ptr: u64,
     kt_ptr: u64,
     v_ptr: u64,
     out_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct PrefillQkvPackPc {
+    tokens: u32,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    rot_dim: u32,
+    pos_base: u32,
+    qkv_stride: u32,
+    t_max: u32,
+    k_offset: u32,
+    v_offset: u32,
+    qkv_ptr: u64,
+    q_ptr: u64,
+    kt_ptr: u64,
+    v_ptr: u64,
+    table_ptr: u64,
 }
 
 #[repr(C)]
@@ -363,10 +421,41 @@ struct EmbedGatherPc {
     embd: u32,
     vocab: u32,
     table_f16: u32,
+    n_tokens: u32,
+    out_f16: u32,
     _pad: u32,
     token_ptr: u64,
     table_ptr: u64,
     out_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct GemvChainPc {
+    jobs_ptr: u64,
+    sync_ptr: u64,
+    n_jobs: u32,
+    n_wg: u32,
+}
+
+/// Must stay 80 bytes / 16-aligned to match the GLSL `GemvJob`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct GemvJob {
+    n: u32,
+    k: u32,
+    flags: u32,
+    vcols: u32,
+    alpha: f32,
+    beta: f32,
+    pad0: u32,
+    pad1: u32,
+    a_ptr: u64,
+    b_ptr: u64,
+    c_ptr: u64,
+    d_ptr: u64,
+    bias_ptr: u64,
+    pad2: u64,
 }
 
 #[repr(C)]
@@ -393,6 +482,10 @@ pub(super) struct ElementwiseDispatch {
     push: [u8; ELEMENTWISE_PC_BYTES],
     push_len: usize,
     groups: (u32, u32),
+    /// Side allocation the recorded push constants point at (GEMV-chain
+    /// job table + quorum counters).  Held so prepared replay cannot
+    /// drop the buffer out from under a baked device address.
+    pub(super) retain: Option<Arc<Buffer>>,
 }
 
 struct OpKernel {
@@ -406,6 +499,10 @@ pub(super) struct ElementwisePipeline {
     kernels: [OpKernel; Op::COUNT],
     /// `Some` iff [`VulkanContext::coopmat2_enabled`].
     cm2_kernels: Option<[OpKernel; Cm2Op::COUNT]>,
+    /// Persistent GEMV-chain kernel; `Some` iff the device enabled
+    /// the Vulkan memory model with device scope (required for the
+    /// quorum atomics).
+    gemv_chain: Option<OpKernel>,
 }
 
 impl ElementwisePipeline {
@@ -454,11 +551,24 @@ impl ElementwisePipeline {
         let cm2_kernels = ctx.coopmat2_enabled.then(|| {
             std::array::from_fn(|_| built.next().expect("CM2_KERNELS has Cm2Op::COUNT entries"))
         });
+        let gemv_chain = if ctx.memory_model_device_scope_enabled {
+            let (module, pipeline) = crate::pipeline::build_compute_pipeline(
+                ctx,
+                layout,
+                &[],
+                include_bytes!(concat!(env!("OUT_DIR"), "/matmul_gemv_chain.spv")),
+                "op gemv_chain",
+            )?;
+            Some(OpKernel { module, pipeline })
+        } else {
+            None
+        };
         Ok(Self {
             ctx: Arc::clone(ctx),
             layout: scopeguard::ScopeGuard::into_inner(layout_guard),
             kernels,
             cm2_kernels,
+            gemv_chain,
         })
     }
 }
@@ -467,7 +577,12 @@ impl Drop for ElementwisePipeline {
     fn drop(&mut self) {
         unsafe {
             let _ = self.ctx.device.device_wait_idle();
-            for kernel in self.kernels.iter().chain(self.cm2_kernels.iter().flatten()) {
+            for kernel in self
+                .kernels
+                .iter()
+                .chain(self.cm2_kernels.iter().flatten())
+                .chain(self.gemv_chain.iter())
+            {
                 self.ctx.device.destroy_pipeline(kernel.pipeline, None);
                 self.ctx.device.destroy_shader_module(kernel.module, None);
             }
@@ -565,6 +680,7 @@ impl Executor {
             push,
             push_len: bytes.len(),
             groups: (groups_x, groups_y),
+            retain: None,
         })
     }
 
@@ -976,19 +1092,6 @@ impl Executor {
             );
         }
         let kv_f16 = kt.dtype() == DType::F16;
-        let [heads, t_q, dh] = *q.shape() else {
-            bail!(
-                "run_flash_attention: q must be [H, T_q, dh], got {:?}",
-                q.shape()
-            );
-        };
-        if out.shape() != q.shape() {
-            bail!(
-                "run_flash_attention: out shape {:?} must equal q shape {:?}",
-                out.shape(),
-                q.shape()
-            );
-        }
         let [kv_heads, kt_dh, t_max] = *kt.shape() else {
             bail!(
                 "run_flash_attention: kt must be [H_kv, dh, T_max], got {:?}",
@@ -1001,7 +1104,80 @@ impl Executor {
                 v.shape()
             );
         };
-        if kt_dh != dh || v_dh != dh || v_t != t_max || v_heads != kv_heads {
+        if v_t != t_max || v_heads != kv_heads || v_dh != kt_dh {
+            bail!(
+                "run_flash_attention: inconsistent cache shapes kt {:?}, v {:?}",
+                kt.shape(),
+                v.shape()
+            );
+        }
+        let dh = kt_dh;
+        let (heads, t_q, q_head_stride, q_row_stride) = if let Some(heads) = desc.token_major_heads
+        {
+            if heads == 0 {
+                bail!("run_flash_attention: token_major_heads must be nonzero");
+            }
+            let t_q = q.shape().first().copied().unwrap_or(0);
+            let q_elems = q.len();
+            let want = t_q as u64 * heads as u64 * dh as u64;
+            if t_q == 0 || q_elems != want {
+                bail!(
+                    "run_flash_attention: token-major q {:?} does not hold [T={t_q}, H={heads}, dh={dh}]",
+                    q.shape()
+                );
+            }
+            // [T, H, dh] or rank-2 [T, H*dh]: head stride is dh, row stride is H*dh.
+            (heads, t_q, dh, heads * dh)
+        } else {
+            let [heads, t_q, q_dh] = *q.shape() else {
+                bail!(
+                    "run_flash_attention: q must be [H, T_q, dh], got {:?}",
+                    q.shape()
+                );
+            };
+            if q_dh != dh {
+                bail!(
+                    "run_flash_attention: q dh {q_dh} != cache dh {dh} (q {:?}, kt {:?})",
+                    q.shape(),
+                    kt.shape()
+                );
+            }
+            (heads, t_q, t_q * dh, dh)
+        };
+        let (o_head_stride, o_row_stride) = if let Some(oh) = desc.out_token_major_heads {
+            if oh == 0 {
+                bail!("run_flash_attention: out_token_major_heads must be nonzero");
+            }
+            if oh != heads {
+                bail!("run_flash_attention: out_token_major_heads {oh} != q heads {heads}");
+            }
+            let want = t_q as u64 * oh as u64 * dh as u64;
+            if out.len() != want {
+                bail!(
+                    "run_flash_attention: token-major out {:?} does not hold [T={t_q}, H={oh}, dh={dh}]",
+                    out.shape()
+                );
+            }
+            (dh, oh * dh)
+        } else if desc.token_major_heads.is_some() {
+            if out.len() != q.len() {
+                bail!(
+                    "run_flash_attention: out shape {:?} must match token-major q {:?}",
+                    out.shape(),
+                    q.shape()
+                );
+            }
+            (q_head_stride, q_row_stride)
+        } else if out.shape() != q.shape() || out.len() != q.len() {
+            bail!(
+                "run_flash_attention: out shape {:?} must equal q shape {:?}",
+                out.shape(),
+                q.shape()
+            );
+        } else {
+            (q_head_stride, q_row_stride)
+        };
+        if v_dh != dh {
             bail!(
                 "run_flash_attention: inconsistent shapes q {:?}, kt {:?}, v {:?}",
                 q.shape(),
@@ -1068,8 +1244,10 @@ impl Executor {
                 pos_base: desc.pos_base,
                 group_size: heads / kv_heads,
                 scale: desc.scale,
-                _pad0: 0,
-                _pad1: 0,
+                q_head_stride,
+                q_row_stride,
+                o_head_stride,
+                o_row_stride,
                 q_ptr: q.device_address(),
                 kt_ptr: kt.device_address(),
                 v_ptr: v.device_address(),
@@ -1077,6 +1255,155 @@ impl Executor {
             },
             t_q.div_ceil(rows_per_wg),
             heads,
+        )
+    }
+
+    /// Fused wide-prefill QKV pack: RoPE-rotate Q into head-major
+    /// `[H, T, dh]`, RoPE-scatter K into the Kt cache, and copy V into
+    /// the V cache, all from one concatenated `[T, n_qkv]` row.  f16
+    /// activations and f16 caches only — the T≥128 a16 prefill path.
+    pub fn run_prefill_qkv_pack(
+        &self,
+        qkv: &Tensor,
+        table: &Tensor,
+        q: &Tensor,
+        kt: &Tensor,
+        v: &Tensor,
+        desc: PrefillQkvPackDesc,
+    ) -> Result<RunStats> {
+        let dispatch = self.plan_prefill_qkv_pack(qkv, table, q, kt, v, desc)?;
+        self.submit_one_elementwise(dispatch)
+    }
+
+    pub(super) fn plan_prefill_qkv_pack(
+        &self,
+        qkv: &Tensor,
+        table: &Tensor,
+        q: &Tensor,
+        kt: &Tensor,
+        v: &Tensor,
+        desc: PrefillQkvPackDesc,
+    ) -> Result<ElementwiseDispatch> {
+        for (tensor, name) in [(qkv, "qkv"), (q, "q"), (kt, "kt"), (v, "v")] {
+            self.validate_tensor_context(tensor, name)?;
+            if tensor.dtype() != DType::F16 {
+                bail!(
+                    "run_prefill_qkv_pack: {name} must be f16 storage, got {}",
+                    tensor.dtype().name()
+                );
+            }
+        }
+        self.ensure_f32(table, "run_prefill_qkv_pack", "table")?;
+        if desc.heads == 0
+            || desc.kv_heads == 0
+            || desc.head_dim == 0
+            || desc.rot_dim == 0
+            || !desc.rot_dim.is_multiple_of(2)
+            || desc.rot_dim > desc.head_dim
+        {
+            bail!(
+                "run_prefill_qkv_pack: invalid heads/kv_heads/dh/rot_dim \
+                 ({}/{}/{}/{})",
+                desc.heads,
+                desc.kv_heads,
+                desc.head_dim,
+                desc.rot_dim
+            );
+        }
+        let [tokens, qkv_stride] = *qkv.shape() else {
+            bail!(
+                "run_prefill_qkv_pack: qkv must be [T, n_qkv], got {:?}",
+                qkv.shape()
+            );
+        };
+        let embd = desc.heads * desc.head_dim;
+        let kv_dim = desc.kv_heads * desc.head_dim;
+        let want_stride = embd + 2 * kv_dim;
+        if qkv_stride != want_stride {
+            bail!("run_prefill_qkv_pack: qkv N {qkv_stride} != H*dh + 2*H_kv*dh ({want_stride})");
+        }
+        if *q.shape() != [desc.heads, tokens, desc.head_dim] {
+            bail!(
+                "run_prefill_qkv_pack: q must be head-major [H={}, T={tokens}, dh={}], got {:?}",
+                desc.heads,
+                desc.head_dim,
+                q.shape()
+            );
+        }
+        let [kt_heads, kt_dh, t_max] = *kt.shape() else {
+            bail!(
+                "run_prefill_qkv_pack: kt must be [H_kv, dh, T_max], got {:?}",
+                kt.shape()
+            );
+        };
+        let [v_heads, v_t, v_dh] = *v.shape() else {
+            bail!(
+                "run_prefill_qkv_pack: v must be [H_kv, T_max, dh], got {:?}",
+                v.shape()
+            );
+        };
+        if kt_heads != desc.kv_heads
+            || v_heads != desc.kv_heads
+            || kt_dh != desc.head_dim
+            || v_dh != desc.head_dim
+            || v_t != t_max
+        {
+            bail!(
+                "run_prefill_qkv_pack: cache shapes kt {:?} v {:?} vs H_kv={} dh={}",
+                kt.shape(),
+                v.shape(),
+                desc.kv_heads,
+                desc.head_dim
+            );
+        }
+        if desc.pos_base.saturating_add(tokens) > t_max {
+            bail!(
+                "run_prefill_qkv_pack: pos_base {} + T {tokens} exceeds T_max {t_max}",
+                desc.pos_base
+            );
+        }
+        let needed = (desc.pos_base as u64 + tokens as u64) * desc.rot_dim as u64;
+        if table.len() < needed {
+            bail!(
+                "run_prefill_qkv_pack: table length {} < required {needed} \
+                 (pos_base {} + {tokens} tokens, rot_dim {})",
+                table.len(),
+                desc.pos_base,
+                desc.rot_dim
+            );
+        }
+        if !desc.head_dim.is_multiple_of(4) {
+            bail!(
+                "run_prefill_qkv_pack: head_dim {} must be a multiple of 4",
+                desc.head_dim
+            );
+        }
+        let q_pairs = tokens * desc.heads * (desc.rot_dim / 2);
+        let k_pairs = tokens * desc.kv_heads * (desc.rot_dim / 2);
+        let v_vec4s = tokens * desc.kv_heads * (desc.head_dim / 4);
+        let threads = q_pairs.saturating_add(k_pairs).saturating_add(v_vec4s);
+        let pipeline = self.elementwise()?.pipeline(Op::PrefillQkvPack);
+        self.plan_elementwise(
+            pipeline,
+            &PrefillQkvPackPc {
+                tokens,
+                heads: desc.heads,
+                kv_heads: desc.kv_heads,
+                head_dim: desc.head_dim,
+                rot_dim: desc.rot_dim,
+                pos_base: desc.pos_base,
+                qkv_stride,
+                t_max,
+                k_offset: embd,
+                v_offset: embd + kv_dim,
+                qkv_ptr: qkv.device_address(),
+                q_ptr: q.device_address(),
+                kt_ptr: kt.device_address(),
+                v_ptr: v.device_address(),
+                table_ptr: table.device_address(),
+            },
+            threads.div_ceil(WG),
+            1,
         )
     }
 
@@ -1307,7 +1634,7 @@ impl Executor {
                 b_ptr: b.device_address(),
                 out_ptr: out.device_address(),
             },
-            n.div_ceil(WG),
+            n.div_ceil(4 * WG),
             1,
         )
     }
@@ -1449,20 +1776,40 @@ impl Executor {
         table: &Tensor,
         out: &Tensor,
     ) -> Result<RunStats> {
-        let dispatch = self.plan_embed_gather(token, table, out)?;
+        let dispatch =
+            self.plan_embed_gather(token.device_address(), token.buffer(), table, out)?;
+        self.submit_one_elementwise(dispatch)
+    }
+
+    /// Gather `tokens[0..n]` into `out` shaped `[n, embd]`.
+    pub fn run_embed_gather_rows(
+        &self,
+        tokens: &super::TokenIdBuffer,
+        table: &Tensor,
+        out: &Tensor,
+    ) -> Result<RunStats> {
+        let dispatch =
+            self.plan_embed_gather(tokens.device_address(), tokens.buffer(), table, out)?;
         self.submit_one_elementwise(dispatch)
     }
 
     pub(super) fn plan_embed_gather(
         &self,
-        token: &super::HostU32Buffer,
+        token_addr: u64,
+        token_buf: &crate::buffer::Buffer,
         table: &Tensor,
         out: &Tensor,
     ) -> Result<ElementwiseDispatch> {
         self.validate_tensor_context(table, "table")?;
-        self.ensure_f32(out, "run_embed_gather", "out")?;
-        if !token.buffer().belongs_to(&self.ctx) {
+        self.validate_tensor_context(out, "out")?;
+        if !token_buf.belongs_to(&self.ctx) {
             bail!("run_embed_gather: token buffer belongs to a different VulkanContext");
+        }
+        if !matches!(out.dtype(), DType::F32 | DType::F16) {
+            bail!(
+                "run_embed_gather: out must be f32 or f16 (got {})",
+                out.dtype().name()
+            );
         }
         let [vocab, embd] = *table.shape() else {
             bail!(
@@ -1476,8 +1823,20 @@ impl Executor {
                 table.shape()
             );
         }
-        if out.len() != embd as u64 {
-            bail!("run_embed_gather: out length {} != embd {embd}", out.len());
+        let n_tokens = match *out.shape() {
+            [e] if e == embd => 1,
+            [t, e] if e == embd && t > 0 => t,
+            _ => bail!(
+                "run_embed_gather: out shape {:?} must be [embd] or [t, embd] with embd={embd}",
+                out.shape()
+            ),
+        };
+        let need = n_tokens as u64 * 4;
+        if token_buf.size_bytes() < need {
+            bail!(
+                "run_embed_gather: token buffer {} B < {need} B for {n_tokens} ids",
+                token_buf.size_bytes()
+            );
         }
         let pipeline = self.elementwise()?.pipeline(Op::EmbedGather);
         self.plan_elementwise(
@@ -1486,15 +1845,240 @@ impl Executor {
                 embd,
                 vocab,
                 table_f16: (table.dtype() == DType::F16) as u32,
+                n_tokens,
+                out_f16: (out.dtype() == DType::F16) as u32,
                 _pad: 0,
-                token_ptr: token.device_address(),
+                token_ptr: token_addr,
                 table_ptr: table.device_address(),
                 out_ptr: out.device_address(),
             },
-            embd.div_ceil(WG),
-            1,
+            embd.div_ceil(4 * WG),
+            n_tokens,
         )
     }
+
+    /// Plan a persistent GEMV chain (see [`super::ExecOp::GemvChain`]).
+    pub(super) fn plan_gemv_chain(&self, jobs: &[MatmulOp<'_>]) -> Result<ElementwiseDispatch> {
+        if !self.ctx.memory_model_device_scope_enabled {
+            bail!(
+                "gemv_chain: device lacks vulkanMemoryModelDeviceScope \
+                 (required for the quorum barrier)"
+            );
+        }
+        if jobs.is_empty() {
+            bail!("gemv_chain: empty job list");
+        }
+        if jobs.len() > GEMV_CHAIN_MAX_JOBS {
+            bail!(
+                "gemv_chain: {} jobs exceeds max {GEMV_CHAIN_MAX_JOBS}",
+                jobs.len()
+            );
+        }
+        let pipeline = self
+            .elementwise()?
+            .gemv_chain
+            .as_ref()
+            .map(|k| k.pipeline)
+            .ok_or_else(|| anyhow::anyhow!("gemv_chain: kernel was not built"))?;
+
+        let mut packed = Vec::with_capacity(jobs.len());
+        for (i, op) in jobs.iter().enumerate() {
+            packed.push(self.pack_gemv_job(op, i)?);
+        }
+        // SYNC_AFTER on job i means "barrier after the group that
+        // *ends* at i".  Independent neighbours (no RAW/WAW/WAR)
+        // share a group so they occupy one flattened tile space.
+        for i in 0..packed.len().saturating_sub(1) {
+            if gemv_jobs_hazard(&jobs[..=i], &jobs[i + 1]) {
+                packed[i].flags |= GEMV_FLAG_SYNC_AFTER;
+            }
+        }
+
+        // Header: arrived[2] + phase + pad, then 80-byte jobs.  Device-local
+        // so the quorum atomics stay on the GPU; a host-visible sync
+        // cell would bounce every arrival over PCIe and lose the
+        // 7.7 µs pipeline-barrier win.
+        let header = [0u32; 4];
+        let nbytes = std::mem::size_of_val(&header) + packed.len() * std::mem::size_of::<GemvJob>();
+        let buf = Buffer::new(
+            &self.ctx,
+            nbytes as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            BufferLocation::Device,
+        )
+        .context("gemv_chain job buffer")?;
+        let job_bytes = bytemuck::cast_slice::<GemvJob, u8>(&packed);
+        let mut all = vec![0u8; nbytes];
+        all[..16].copy_from_slice(bytemuck::bytes_of(&header));
+        all[16..].copy_from_slice(job_bytes);
+        self.upload_bytes_to_buffer(&buf, &all)?;
+
+        let max_tiles = packed
+            .iter()
+            .map(|j| {
+                let vcols = if j.vcols == 2 { 2 } else { 1 };
+                j.n.div_ceil(32 * vcols)
+            })
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let n_wg = max_tiles.min(GEMV_CHAIN_MAX_WG);
+        let pc = GemvChainPc {
+            jobs_ptr: buf.device_address() + 16,
+            sync_ptr: buf.device_address(),
+            n_jobs: packed.len() as u32,
+            n_wg,
+        };
+        let bytes = bytemuck::bytes_of(&pc);
+        let mut push = [0u8; ELEMENTWISE_PC_BYTES];
+        push[..bytes.len()].copy_from_slice(bytes);
+        Ok(ElementwiseDispatch {
+            pipeline,
+            layout: self.elementwise()?.layout,
+            push,
+            push_len: bytes.len(),
+            groups: (n_wg, 1),
+            retain: Some(Arc::new(buf)),
+        })
+    }
+
+    fn pack_gemv_job(&self, op: &MatmulOp<'_>, index: usize) -> Result<GemvJob> {
+        self.validate_op_context(op)?;
+        if !matches!(op.store, crate::matmul::MatmulStore::None) {
+            bail!("gemv_chain[{index}]: fused store epilogues are not supported");
+        }
+        if op.call.accumulate {
+            bail!("gemv_chain[{index}]: accumulate is not supported");
+        }
+        if op.call.a.dtype() != DType::F32 || op.call.c.dtype() != DType::F32 {
+            bail!("gemv_chain[{index}]: A and C must be f32 storage");
+        }
+        if op.call.b.dtype() != DType::F16 {
+            bail!("gemv_chain[{index}]: B must be f16 storage");
+        }
+        if op.packed_b {
+            bail!("gemv_chain[{index}]: packed-B layout is not supported");
+        }
+        if op.epilogue.bias.is_some() {
+            bail!("gemv_chain[{index}]: bias epilogue is not supported");
+        }
+        let dims = ResolvedMatmul::from_op(op)?;
+        if dims.batch != 1 || dims.m != 1 {
+            bail!(
+                "gemv_chain[{index}]: requires batch=1 M=1 (got B={} M={})",
+                dims.batch,
+                dims.m
+            );
+        }
+        if dims.a_f16 {
+            bail!("gemv_chain[{index}]: f16 activations are not supported");
+        }
+        let (epi_bin, epi_beta) = match op.epilogue.binary {
+            EpilogueBinary::None => (0u32, 0.0f32),
+            EpilogueBinary::AddScaled { beta, .. } => (1, beta),
+            EpilogueBinary::Mul { .. } => (2, 0.0),
+        };
+        let epi_act = match op.epilogue.activation {
+            Activation::None => 0u32,
+            Activation::Silu => 2,
+            other => bail!("gemv_chain[{index}]: unsupported activation {other:?}"),
+        };
+        if op.normed_a.is_some() && epi_bin == 1 {
+            bail!("gemv_chain[{index}]: NORM_A cannot combine with AddScaled");
+        }
+        let mut flags = 0u32;
+        if op.normed_a.is_some() {
+            flags |= GEMV_FLAG_NORM_A;
+        }
+        flags |= (epi_bin & 3) << 8;
+        flags |= (epi_act & 3) << 16;
+        let beta = if let Some((_, eps)) = op.normed_a {
+            eps
+        } else {
+            epi_beta
+        };
+        let vcols = gemv_chain_vcols(dims.k, dims.n);
+        let d_ptr = op.epilogue.d_tensor().map_or(0, Tensor::device_address);
+        let bias_ptr = op.normed_a.map(|(w, _)| w.device_address()).unwrap_or(0);
+        Ok(GemvJob {
+            n: dims.n,
+            k: dims.k,
+            flags,
+            vcols,
+            alpha: op.call.alpha,
+            beta,
+            pad0: 0,
+            pad1: 0,
+            a_ptr: op.call.a.device_address(),
+            b_ptr: op.call.b.device_address(),
+            c_ptr: op.call.c.device_address(),
+            d_ptr,
+            bias_ptr,
+            pad2: 0,
+        })
+    }
+
+    /// Run a GEMV chain as its own submission (tests / microbench).
+    pub fn run_gemv_chain(&self, jobs: &[MatmulOp<'_>]) -> Result<RunStats> {
+        let dispatch = self.plan_gemv_chain(jobs)?;
+        let total_flops = jobs
+            .iter()
+            .map(|op| ResolvedMatmul::from_op(op).map(|d| d.total_flops))
+            .sum::<Result<u64>>()?;
+        let stats = self.submit_one_elementwise(dispatch)?;
+        Ok(RunStats {
+            gpu_time_ns: stats.gpu_time_ns,
+            n_calls: jobs.len(),
+            total_flops,
+        })
+    }
+}
+
+/// VCOLS pick matching the f16w row-kernel heuristic.
+fn gemv_chain_vcols(k: u32, n: u32) -> u32 {
+    if k >= 4096 || n <= 512 || (k >= 2048 && n <= 2048) {
+        1
+    } else {
+        2
+    }
+}
+
+const GEMV_FLAG_NORM_A: u32 = 1;
+const GEMV_FLAG_SYNC_AFTER: u32 = 1 << 24;
+
+fn gemv_jobs_hazard(prior: &[MatmulOp<'_>], next: &MatmulOp<'_>) -> bool {
+    let next_reads = gemv_job_reads(next);
+    let next_writes = gemv_job_writes(next);
+    for prev in prior {
+        let writes = gemv_job_writes(prev);
+        let reads = gemv_job_reads(prev);
+        if next_reads.iter().any(|b| writes.contains(b))
+            || next_writes
+                .iter()
+                .any(|b| writes.contains(b) || reads.contains(b))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn gemv_job_reads(op: &MatmulOp<'_>) -> Vec<vk::Buffer> {
+    let mut v = vec![op.call.a.raw_buffer(), op.call.b.raw_buffer()];
+    if let Some(d) = op.epilogue.d_tensor() {
+        v.push(d.raw_buffer());
+    }
+    if let Some((w, _)) = op.normed_a {
+        v.push(w.raw_buffer());
+    }
+    if op.call.accumulate {
+        v.push(op.call.c.raw_buffer());
+    }
+    v
+}
+
+fn gemv_job_writes(op: &MatmulOp<'_>) -> Vec<vk::Buffer> {
+    vec![op.call.c.raw_buffer()]
 }
 
 // SAFETY: plain-old-data push-constant mirrors of the GLSL blocks.
@@ -1518,5 +2102,15 @@ unsafe impl bytemuck::Pod for ArgmaxPc {}
 unsafe impl bytemuck::Zeroable for ArgmaxPc {}
 unsafe impl bytemuck::Pod for EmbedGatherPc {}
 unsafe impl bytemuck::Zeroable for EmbedGatherPc {}
+unsafe impl bytemuck::Pod for PrefillQkvPackPc {}
+unsafe impl bytemuck::Zeroable for PrefillQkvPackPc {}
 unsafe impl bytemuck::Pod for BinaryPc {}
 unsafe impl bytemuck::Zeroable for BinaryPc {}
+unsafe impl bytemuck::Pod for GemvChainPc {}
+unsafe impl bytemuck::Zeroable for GemvChainPc {}
+unsafe impl bytemuck::Pod for GemvJob {}
+unsafe impl bytemuck::Zeroable for GemvJob {}
+
+const _: () = assert!(std::mem::size_of::<GemvJob>() == 80);
+const _: () = assert!(std::mem::size_of::<PrefillQkvPackPc>() == 80);
+const _: () = assert!(std::mem::size_of::<PrefillQkvPackPc>() <= ELEMENTWISE_PC_BYTES);

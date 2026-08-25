@@ -34,11 +34,13 @@ impl MatmulKernel {
 
     /// Whether this kernel's shader body implements the fused-epilogue
     /// specialization constants (IDs 4..6). True for the BDA and
-    /// BDA_V4 bodies; false for descriptor-bound kernels and for the
-    /// source-stripped `*_aligned` bodies.
+    /// BDA_V4 bodies; false for descriptor-bound kernels, the
+    /// source-stripped `*_aligned` bodies, and every coopmat1 tile
+    /// (those have no epilogue macros — the `_aligned` suffix is not
+    /// on the 64x64 wave-fill names).
     #[inline]
     pub fn supports_epilogue(&self) -> bool {
-        !self.uses_descriptors && !self.name.ends_with("_aligned")
+        !self.uses_descriptors && !self.name.ends_with("_aligned") && !self.name.contains("coopmat")
     }
 
     /// Whether the shader reads B as f16 storage (the `f16w_*` family).

@@ -126,6 +126,39 @@ impl Executor {
             .read_pod_slice(dst)
     }
 
+    /// Stage raw bytes into a device-local buffer (one submit + wait).
+    pub(super) fn upload_bytes_to_buffer(
+        &self,
+        dst: &crate::buffer::Buffer,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let size = vk::DeviceSize::try_from(bytes.len())
+            .map_err(|_| anyhow!("upload_bytes_to_buffer: size does not fit VkDeviceSize"))?;
+        if size > dst.size_bytes() {
+            bail!(
+                "upload_bytes_to_buffer: {} bytes > buffer {}",
+                bytes.len(),
+                dst.size_bytes()
+            );
+        }
+        let mut slot = self.checkout_slot();
+        let staging_raw = {
+            let staging = ensure_slot_buffer(
+                &self.ctx,
+                &mut slot.upload_staging,
+                size,
+                STAGING_USAGE,
+                BufferLocation::Host,
+            )?;
+            staging.write_from_slice(bytes)?;
+            staging.raw
+        };
+        self.run_copy_on_slot(&mut slot, staging_raw, dst.raw_buffer(), size)
+    }
+
     fn run_copy_on_slot(
         &self,
         slot: &mut Slot,

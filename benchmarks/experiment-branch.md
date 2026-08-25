@@ -1,5 +1,67 @@
 # Experiment branch log
 
+## Leg 18 — packed decode GEMVs, 64x64 wave-fill coopmat, fused prefill QKV pack — MEASURED (RTX 4060)
+
+Uncommitted session work finalized on `experiment/pack-and-wavefill`.
+GPU gate: RTX 4060 (AD107), 136/137 then 137/137 after the RMSNorm
+vec4 alignment fix; TinyLlama generate of the pinned 6-id prompt
+completed (24 tokens, finite logits).  Kernel benches are GPU
+timestamps, 12 iters / 4 warmup, debug ml-bench, no TinyLlama in
+the same process as the microbenches.
+
+**Packed-B row GEMVs.** Decode weights pack to `[N/tile][K][tile]` at
+load (`pack_f16w_row_tiles`); `MatmulOp::with_packed_b` fail-closes
+onto `f16w_row_bda_k16_packed` / `k16_v2_packed`.  Inner-product order
+matches the unpacked k16 pair (correctness:
+`packed_row_gemv_matches_unpacked_and_cpu`, packed store-fusion).
+Unpacked fallback is a panic — the layouts do not alias.  ml-bench
+`cases` cannot pack B, so there is no isolated packed-vs-unpacked
+TF/s number here; llama-ash decode on the 4060 was 80 t/s in a debug
+24-token generate (not a throughput claim).
+
+**64x64 coopmat wave-fill.** 512x2048 is 64 128-tiles (a short wave
+plus a tail on GA104) vs 256 64-tiles.  Heuristic
+`coopmat_prefers_m64` (tiles_128 < 96, or 64-aligned-not-128).
+Tuner excludes m64 so a measured 128x128 winner cannot override
+the static pick.
+
+RTX 4060, f16w, auto route, GPU median:
+
+| shape | kernel | TF/s |
+|---|---|---:|
+| 512x2048x2048 | `f16w_coopmat_m64n64` | 22.2 |
+| 512x5632x2048 | `f16w_coopmat_aligned` | 21.2 |
+| 512x2048x5632 | `f16w_coopmat_m64n64` | 22.8 |
+| 1024³ | `f16w_coopmat_m64n64` | 21.3 |
+| 2048³ | `f16w_coopmat_aligned` | 22.7 |
+
+**LDS double-buffer REJECTED.** Ping-ponging K tiles in shared memory
+(128x128 → 37.9 KiB) dropped 2048³ to 6.4 TF/s on the 4060.  Reverted
+to single-buffer (18.9 KiB / 9.7 KiB); 2048³ recovered to 22.7 TF/s.
+Same occupancy-cliff family as the register-prefetch experiment.
+
+**Prefill QKV concat + pack.** One `w_qkv` GEMM per layer (T=6 and
+T≥128 share it — the duplicate `wq`/`wk`/`wv` copies are gone).
+f16 T≥128 then `PrefillQkvPack` (RoPE Q to head-major `[H,T,dh]`,
+K into Kt, V into V) and flash with token-major O.  Pack requires
+`q.shape() == [H,T,dh]`.  CM2 flash row-sums via `coopMatReduceNV`
+instead of P@ones.
+
+**RMSNorm vec4 footgun.** Vec4 row walks on `cols=771` (not a
+multiple of 4) used `base >> 2` and misread every row after the
+first.  Scalar fallback when `cols % 4 != 0`; 768-col pins the
+fast path.
+
+**GEMV-chain.** Built, tested, default-off (`ML_DEVICE_SCOPE=1`).
+Device-scope memory model scrambled CM2 flash when enabled
+globally; llama does not emit `ExecOp::GemvChain`.  Packed B is
+rejected.
+
+**Not claimed this leg.** No 3070 pp512/tg128 A/B.  Packed vs
+unpacked GEMV microbench needs a `packed_b` cases path.  llama-ash
+still keeps packed + unpacked weight copies (prefill GEMM wants
+row-major, decode GEMV wants tiled).
+
 ## Leg 17 — `experiment/cm2-gemm` (CM2 GEMM with fused store epilogues) — MEASURED (RTX 3070): plain CM2 loses 18-35%, un-demote kept
 
 Coopmat-eligible f16w shapes with a fused epilogue currently DEMOTE to

@@ -63,8 +63,15 @@ callable GEMM component; those runtimes still need their own adapter layer.
   GEMM these cover a full transformer decoder block.
 - **Fused flash-attention prefill** (`run_flash_attention`): causal
   online-softmax attention in one dispatch — no materialized score
-  tensor, causal tile skipping, GQA, warm-cache offsets; interoperates
-  with the composed softmax/matmul path on the same KV-cache layouts.
+  tensor, causal tile skipping, GQA, warm-cache offsets, optional
+  token-major Q/O addressing; interoperates with the composed
+  softmax/matmul path on the same KV-cache layouts.
+- **Packed-B decode GEMVs** (`pack_f16w_row_tiles`,
+  `MatmulOp::with_packed_b`): B stored `[N/tile][K][tile]` so the
+  K-walk is sequential.  Selected only when the op opts in.
+- **Wave-fill 64x64 coopmat** for under-filled 128x128 prefill grids
+  (M=128/256/512), plus a fused wide-prefill QKV pack that RoPE-writes
+  head-major Q and scatters K/V in one dispatch.
 - **Fused split-K decode attention** (`run_attn_decode`): single-token
   attention over only the valid KV prefix as two dispatches (chunked
   online-softmax partials + exact combine); f32 or f16 caches,
