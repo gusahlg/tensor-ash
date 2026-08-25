@@ -14,10 +14,25 @@ load (`pack_f16w_row_tiles`); `MatmulOp::with_packed_b` fail-closes
 onto `f16w_row_bda_k16_packed` / `k16_v2_packed`.  Inner-product order
 matches the unpacked k16 pair (correctness:
 `packed_row_gemv_matches_unpacked_and_cpu`, packed store-fusion).
-Unpacked fallback is a panic — the layouts do not alias.  ml-bench
-`cases` cannot pack B, so there is no isolated packed-vs-unpacked
-TF/s number here; llama-ash decode on the 4060 was 80 t/s in a debug
-24-token generate (not a throughput claim).
+Unpacked fallback is a panic — the layouts do not alias.
+
+RTX 4060, `examples/bench_packed_gemv.rs`, GPU median, interleaved
+unpacked then packed per shape after a 300 ms GEMM burn-in:
+
+| shape | unpacked | packed | packed/unpacked |
+|---|---:|---:|---:|
+| k/v 1×256×2048 | 6.3 µs | 6.3 µs | 1.00 |
+| q/o 1×2048×2048 | 12.5 µs | 12.6 µs | 1.01 |
+| up 1×5632×2048 | 24.9 µs | 24.1 µs | 0.97 |
+| down 1×2048×5632 | 30.9 µs | 30.5 µs | 0.99 |
+| **lm 1×32000×2048** | **3759 µs** | **511 µs** | **0.14** |
+
+lm_head is the reason packing exists: N=32000 makes the unpacked
+K-walk a 64 KiB stride, and packed sequential K hits 257 GB/s
+(94% of the 4060's 272 GB/s).  Square and deep-K GEMVs are already
+at the bandwidth floor unpacked, so packing them is a memory tax
+with no speedup — a later leg should pack only the v2/wide-N
+shapes (gate/up + lm_head) and keep q/o/k/v/down unpacked.
 
 **64x64 coopmat wave-fill.** 512x2048 is 64 128-tiles (a short wave
 plus a tail on GA104) vs 256 64-tiles.  Heuristic

@@ -40,7 +40,9 @@
   is sequential at stride `tile_n` instead of `N`.  Same inner-product
   order as the unpacked row kernels.  llama-ash packs every decode
   weight at load.  Packed routing is fail-closed (no unpacked fallback:
-  the layouts do not alias).
+  the layouts do not alias).  RTX 4060: lm_head 1×32000×2048 3759 →
+  511 µs (7.4x, 94% of 272 GB/s); q/o/k/v/down are already at the
+  unpacked bandwidth floor. `examples/bench_packed_gemv.rs`.
 - **Wave-fill 64x64 coopmat** (`f16w_coopmat_m64n64` /
   `f16w_a16_coopmat_m64n64`): 4x the CTA count of 128x128 on M=512
   prefill projections.  Heuristic: prefer 64x64 when a 128x128 grid
