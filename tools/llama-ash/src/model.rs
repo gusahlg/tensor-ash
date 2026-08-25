@@ -43,14 +43,15 @@ struct Layer {
     w_gate: Tensor,
     w_up: Tensor,
     w_down: Tensor,
-    /// Packed `[N/tile][K][tile]` copies for decode GEMVs.
+    /// Packed `[N/tile][K][tile]` copies for decode GEMVs that win on
+    /// the packed K-walk (q/k/v have no unpacked sibling; gate/up are
+    /// the wide-N v2 shapes).  o/down stay on the unpacked tensors —
+    /// packing them was measured-neutral.
     wq_p: Tensor,
     wk_p: Tensor,
     wv_p: Tensor,
-    wo_p: Tensor,
     w_gate_p: Tensor,
     w_up_p: Tensor,
-    w_down_p: Tensor,
     attn_norm: Tensor,
     ffn_norm: Tensor,
     /// Kt cache [kv_heads, dh, t_max], f16 by default
@@ -503,10 +504,10 @@ impl Model {
             }
             let w_qkv = Tensor::uninit_device_f16(ctx, &[embd, qkv_n])?;
             exec.upload(&qkv_host, &w_qkv)?;
-            let (wo, wo_host) = load_linear(&mut gguf, &p("attn_output.weight"), embd, embd)?;
+            let (wo, _) = load_linear(&mut gguf, &p("attn_output.weight"), embd, embd)?;
             let (w_gate, gate_host) = load_linear(&mut gguf, &p("ffn_gate.weight"), embd, ffn)?;
             let (w_up, up_host) = load_linear(&mut gguf, &p("ffn_up.weight"), embd, ffn)?;
-            let (w_down, down_host) = load_linear(&mut gguf, &p("ffn_down.weight"), ffn, embd)?;
+            let (w_down, _) = load_linear(&mut gguf, &p("ffn_down.weight"), ffn, embd)?;
             let pack = |host: &[f32], k: u32, n: u32| -> Result<Tensor> {
                 let tile = f16w_row_tile_n(k, n) as usize;
                 let packed = pack_f16w_row_tiles(host, k as usize, n as usize, tile);
@@ -517,10 +518,8 @@ impl Model {
             let wq_p = pack(&wq_host, embd, embd)?;
             let wk_p = pack(&wk_host, embd, kv_dim)?;
             let wv_p = pack(&wv_host, embd, kv_dim)?;
-            let wo_p = pack(&wo_host, embd, embd)?;
             let w_gate_p = pack(&gate_host, embd, ffn)?;
             let w_up_p = pack(&up_host, embd, ffn)?;
-            let w_down_p = pack(&down_host, ffn, embd)?;
             let attn_norm = load_norm(&mut gguf, &p("attn_norm.weight"))?;
             let ffn_norm = load_norm(&mut gguf, &p("ffn_norm.weight"))?;
             let (kt_cache, v_cache) = if kv_f32 {
@@ -545,10 +544,8 @@ impl Model {
                 wq_p,
                 wk_p,
                 wv_p,
-                wo_p,
                 w_gate_p,
                 w_up_p,
-                w_down_p,
                 attn_norm,
                 ffn_norm,
                 kt_cache,
@@ -1155,24 +1152,13 @@ impl Model {
             });
             return;
         }
-        ops.push(ExecOp::Matmul(if s.t == 1 {
-            MatmulOp::with_epilogue(
-                mm(&s.attn_flat, &layer.wo_p, &s.o),
-                epi(
-                    Activation::None,
-                    EpilogueBinary::AddScaled { d: x_in, beta: 1.0 },
-                ),
-            )
-            .with_packed_b()
-        } else {
-            MatmulOp::with_epilogue(
-                mm(&s.attn_flat, &layer.wo, &s.o),
-                epi(
-                    Activation::None,
-                    EpilogueBinary::AddScaled { d: x_in, beta: 1.0 },
-                ),
-            )
-        }));
+        ops.push(ExecOp::Matmul(MatmulOp::with_epilogue(
+            mm(&s.attn_flat, &layer.wo, &s.o),
+            epi(
+                Activation::None,
+                EpilogueBinary::AddScaled { d: x_in, beta: 1.0 },
+            ),
+        )));
         if s.t == 1 {
             ops.push(ExecOp::Matmul(
                 MatmulOp::new(mm(&s.o, &layer.w_up_p, &s.up))
@@ -1200,24 +1186,13 @@ impl Model {
                 epi(Activation::Silu, EpilogueBinary::Mul { d: &s.up }),
             )));
         }
-        ops.push(ExecOp::Matmul(if s.t == 1 {
-            MatmulOp::with_epilogue(
-                mm(&s.gate, &layer.w_down_p, x_out),
-                epi(
-                    Activation::None,
-                    EpilogueBinary::AddScaled { d: &s.o, beta: 1.0 },
-                ),
-            )
-            .with_packed_b()
-        } else {
-            MatmulOp::with_epilogue(
-                mm(&s.gate, &layer.w_down, x_out),
-                epi(
-                    Activation::None,
-                    EpilogueBinary::AddScaled { d: &s.o, beta: 1.0 },
-                ),
-            )
-        }));
+        ops.push(ExecOp::Matmul(MatmulOp::with_epilogue(
+            mm(&s.gate, &layer.w_down, x_out),
+            epi(
+                Activation::None,
+                EpilogueBinary::AddScaled { d: &s.o, beta: 1.0 },
+            ),
+        )));
     }
 
     /// Emit the final-norm + LM-head tail on the last row of `x`
@@ -1274,13 +1249,12 @@ impl Model {
         x_out: &Tensor,
     ) -> Result<()> {
         let stats = self.exec.run_ops(&[MatmulOp::with_epilogue(
-            mm(&s.attn_flat, &layer.wo_p, &s.o),
+            mm(&s.attn_flat, &layer.wo, &s.o),
             epi(
                 Activation::None,
                 EpilogueBinary::AddScaled { d: x_in, beta: 1.0 },
             ),
-        )
-        .with_packed_b()])?;
+        )])?;
         self.note("o_proj_mm", &stats);
         let stats = self
             .exec
@@ -1296,13 +1270,12 @@ impl Model {
         .with_normed_a(&layer.ffn_norm, self.cfg.rms_eps)])?;
         self.note("ffn_gate_mm", &stats);
         let stats = self.exec.run_ops(&[MatmulOp::with_epilogue(
-            mm(&s.gate, &layer.w_down_p, x_out),
+            mm(&s.gate, &layer.w_down, x_out),
             epi(
                 Activation::None,
                 EpilogueBinary::AddScaled { d: &s.o, beta: 1.0 },
             ),
-        )
-        .with_packed_b()])?;
+        )])?;
         self.note("ffn_down_mm", &stats);
         Ok(())
     }

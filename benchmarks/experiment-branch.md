@@ -30,9 +30,12 @@ unpacked then packed per shape after a 300 ms GEMM burn-in:
 lm_head is the reason packing exists: N=32000 makes the unpacked
 K-walk a 64 KiB stride, and packed sequential K hits 257 GB/s
 (94% of the 4060's 272 GB/s).  Square and deep-K GEMVs are already
-at the bandwidth floor unpacked, so packing them is a memory tax
-with no speedup — a later leg should pack only the v2/wide-N
-shapes (gate/up + lm_head) and keep q/o/k/v/down unpacked.
+at the bandwidth floor unpacked, so llama-ash no longer packs o/down
+(they have unpacked siblings).  q/k/v stay packed because the
+unpacked copies were dropped in favour of concat `w_qkv`.  gate/up
++ lm_head stay packed (the v2/wide-N wins).  TinyLlama generate of
+the 6-id prompt is token-identical after that cut
+(`3681,29889,13,13,29906,...`).
 
 **64x64 coopmat wave-fill.** 512x2048 is 64 128-tiles (a short wave
 plus a tail on GA104) vs 256 64-tiles.  Heuristic
