@@ -64,6 +64,12 @@ Two numbers that looked like levers were not:
    / 128×64 earlier without a 3070 regression if keyed by SM count.
 3. **BK / WM retune of 128×64** on 512×5632 (the fattest prefill GEMM).
 4. **ml-bench `cases` packed_b flag** so T2 can see packed lm_head.
+   Landed on `grok/packed-b-cases` (CPU-side): `,packed` on `cases`,
+   T2 packs k/v + gate/up + lm_head, C ABI `ta_pack_f16w_row_tiles` /
+   `ta_matmul_op.packed_b` / `ta_dispatch_info_packed`. GPU gate is
+   `ml_bench thesis t2` and a tiny packed vs unpacked `cases` pair
+   (see `benchmarks/packed-b-cases.md`); do not run on the 3070/4060
+   while they are training.
 5. **B-column offset into concat `w_qkv`** would drop packed q/k/v
    copies (~220 MB on TinyLlama).  Decode-only memory, not speed.
 6. **Record a 4060 section in `thesis-expectations.toml`** so `ml_bench

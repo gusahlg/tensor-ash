@@ -171,6 +171,24 @@ impl Executor {
         }
     }
 
+    /// Fail-closed packed-B row-GEMV route used when
+    /// [`crate::MatmulOp::with_packed_b`] is set. Packed B is f16
+    /// `[N/tile_n][K][tile_n]` (see [`crate::pack_f16w_row_tiles`]);
+    /// M and batch are 1. The layouts do not alias the unpacked row
+    /// kernels, so this is a distinct diagnostic from
+    /// [`Self::dispatch_info_for`].
+    pub fn dispatch_info_packed(&self, n: u32, k: u32) -> DispatchInfo {
+        let selection = crate::pipeline::f16w_row_packed_selection(k, n);
+        let kernel = self
+            .pipeline
+            .kernel_at(self.pipeline.in_budget_index(selection));
+        DispatchInfo {
+            kernel: kernel.name,
+            tile: [kernel.tile_m, kernel.tile_n, kernel.tile_k],
+            split_k2_splits: None,
+        }
+    }
+
     /// Resolve the complete route for one shape.  `splitk2_eligible`
     /// captures the call form (single plain non-accumulating op, or a
     /// graph op); the measured or conservative untuned split-K2 route is

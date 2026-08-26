@@ -58,10 +58,13 @@ typedef struct ta_epilogue {
   float beta; /* used by TA_BINARY_ADD_SCALED */
 } ta_epilogue;
 
-/* One GEMM plus its fused epilogue. */
+/* One GEMM plus its fused epilogue. packed_b != 0 means B is the
+ * decode layout from ta_pack_f16w_row_tiles ([N/tile_n][K][tile_n]);
+ * requires M=1, batch=1, and f16 B. Zero keeps row-major B. */
 typedef struct ta_matmul_op {
   ta_matmul_call call;
   ta_epilogue epilogue;
+  uint32_t packed_b;
 } ta_matmul_op;
 
 /* Values for ta_softmax_rows mask_kind. */
@@ -148,6 +151,14 @@ int ta_upload(const ta_executor *exec, const ta_tensor *dst, const float *src,
               size_t len);
 int ta_download(const ta_executor *exec, const ta_tensor *src, float *dst,
                 size_t len);
+
+/* Host-only packed-B helpers for decode GEMVs. No GPU work.
+ * ta_f16w_row_tile_n returns 32 or 64, matching the packed kernel
+ * the runtime would pick for (K, N). ta_pack_f16w_row_tiles writes
+ * [N/tile_n][K][tile_n] into dst; len must equal K*N. */
+uint32_t ta_f16w_row_tile_n(uint32_t k, uint32_t n);
+int ta_pack_f16w_row_tiles(const float *src, uint32_t k, uint32_t n,
+                           uint32_t tile_n, float *dst, size_t len);
 
 int ta_matmul(const ta_executor *exec, const ta_tensor *a, const ta_tensor *b,
               const ta_tensor *c, float alpha, uint32_t accumulate,
@@ -238,6 +249,10 @@ void ta_prepared_destroy(ta_prepared *prepared);
 int ta_dispatch_info_for(const ta_executor *exec, uint32_t batch, uint32_t m,
                          uint32_t n, uint32_t k, uint32_t b_f16,
                          ta_dispatch_info *out);
+/* Packed-B sibling of ta_dispatch_info_for: the fail-closed row-GEMV
+ * route for an M=1 f16-weights decode GEMV of shape [1,K] @ [K,N]. */
+int ta_dispatch_info_packed(const ta_executor *exec, uint32_t n, uint32_t k,
+                            ta_dispatch_info *out);
 /* Measure every eligible kernel for one shape and persist the winner
  * in the tuning store; no-op if already tuned. */
 int ta_tune_shape(const ta_executor *exec, uint32_t batch, uint32_t m,

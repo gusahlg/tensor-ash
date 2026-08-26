@@ -14,6 +14,9 @@ pub(super) struct BenchCase {
     pub(super) k: u32,
     /// Store B as f16 (append `,f16w` to the case spec).
     pub(super) b_f16: bool,
+    /// B is packed `[N/tile_n][K][tile_n]` (append `,packed`; implies
+    /// `f16w`). Decode GEMV only: B=1, M=1, N a multiple of 32.
+    pub(super) packed_b: bool,
 }
 
 impl BenchCase {
@@ -25,6 +28,7 @@ impl BenchCase {
             n,
             k,
             b_f16: false,
+            packed_b: false,
         }
     }
 
@@ -52,15 +56,27 @@ impl BenchCase {
             dimension("N")?,
             dimension("K")?,
         );
-        let b_f16 = match fields.next() {
-            None => false,
-            Some("f16w") => true,
-            Some(other) => bail!(
-                "benchmark case '{label}' has unknown flag '{other}'; expected label,b,m,n,k[,f16w]"
-            ),
-        };
-        if fields.next().is_some() {
-            bail!("benchmark case '{label}' has extra fields; expected label,b,m,n,k[,f16w]");
+        let mut b_f16 = false;
+        let mut packed_b = false;
+        for flag in fields {
+            match flag {
+                "f16w" => {
+                    if b_f16 {
+                        bail!("benchmark case '{label}' repeats flag 'f16w'");
+                    }
+                    b_f16 = true;
+                }
+                "packed" => {
+                    if packed_b {
+                        bail!("benchmark case '{label}' repeats flag 'packed'");
+                    }
+                    packed_b = true;
+                }
+                other => bail!(
+                    "benchmark case '{label}' has unknown flag '{other}'; \
+                     expected label,b,m,n,k[,f16w][,packed]"
+                ),
+            }
         }
         Ok(Self {
             label: Cow::Owned(label.into()),
@@ -68,7 +84,8 @@ impl BenchCase {
             m,
             n,
             k,
-            b_f16,
+            b_f16: b_f16 || packed_b,
+            packed_b,
         })
     }
 }
@@ -199,10 +216,33 @@ mod tests {
     fn bench_case_parser_validates_compact_cli_specs() {
         let case = BenchCase::parse("odd,2,3,5,7").unwrap();
         assert_eq!(
-            (&*case.label, case.b, case.m, case.n, case.k),
-            ("odd", 2, 3, 5, 7)
+            (
+                &*case.label,
+                case.b,
+                case.m,
+                case.n,
+                case.k,
+                case.b_f16,
+                case.packed_b
+            ),
+            ("odd", 2, 3, 5, 7, false, false)
         );
-        for invalid in ["", "odd,1,2,3", "odd,1,2,0,4", "odd,1,2,3,4,5"] {
+        let f16 = BenchCase::parse("gemv,1,1,256,2048,f16w").unwrap();
+        assert!(f16.b_f16 && !f16.packed_b);
+        let packed = BenchCase::parse("lm,1,1,32000,2048,packed").unwrap();
+        assert!(packed.b_f16 && packed.packed_b);
+        let both = BenchCase::parse("up,1,1,5632,2048,f16w,packed").unwrap();
+        assert!(both.b_f16 && both.packed_b);
+        let swapped = BenchCase::parse("up,1,1,5632,2048,packed,f16w").unwrap();
+        assert!(swapped.b_f16 && swapped.packed_b);
+        for invalid in [
+            "",
+            "odd,1,2,3",
+            "odd,1,2,0,4",
+            "odd,1,2,3,4,5",
+            "odd,1,2,3,4,f16w,f16w",
+            "odd,1,2,3,4,packed,packed",
+        ] {
             assert!(BenchCase::parse(invalid).is_err(), "accepted {invalid}");
         }
     }

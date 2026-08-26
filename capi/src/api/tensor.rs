@@ -1,7 +1,7 @@
 use std::ffi::c_int;
 use std::sync::Arc;
 
-use tensor_ash_core::{DType, Tensor, VulkanContext};
+use tensor_ash_core::{DType, Tensor, VulkanContext, f16w_row_tile_n, pack_f16w_row_tiles};
 
 use crate::error::{
     checked_ref, checked_slice, checked_slice_mut, destroy_handle, ffi_create, ffi_status,
@@ -212,5 +212,52 @@ pub unsafe extern "C" fn ta_download(
         let src = exec.checked_tensor(src, "ta_download", "src")?;
         let dst = checked_slice_mut(dst, len, "ta_download: dst is null")?;
         exec.exec.download(&src.tensor, dst)
+    })
+}
+
+/// Tile width (`32` or `64`) matching the packed row-GEMV kernel
+/// [`f16w_row_tile_n`] would pick for this `(K, N)`. Host-only; no GPU.
+///
+/// Pack B with this tile before setting `ta_matmul_op.packed_b`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ta_f16w_row_tile_n(k: u32, n: u32) -> u32 {
+    f16w_row_tile_n(k, n)
+}
+
+/// Pack a row-major `[K, N]` weight matrix into the decode GEMV layout
+/// `[N/tile_n][K][tile_n]`. Host-only; `len` must equal `K * N`.
+/// `tile_n` is typically [`ta_f16w_row_tile_n`].
+///
+/// # Safety
+///
+/// If `len > 0`, `src` and `dst` must each point to at least `len`
+/// floats. `src` and `dst` may alias only when they are the same
+/// buffer; the implementation still copies through a temporary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ta_pack_f16w_row_tiles(
+    src: *const f32,
+    k: u32,
+    n: u32,
+    tile_n: u32,
+    dst: *mut f32,
+    len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let k = k as usize;
+        let n = n as usize;
+        let tile_n = tile_n as usize;
+        let expected = k
+            .checked_mul(n)
+            .ok_or_else(|| anyhow::anyhow!("ta_pack_f16w_row_tiles: K*N overflows usize"))?;
+        if len != expected {
+            anyhow::bail!("ta_pack_f16w_row_tiles: len {len} != K*N = {k}*{n} = {expected}");
+        }
+        if tile_n == 0 || !n.is_multiple_of(tile_n) {
+            anyhow::bail!("ta_pack_f16w_row_tiles: N={n} is not a multiple of tile_n={tile_n}");
+        }
+        let src = checked_slice(src, len, "ta_pack_f16w_row_tiles: src is null")?;
+        let dst = checked_slice_mut(dst, len, "ta_pack_f16w_row_tiles: dst is null")?;
+        dst.copy_from_slice(&pack_f16w_row_tiles(src, k, n, tile_n));
+        Ok(())
     })
 }

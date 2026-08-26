@@ -73,6 +73,39 @@ pub unsafe extern "C" fn ta_dispatch_info_for(
     })
 }
 
+/// Report the fail-closed packed-B row-GEMV route for an `M=1`
+/// f16-weights decode GEMV of shape `[1, K] @ [K, N]`.
+///
+/// # Safety
+///
+/// `exec` must be a live executor and `out` must point to writable
+/// `ta_dispatch_info` storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ta_dispatch_info_packed(
+    exec: *const ta_executor,
+    n: u32,
+    k: u32,
+    out: *mut ta_dispatch_info,
+) -> c_int {
+    ffi_status(|| {
+        let exec = checked_ref(exec, "ta_dispatch_info_packed: exec is null")?;
+        if out.is_null() {
+            anyhow::bail!("ta_dispatch_info_packed: out is null");
+        }
+        let info = exec.exec.dispatch_info_packed(n, k);
+        let kernel = intern_kernel_name(info.kernel)?;
+        unsafe {
+            *out = ta_dispatch_info {
+                kernel,
+                tile: info.tile,
+                has_split_k2: 0,
+                split_k2_splits: 0,
+            };
+        }
+        Ok(())
+    })
+}
+
 /// Measure every eligible kernel for one GEMM shape against scratch
 /// tensors and persist the winner in the tuning store. Useful to
 /// pre-warm shapes an inference workload will hit without paying the

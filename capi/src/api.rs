@@ -11,7 +11,7 @@ mod tests {
     use std::ffi::CStr;
     use std::ptr;
 
-    use super::diagnostics::{ta_dispatch_info_for, ta_tune_shape};
+    use super::diagnostics::{ta_dispatch_info_for, ta_dispatch_info_packed, ta_tune_shape};
     use super::elementwise::{
         ta_copy_strided, ta_layer_norm, ta_rms_norm, ta_rope, ta_softmax_rows,
     };
@@ -24,7 +24,9 @@ mod tests {
         ta_prepared_create, ta_prepared_destroy, ta_prepared_run, ta_prepared_submit,
         ta_prepared_wait,
     };
-    use super::tensor::{ta_tensor_destroy, ta_tensor_is_f16, ta_upload};
+    use super::tensor::{
+        ta_f16w_row_tile_n, ta_pack_f16w_row_tiles, ta_tensor_destroy, ta_tensor_is_f16, ta_upload,
+    };
 
     fn last_error() -> &'static str {
         unsafe { CStr::from_ptr(ta_last_error()) }.to_str().unwrap()
@@ -169,6 +171,76 @@ mod tests {
             assert!(last_error().contains("ta_dispatch_info_for: exec is null"));
             assert_eq!(ta_tune_shape(ptr::null(), 1, 64, 64, 64), -1);
             assert!(last_error().contains("ta_tune_shape: exec is null"));
+            assert_eq!(
+                ta_dispatch_info_packed(ptr::null(), 64, 64, ptr::null_mut()),
+                -1
+            );
+            assert!(last_error().contains("ta_dispatch_info_packed: exec is null"));
         }
+    }
+
+    #[test]
+    fn pack_f16w_row_tiles_matches_rust_helper() {
+        let (k, n) = (4u32, 4u32);
+        let src: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let mut dst = vec![0.0f32; 16];
+        let rc =
+            unsafe { ta_pack_f16w_row_tiles(src.as_ptr(), k, n, 2, dst.as_mut_ptr(), dst.len()) };
+        assert_eq!(rc, 0, "{}", last_error());
+        assert_eq!(
+            dst,
+            vec![
+                0.0, 1.0, 4.0, 5.0, 8.0, 9.0, 12.0, 13.0, 2.0, 3.0, 6.0, 7.0, 10.0, 11.0, 14.0,
+                15.0
+            ]
+        );
+        let rust = tensor_ash_core::pack_f16w_row_tiles(&src, k as usize, n as usize, 2);
+        assert_eq!(dst, rust);
+    }
+
+    #[test]
+    fn pack_f16w_row_tiles_rejects_bad_args() {
+        let src = [1.0f32; 4];
+        let mut dst = [0.0f32; 4];
+        unsafe {
+            assert_eq!(
+                ta_pack_f16w_row_tiles(ptr::null(), 2, 2, 2, dst.as_mut_ptr(), 4),
+                -1
+            );
+            assert!(last_error().contains("src is null"));
+
+            assert_eq!(
+                ta_pack_f16w_row_tiles(src.as_ptr(), 2, 2, 2, ptr::null_mut(), 4),
+                -1
+            );
+            assert!(last_error().contains("dst is null"));
+
+            assert_eq!(
+                ta_pack_f16w_row_tiles(src.as_ptr(), 2, 2, 2, dst.as_mut_ptr(), 3),
+                -1
+            );
+            assert!(last_error().contains("len 3"));
+
+            assert_eq!(
+                ta_pack_f16w_row_tiles(src.as_ptr(), 2, 2, 3, dst.as_mut_ptr(), 4),
+                -1
+            );
+            assert!(last_error().contains("not a multiple of tile_n=3"));
+        }
+    }
+
+    #[test]
+    fn f16w_row_tile_n_matches_rust_helper() {
+        assert_eq!(ta_f16w_row_tile_n(2048, 256), 32);
+        assert_eq!(ta_f16w_row_tile_n(2048, 5632), 64);
+        assert_eq!(ta_f16w_row_tile_n(2048, 32000), 64);
+        assert_eq!(
+            ta_f16w_row_tile_n(2048, 256),
+            tensor_ash_core::f16w_row_tile_n(2048, 256)
+        );
+        assert_eq!(
+            ta_f16w_row_tile_n(2048, 5632),
+            tensor_ash_core::f16w_row_tile_n(2048, 5632)
+        );
     }
 }

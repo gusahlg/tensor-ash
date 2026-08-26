@@ -221,6 +221,7 @@ pub(crate) fn t5_prefill_accounting(
             n,
             k,
             b_f16: true,
+            packed_b: false,
         };
         Ok(run_case(ctx, exec, case, 10, 2)?
             .gpu_ms

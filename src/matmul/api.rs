@@ -377,4 +377,17 @@ mod pack_tests {
             ]
         );
     }
+
+    #[test]
+    fn pack_is_a_permutation_of_the_row_major_matrix() {
+        let (k, n, tile) = (8usize, 64usize, 32usize);
+        let src: Vec<f32> = (0..k * n).map(|i| i as f32).collect();
+        let packed = pack_f16w_row_tiles(&src, k, n, tile);
+        let mut a = src.clone();
+        let mut b = packed.clone();
+        a.sort_by(f32::total_cmp);
+        b.sort_by(f32::total_cmp);
+        assert_eq!(a, b);
+        assert_ne!(packed, src, "layout must actually change");
+    }
 }

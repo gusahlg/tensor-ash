@@ -39,11 +39,16 @@ pub struct ta_epilogue {
 }
 
 /// One GEMM plus its fused epilogue.
+///
+/// `packed_b != 0` means B is the decode GEMV layout produced by
+/// `ta_pack_f16w_row_tiles` (`[N/tile_n][K][tile_n]`, M=1, batch=1,
+/// f16 B). Zero keeps row-major B.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ta_matmul_op {
     pub call: ta_matmul_call,
     pub epilogue: ta_epilogue,
+    pub packed_b: u32,
 }
 
 /// Rotary-embedding geometry for `ta_rope`. `rot_dim` is the rotated

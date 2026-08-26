@@ -49,6 +49,12 @@
 
 ### Added
 
+- **Packed-B from the C ABI and ml-bench**: `ta_pack_f16w_row_tiles` /
+  `ta_f16w_row_tile_n` (host-only), `ta_matmul_op.packed_b`, and
+  `ta_dispatch_info_packed`. `ml-bench cases` accepts `,packed`
+  (implies f16w; B=1 M=1) so T2 measures the sequential K-walk llama-ash
+  actually uses for k/v, gate/up, and lm_head. See
+  `benchmarks/packed-b-cases.md`.
 - **Packed-B decode GEMVs** (`pack_f16w_row_tiles`,
   `MatmulOp::with_packed_b`, `f16w_row_bda_k16_packed` /
   `k16_v2_packed`): B is stored `[N/tile_n][K][tile_n]` so the K-walk

@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tensor_ash::{DeviceKind, Executor, MatmulCall, Tensor, VulkanContext};
+use tensor_ash::{
+    DeviceKind, Executor, MatmulCall, MatmulOp, Tensor, VulkanContext, f16w_row_tile_n,
+    pack_f16w_row_tiles,
+};
 use tensor_ash_test_support::{cpu_bmm, fill_det, max_abs_err, tolerance};
 
 use super::cases::{BenchCase, BenchResult, SampleSummary, host_len, sweep_cases};
@@ -105,7 +108,7 @@ pub(super) fn cases(
         .collect::<Result<Vec<_>>>()?;
     anyhow::ensure!(
         !cases.is_empty(),
-        "cases requires at least one label,b,m,n,k argument"
+        "cases requires at least one label,b,m,n,k[,f16w][,packed] argument"
     );
     let (mut reporter, iters, warmup) = reporter_setup(ctx);
     for case in cases {
@@ -136,16 +139,51 @@ pub(super) fn run_case(
     let mut h_b = vec![0.0f32; host_len(&[bsz, k, n])?];
     fill_det(&mut h_a, 7);
     fill_det(&mut h_b, 11);
-    exec.upload(&h_a, &a)?;
-    exec.upload(&h_b, &b)?;
+
+    let split_k2 = env_u32("ML_SPLIT_K2", 0);
+    if case.packed_b {
+        anyhow::ensure!(
+            case.b_f16,
+            "packed-B cases require f16 weights (the 'packed' flag implies f16w)"
+        );
+        anyhow::ensure!(
+            bsz == 1 && m == 1,
+            "packed-B GEMV requires B=1 M=1 (got B={bsz} M={m})"
+        );
+        anyhow::ensure!(
+            n.is_multiple_of(32),
+            "packed-B GEMV requires N a multiple of 32 (got {n})"
+        );
+        anyhow::ensure!(
+            split_k2 < 2,
+            "packed-B is incompatible with ML_SPLIT_K2={split_k2}"
+        );
+    }
+
     if case.b_f16 {
         // Validation compares against exactly what the GPU stores.
+        // Round before pack/upload so the packed layout holds the
+        // same f16 values the kernel will multiply.
         for value in &mut h_b {
             *value = tensor_ash::dtype::round_f32_via_f16(*value);
         }
+    }
+    exec.upload(&h_a, &a)?;
+    if case.packed_b {
+        let tile = f16w_row_tile_n(k, n) as usize;
+        let packed = pack_f16w_row_tiles(&h_b, k as usize, n as usize, tile);
+        exec.upload(&packed, &b)?;
+    } else {
+        exec.upload(&h_b, &b)?;
+    }
+    if case.b_f16 {
         // The tensor-core routes also quantize A (coopmat1 while
         // staging, cm2 in its tensor-load decode callback).
-        let kernel = exec.dispatch_info_for(bsz, m, n, k, true).kernel;
+        let kernel = if case.packed_b {
+            exec.dispatch_info_packed(n, k).kernel
+        } else {
+            exec.dispatch_info_for(bsz, m, n, k, true).kernel
+        };
         if kernel.contains("coopmat") || kernel.contains("cm2") {
             for value in &mut h_a {
                 *value = tensor_ash::dtype::round_f32_via_f16(*value);
@@ -155,7 +193,6 @@ pub(super) fn run_case(
     }
 
     let flops = 2.0f64 * bsz as f64 * m as f64 * n as f64 * k as f64;
-    let split_k2 = env_u32("ML_SPLIT_K2", 0);
 
     let run_once = || {
         let call = MatmulCall {
@@ -165,7 +202,9 @@ pub(super) fn run_case(
             alpha: 1.0,
             accumulate: false,
         };
-        if split_k2 < 2 {
+        if case.packed_b {
+            exec.run_ops(&[MatmulOp::new(call).with_packed_b()])
+        } else if split_k2 < 2 {
             exec.run_matmuls(std::slice::from_ref(&call))
         } else {
             exec.run_matmuls_split_k2(call, split_k2)
@@ -205,7 +244,9 @@ pub(super) fn run_case(
         f64::NAN
     };
     // Split factors below 2 execute the normal dispatch path, so report it.
-    let dispatch = if split_k2 < 2 {
+    let dispatch = if case.packed_b {
+        exec.dispatch_info_packed(n, k)
+    } else if split_k2 < 2 {
         exec.dispatch_info_for(bsz, m, n, k, case.b_f16)
     } else {
         tensor_ash::DispatchInfo::split_k2(m, n, split_k2)
@@ -279,6 +320,7 @@ pub(super) fn single(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
     let k = env_u32("ML_K", 4096);
     let case = BenchCase {
         b_f16: false,
+        packed_b: false,
         label: Cow::Owned(format!("B={b} M={m} N={n} K={k}")),
         b,
         m,
