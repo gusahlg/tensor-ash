@@ -8,7 +8,7 @@ mod resolution;
 
 pub use api::{
     Activation, Epilogue, EpilogueBinary, MatmulCall, MatmulOp, MatmulStore, MatmulStoreDesc,
-    RunStats,
+    RunStats, pack_f16w_row_tiles,
 };
 pub use resolution::MatrixShape;
 pub(crate) use resolution::{ResolvedMatmul, ResolvedMatmulBatch, total_flops};

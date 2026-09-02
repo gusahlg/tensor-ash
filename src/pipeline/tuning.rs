@@ -18,7 +18,9 @@ use crate::context::VulkanContext;
 
 use super::catalog::KERNEL_SPECS;
 
-const SPLITK2_SPIRV: [&[u8]; 3] = [
+/// Split-K2 SPIR-V, hashed into the tune store with `KERNEL_SPECS`.
+/// The executor's split-K2 pipeline loads the same blobs.
+pub(crate) const SPLITK2_SPIRV: [&[u8]; 3] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_splitk2_m128n128.spv")),
     include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_splitk2_m64n64.spv")),
     include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_splitk2_reduce.spv")),

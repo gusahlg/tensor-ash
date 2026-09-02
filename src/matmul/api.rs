@@ -222,6 +222,10 @@ pub struct MatmulOp<'a> {
     pub normed_a: Option<(&'a Tensor, f32)>,
     /// Fused store-time RoPE / KV-cache scatter (see [`MatmulStore`]).
     pub store: MatmulStore<'a>,
+    /// B is stored in the row-GEMV packed layout `[N/tile_n][K][tile_n]`
+    /// produced by [`pack_f16w_row_tiles`].  Routes to the `*_packed`
+    /// row kernels; ignored on every other path.
+    pub packed_b: bool,
 }
 
 impl<'a> MatmulOp<'a> {
@@ -232,6 +236,7 @@ impl<'a> MatmulOp<'a> {
             epilogue: Epilogue::NONE,
             normed_a: None,
             store: MatmulStore::None,
+            packed_b: false,
         }
     }
 
@@ -242,7 +247,16 @@ impl<'a> MatmulOp<'a> {
             epilogue,
             normed_a: None,
             store: MatmulStore::None,
+            packed_b: false,
         }
+    }
+
+    /// Interpret B as the packed row-GEMV layout produced by
+    /// [`pack_f16w_row_tiles`].
+    #[inline]
+    pub fn with_packed_b(mut self) -> Self {
+        self.packed_b = true;
+        self
     }
 
     /// Fold an RMSNorm of A into the kernel (see [`MatmulOp::normed_a`]):
@@ -300,11 +314,67 @@ pub struct RunStats {
     pub total_flops: u64,
 }
 
+/// Pack a row-major `[K, N]` weight matrix into the decode GEMV
+/// layout `[N/tile_n][K][tile_n]`.  Consecutive K for one output tile
+/// is then stride-`tile_n` instead of stride-`N`, while the inner
+/// product still walks `k = slice, slice+16, ...` — bit-identical
+/// to the unpacked row kernel.  `tile_n` is 32 (k16) or 64 (k16_v2).
+/// The output has the same length as `src` and uploads as a `[K, N]`
+/// f16 tensor.
+pub fn pack_f16w_row_tiles(src: &[f32], k: usize, n: usize, tile_n: usize) -> Vec<f32> {
+    assert!(
+        tile_n > 0 && n.is_multiple_of(tile_n),
+        "N={n} is not a multiple of tile_n={tile_n}"
+    );
+    assert_eq!(
+        src.len(),
+        k.saturating_mul(n),
+        "pack_f16w_row_tiles: src len"
+    );
+    let tiles = n / tile_n;
+    let mut out = vec![0.0; src.len()];
+    for tile in 0..tiles {
+        for ki in 0..k {
+            let dst = (tile * k + ki) * tile_n;
+            let src_row = ki * n + tile * tile_n;
+            out[dst..dst + tile_n].copy_from_slice(&src[src_row..src_row + tile_n]);
+        }
+    }
+    out
+}
+
 impl RunStats {
     /// GPU TFLOPS if GPU time was measured, else `None`.
     pub fn tflops(&self) -> Option<f64> {
         self.gpu_time_ns
             .filter(|&ns| ns > 0)
             .map(|ns| self.total_flops as f64 / ns as f64 * 1e-3)
+    }
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::pack_f16w_row_tiles;
+
+    #[test]
+    fn pack_tiles_are_contiguous_k_walks() {
+        let (k, n, tile) = (4usize, 4usize, 2usize);
+        // row-major [k][n]:
+        //  0  1  2  3
+        //  4  5  6  7
+        //  8  9 10 11
+        // 12 13 14 15
+        let src: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let packed = pack_f16w_row_tiles(&src, k, n, tile);
+        // [tiles][K][tile_n]: tile 0 (cols 0-1) walking K, then tile 1.
+        //   k0: 0,1   k1: 4,5   k2: 8,9   k3: 12,13
+        //   k0: 2,3   k1: 6,7   k2: 10,11 k3: 14,15
+        assert_eq!(
+            packed,
+            vec![
+                0.0, 1.0, 4.0, 5.0, 8.0, 9.0, 12.0, 13.0, 2.0, 3.0, 6.0, 7.0, 10.0, 11.0, 14.0,
+                15.0
+            ]
+        );
     }
 }

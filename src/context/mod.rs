@@ -69,6 +69,11 @@ pub struct VulkanContext {
     /// Requires [`Self::coopmat_enabled`]; `ML_NO_COOPMAT2=1` forces
     /// it off.
     pub coopmat2_enabled: bool,
+    /// Whether `vulkanMemoryModel` + `vulkanMemoryModelDeviceScope`
+    /// were enabled.  Required for the persistent GEMV-chain's
+    /// device-scope quorum atomics.  Default off (`ML_DEVICE_SCOPE=1`
+    /// opts in): enabling it globally scrambled CM2 flash numerics.
+    pub memory_model_device_scope_enabled: bool,
     /// Pipeline cache, seeded from disk on init and flushed back on drop.
     /// Persisting it avoids the SPIR-V -> ISA recompile (50-200 ms on
     /// NVIDIA) on every cold start.

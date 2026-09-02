@@ -104,6 +104,8 @@ fn main() -> Result<()> {
             kv_len: t,
             pos_base: 0,
             scale: 1.0 / (dh as f32).sqrt(),
+            token_major_heads: None,
+            out_token_major_heads: None,
         };
 
         // Warm the clocks with >= 300 ms of real GPU work before

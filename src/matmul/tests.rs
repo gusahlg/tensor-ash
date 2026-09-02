@@ -16,6 +16,7 @@ fn resolves_rank2_matmul() {
             total_flops: 48,
             b_f16: false,
             a_f16: false,
+            packed_b: false,
         }
     );
 }

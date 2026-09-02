@@ -65,6 +65,7 @@ pub(crate) fn checked_op<'a>(
         // Not exposed through the C ABI yet.
         normed_a: None,
         store: MatmulStore::None,
+        packed_b: false,
     })
 }
 

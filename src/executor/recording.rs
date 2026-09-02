@@ -45,7 +45,12 @@ fn ensure_kernel_alignment(kernel_name: &str, tile: [u32; 3], shape: [u32; 3]) -
     };
     let [tile_m, tile_n, tile_k] = required;
     let [m, n, k] = shape;
-    if (kernel_name.ends_with("_aligned") || kernel_name == "v3_128x128_bk8_static")
+    // Coopmat1 tiles have no bounds-checked edge path (subgroup-uniform
+    // control flow + no robust buffer access), including the 64x64
+    // wave-fill names that do not carry an `_aligned` suffix.
+    if (kernel_name.ends_with("_aligned")
+        || kernel_name.contains("coopmat")
+        || kernel_name == "v3_128x128_bk8_static")
         && (!m.is_multiple_of(tile_m) || !n.is_multiple_of(tile_n) || !k.is_multiple_of(tile_k))
     {
         bail!(
@@ -130,6 +135,18 @@ pub(super) fn record_one_matmul(
     }
     if dims.b_f16 && !ctx.buffer_device_address_enabled {
         bail!("f16-weight matmuls require bufferDeviceAddress, which this device lacks");
+    }
+    if dims.packed_b != kernel.name.contains("packed") {
+        bail!(
+            "kernel '{}' {} packed-B layout but op.packed_b={}",
+            kernel.name,
+            if kernel.name.contains("packed") {
+                "expects"
+            } else {
+                "does not expect"
+            },
+            dims.packed_b
+        );
     }
 
     let call = &op.call;
@@ -309,5 +326,10 @@ mod tests {
         ] {
             assert!(ensure_kernel_alignment("v3_128x128_bk8_static", v3_tile, shape).is_err());
         }
+        let m64 = [64, 64, 32];
+        assert!(ensure_kernel_alignment("f16w_coopmat_m64n64", m64, m64).is_ok());
+        assert!(ensure_kernel_alignment("f16w_a16_coopmat_m64n64", m64, [192, 320, 64]).is_ok());
+        assert!(ensure_kernel_alignment("f16w_coopmat_m64n64", m64, [96, 64, 32]).is_err());
+        assert!(ensure_kernel_alignment("f16w_coopmat_m64n64", m64, [64, 64, 16]).is_err());
     }
 }

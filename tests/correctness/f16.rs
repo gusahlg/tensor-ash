@@ -8,7 +8,8 @@ use crate::common::*;
 
 use tensor_ash::dtype::round_f32_via_f16;
 use tensor_ash::{
-    Activation, Epilogue, EpilogueBinary, KernelSelection, MatmulCall, MatmulOp, Tensor,
+    Activation, CopyDesc, Epilogue, EpilogueBinary, ExecOp, KernelSelection, MatmulCall, MatmulOp,
+    Tensor, f16w_row_tile_n, pack_f16w_row_tiles,
 };
 
 fn f16_available(ctx: &std::sync::Arc<tensor_ash::VulkanContext>) -> bool {
@@ -157,7 +158,7 @@ fn f16_routes_pick_f16w_kernels_and_skip_splitk2() {
     // route demotes to the family's 64x64 fallback.
     let mid = exec.dispatch_info_for(1, 1024, 1024, 1024, true);
     if ctx.coopmat_enabled {
-        assert_eq!(mid.kernel, "f16w_coopmat_aligned", "mid route: {mid:?}");
+        assert_eq!(mid.kernel, "f16w_coopmat_m64n64", "mid route: {mid:?}");
     } else if kernel_in_budget(&ctx, KernelSelection::F16wM128N64K64BdaV4) {
         assert_eq!(mid.kernel, "f16w_m128n64k64_bda_v4", "mid route: {mid:?}");
     } else {
@@ -328,6 +329,8 @@ fn a16_activations_coopmat_matches_rounded_reference() {
         (1, 128, 128, 64),
         (1, 512, 256, 2048),
         (2, 128, 256, 96),
+        // 64-tile-aligned but not 128-aligned: only the wave-fill kernel.
+        (1, 192, 320, 64),
     ];
     for &(batch, m, n, k) in cases {
         let shape = |rows: u32, cols: u32| -> Vec<u32> {
@@ -414,6 +417,298 @@ fn a16_alpha_accumulate_and_graph_path_match() {
     assert_close_tol(&gpu2, &cpu2, a16_tolerance(&cpu2, k), "a16 graph path");
 }
 
+/// Prefill QKV concat: one wide GEMM + row-splits must match three
+/// independent projections (and the CPU reference) on an a16 shape
+/// that is 64-aligned but not 128-aligned, so it hits the wave-fill
+/// tile the llama path uses at T=128/512.
+#[test]
+#[ignore]
+fn a16_qkv_concat_matches_three_gemms() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !f16_available(&ctx) || !ctx.coopmat_enabled {
+        eprintln!("skipping: no coopmat support");
+        return;
+    }
+    let (t, k, n_q, n_kv) = (192_u32, 256_u32, 256_u32, 64_u32);
+    let n_qkv = n_q + 2 * n_kv;
+    let (x, wq, host_x, host_wq) = setup_a16_case(&ctx, &exec, &[t, k], &[k, n_q], 11_000, 11_001);
+    let (wk, host_wk) = {
+        let mut host = vec![0.0; (k * n_kv) as usize];
+        fill_det(&mut host, 11_002);
+        let w = Tensor::uninit_device_f16(&ctx, &[k, n_kv]).unwrap();
+        exec.upload(&host, &w).unwrap();
+        for v in &mut host {
+            *v = round_f32_via_f16(*v);
+        }
+        (w, host)
+    };
+    let (wv, host_wv) = {
+        let mut host = vec![0.0; (k * n_kv) as usize];
+        fill_det(&mut host, 11_003);
+        let w = Tensor::uninit_device_f16(&ctx, &[k, n_kv]).unwrap();
+        exec.upload(&host, &w).unwrap();
+        for v in &mut host {
+            *v = round_f32_via_f16(*v);
+        }
+        (w, host)
+    };
+    let mut host_qkv = vec![0.0; (k * n_qkv) as usize];
+    for row in 0..k as usize {
+        let dst = row * n_qkv as usize;
+        let q = row * n_q as usize;
+        host_qkv[dst..dst + n_q as usize].copy_from_slice(&host_wq[q..q + n_q as usize]);
+        let kv = row * n_kv as usize;
+        host_qkv[dst + n_q as usize..dst + n_q as usize + n_kv as usize]
+            .copy_from_slice(&host_wk[kv..kv + n_kv as usize]);
+        host_qkv[dst + n_q as usize + n_kv as usize..dst + n_qkv as usize]
+            .copy_from_slice(&host_wv[kv..kv + n_kv as usize]);
+    }
+    let w_qkv = Tensor::uninit_device_f16(&ctx, &[k, n_qkv]).unwrap();
+    exec.upload(&host_qkv, &w_qkv).unwrap();
+
+    let qkv = Tensor::uninit_device_f16(&ctx, &[t, n_qkv]).unwrap();
+    let q = Tensor::uninit_device_f16(&ctx, &[t, n_q]).unwrap();
+    let k_out = Tensor::uninit_device_f16(&ctx, &[t, n_kv]).unwrap();
+    let v = Tensor::uninit_device_f16(&ctx, &[t, n_kv]).unwrap();
+    exec.run_exec_ops(&[
+        ExecOp::Matmul(MatmulOp::new(MatmulCall {
+            a: &x,
+            b: &w_qkv,
+            c: &qkv,
+            alpha: 1.0,
+            accumulate: false,
+        })),
+        ExecOp::CopyStrided {
+            src: &qkv,
+            dst: &q,
+            desc: CopyDesc {
+                extent: [n_q, t, 1],
+                src_offset: 0,
+                src_strides: [1, n_qkv, 0],
+                dst_offset: 0,
+                dst_strides: [1, n_q, 0],
+                ..Default::default()
+            },
+        },
+        ExecOp::CopyStrided {
+            src: &qkv,
+            dst: &k_out,
+            desc: CopyDesc {
+                extent: [n_kv, t, 1],
+                src_offset: n_q,
+                src_strides: [1, n_qkv, 0],
+                dst_offset: 0,
+                dst_strides: [1, n_kv, 0],
+                ..Default::default()
+            },
+        },
+        ExecOp::CopyStrided {
+            src: &qkv,
+            dst: &v,
+            desc: CopyDesc {
+                extent: [n_kv, t, 1],
+                src_offset: n_q + n_kv,
+                src_strides: [1, n_qkv, 0],
+                dst_offset: 0,
+                dst_strides: [1, n_kv, 0],
+                ..Default::default()
+            },
+        },
+    ])
+    .unwrap();
+
+    let mut gpu_q = vec![0.0; (t * n_q) as usize];
+    let mut gpu_k = vec![0.0; (t * n_kv) as usize];
+    let mut gpu_v = vec![0.0; (t * n_kv) as usize];
+    exec.download(&q, &mut gpu_q).unwrap();
+    exec.download(&k_out, &mut gpu_k).unwrap();
+    exec.download(&v, &mut gpu_v).unwrap();
+
+    let cpu_q = cpu_bmm(&host_x, &host_wq, None, 1, t, n_q, k, 1.0, false);
+    let cpu_k = cpu_bmm(&host_x, &host_wk, None, 1, t, n_kv, k, 1.0, false);
+    let cpu_v = cpu_bmm(&host_x, &host_wv, None, 1, t, n_kv, k, 1.0, false);
+    assert_close_tol(&gpu_q, &cpu_q, a16_tolerance(&cpu_q, k), "qkv concat q");
+    assert_close_tol(&gpu_k, &cpu_k, a16_tolerance(&cpu_k, k), "qkv concat k");
+    assert_close_tol(&gpu_v, &cpu_v, a16_tolerance(&cpu_v, k), "qkv concat v");
+
+    // Separate projections on the same inputs must match the split.
+    let q2 = Tensor::uninit_device_f16(&ctx, &[t, n_q]).unwrap();
+    let k2 = Tensor::uninit_device_f16(&ctx, &[t, n_kv]).unwrap();
+    let v2 = Tensor::uninit_device_f16(&ctx, &[t, n_kv]).unwrap();
+    exec.run_matmuls(&[
+        MatmulCall {
+            a: &x,
+            b: &wq,
+            c: &q2,
+            alpha: 1.0,
+            accumulate: false,
+        },
+        MatmulCall {
+            a: &x,
+            b: &wk,
+            c: &k2,
+            alpha: 1.0,
+            accumulate: false,
+        },
+        MatmulCall {
+            a: &x,
+            b: &wv,
+            c: &v2,
+            alpha: 1.0,
+            accumulate: false,
+        },
+    ])
+    .unwrap();
+    let mut sep_q = vec![0.0; (t * n_q) as usize];
+    let mut sep_k = vec![0.0; (t * n_kv) as usize];
+    let mut sep_v = vec![0.0; (t * n_kv) as usize];
+    exec.download(&q2, &mut sep_q).unwrap();
+    exec.download(&k2, &mut sep_k).unwrap();
+    exec.download(&v2, &mut sep_v).unwrap();
+    assert_close_tol(&gpu_q, &sep_q, a16_tolerance(&sep_q, k), "concat vs 3x q");
+    assert_close_tol(&gpu_k, &sep_k, a16_tolerance(&sep_k, k), "concat vs 3x k");
+    assert_close_tol(&gpu_v, &sep_v, a16_tolerance(&sep_v, k), "concat vs 3x v");
+}
+
+/// Packed-B row GEMV (decode layout) vs the unpacked kernel and a CPU
+/// reference.  Covers both tile_n=32 (narrow N) and tile_n=64 (wide N).
+#[test]
+#[ignore]
+fn packed_row_gemv_matches_unpacked_and_cpu() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !f16_available(&ctx) {
+        eprintln!("skipping: no f16/BDA support");
+        return;
+    }
+    let cases: &[(u32, u32)] = &[
+        (2048, 256),  // k/v: k16 tile 32
+        (2048, 2048), // q/o: k16 tile 32
+        (2048, 5632), // gate/up: k16_v2 tile 64
+    ];
+    for &(k, n) in cases {
+        let tile = f16w_row_tile_n(k, n);
+        let (a, _) = upload_det(&ctx, &exec, &[1, k], 12_000 + n as u64);
+        let mut host_b = vec![0.0; (k * n) as usize];
+        fill_det(&mut host_b, 12_100 + n as u64);
+        let b = Tensor::uninit_device_f16(&ctx, &[k, n]).unwrap();
+        exec.upload(&host_b, &b).unwrap();
+        for v in &mut host_b {
+            *v = round_f32_via_f16(*v);
+        }
+        let packed_host = pack_f16w_row_tiles(&host_b, k as usize, n as usize, tile as usize);
+        let b_p = Tensor::uninit_device_f16(&ctx, &[k, n]).unwrap();
+        exec.upload(&packed_host, &b_p).unwrap();
+
+        let c = Tensor::uninit_device(&ctx, &[1, n]).unwrap();
+        let c_p = Tensor::uninit_device(&ctx, &[1, n]).unwrap();
+        exec.run_ops(&[MatmulOp::new(MatmulCall {
+            a: &a,
+            b: &b,
+            c: &c,
+            alpha: 1.0,
+            accumulate: false,
+        })])
+        .unwrap();
+        exec.run_ops(&[MatmulOp::new(MatmulCall {
+            a: &a,
+            b: &b_p,
+            c: &c_p,
+            alpha: 1.0,
+            accumulate: false,
+        })
+        .with_packed_b()])
+            .unwrap();
+        let mut gpu = vec![0.0; n as usize];
+        let mut gpu_p = vec![0.0; n as usize];
+        exec.download(&c, &mut gpu).unwrap();
+        exec.download(&c_p, &mut gpu_p).unwrap();
+        let mut host_a = vec![0.0; k as usize];
+        exec.download(&a, &mut host_a).unwrap();
+        let cpu = cpu_bmm(&host_a, &host_b, None, 1, 1, n, k, 1.0, false);
+        assert_close(&gpu_p, &cpu, k, &format!("packed {k}x{n} vs cpu"));
+        assert_close(&gpu_p, &gpu, k, &format!("packed vs unpacked {k}x{n}"));
+    }
+
+    // Decode path: packed + folded RMSNorm vs f64 RMS then GEMM.
+    let (k, n) = (2048_u32, 256_u32);
+    let tile = f16w_row_tile_n(k, n);
+    let (a, host_a) = upload_det(&ctx, &exec, &[1, k], 13_001);
+    let (w, host_w) = upload_det(&ctx, &exec, &[k], 13_002);
+    let mut host_b = vec![0.0; (k * n) as usize];
+    fill_det(&mut host_b, 13_003);
+    let packed_host = {
+        let mut b = host_b.clone();
+        for v in &mut b {
+            *v = round_f32_via_f16(*v);
+        }
+        host_b = b.clone();
+        pack_f16w_row_tiles(&b, k as usize, n as usize, tile as usize)
+    };
+    let b_p = Tensor::uninit_device_f16(&ctx, &[k, n]).unwrap();
+    exec.upload(&packed_host, &b_p).unwrap();
+    let c = Tensor::uninit_device(&ctx, &[1, n]).unwrap();
+    let eps = 1e-5_f32;
+    exec.run_ops(&[MatmulOp::new(MatmulCall {
+        a: &a,
+        b: &b_p,
+        c: &c,
+        alpha: 1.0,
+        accumulate: false,
+    })
+    .with_packed_b()
+    .with_normed_a(&w, eps)])
+        .unwrap();
+    let mut gpu = vec![0.0; n as usize];
+    exec.download(&c, &mut gpu).unwrap();
+    let mean = host_a.iter().map(|&v| v as f64 * v as f64).sum::<f64>() / k as f64;
+    let inv = 1.0 / (mean + eps as f64).sqrt();
+    let xn: Vec<f32> = host_a
+        .iter()
+        .zip(&host_w)
+        .map(|(&v, &ww)| (v as f64 * inv * ww as f64) as f32)
+        .collect();
+    let cpu = cpu_bmm(&xn, &host_b, None, 1, 1, n, k, 1.0, false);
+    assert_close(&gpu, &cpu, k, "packed + normed-A vs f64 RMS+GEMM");
+
+    // Gate-shaped packed GEMV with Silu+Mul epilogue (decode MLP).
+    let (k, n) = (2048_u32, 5632_u32);
+    let tile = f16w_row_tile_n(k, n);
+    let (a, host_a) = upload_det(&ctx, &exec, &[1, k], 14_001);
+    let (d, host_d) = upload_det(&ctx, &exec, &[1, n], 14_002);
+    let mut host_b = vec![0.0; (k * n) as usize];
+    fill_det(&mut host_b, 14_003);
+    for v in &mut host_b {
+        *v = round_f32_via_f16(*v);
+    }
+    let packed = pack_f16w_row_tiles(&host_b, k as usize, n as usize, tile as usize);
+    let b_p = Tensor::uninit_device_f16(&ctx, &[k, n]).unwrap();
+    exec.upload(&packed, &b_p).unwrap();
+    let c = Tensor::uninit_device(&ctx, &[1, n]).unwrap();
+    exec.run_ops(&[MatmulOp::with_epilogue(
+        MatmulCall {
+            a: &a,
+            b: &b_p,
+            c: &c,
+            alpha: 1.0,
+            accumulate: false,
+        },
+        Epilogue {
+            bias: None,
+            activation: Activation::Silu,
+            binary: EpilogueBinary::Mul { d: &d },
+        },
+    )
+    .with_packed_b()])
+        .unwrap();
+    let mut gpu = vec![0.0; n as usize];
+    exec.download(&c, &mut gpu).unwrap();
+    let mut cpu = cpu_bmm(&host_a, &host_b, None, 1, 1, n, k, 1.0, false);
+    for (value, &dv) in cpu.iter_mut().zip(&host_d) {
+        *value = (*value / (1.0 + (-*value).exp())) * dv;
+    }
+    assert_close(&gpu, &cpu, k, "packed silu*mul epilogue");
+}
+
 #[test]
 #[ignore]
 fn a16_invalid_combinations_are_rejected() {
@@ -452,7 +747,7 @@ fn a16_invalid_combinations_are_rejected() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("multiples of (128, 128, 32)"),
+        err.contains("multiples of (64, 64, 32)"),
         "unexpected error: {err}"
     );
     // Fusions cannot ride the a16 route.
@@ -486,9 +781,9 @@ fn coopmat_routes_and_matches_dual_rounded_reference() {
     }
     // Aligned + big => tensor cores; small or ragged stays SIMT.
     let big = exec.dispatch_info_for(1, 1024, 1024, 1024, true);
-    assert_eq!(big.kernel, "f16w_coopmat_aligned", "{big:?}");
+    assert_eq!(big.kernel, "f16w_coopmat_m64n64", "{big:?}");
     let small = exec.dispatch_info_for(1, 128, 128, 128, true);
-    assert_ne!(small.kernel, "f16w_coopmat_aligned", "{small:?}");
+    assert_eq!(small.kernel, "f16w_coopmat_m64n64", "{small:?}");
     let ragged = exec.dispatch_info_for(1, 1024, 1000, 1024, true);
     assert_ne!(ragged.kernel, "f16w_coopmat_aligned", "{ragged:?}");
 
@@ -517,6 +812,85 @@ fn coopmat_routes_and_matches_dual_rounded_reference() {
     assert_close(&gpu, &cpu, k, "coopmat");
 }
 
+/// The asymmetric wave-fill tiles (64x128 / 128x64) are explicit-only
+/// until a heuristic A/B lands; this pins they match the dual-rounded
+/// reference on a shape both tiles cover.
+#[test]
+#[ignore]
+fn coopmat_asymmetric_tiles_match_dual_rounded_reference() {
+    let selections = [
+        KernelSelection::F16wCoopmatM64N128,
+        KernelSelection::F16wCoopmatM128N64,
+        KernelSelection::F16wA16CoopmatM64N128,
+        KernelSelection::F16wA16CoopmatM128N64,
+    ];
+    let (batch, m, n, k) = (1_u32, 256, 384, 256);
+    for selection in selections {
+        let Some((ctx, exec)) = make_setup_with_kernel_if_fits(2, 8, selection) else {
+            continue;
+        };
+        if !f16_available(&ctx) || !ctx.coopmat_enabled {
+            continue;
+        }
+        let a16 = selection_is_a16(selection);
+        let (a, b, host_a, host_b) = if a16 {
+            setup_a16_case(&ctx, &exec, &[m, k], &[k, n], 9800, 9801)
+        } else {
+            let (a, b, mut host_a, host_b) =
+                setup_f16_case(&ctx, &exec, &[m, k], &[k, n], 9800, 9801);
+            for value in &mut host_a {
+                *value = round_f32_via_f16(*value);
+            }
+            exec.upload(&host_a, &a).unwrap();
+            (a, b, host_a, host_b)
+        };
+        let c = if a16 {
+            Tensor::uninit_device_f16(&ctx, &[m, n]).unwrap()
+        } else {
+            Tensor::uninit_device(&ctx, &[m, n]).unwrap()
+        };
+        exec.run_matmuls(&[MatmulCall {
+            a: &a,
+            b: &b,
+            c: &c,
+            alpha: 1.0,
+            accumulate: false,
+        }])
+        .unwrap();
+        let mut gpu = vec![0.0; (m * n) as usize];
+        exec.download(&c, &mut gpu).unwrap();
+        let cpu = cpu_bmm(&host_a, &host_b, None, batch, m, n, k, 1.0, false);
+        if a16 {
+            assert_close_tol(
+                &gpu,
+                &cpu,
+                a16_tolerance(&cpu, k),
+                &format!("asymmetric {}", kernel_sel_name(selection)),
+            );
+        } else {
+            assert_close(
+                &gpu,
+                &cpu,
+                k,
+                &format!("asymmetric {}", kernel_sel_name(selection)),
+            );
+        }
+    }
+}
+
+fn selection_is_a16(selection: KernelSelection) -> bool {
+    selection
+        .index()
+        .is_some_and(|i| tensor_ash::KERNEL_SPECS[i].a_f16())
+}
+
+fn kernel_sel_name(selection: KernelSelection) -> &'static str {
+    selection
+        .index()
+        .map(|i| tensor_ash::KERNEL_SPECS[i].name)
+        .unwrap_or("?")
+}
+
 /// Regression: TinyLlama prefill surfaced that aligned f16 shapes
 /// route to the coopmat kernel, which cannot fuse epilogues — fused
 /// ops must demote to the SIMT sibling (or, with coopmat2, reroute to
@@ -533,7 +907,7 @@ fn f16_epilogue_on_coopmat_shape_demotes_and_matches() {
     // Plain route for this aligned shape is the tensor-core kernel.
     let (m, n, k) = (256_u32, 384_u32, 256_u32);
     let plain = exec.dispatch_info_for(1, m, n, k, true);
-    assert_eq!(plain.kernel, "f16w_coopmat_aligned", "{plain:?}");
+    assert_eq!(plain.kernel, "f16w_coopmat_m64n64", "{plain:?}");
 
     // A fused bias+SiLU+gate op on the same shape must run (demoted)
     // and match the reference computed from f16-rounded inputs.

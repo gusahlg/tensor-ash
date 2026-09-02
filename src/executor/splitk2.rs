@@ -27,12 +27,11 @@ use ash::vk;
 use crate::context::VulkanContext;
 use crate::matmul::ResolvedMatmul;
 
-const SPIRV_STAGE1_M128N128: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_splitk2_m128n128.spv"));
-const SPIRV_STAGE1_M64N64: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_splitk2_m64n64.spv"));
-const SPIRV_REDUCE: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_splitk2_reduce.spv"));
+use crate::pipeline::SPLITK2_SPIRV;
+
+const SPIRV_STAGE1_M128N128: &[u8] = SPLITK2_SPIRV[0];
+const SPIRV_STAGE1_M64N64: &[u8] = SPLITK2_SPIRV[1];
+const SPIRV_REDUCE: &[u8] = SPLITK2_SPIRV[2];
 
 pub(super) fn stage1_dispatch_info(m: u32, n: u32) -> (&'static str, [u32; 3]) {
     if m >= 128 && n >= 128 {
@@ -370,47 +369,45 @@ pub(super) struct SplitK2Pipeline {
 
 impl SplitK2Pipeline {
     pub(super) fn new(ctx: &Arc<VulkanContext>) -> Result<Self> {
-        unsafe {
-            let stage1_layout = create_pc_only_layout(
+        let stage1_layout = crate::pipeline::create_pc_only_layout(
+            ctx,
+            std::mem::size_of::<crate::pipeline::MatmulPushConstants>() as u32,
+        )
+        .context("split-K2 stage-1 pipeline layout")?;
+        let reduce_layout = crate::pipeline::create_pc_only_layout(
+            ctx,
+            std::mem::size_of::<SplitK2ReducePushConstants>() as u32,
+        )
+        .context("split-K2 reduce pipeline layout")?;
+
+        let build = |tile_m, tile_n, spv| -> Result<SplitK2Kernel> {
+            build_kernel(
                 ctx,
-                std::mem::size_of::<crate::pipeline::MatmulPushConstants>() as u32,
+                if tile_m == 0 {
+                    reduce_layout
+                } else {
+                    stage1_layout
+                },
+                tile_m,
+                tile_n,
+                spv,
             )
-            .context("split-K2 stage-1 pipeline layout")?;
-            let reduce_layout = create_pc_only_layout(
-                ctx,
-                std::mem::size_of::<SplitK2ReducePushConstants>() as u32,
-            )
-            .context("split-K2 reduce pipeline layout")?;
+        };
 
-            let build = |tile_m, tile_n, spv| -> Result<SplitK2Kernel> {
-                build_kernel(
-                    ctx,
-                    if tile_m == 0 {
-                        reduce_layout
-                    } else {
-                        stage1_layout
-                    },
-                    tile_m,
-                    tile_n,
-                    spv,
-                )
-            };
+        let m128n128 = build(128, 128, SPIRV_STAGE1_M128N128)
+            .context("build split-K2 128x128 stage-1 kernel")?;
+        let m64n64 =
+            build(64, 64, SPIRV_STAGE1_M64N64).context("build split-K2 64x64 stage-1 kernel")?;
+        let reduce = build(0, 0, SPIRV_REDUCE).context("build split-K2 reduce kernel")?;
 
-            let m128n128 = build(128, 128, SPIRV_STAGE1_M128N128)
-                .context("build split-K2 128x128 stage-1 kernel")?;
-            let m64n64 = build(64, 64, SPIRV_STAGE1_M64N64)
-                .context("build split-K2 64x64 stage-1 kernel")?;
-            let reduce = build(0, 0, SPIRV_REDUCE).context("build split-K2 reduce kernel")?;
-
-            Ok(Self {
-                ctx: Arc::clone(ctx),
-                stage1_layout,
-                reduce_layout,
-                m128n128,
-                m64n64,
-                reduce,
-            })
-        }
+        Ok(Self {
+            ctx: Arc::clone(ctx),
+            stage1_layout,
+            reduce_layout,
+            m128n128,
+            m64n64,
+            reduce,
+        })
     }
 
     /// Stage-1 tile choice: 128x128 when both dims fill it, else 64x64.
@@ -420,24 +417,6 @@ impl SplitK2Pipeline {
         } else {
             &self.m64n64
         }
-    }
-}
-
-pub(super) unsafe fn create_pc_only_layout(
-    ctx: &Arc<VulkanContext>,
-    pc_size: u32,
-) -> Result<vk::PipelineLayout> {
-    let pc_ranges = [vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::COMPUTE)
-        .offset(0)
-        .size(pc_size)];
-    unsafe {
-        ctx.device
-            .create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc_ranges),
-                None,
-            )
-            .context("create_pipeline_layout (split-K2)")
     }
 }
 

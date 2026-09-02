@@ -308,7 +308,7 @@ fn cm2_epilogue_on_coopmat_shape_stays_on_tensor_cores() {
     }
     // Plain routes are untouched: coopmat1 keeps the eligible shape.
     let plain = exec.dispatch_info_for(1, 512, 512, 512, true);
-    assert_eq!(plain.kernel, "f16w_coopmat_aligned", "{plain:?}");
+    assert_eq!(plain.kernel, "f16w_coopmat_m64n64", "{plain:?}");
 
     // Fused op on an eligible shape: rides the CM2 GEMM (A quantized
     // to f16 at load — the reference mirrors it) instead of demoting.
