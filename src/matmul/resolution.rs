@@ -92,6 +92,8 @@ pub(crate) struct ResolvedMatmul {
     /// the strictly-aligned `*_a16_*` coopmat kernel, so resolution
     /// also enforces its tile alignment and f16 B.
     pub a_f16: bool,
+    /// B is in the packed row-GEMV layout; routes to `*_packed`.
+    pub packed_b: bool,
 }
 
 pub(crate) enum ResolvedMatmulBatch {
@@ -151,14 +153,15 @@ impl ResolvedMatmul {
         )?;
         resolved.b_f16 = call.b.dtype() == DType::F16;
         resolved.a_f16 = a_f16;
+        resolved.packed_b = false;
         if a_f16
-            && (!resolved.m.is_multiple_of(128)
-                || !resolved.n.is_multiple_of(128)
+            && (!resolved.m.is_multiple_of(64)
+                || !resolved.n.is_multiple_of(64)
                 || !resolved.k.is_multiple_of(32))
         {
             bail!(
-                "matmul with f16 A storage routes to the aligned coopmat kernel only: \
-                 M/N/K must be multiples of (128, 128, 32), got ({}, {}, {})",
+                "matmul with f16 A storage routes to the aligned coopmat kernels only: \
+                 M/N/K must be multiples of (64, 64, 32), got ({}, {}, {})",
                 resolved.m,
                 resolved.n,
                 resolved.k
@@ -168,7 +171,29 @@ impl ResolvedMatmul {
     }
 
     pub(crate) fn from_op(op: &MatmulOp<'_>) -> Result<Self> {
-        let resolved = Self::from_call(&op.call)?;
+        let mut resolved = Self::from_call(&op.call)?;
+        resolved.packed_b = op.packed_b;
+        if op.packed_b {
+            if resolved.m != 1 || resolved.batch != 1 {
+                bail!(
+                    "packed-B GEMV requires M == 1 and batch == 1 (got M={}, batch={})",
+                    resolved.m,
+                    resolved.batch
+                );
+            }
+            if !resolved.b_f16 {
+                bail!("packed-B GEMV requires f16 weights");
+            }
+            if resolved.a_f16 {
+                bail!("packed-B GEMV does not support f16 activations");
+            }
+            if !resolved.n.is_multiple_of(32) {
+                bail!(
+                    "packed-B GEMV requires N to be a multiple of 32 (got {})",
+                    resolved.n
+                );
+            }
+        }
         // The a16 coopmat kernel is the ONLY f16-A route and has no
         // fused-epilogue / normed-A / store specializations; callers
         // apply combines as standalone elementwise passes instead.
@@ -411,6 +436,7 @@ impl ResolvedMatmul {
             total_flops: checked_flops(c.batch, a.rows, b.cols, a.cols)?,
             b_f16: false,
             a_f16: false,
+            packed_b: false,
         })
     }
 }

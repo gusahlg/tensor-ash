@@ -56,6 +56,10 @@ pub struct PreparedOps<'e, 't> {
     total_flops: u64,
     /// The recorded push constants point at these tensors' memory.
     _tensors: PhantomData<&'t ()>,
+    /// Side buffers baked into the recording (GEMV-chain job tables).
+    /// Dropped after the fence wait in [`Drop`].
+    #[allow(dead_code)]
+    retain: Vec<std::sync::Arc<crate::buffer::Buffer>>,
 }
 
 impl Executor {
@@ -162,6 +166,16 @@ impl Executor {
         total_flops: u64,
         record: impl FnOnce(vk::CommandBuffer) -> Result<()>,
     ) -> Result<PreparedOps<'e, 't>> {
+        self.prepare_recorded_retain(n_calls, total_flops, Vec::new(), record)
+    }
+
+    pub(super) fn prepare_recorded_retain<'e, 't>(
+        &'e self,
+        n_calls: usize,
+        total_flops: u64,
+        retain: Vec<std::sync::Arc<crate::buffer::Buffer>>,
+        record: impl FnOnce(vk::CommandBuffer) -> Result<()>,
+    ) -> Result<PreparedOps<'e, 't>> {
         let dev = &self.ctx.device;
         unsafe {
             let cmd_pool = dev
@@ -222,6 +236,7 @@ impl Executor {
                 n_calls,
                 total_flops,
                 _tensors: PhantomData,
+                retain,
             })
         }
     }
@@ -237,6 +252,26 @@ impl PreparedOps<'_, '_> {
         // leak hazard below cannot arise.
         unsafe { self.submit()? };
         self.wait()
+    }
+
+    /// [`run`](Self::run) without reading timestamp queries.  Decode's
+    /// per-token replay only needs the fence; the query-pool wait was
+    /// extra host time on the tg128 path.
+    pub fn run_silent(&mut self) -> Result<()> {
+        unsafe { self.submit()? };
+        if !self.in_flight {
+            bail!("PreparedOps::run_silent: nothing submitted");
+        }
+        wait_fence_spin(&self.exec.ctx.device, self.fence)?;
+        unsafe {
+            self.exec
+                .ctx
+                .device
+                .reset_fences(&[self.fence])
+                .context("reset_fences (prepared silent)")?;
+        }
+        self.in_flight = false;
+        Ok(())
     }
 
     /// Submit without waiting.  The caller must [`wait`](Self::wait)

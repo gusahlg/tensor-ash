@@ -1,0 +1,13 @@
+#version 460
+// f16-activation sibling of the 128x64 wave-fill coopmat tile.
+
+#define A_F16 1
+#define C_F16 1
+#define BM 128u
+#define BN 64u
+#define THREADS 128u
+#define WM 64u
+#define WN 32u
+#define SG_N 2u
+
+#include "matmul_coopmat_kernel.glsl"

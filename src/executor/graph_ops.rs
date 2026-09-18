@@ -7,128 +7,19 @@
 //! ~10 µs each.  One submission amortizes that to a single wait; the
 //! ops still serialize on the GPU exactly as the per-op path would.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use ash::vk;
 
-use crate::buffer::{Buffer, BufferLocation};
 use crate::matmul::{MatmulOp, ResolvedMatmul, RunStats};
 use crate::tensor::Tensor;
 
-use super::elementwise::ElementwiseDispatch;
+use super::elementwise::{ElementwiseDispatch, GEMV_CHAIN_MAX_JOBS};
 use super::prepared::PreparedOps;
 use super::recording::{record_compute_to_compute_barrier, record_one_matmul};
 use super::{
-    AttnDecodeDesc, BinaryOp, CopyDesc, Executor, FlashAttentionDesc, OpPlan, RopeDesc,
-    RopeScatterDesc, SoftmaxMask,
+    AttnDecodeDesc, BinaryOp, CopyDesc, Executor, FlashAttentionDesc, HostU32Buffer, OpPlan,
+    PosBuffer, PrefillQkvPackDesc, RopeDesc, RopeScatterDesc, SoftmaxMask, TokenIdBuffer,
 };
-
-/// A 4-byte host-visible, device-readable position cell for replayable
-/// decode graphs (see [`Executor::prepare_exec_ops`]).  The ops that
-/// depend on the token position take its [`device_address`]
-/// (`RopeDesc::pos_addr`, `CopyDesc::pos_addr`,
-/// `AttnDecodeDesc::pos_addr`); the recorded shaders read the current
-/// value each execution, so the host just [`set`]s the new position
-/// between replays instead of re-recording push constants.
-///
-/// Host writes made before a `vkQueueSubmit` are visible to that
-/// submission (the submit performs the domain operation; `set` flushes
-/// non-coherent memory), so no barrier is needed — only the usual
-/// "don't write while a replay is in flight" discipline, which
-/// [`PreparedOps::run`]'s fence wait already enforces.
-///
-/// [`device_address`]: Self::device_address
-/// [`set`]: Self::set
-pub struct PosBuffer {
-    buffer: Buffer,
-}
-
-impl PosBuffer {
-    /// Write a new position for the next submission.
-    pub fn set(&self, value: u32) -> Result<()> {
-        self.buffer.write_pod_slice(&[value])
-    }
-
-    /// GPU pointer for the shaders' position indirection; store it in
-    /// the descs' `pos_addr` fields.  The buffer must outlive every
-    /// execution of any op that captured this address.
-    pub fn device_address(&self) -> u64 {
-        self.buffer.device_address()
-    }
-}
-
-/// A 4-byte u32 cell that is BOTH device-writable and host-readable —
-/// the [`PosBuffer`] machinery pointed the other way.  The GPU-argmax
-/// decode loop writes the chosen token id here
-/// ([`ExecOp::Argmax`] / [`Executor::run_argmax`]), a chained
-/// [`ExecOp::EmbedGather`] reads it back on-device for the next token's
-/// embedding, and the host [`read`]s ONE u32 after the fence instead of
-/// downloading the logits.
-///
-/// Device writes become visible to the host once the submission's fence
-/// wait returns (the fence signal is the domain operation; `read`
-/// invalidates non-coherent memory), so the usual "wait before you
-/// read" discipline — which [`super::PreparedOps::run`]'s fence already
-/// enforces — is the only requirement.
-///
-/// [`read`]: Self::read
-pub struct HostU32Buffer {
-    buffer: Buffer,
-}
-
-impl HostU32Buffer {
-    /// Read the current value (call only after the writing submission's
-    /// fence wait has returned).
-    pub fn read(&self) -> Result<u32> {
-        let mut value = [0u32];
-        self.buffer.read_pod_slice(&mut value)?;
-        Ok(value[0])
-    }
-
-    /// Host-side write, for seeding the cell before a submission that
-    /// only reads it (e.g. a standalone embed-gather).
-    pub fn set(&self, value: u32) -> Result<()> {
-        self.buffer.write_pod_slice(&[value])
-    }
-
-    /// GPU pointer for the shaders' indirection.  The buffer must
-    /// outlive every execution of any op that captured this address.
-    pub fn device_address(&self) -> u64 {
-        self.buffer.device_address()
-    }
-
-    pub(super) fn buffer(&self) -> &Buffer {
-        &self.buffer
-    }
-}
-
-fn create_u32_cell(exec: &Executor, label: &str) -> Result<Buffer> {
-    if !exec.ctx.buffer_device_address_enabled {
-        bail!("{label}: requires bufferDeviceAddress");
-    }
-    Buffer::new(
-        &exec.ctx,
-        std::mem::size_of::<u32>() as u64,
-        vk::BufferUsageFlags::STORAGE_BUFFER,
-        BufferLocation::Host,
-    )
-    .context(label.to_string())
-}
-
-impl Executor {
-    /// Allocate a [`PosBuffer`] on this executor's device.
-    pub fn create_pos_buffer(&self) -> Result<PosBuffer> {
-        Ok(PosBuffer {
-            buffer: create_u32_cell(self, "create_pos_buffer")?,
-        })
-    }
-
-    /// Allocate a [`HostU32Buffer`] on this executor's device.
-    pub fn create_host_u32_buffer(&self) -> Result<HostU32Buffer> {
-        Ok(HostU32Buffer {
-            buffer: create_u32_cell(self, "create_host_u32_buffer")?,
-        })
-    }
-}
 
 /// One step of a mixed-op graph.  All variants execute in submission
 /// order with a full compute barrier between consecutive steps, so a
@@ -218,6 +109,18 @@ pub enum ExecOp<'t> {
         out: &'t Tensor,
         desc: FlashAttentionDesc,
     },
+    /// Fused wide-prefill QKV pack (see
+    /// [`Executor::run_prefill_qkv_pack`]): RoPE Q to head-major
+    /// `[H, T, dh]`, RoPE-scatter K into the Kt cache, copy V into
+    /// the V cache.
+    PrefillQkvPack {
+        qkv: &'t Tensor,
+        table: &'t Tensor,
+        q: &'t Tensor,
+        kt: &'t Tensor,
+        v: &'t Tensor,
+        desc: PrefillQkvPackDesc,
+    },
     /// Greedy argmax (see [`Executor::run_argmax`]): writes the index
     /// of `input`'s largest element into the host-readable `result`
     /// cell (ties keep the largest index, matching Rust's
@@ -234,6 +137,26 @@ pub enum ExecOp<'t> {
         token: &'t HostU32Buffer,
         table: &'t Tensor,
         out: &'t Tensor,
+    },
+    /// Multi-row embedding gather: `tokens[0..n]` indexes rows of
+    /// `table` into `out` shaped `[n, embd]` (f16 or f32).  Prefill
+    /// uses this so the 512-token prompt is a 2 KiB id write plus a
+    /// gather, matching CUDA's on-device embedding table.
+    EmbedGatherRows {
+        tokens: &'t TokenIdBuffer,
+        table: &'t Tensor,
+        out: &'t Tensor,
+    },
+    /// Persistent GEMV chain: up to [`GEMV_CHAIN_MAX_JOBS`] M=1
+    /// f16-weight row GEMVs in ONE dispatch. Dependent groups wait on
+    /// an in-kernel device-scope quorum; independent neighbours share
+    /// a flattened tile space and stay concurrent.  Requires
+    /// `ML_DEVICE_SCOPE=1`.  llama-ash decode stays on packed row
+    /// GEMVs by default — enabling the chain globally scrambled CM2
+    /// flash numerics.
+    GemvChain {
+        jobs: Box<[MatmulOp<'t>; GEMV_CHAIN_MAX_JOBS]>,
+        n: u32,
     },
 }
 
@@ -266,6 +189,10 @@ impl Access {
         self.reads.push(cell.buffer().raw_buffer());
         self
     }
+    fn read_raw(mut self, buffer: vk::Buffer) -> Self {
+        self.reads.push(buffer);
+        self
+    }
     fn write_cell(mut self, cell: &HostU32Buffer) -> Self {
         self.writes.push(cell.buffer().raw_buffer());
         self
@@ -281,6 +208,37 @@ impl Access {
             .chain(&self.writes)
             .any(|b| pending_writes.contains(b))
             || self.writes.iter().any(|b| pending_reads.contains(b))
+    }
+}
+
+/// Walks a planned graph's access list, emitting a barrier whenever
+/// the next op RAW/WAW/WARs against work since the last barrier.
+/// Shared by recording and the plan-only census so the two cannot
+/// disagree on how many barriers a graph pays.
+struct HazardCursor {
+    pending_writes: Vec<vk::Buffer>,
+    pending_reads: Vec<vk::Buffer>,
+}
+
+impl HazardCursor {
+    fn new() -> Self {
+        Self {
+            pending_writes: Vec::new(),
+            pending_reads: Vec::new(),
+        }
+    }
+
+    /// True when a compute barrier must precede `access` (never for
+    /// the first dispatch).
+    fn barrier_before(&mut self, index: usize, access: &Access) -> bool {
+        let needed = index > 0 && access.hazard_with(&self.pending_writes, &self.pending_reads);
+        if needed {
+            self.pending_writes.clear();
+            self.pending_reads.clear();
+        }
+        self.pending_reads.extend(&access.reads);
+        self.pending_writes.extend(&access.writes);
+        needed
     }
 }
 
@@ -353,7 +311,14 @@ impl Executor {
             }
         }
         let (planned, accesses, total_flops) = self.plan_exec_ops(ops)?;
-        self.prepare_recorded(ops.len(), total_flops, |cb| {
+        let retain: Vec<std::sync::Arc<crate::buffer::Buffer>> = planned
+            .iter()
+            .filter_map(|step| match step {
+                Planned::Elementwise(dispatch) => dispatch.retain.clone(),
+                Planned::Matmul { .. } => None,
+            })
+            .collect();
+        self.prepare_recorded_retain(ops.len(), total_flops, retain, |cb| {
             self.record_exec_ops(cb, &planned, &accesses)
         })
     }
@@ -365,10 +330,11 @@ impl Executor {
     /// between them.  Nothing touches the queue.
     ///
     /// Diagnostics for performance accounting: a full compute barrier
-    /// drains the GPU (~7.7 µs measured on GA104), so pricing a graph
-    /// requires knowing how many the hazard tracker will emit.  The
-    /// perf-thesis harness (`ml_bench thesis`) uses this to separate
-    /// barrier drain from kernel time.
+    /// drains ~0.9 µs on GA104 (T3's original 7.7 µs inference was
+    /// falsified), so pricing a graph requires knowing how many the
+    /// hazard tracker will emit.  The perf-thesis harness
+    /// (`ml_bench thesis`) uses this to separate barrier drain from
+    /// kernel time.
     pub fn exec_ops_barrier_count(&self, ops: &[ExecOp<'_>]) -> Result<(usize, usize)> {
         if ops.is_empty() {
             bail!("exec_ops_barrier_count: empty op list");
@@ -377,18 +343,12 @@ impl Executor {
             bail!("exec_ops_barrier_count: requires bufferDeviceAddress");
         }
         let (planned, accesses, _total_flops) = self.plan_exec_ops(ops)?;
-        let mut pending_writes: Vec<vk::Buffer> = Vec::new();
-        let mut pending_reads: Vec<vk::Buffer> = Vec::new();
-        let mut barriers = 0usize;
-        for (index, access) in accesses.iter().enumerate() {
-            if index > 0 && access.hazard_with(&pending_writes, &pending_reads) {
-                barriers += 1;
-                pending_writes.clear();
-                pending_reads.clear();
-            }
-            pending_reads.extend(&access.reads);
-            pending_writes.extend(&access.writes);
-        }
+        let mut cursor = HazardCursor::new();
+        let barriers = accesses
+            .iter()
+            .enumerate()
+            .filter(|(index, access)| cursor.barrier_before(*index, access))
+            .count();
         Ok((planned.len(), barriers))
     }
 
@@ -533,13 +493,46 @@ impl Executor {
                     Planned::Elementwise(self.plan_flash_attention(q, kt, v, out, *desc, false)?),
                     Access::default().read(q).read(kt).read(v).write(out),
                 ),
+                ExecOp::PrefillQkvPack {
+                    qkv,
+                    table,
+                    q,
+                    kt,
+                    v,
+                    desc,
+                } => (
+                    Planned::Elementwise(self.plan_prefill_qkv_pack(qkv, table, q, kt, v, *desc)?),
+                    Access::default()
+                        .read(qkv)
+                        .read(table)
+                        .write(q)
+                        .write(kt)
+                        .write(v),
+                ),
                 ExecOp::Argmax { input, result } => (
                     Planned::Elementwise(self.plan_argmax(input, result)?),
                     Access::default().read(input).write_cell(result),
                 ),
                 ExecOp::EmbedGather { token, table, out } => (
-                    Planned::Elementwise(self.plan_embed_gather(token, table, out)?),
+                    Planned::Elementwise(self.plan_embed_gather(
+                        token.device_address(),
+                        token.buffer(),
+                        table,
+                        out,
+                    )?),
                     Access::default().read_cell(token).read(table).write(out),
+                ),
+                ExecOp::EmbedGatherRows { tokens, table, out } => (
+                    Planned::Elementwise(self.plan_embed_gather(
+                        tokens.device_address(),
+                        tokens.buffer(),
+                        table,
+                        out,
+                    )?),
+                    Access::default()
+                        .read_raw(tokens.buffer().raw_buffer())
+                        .read(table)
+                        .write(out),
                 ),
                 ExecOp::AttnDecode {
                     q,
@@ -556,6 +549,29 @@ impl Executor {
                         Planned::Elementwise(combine),
                         Access::default().read(scratch).write(out),
                     )
+                }
+                ExecOp::GemvChain { jobs, n } => {
+                    let n = *n as usize;
+                    if n == 0 || n > GEMV_CHAIN_MAX_JOBS {
+                        bail!("run_exec_ops: GemvChain n={n} out of range");
+                    }
+                    let slice = &jobs[..n];
+                    let dispatch = self.plan_gemv_chain(slice)?;
+                    let mut access = Access::default();
+                    let mut flops = 0u64;
+                    for op in slice {
+                        let dims = ResolvedMatmul::from_op(op)?;
+                        flops = flops.saturating_add(dims.total_flops);
+                        access = access.read(op.call.a).read(op.call.b).write(op.call.c);
+                        if let Some(d) = op.epilogue.d_tensor() {
+                            access = access.read(d);
+                        }
+                        if let Some((w, _)) = op.normed_a {
+                            access = access.read(w);
+                        }
+                    }
+                    total_flops = total_flops.saturating_add(flops);
+                    (Planned::Elementwise(dispatch), access)
                 }
             };
             planned.push(step);
@@ -575,23 +591,14 @@ impl Executor {
         accesses: &[Access],
     ) -> Result<()> {
         let mut bound = vk::Pipeline::null();
-        // Hazard tracking: barrier only when this op reads or
-        // overwrites something written since the last barrier
-        // (RAW/WAW), or writes something read since (WAR).
         // Independent neighbours overlap on the GPU, which both
-        // removes ~7 us of drain per avoided barrier and lets tiny
+        // removes ~0.9 µs of drain per avoided barrier and lets tiny
         // dispatches fill idle SMs.
-        let mut pending_writes: Vec<vk::Buffer> = Vec::new();
-        let mut pending_reads: Vec<vk::Buffer> = Vec::new();
+        let mut cursor = HazardCursor::new();
         for (index, step) in planned.iter().enumerate() {
-            let access = &accesses[index];
-            if index > 0 && access.hazard_with(&pending_writes, &pending_reads) {
+            if cursor.barrier_before(index, &accesses[index]) {
                 record_compute_to_compute_barrier(&self.ctx, cb);
-                pending_writes.clear();
-                pending_reads.clear();
             }
-            pending_reads.extend(&access.reads);
-            pending_writes.extend(&access.writes);
             match step {
                 Planned::Matmul { op, dims, plan } => {
                     record_one_matmul(

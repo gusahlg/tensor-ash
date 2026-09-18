@@ -3,12 +3,12 @@
 // (converted to f16 while staging into shared memory), B f16 storage,
 // f32 accumulate on 16x16x16 subgroup fragments.
 //
-// Strictly aligned (the "_aligned" suffix is load-bearing: the host
-// rejects dispatches unless M % 128 == 0, N % 128 == 0, K % 32 == 0),
-// because cooperative-matrix ops require subgroup-uniform control flow
-// — the divergent bounds tricks of the SIMT kernels are invalid here,
-// and `cooperativeMatrixRobustBufferAccess` is not required by this
-// device, so out-of-bounds loads would be UB rather than zeros.
+// Strictly aligned: the host rejects dispatches unless M % BM == 0,
+// N % BN == 0, K % 32 == 0 (BM/BN default 128; the wave-fill wrapper
+// uses 64).  Cooperative-matrix ops require subgroup-uniform control
+// flow — the divergent bounds tricks of the SIMT kernels are invalid
+// here, and `cooperativeMatrixRobustBufferAccess` is not required by
+// this device, so out-of-bounds loads would be UB rather than zeros.
 //
 // Compile-time inputs (set by the .comp wrapper):
 //     A_F16 (optional): A is stored as IEEE half; staging becomes a
@@ -19,10 +19,11 @@
 //     fragments convert (RNE) at store time, and ACCUMULATE reloads
 //     prior C through the same half view.
 //
-// Layout: 256 threads = 8 subgroups of 32.  Workgroup tile 128x128,
-// BK = 32.  Subgroups tile the output 2 rows x 4 cols, each owning a
-// 64x32 slice = 4x2 fragments of 16x16.  Shared tiles are staged as
-// uvec4 (8 halves) with a 16-byte row skew, per NVIDIA's
+// Default layout: 256 threads = 8 subgroups of 32.  Workgroup tile
+// 128x128, BK = 32.  Subgroups tile the output (BM/WM) x SG_N, each
+// owning a WM x WN slice of 16x16 fragments.  The 64x64 wrapper uses
+// 128 threads / 4 subgroups / 32x32 slices.  Shared tiles are staged
+// as uvec4 (8 halves) with a 16-byte row skew, per NVIDIA's
 // vk_cooperative_matrix_perf shmem kernel.
 
 #extension GL_KHR_cooperative_matrix : require
@@ -34,7 +35,26 @@
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#ifndef BM
+#define BM 128u
+#endif
+#ifndef BN
+#define BN 128u
+#endif
+#ifndef THREADS
+#define THREADS 256u
+#endif
+#ifndef WM
+#define WM 64u
+#endif
+#ifndef WN
+#define WN 32u
+#endif
+#ifndef SG_N
+#define SG_N 4u
+#endif
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
 
 layout(constant_id = 0) const bool ACCUMULATE = false;
 layout(constant_id = 1) const bool ALPHA_IS_ONE = true;
@@ -43,22 +63,17 @@ layout(constant_id = 1) const bool ALPHA_IS_ONE = true;
 layout(constant_id = 2) const bool INTERIOR_ONLY = false;
 layout(constant_id = 3) const bool K_MULTIPLE = false;
 
-const uint BM = 128u;
-const uint BN = 128u;
 const uint BK = 32u;
 const uint LM = 16u;
 const uint LN = 16u;
 const uint LK = 16u;
-const uint WM = 64u;  // subgroup output rows
-const uint WN = 32u;  // subgroup output cols
-const uint FRAG_M = WM / LM; // 4
-const uint FRAG_N = WN / LN; // 2
-const uint THREADS = 256u;
+const uint FRAG_M = WM / LM;
+const uint FRAG_N = WN / LN;
 
 // Shared rows carry a 16-byte (one uvec4 / 8 halves) skew to dodge
 // bank conflicts on the fragment loads.
 const uint A_ROW_V4 = BK / 8u + 1u; // 5 uvec4 per A row
-const uint B_ROW_V4 = BN / 8u + 1u; // 17 uvec4 per B row
+const uint B_ROW_V4 = BN / 8u + 1u; // 17 (BN=128) or 9 (BN=64) uvec4 per B row
 
 layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer F32V4ReadOnly {
     vec4 v[];
@@ -102,10 +117,12 @@ layout(push_constant) uniform PC {
 shared uvec4 Ash[BM * A_ROW_V4];
 shared uvec4 Bsh[BK * B_ROW_V4];
 
-// A tile: BM x BK halves = 512 uvec4 slots, 2 per thread.  f32 A
-// packs 8 K-consecutive loads (two vec4) into 8 halves; f16 A is a
-// straight 16-byte copy (row starts stay uvec4-aligned because
-// K % 32 == 0 is a host-checked precondition).
+// A tile: BM x BK halves.  f32 A packs 8 K-consecutive loads (two
+// vec4) into 8 halves; f16 A is a straight 16-byte copy (row starts
+// stay uvec4-aligned because K % 32 == 0 is a host-checked
+// precondition).  Whole-tile LDS double-buffering was measured at
+// 6.4 TF/s on 2048^3 (4060) vs the single-buffer ~20+ TF/s class —
+// 128x128 x2 exceeds the 48 KiB occupancy budget.
 void load_a_tile(uint a_base, uint block_row, uint k_base, uint tid) {
 #ifdef A_F16
     H8ReadOnly a_v8 = H8ReadOnly(uint64_t(pc.a_ptr));
@@ -130,8 +147,7 @@ void load_a_tile(uint a_base, uint block_row, uint k_base, uint tid) {
     }
 }
 
-// B tile: BK x BN halves = 512 uvec4 slots, 2 per thread, straight
-// 16-byte copies.
+// B tile: BK x BN halves, straight 16-byte copies.
 void load_b_tile(uint b_base, uint block_col, uint k_base, uint tid) {
     H8ReadOnly b_v8 = H8ReadOnly(uint64_t(pc.b_ptr));
     const uint slots = BK * (BN / 8u);
@@ -155,9 +171,9 @@ void main() {
     const uint b_base = batch * pc.batch_stride_b;
     const uint c_base = batch * pc.batch_stride_c;
 
-    // Subgroup slice of the 128x128 tile: 2 x 4 grid of 64x32.
-    const uint warp_row0 = (sg / 4u) * WM;
-    const uint warp_col0 = (sg % 4u) * WN;
+    // Subgroup slice of the BM x BN tile: (BM/WM) x SG_N grid.
+    const uint warp_row0 = (sg / SG_N) * WM;
+    const uint warp_col0 = (sg % SG_N) * WN;
 
     coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator> acc[FRAG_M][FRAG_N];
     [[unroll]] for (uint i = 0u; i < FRAG_M; ++i)
@@ -197,7 +213,7 @@ void main() {
     }
 
     // Store: fragment rows are 16 floats = 4 vec4 (or 16 halves),
-    // N % 128 == 0 keeps every row start 16-byte aligned.  Alpha and
+    // N % BN == 0 keeps every row start 16-byte aligned.  Alpha and
     // accumulate act on fragment elements before the store; with
     // C_F16 the f32 accumulator converts (RNE) as the last step.
 #ifdef C_F16

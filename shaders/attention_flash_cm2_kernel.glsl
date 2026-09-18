@@ -2,8 +2,10 @@
 // GL_NV_cooperative_matrix2 (workgroup-scope cooperative matrices).
 //
 // Same semantics and push-constant block as the SIMT kernel
-// (`attention_flash_kernel.glsl`): `q`/`out` are `[H, T_q, dh]`, `Kt`
-// is `[H_kv, dh, T_max]`, `V` is `[H_kv, T_max, dh]`; query row `i`
+// (`attention_flash_kernel.glsl`): `q`/`out` default to `[H, T_q, dh]`
+// (head-major) and can be `[T_q, H, dh]` via `q_head_stride` /
+// `q_row_stride`; `Kt` is `[H_kv, dh, T_max]`, `V` is `[H_kv, T_max, dh]`;
+// query row `i`
 // attends to positions `< min(kv_len, pos_base + i + 1)`; GQA maps
 // `kv_head = head / group_size`; all-masked rows store zeros.
 //
@@ -92,8 +94,13 @@ layout(push_constant) uniform PC {
     uint pos_base;
     uint group_size;
     float scale;
-    uint _pad0;
-    uint _pad1;
+    // Q/out addressing: index = head * q_head_stride + row * q_row_stride + d.
+    // Head-major [H, T, dh]: head_stride = T*dh, row_stride = dh.
+    // Token-major [T, H, dh]: head_stride = dh, row_stride = H*dh.
+    uint q_head_stride;
+    uint q_row_stride;
+    uint o_head_stride;
+    uint o_row_stride;
     IO_READER q_ptr;
     KV_READER kt_ptr;
     KV_READER v_ptr;
@@ -107,6 +114,7 @@ layout(push_constant) uniform PC {
 
 // coopMatReduceNV combine ops (both operands and result f32).
 float maxReduce(const in float x, const in float y) { return max(x, y); }
+float addReduce(const in float x, const in float y) { return x + y; }
 // Row-smear: reduce keeps column 0 and broadcasts it across the row,
 // which also resizes Br x Bc state onto Br x DH accumulators.
 float smearReduce(const in float x, const in float y) { return x; }
@@ -155,7 +163,7 @@ void main() {
     tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tlQ =
         createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
     tlQ = setTensorLayoutDimensionNV(tlQ, pc.t_q, DH);
-    tlQ = setTensorLayoutStrideNV(tlQ, DH, 1);
+    tlQ = setTensorLayoutStrideNV(tlQ, pc.q_row_stride, 1);
     tlQ = setTensorLayoutClampValueNV(tlQ, 0u);
 
     tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tlK =
@@ -177,12 +185,12 @@ void main() {
 #ifdef IO_F16
     {
         coopmat<float16_t, gl_ScopeWorkgroup, Br, DH, gl_MatrixUseAccumulator> Qh;
-        coopMatLoadTensorNV(Qh, pc.q_ptr.v, head * pc.t_q * DH,
+        coopMatLoadTensorNV(Qh, pc.q_ptr.v, head * pc.q_head_stride,
             sliceTensorLayoutNV(tlQ, q0, Br, 0, DH));
         Q = coopmat<float, gl_ScopeWorkgroup, Br, DH, gl_MatrixUseAccumulator>(Qh);
     }
 #else
-    coopMatLoadTensorNV(Q, pc.q_ptr.v, head * pc.t_q * DH,
+    coopMatLoadTensorNV(Q, pc.q_ptr.v, head * pc.q_head_stride,
         sliceTensorLayoutNV(tlQ, q0, Br, 0, DH));
 #endif
     Q *= pc.scale;
@@ -239,14 +247,12 @@ void main() {
         coopMatPerElementNV(P, S - M, Exp);        // P = e^(S-M)
         coopMatPerElementNV(eM, Mold - M, Exp);    // per-row rescale factor
 
-        // P in [0, 1] is exact-safe as an f16 operand; row sums via
-        // P x ones so they ride the tensor cores too (f32 accumulate).
+        // P in [0, 1] is exact-safe as an f16 operand for P@V.
+        // Row sums use a row-reduce instead of P @ ones (a full
+        // 64x64x64 tensor-core product just to add 64 numbers).
         coopmat<float16_t, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseA> P_A =
             coopmat<float16_t, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseA>(P);
-        coopmat<float16_t, gl_ScopeWorkgroup, Bc, Bc, gl_MatrixUseB> One =
-            coopmat<float16_t, gl_ScopeWorkgroup, Bc, Bc, gl_MatrixUseB>(1.0);
-        rowsum = coopmat<float, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator>(0.0);
-        rowsum = coopMatMulAdd(P_A, One, rowsum);
+        coopMatReduceNV(rowsum, P, gl_CooperativeMatrixReduceRowNV, addReduce);
 
         coopmat<float16_t, gl_ScopeWorkgroup, Bc, DH, gl_MatrixUseB> V;
 #ifdef KV_F16
@@ -281,14 +287,14 @@ void main() {
     tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tlO =
         createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
     tlO = setTensorLayoutDimensionNV(tlO, pc.t_q, DH);
-    tlO = setTensorLayoutStrideNV(tlO, DH, 1);
+    tlO = setTensorLayoutStrideNV(tlO, pc.o_row_stride, 1);
 #ifdef IO_F16
     coopmat<float16_t, gl_ScopeWorkgroup, Br, DH, gl_MatrixUseAccumulator> O16 =
         coopmat<float16_t, gl_ScopeWorkgroup, Br, DH, gl_MatrixUseAccumulator>(O);
-    coopMatStoreTensorNV(O16, pc.out_ptr.v, head * pc.t_q * DH,
+    coopMatStoreTensorNV(O16, pc.out_ptr.v, head * pc.o_head_stride,
         sliceTensorLayoutNV(tlO, q0, Br, 0, DH));
 #else
-    coopMatStoreTensorNV(O, pc.out_ptr.v, head * pc.t_q * DH,
+    coopMatStoreTensorNV(O, pc.out_ptr.v, head * pc.o_head_stride,
         sliceTensorLayoutNV(tlO, q0, Br, 0, DH));
 #endif
 }

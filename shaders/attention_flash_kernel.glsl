@@ -65,8 +65,11 @@ layout(push_constant) uniform PC {
     uint pos_base;
     uint group_size;
     float scale;
-    uint _pad0;
-    uint _pad1;
+    // Q/out addressing: index = head * q_head_stride + row * q_row_stride + d.
+    uint q_head_stride;
+    uint q_row_stride;
+    uint o_head_stride;
+    uint o_row_stride;
     F32ReadOnly q_ptr;
     F32ReadOnly kt_ptr;
     F32ReadOnly v_ptr;
@@ -86,7 +89,7 @@ void main() {
     const bool live = row < pc.t_q;
 
     const uint kv_head = head / pc.group_size;
-    const uint q_base = (head * pc.t_q + min(row, pc.t_q - 1u)) * DH;
+    const uint q_base = head * pc.q_head_stride + min(row, pc.t_q - 1u) * pc.q_row_stride;
     const uint kt_base = kv_head * DH * pc.t_max;
     const uint v_base = kv_head * pc.t_max * DH;
 
@@ -166,7 +169,7 @@ void main() {
 
     if (live && valid_row > 0u) {
         const float inv = l > 0.0 ? 1.0 / l : 0.0;
-        const uint out_base = (head * pc.t_q + row) * DH + d0;
+        const uint out_base = head * pc.o_head_stride + row * pc.o_row_stride + d0;
         [[unroll]] for (uint d = 0u; d < DHS; ++d) {
             pc.out_ptr.v[out_base + d] = acc[d] * inv;
         }

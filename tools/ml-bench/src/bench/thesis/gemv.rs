@@ -3,7 +3,10 @@
 //! T2 holds every decode GEMV class (the TinyLlama-family M=1 f16w row
 //! GEMVs) to a fraction of its bandwidth floor, where the floor is
 //! bytes moved (f16 weights, f32 activation row in, f32 row out) over
-//! the recorded device bandwidth.  T6 holds the f16w coopmat GEMM to a
+//! the recorded device bandwidth.  Packed-B is used where llama-ash
+//! packs (k/v, gate/up, lm_head) so T2 sees the sequential K-walk
+//! that made lm_head hit 94% of device BW; q/o and down stay unpacked.
+//! T6 holds the f16w coopmat GEMM to a
 //! TFLOPS floor on REAL aligned prefill shapes (the 34.6 TF/s headline
 //! was 4096^3; what 512-row shapes sustain is the falsifiable claim),
 //! with 4096^3 kept as a regression reference.
@@ -24,14 +27,16 @@ use crate::bench::cases::BenchCase;
 use crate::bench::commands::run_case;
 use crate::bench::env::env_u32;
 
-/// Decode GEMV classes: `(label, K, N)` for a `[1,K] @ [K,N]` f16w row
-/// GEMV (TinyLlama-1.1B geometry, the campaign's reference model).
-const GEMV_SHAPES: &[(&str, u32, u32)] = &[
-    ("q/o 2048x2048", 2048, 2048),
-    ("k/v 2048x256", 2048, 256),
-    ("gate/up 2048x5632", 2048, 5632),
-    ("down 5632x2048", 5632, 2048),
-    ("lm_head 2048x32000", 2048, 32000),
+/// Decode GEMV classes: `(label, K, N, packed)` for a `[1,K] @ [K,N]`
+/// f16w row GEMV (TinyLlama-1.1B geometry). `packed` follows llama-ash:
+/// k/v, gate/up, and lm_head use `[N/tile][K][tile]`; q/o and down stay
+/// row-major (already at the unpacked bandwidth floor).
+const GEMV_SHAPES: &[(&str, u32, u32, bool)] = &[
+    ("q/o 2048x2048", 2048, 2048, false),
+    ("k/v 2048x256", 2048, 256, true),
+    ("gate/up 2048x5632", 2048, 5632, true),
+    ("down 5632x2048", 5632, 2048, false),
+    ("lm_head 2048x32000", 2048, 32000, true),
 ];
 
 pub(crate) fn t2_gemv_efficiency(
@@ -54,7 +59,7 @@ pub(crate) fn t2_gemv_efficiency(
     let min_frac = key(section, "t2_min_bw_frac");
 
     let mut rows = Vec::new();
-    for &(label, k, n) in GEMV_SHAPES {
+    for &(label, k, n, packed_b) in GEMV_SHAPES {
         let case = BenchCase {
             label: Cow::Owned(format!("gemv {label}")),
             b: 1,
@@ -62,9 +67,14 @@ pub(crate) fn t2_gemv_efficiency(
             n,
             k,
             b_f16: true,
+            packed_b,
         };
         let result = run_case(ctx, exec, case, iters, warmup)?;
-        let item = format!("GEMV {label} f16w");
+        let item = if packed_b {
+            format!("GEMV {label} f16w packed")
+        } else {
+            format!("GEMV {label} f16w")
+        };
         let Some(gpu) = result.gpu_ms else {
             rows.push(Row {
                 thesis: "T2",
@@ -153,6 +163,7 @@ pub(crate) fn t6_coopmat_ceiling(
             n,
             k,
             b_f16: true,
+            packed_b: false,
         };
         let result = run_case(ctx, exec, case, iters, warmup)?;
         let kernel = result.dispatch.kernel;

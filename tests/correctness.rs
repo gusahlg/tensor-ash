@@ -31,6 +31,8 @@ mod f16;
 mod flash;
 #[path = "correctness/fusion.rs"]
 mod fusion;
+#[path = "correctness/gemv_chain.rs"]
+mod gemv_chain;
 #[path = "correctness/graph.rs"]
 mod graph;
 #[path = "correctness/kernels.rs"]

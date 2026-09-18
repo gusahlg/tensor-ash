@@ -6,6 +6,7 @@
 mod abi;
 mod catalog;
 mod create;
+mod routing;
 mod runtime;
 mod selection;
 mod tuning;
@@ -26,9 +27,14 @@ use tuning::{load_tuned, save_tuned, shader_registry_hash};
 
 pub use abi::{EpilogueKey, KernelVariant, MATMUL_FLAG_NORM_A, MatmulPushConstants};
 pub use catalog::{KERNEL_SPECS, KernelSelection, KernelSpec};
-pub(crate) use create::build_compute_pipeline;
+pub(crate) use create::{build_compute_pipeline, create_pc_only_layout};
 pub use runtime::MatmulKernel;
-pub(crate) use tuning::{TuneEntry, TuneKey};
+pub(crate) use tuning::{SPLITK2_SPIRV, TuneEntry, TuneKey};
+
+pub(crate) use routing::{
+    coopmat_selection, f16w_row_packed_selection, f16w_row_selection, maybe_to_bda, to_f16w,
+};
+pub use routing::{f16w_row_tile_n, f16w_row_uses_k16};
 
 pub struct MatmulPipeline {
     ctx: Arc<VulkanContext>,
@@ -134,13 +140,8 @@ impl MatmulPipeline {
             // descriptor set, so the dispatcher can skip
             // `vkCmdBindDescriptorSets` and `vkUpdateDescriptorSets`
             // entirely for these kernels.
-            let pipeline_layout_bda = ctx
-                .device
-                .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc_ranges),
-                    None,
-                )
-                .context("create_pipeline_layout (BDA)")?;
+            let pipeline_layout_bda =
+                create_pc_only_layout(ctx, pc_size).context("create_pipeline_layout (BDA)")?;
             let pipeline_layout_bda_guard = scopeguard::guard(pipeline_layout_bda, |l| {
                 ctx.device.destroy_pipeline_layout(l, None)
             });
@@ -300,23 +301,7 @@ impl MatmulPipeline {
         if self.ctx.buffer_device_address_enabled {
             let selection = if m == 1 {
                 Some(if b_f16 {
-                    // Sixteen K-slice warps win when K is deep, N is
-                    // narrow, or the shape is square-ish (measured:
-                    // 2048^2 -23%, K=5632/N=2048 -22%, N=256 helps;
-                    // wide-N moderate-K like N=5632/K=2048 regresses
-                    // -8% and stays on eight).
-                    if k >= 4096 || n <= 512 || (k >= 2048 && n <= 2048) {
-                        KernelSelection::F16wRowBdaK16
-                    } else {
-                        // Wide-N moderate-K: sixteen slices alone lose
-                        // ~5% to the eight-slice kernel here, but with
-                        // two packed columns per lane (f16vec2 loads)
-                        // they win ~3% instead (K=2048/N=5632: 58 ->
-                        // 56 µs); VCOLS=2 is measured-neutral on the
-                        // k16-routed shapes and -12% on N=256, so the
-                        // narrow/deep branch stays on plain k16.
-                        KernelSelection::F16wRowBdaK16V2
-                    }
+                    f16w_row_selection(k, n)
                 } else {
                     KernelSelection::RowBda
                 })
@@ -344,18 +329,17 @@ impl MatmulPipeline {
         }
         let tile = auto_select_kernel(batch, m, n, k, self.auto_min_large_tiles);
         let selection = if b_f16 {
-            // Tensor cores first when the shape allows them: strictly
-            // aligned and big enough that the 128x128 tiles fill the
-            // device (small aligned shapes stay on the SIMT f16w
-            // kernels, which handle low occupancy better).
+            // Tensor cores first when the shape allows them.  64x64
+            // covers the under-filled 128x128 grids (M=128/256/512
+            // prefill); 128x128 stays on large well-filled shapes.
             if self.ctx.coopmat_enabled
-                && m.is_multiple_of(128)
-                && n.is_multiple_of(128)
                 && k.is_multiple_of(32)
-                && m >= 256
-                && n >= 256
+                && m >= 128
+                && n >= 128
+                && m.is_multiple_of(64)
+                && n.is_multiple_of(64)
             {
-                KernelSelection::F16wCoopmat
+                coopmat_selection(batch, m, n, false).expect("M/N are 64-aligned")
             } else {
                 // f16-storage B is validated as BDA-capable upstream;
                 // map the tile class onto the nearest f16w sibling.
@@ -381,7 +365,7 @@ impl MatmulPipeline {
     /// small tile (16,640 B), which fits every device this library
     /// realistically initializes on; a budget below that panics with
     /// the kernel name rather than dispatching into an empty slot.
-    fn in_budget_index(&self, selection: KernelSelection) -> usize {
+    pub(crate) fn in_budget_index(&self, selection: KernelSelection) -> usize {
         use KernelSelection as K;
         let mut selection = selection;
         loop {
@@ -407,6 +391,22 @@ impl MatmulPipeline {
                     K::SmallBdaV4
                 }
                 K::F16wLargeBdaV4 | K::F16wK64BdaV4 => K::F16wSmallBdaV4,
+                // Wave-fill tiles are ~9.7 KiB; if a future budget
+                // gate empties them, fall back to the 128x128 sibling
+                // (same family, same alignment).
+                K::F16wCoopmatM64 | K::F16wCoopmatM64N128 | K::F16wCoopmatM128N64 => K::F16wCoopmat,
+                K::F16wA16CoopmatM64 | K::F16wA16CoopmatM64N128 | K::F16wA16CoopmatM128N64 => {
+                    K::F16wA16Coopmat
+                }
+                // Packed B is a different layout; falling back to the
+                // unpacked row kernel would silently read garbage.
+                K::F16wRowBdaK16Packed | K::F16wRowBdaK16V2Packed => {
+                    panic!(
+                        "packed row-GEMV kernel '{}' is gated off on this device \
+                         (no unpacked fallback: B layout would not match)",
+                        KERNEL_SPECS[index].name
+                    )
+                }
                 other => panic!(
                     "kernel '{}' is gated off on this device and has no in-budget fallback",
                     KERNEL_SPECS[other.index().expect("selection is concrete")].name
@@ -503,6 +503,18 @@ impl MatmulPipeline {
                 // needs 16-byte-aligned batched tensor bases, which the
                 // alignment guarantees.
                 let tensor_core = kernel.name.contains("coopmat") || kernel.name.contains("cm2");
+                // 64x64 is heuristic-only: including it in the tuner
+                // would let a measured 128x128 winner override the
+                // wave-fill pick and flake tests that assert the
+                // static route.  Prefill uses the a16 fixed pick.
+                // Wave-fill coopmat tiles are heuristic-only: a measured
+                // 128x128 winner must not override them.  Packed B is a
+                // different layout.  Do not match SIMT `m128n64k64`.
+                if (kernel.name.contains("coopmat") && !kernel.name.ends_with("_aligned"))
+                    || kernel.name.contains("packed")
+                {
+                    return false;
+                }
                 let coopmat_fits = tensor_core
                     && m.is_multiple_of(128)
                     && n.is_multiple_of(128)
@@ -580,38 +592,6 @@ impl MatmulPipeline {
 /// Coarser than the f32 family on purpose: three tile classes cover
 /// the heuristic winners, and the measured tuner refines per shape
 /// within the f16w candidate set.
-fn to_f16w(tile: KernelSelection) -> KernelSelection {
-    match tile {
-        KernelSelection::Large | KernelSelection::M64N128 => KernelSelection::F16wLargeBdaV4,
-        KernelSelection::M128N64 | KernelSelection::M128N64K64 => {
-            KernelSelection::F16wM128N64K64BdaV4
-        }
-        KernelSelection::K64 => KernelSelection::F16wK64BdaV4,
-        _ => KernelSelection::F16wSmallBdaV4,
-    }
-}
-
-fn maybe_to_bda(tile: KernelSelection) -> KernelSelection {
-    match tile {
-        KernelSelection::Large => KernelSelection::LargeBdaV4,
-        KernelSelection::Small => KernelSelection::SmallBdaV4,
-        KernelSelection::M128N64K64 => KernelSelection::M128N64K64BdaV4,
-        // K64 promotes to the TM=8 TN=4 register-tile variant: empirically
-        // wins +6-7% on every K64-routed shape (medium_384,
-        // skinny_1024x128x512, wide_128x1024x512) vs the TM=4 TN=4 default
-        // by trading half the active threads for double the M-side
-        // register strip per thread (verified with 10-round interleaved
-        // A/B on RTX 3070).  The plain V4 sibling stays selectable via
-        // ML_KERNEL=k64_bda_v4 for back-comparison.
-        KernelSelection::K64 => KernelSelection::K64BdaV4Tm8Tn4,
-        KernelSelection::M128N64 => KernelSelection::M128N64BdaV4,
-        KernelSelection::M64N128 => KernelSelection::M64N128BdaV4,
-        // TN=2 has no V4 path; use the plain BDA fallback.
-        KernelSelection::M64N32 => KernelSelection::M64N32Bda,
-        other => other,
-    }
-}
-
 impl Drop for MatmulPipeline {
     fn drop(&mut self) {
         unsafe {
@@ -634,50 +614,5 @@ impl Drop for MatmulPipeline {
                 .device
                 .destroy_descriptor_set_layout(self.set_layout, None);
         }
-    }
-}
-
-#[cfg(test)]
-mod bda_tests {
-    use super::*;
-
-    #[test]
-    fn bda_promotion_covers_every_auto_target() {
-        // The auto-selector's possible returns should each promote to
-        // their BDA_V4 sibling (or BDA for TN=2 / unchanged when no
-        // BDA path exists).  Listing them explicitly here keeps the
-        // rule from silently drifting when new kernels land.
-        assert_eq!(
-            maybe_to_bda(KernelSelection::Large),
-            KernelSelection::LargeBdaV4
-        );
-        assert_eq!(
-            maybe_to_bda(KernelSelection::Small),
-            KernelSelection::SmallBdaV4
-        );
-        assert_eq!(
-            maybe_to_bda(KernelSelection::M128N64K64),
-            KernelSelection::M128N64K64BdaV4
-        );
-        assert_eq!(
-            maybe_to_bda(KernelSelection::K64),
-            KernelSelection::K64BdaV4Tm8Tn4
-        );
-        assert_eq!(
-            maybe_to_bda(KernelSelection::M128N64),
-            KernelSelection::M128N64BdaV4
-        );
-        assert_eq!(
-            maybe_to_bda(KernelSelection::M64N128),
-            KernelSelection::M64N128BdaV4
-        );
-        // TN=2 stays on the plain BDA path (no V4 sibling).
-        assert_eq!(
-            maybe_to_bda(KernelSelection::M64N32),
-            KernelSelection::M64N32Bda
-        );
-        // No BDA sibling at all — pass through.
-        assert_eq!(maybe_to_bda(KernelSelection::Bk16), KernelSelection::Bk16);
-        assert_eq!(maybe_to_bda(KernelSelection::V2), KernelSelection::V2);
     }
 }

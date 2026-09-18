@@ -1,0 +1,9 @@
+#version 460
+// Packed-B sibling of k16: B is [N/32][K][32] so the K-walk is
+// sequential at stride 32, same inner-product order as unpacked.
+
+#define B_F16 1
+#define B_PACKED 1
+#define KSLICES 16
+
+#include "matmul_row_bda_kernel.glsl"

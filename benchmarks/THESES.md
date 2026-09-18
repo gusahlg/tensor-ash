@@ -76,8 +76,12 @@ activation row + f32 output row:
 | lm_head | 2048×32000 | 131.2 MB | 292.9 µs |
 
 **Measurement.** `run_case` per shape (B=1, M=1, f16w, auto-routed —
-the routed kernel is reported per row), ML_ITERS (default 50)
-timestamped samples, median GPU time, sampled post-timing validation.
+the routed kernel is reported per row), with packed-B on the classes
+llama-ash packs (k/v, gate/up, lm_head) so T2 measures the sequential
+K-walk rather than the stride-N unpacked path that was 7.4x slower on
+lm_head. q/o and down stay unpacked (already at the bandwidth floor).
+ML_ITERS (default 50) timestamped samples, median GPU time, sampled
+post-timing validation.
 
 **Provenance.** Leg 13/15 forensics: row GEMVs at 81-89% of
 bandwidth.  The tiny k/v class is the canary — launch overhead bites

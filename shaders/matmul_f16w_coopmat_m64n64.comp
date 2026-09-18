@@ -1,0 +1,13 @@
+#version 460
+// Wave-fill coopmat tile: 64x64x32 on 128 threads (4 subgroups).
+// Used when a 128x128 grid would leave SMs idle (M=128/256/512
+// prefill projections).
+
+#define BM 64u
+#define BN 64u
+#define THREADS 128u
+#define WM 32u
+#define WN 32u
+#define SG_N 2u
+
+#include "matmul_coopmat_kernel.glsl"

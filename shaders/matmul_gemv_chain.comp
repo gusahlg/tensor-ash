@@ -1,0 +1,5 @@
+#version 460
+// Persistent f16-weight GEMV chain (see matmul_gemv_chain_kernel.glsl).
+
+#define KSLICES 16
+#include "matmul_gemv_chain_kernel.glsl"

@@ -168,6 +168,8 @@ fn bench_flash(
         kv_len: case.t,
         pos_base: 0,
         scale,
+        token_major_heads: None,
+        out_token_major_heads: None,
     };
     let mut samples = Vec::new();
     for _ in 0..ITERS {

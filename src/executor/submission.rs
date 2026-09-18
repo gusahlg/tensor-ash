@@ -189,7 +189,12 @@ pub(super) unsafe fn submit_one(
 /// scheduler wakeup costs more than the GPU work itself; the spin
 /// budget caps the wasted CPU on long dispatches at a few microseconds.
 pub(super) fn wait_fence_spin(dev: &ash::Device, fence: vk::Fence) -> Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_micros(50);
+    // Decode's prepared replay is ~5-7 ms of GPU work; a 50 µs spin
+    // always expires and the blocking wait's scheduler wakeup is
+    // 50-150 µs — enough to lose the CUDA tg128 comparison.  Spin
+    // through a full decode step and still return immediately on
+    // short dispatches (the fence is polled).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(8);
     loop {
         match unsafe { dev.get_fence_status(fence) } {
             Ok(true) => return Ok(()),

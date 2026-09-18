@@ -62,9 +62,10 @@ pub(crate) fn checked_op<'a>(
             activation,
             binary,
         },
-        // Not exposed through the C ABI yet.
+        // Normed-A and fused store are still Rust-only.
         normed_a: None,
         store: MatmulStore::None,
+        packed_b: raw.packed_b != 0,
     })
 }
 

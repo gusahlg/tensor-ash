@@ -25,7 +25,7 @@ regression. `ML_MODEL=<gguf> ml_bench thesis --all` runs everything (the
 model-level theses T1/T5/T7 load a llama-family GGUF through the
 `llama-ash` library); `ml_bench thesis t2 t3 t4 t6` runs the
 kernel-level subset without a model. `cases`
-runs multiple `label,b,m,n,k[,f16w]` arguments in one process, avoiding repeated
+runs multiple `label,b,m,n,k[,f16w][,packed]` arguments in one process, avoiding repeated
 pipeline startup and GPU clock perturbation in automation. The environment
 knobs are documented in the workspace `README.md`; `ML_DEVICE`, `ML_KERNEL`,
 `ML_TUNE`, `ML_B`/`ML_M`/`ML_N`/`ML_K`, and `ML_OUTPUT` are the common ones.
@@ -51,4 +51,6 @@ normal dispatch and report its route.
 ```console
 ML_OUTPUT=csv target/release/ml_bench cases \
   square_512,1,512,512,512 odd_255,1,255,257,263
+ML_OUTPUT=csv target/release/ml_bench cases \
+  lm_head,1,1,32000,2048,packed kv,1,1,256,2048,f16w,packed
 ```

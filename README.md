@@ -63,8 +63,15 @@ callable GEMM component; those runtimes still need their own adapter layer.
   GEMM these cover a full transformer decoder block.
 - **Fused flash-attention prefill** (`run_flash_attention`): causal
   online-softmax attention in one dispatch — no materialized score
-  tensor, causal tile skipping, GQA, warm-cache offsets; interoperates
-  with the composed softmax/matmul path on the same KV-cache layouts.
+  tensor, causal tile skipping, GQA, warm-cache offsets, optional
+  token-major Q/O addressing; interoperates with the composed
+  softmax/matmul path on the same KV-cache layouts.
+- **Packed-B decode GEMVs** (`pack_f16w_row_tiles`,
+  `MatmulOp::with_packed_b`): B stored `[N/tile][K][tile]` so the
+  K-walk is sequential.  Selected only when the op opts in.
+- **Wave-fill coopmat tiles** (64x64, 64x128, 128x64) for under-filled
+  128x128 prefill grids (M=128/256/512), plus a fused wide-prefill QKV
+  pack that RoPE-writes head-major Q and scatters K/V in one dispatch.
 - **Fused split-K decode attention** (`run_attn_decode`): single-token
   attention over only the valid KV prefix as two dispatches (chunked
   online-softmax partials + exact combine); f32 or f16 caches,
@@ -229,6 +236,8 @@ The C ABI lives in `tensor-ash-capi` and is declared in
   `ta_run_op_graph` for `ta_matmul_op` batches with fused epilogues
   (bias, relu/silu/gelu, residual add-scaled or gating mul), the graph
   variant inserting automatic barriers between dependent ops.
+  `ta_matmul_op.packed_b` plus host-only `ta_pack_f16w_row_tiles` /
+  `ta_f16w_row_tile_n` expose the decode packed-B layout.
 - Model ops: `ta_softmax_rows` (full / prefix / causal masks via
   `TA_SOFTMAX_MASK_*`), `ta_rms_norm`, `ta_layer_norm`, `ta_rope`
   (`ta_rope_desc`), and `ta_copy_strided` (`ta_copy_desc`). In-place
@@ -241,8 +250,9 @@ The C ABI lives in `tensor-ash-capi` and is declared in
   tensors must outlive the `ta_prepared` handle (documented in the
   header).
 - Diagnostics: `ta_dispatch_info_for` reports the selected kernel, tile,
-  and split-K route for a shape; `ta_tune_shape` pre-warms the measured
-  tuner.
+  and split-K route for a shape; `ta_dispatch_info_packed` reports the
+  fail-closed packed-B row-GEMV route; `ta_tune_shape` pre-warms the
+  measured tuner.
 
 ```bash
 cargo build --release -p tensor-ash-capi
@@ -270,6 +280,8 @@ ML_DEVICE=discrete cargo run --release -p ml-bench -- self-check
 ML_OUTPUT=csv ML_SWEEP=smoke cargo run --release -p ml-bench -- sweep
 ML_OUTPUT=csv cargo run --release -p ml-bench -- cases \
   square,1,512,512,512 edge,1,511,513,515
+ML_OUTPUT=csv cargo run --release -p ml-bench -- cases \
+  lm_unpacked,1,1,32000,2048,f16w lm_packed,1,1,32000,2048,packed
 ```
 
 Timed runs validate sampled outputs outside the measurement window and report

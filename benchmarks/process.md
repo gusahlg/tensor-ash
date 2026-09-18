@@ -13,11 +13,13 @@ backend attempt. The structure, commands, and file-size audit describe the
 current workspace; older performance numbers below are retained as historical
 measurements rather than implied results of the refactor.
 
-The workspace now contains four deliberately separate packages:
+The workspace now contains five deliberately separate packages:
 
-- `tensor-ash`: the Rust/Vulkan FP32 GEMM library.
+- `tensor-ash`: the Rust/Vulkan GEMM + transformer-ops library.
 - `tensor-ash-capi`: a C ABI wrapper that builds `libtensor_ash.so` and
   `libtensor_ash.a`.
+- `llama-ash`: GGUF load and llama-family prefill/decode on tensor-ash
+  ops.  One model runtime, not a second compute library.
 - `ml-bench`: a non-published benchmark/correctness CLI. Its logging,
   environment parsing, cases, and reporting no longer add dependencies or a
   binary target to the core library package.
@@ -134,22 +136,49 @@ Previously added tests are still present:
 
 ## File Size Check
 
-Largest source files after the split:
+The old "nothing above 500 lines" bar was overrun as model-ops, flash,
+and llama-ash grew.  2026-08-25 quality pass split the worst offenders
+and the shared types they were carrying:
+
+- `elementwise.rs` 2116 → `elementwise/{mod,pc,ops,flash,attn,gemv_chain}.rs`
+- `model.rs` 1667 → `model/{mod,load}.rs` + `model/forward/{mod,prefill,decode}.rs`
+- coopmat / packed-row routing → `pipeline/routing.rs`
+- host u32 cells → `executor/cells.rs`
+- push-constant-only layouts → `pipeline/create.rs::create_pc_only_layout`
+
+Current largest Rust files:
 
 | file | lines | note |
 | --- | ---: | --- |
-| `scripts/bench_compare_backends.py` | 467 | isolated framework/native adapters |
-| `src/pipeline/mod.rs` | 410 | pipeline ownership and caches |
-| `src/executor/splitk2.rs` | 398 | two-stage split-K pipeline and planning |
-| `src/executor/streamk_exec.rs` | 367 | Stream-K validation and GPU recording |
-| `scripts/bench_compare_report.py` | 357 | JSON/Markdown analysis |
-| `tools/ml-bench/src/bench/commands.rs` | 338 | standalone benchmark subcommands |
-| `src/context/device.rs` | 320 | device selection and tests |
-| `src/executor/streamk_schedule.rs` | 309 | pure host scheduling policy and tests |
+| `src/executor/graph_ops.rs` | 625 | mixed-op plan + record; cells extracted |
+| `src/pipeline/mod.rs` | 618 | pipeline ownership |
+| `src/executor/splitk2.rs` | 607 | two-stage split-K |
+| `tools/ml-bench/src/bench/commands.rs` | 595 | bench CLI |
+| `src/executor/elementwise/ops.rs` | 595 | softmax/norm/rope/copy/binary/embed |
+| `src/context/init.rs` | 560 | device/feature enable |
+| `tools/ml-bench/src/bench/thesis/model_theses.rs` | 546 | T1/T5/T7 measurements |
+| `src/executor/elementwise/mod.rs` | 521 | op catalog + pipeline |
 
-No Rust or Python source file remains above 500 lines. The remaining larger
-files each represent one cohesive subsystem; pipeline ownership and split-K2
-creation are the next candidates if either grows materially.
+Next splits if they keep growing: `graph_ops.rs` (`ExecOp` vs recording),
+`commands.rs`, `splitk2.rs`.
+
+### Crate-split evaluation (2026-08-25)
+
+The workspace already has the autonomous packages: `tensor-ash` (runtime),
+`tensor-ash-capi` (FFI), `llama-ash` (GGUF + forward), `ml-bench`
+(harness), `tensor-ash-test-support` (CPU fixtures).  Candidates that
+look tempting and why they stay in-tree:
+
+- **Elementwise / flash / GEMV-chain as `tensor-ash-ops`.** Shares
+  `Executor` slots, BDA layout, `plan_elementwise`, and the same
+  `VulkanContext`.  Not autonomous — a crate boundary would be a
+  circular dep or a massive public internals dump.
+- **GGUF parser as its own crate.** 417 lines, llama-metadata-specific,
+  one consumer.  Extract if a second runtime wants it; not before.
+- **Shader catalog as a crate.** Bound to `build.rs` `OUT_DIR` SPIR-V.
+  Keep with the library.
+
+Module splits inside the existing crates are the right lever.
 
 ## Verification Commands
 

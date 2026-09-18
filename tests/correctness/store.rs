@@ -16,7 +16,8 @@ use crate::common::*;
 
 use tensor_ash::{
     Activation, CopyDesc, Epilogue, EpilogueBinary, ExecOp, Executor, KernelSelection, MatmulCall,
-    MatmulOp, MatmulStoreDesc, RopeDesc, RopeScatterDesc, Tensor, VulkanContext,
+    MatmulOp, MatmulStoreDesc, RopeDesc, RopeScatterDesc, Tensor, VulkanContext, f16w_row_tile_n,
+    pack_f16w_row_tiles,
 };
 
 fn store_available(ctx: &std::sync::Arc<VulkanContext>) -> bool {
@@ -151,6 +152,79 @@ fn store_rope_matches_gemv_plus_standalone_rope() {
             &actual,
             k,
             &format!("store rope {kernel:?} n={n}"),
+        );
+    }
+}
+
+/// Packed-B + fused rope store: the llama decode q-projection.  The
+/// packed kernel walks K in the same order as unpacked, so fused vs
+/// composed (packed GEMV then standalone rope) stays bit-identical
+/// on drivers that keep STORE_MODE variants reproducible.
+#[test]
+#[ignore]
+fn store_rope_packed_matches_gemv_plus_standalone_rope() {
+    let (ctx, exec) = make_setup(2, 8);
+    if !store_available(&ctx) {
+        eprintln!("skipping: no BDA/f16 support");
+        return;
+    }
+    let cases: &[(u32, u32, u32)] = &[
+        (96, 128, 32),  // k16 tile 32
+        (96, 256, 64),  // k16 tile 32, wider
+        (128, 192, 64), // k16_v2 tile 64 if N>512? N=192 -> k16
+    ];
+    for &(k, n, head_dim) in cases {
+        let tile = f16w_row_tile_n(k, n) as usize;
+        let (a, _, table) = setup_case(&ctx, &exec, k, n, head_dim, 16, 71_000 + n as u64);
+        let mut host_b = vec![0.0; (k * n) as usize];
+        fill_det(&mut host_b, 71_100 + n as u64);
+        let packed = pack_f16w_row_tiles(&host_b, k as usize, n as usize, tile);
+        let b_p = Tensor::uninit_device_f16(&ctx, &[k, n]).unwrap();
+        exec.upload(&packed, &b_p).unwrap();
+        let (w, _) = upload_det(&ctx, &exec, &[k], 71_200 + n as u64);
+        let c_ref = Tensor::uninit_device(&ctx, &[1, n]).unwrap();
+        let c_fused = Tensor::uninit_device(&ctx, &[1, n]).unwrap();
+        let pos = 5_u32;
+        let eps = 1e-5_f32;
+        exec.run_ops(&[MatmulOp::new(mm(&a, &b_p, &c_ref))
+            .with_packed_b()
+            .with_normed_a(&w, eps)])
+            .unwrap();
+        exec.run_rope(
+            &c_ref,
+            &table,
+            &c_ref,
+            RopeDesc {
+                heads: n / head_dim,
+                head_dim,
+                rot_dim: head_dim,
+                pos_base: pos,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        exec.run_ops(&[MatmulOp::new(mm(&a, &b_p, &c_fused))
+            .with_packed_b()
+            .with_normed_a(&w, eps)
+            .with_store_rope(
+                &table,
+                MatmulStoreDesc {
+                    head_dim,
+                    pos_base: pos,
+                    ..Default::default()
+                },
+            )])
+        .unwrap();
+        let mut expected = vec![0.0; n as usize];
+        let mut actual = vec![0.0; n as usize];
+        exec.download(&c_ref, &mut expected).unwrap();
+        exec.download(&c_fused, &mut actual).unwrap();
+        assert_fused_matches(
+            &ctx,
+            &expected,
+            &actual,
+            k,
+            &format!("store rope packed {k}x{n}"),
         );
     }
 }
