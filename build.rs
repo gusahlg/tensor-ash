@@ -14,6 +14,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=TENSOR_ASH_GLSLC_LOWMEM");
+    println!("cargo:rerun-if-env-changed=TENSOR_ASH_GLSLC_VMEM_KB");
 
     let entries = std::fs::read_dir(&shader_dir)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", shader_dir.display()));
@@ -43,25 +44,45 @@ fn main() {
         } else {
             "--target-env=vulkan1.2"
         };
-        // glslc's performance passes need >6 GB on the fully-unrolled
-        // BK=64 TM=8/TN=8 tiles; on memory-constrained hosts
-        // TENSOR_ASH_GLSLC_LOWMEM=1 compiles just those with -Os
-        // (138 MB, same SPIR-V semantics; the driver re-optimizes).
+        // glslc's performance passes (-O) need >3 GB on a few fully-unrolled
+        // bodies (the BK=64 TM=8/TN=8 tiles, the dh128 flash kernels).  With
+        // TENSOR_ASH_GLSLC_LOWMEM=1 each -O compile runs under an address-
+        // space cap (TENSOR_ASH_GLSLC_VMEM_KB, default 2.6 GB) and falls back
+        // to -Os (same semantics, ~140 MB; the driver re-optimizes) when it
+        // would exceed it.  `*_os` wrappers are deliberate -Os builds.
         let lowmem = std::env::var_os("TENSOR_ASH_GLSLC_LOWMEM").is_some_and(|v| v != "0");
-        let opt = if lowmem && (stem.contains("tm8_tn8") || stem.contains("v4pf")) {
-            "-Os"
-        } else {
-            "-O"
+        let vmem_kb =
+            std::env::var("TENSOR_ASH_GLSLC_VMEM_KB").unwrap_or_else(|_| "2600000".into());
+        let mut opt = if stem.ends_with("_os") { "-Os" } else { "-O" };
+        let run = |opt: &str, capped: bool| {
+            if capped {
+                Command::new("bash")
+                    .arg("-c")
+                    .arg(format!(
+                        "ulimit -v {vmem_kb} && exec glslc {target_env} {opt} \"$0\" -o \"$1\""
+                    ))
+                    .arg(&path)
+                    .arg(&out)
+                    .status()
+            } else {
+                Command::new("glslc")
+                    .args([target_env, opt])
+                    .arg(&path)
+                    .arg("-o")
+                    .arg(&out)
+                    .status()
+            }
         };
-        let status = Command::new("glslc")
-            .args([target_env, opt])
-            .arg(&path)
-            .arg("-o")
-            .arg(&out)
-            .status()
-            .unwrap_or_else(|e| {
-                panic!("failed to invoke glslc (is the Vulkan SDK installed and on PATH?): {e}")
-            });
+        let mut status = run(opt, lowmem && opt == "-O").unwrap_or_else(|e| {
+            panic!("failed to invoke glslc (is the Vulkan SDK installed and on PATH?): {e}")
+        });
+        if !status.success() && lowmem && opt == "-O" {
+            println!(
+                "cargo:warning={stem}: glslc -O exceeded the {vmem_kb} KB LOWMEM cap; using -Os"
+            );
+            opt = "-Os";
+            status = run(opt, false).expect("glslc -Os fallback");
+        }
 
         if !status.success() {
             panic!("glslc failed for {}", path.display());
