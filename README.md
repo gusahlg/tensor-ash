@@ -260,7 +260,7 @@ device supports them.
 ## Benchmark binary (`ml_bench`)
 
 Subcommands: `self-check`, `correctness`, `sweep`, `single`, `cases`,
-`concurrent`, `transfer`. Useful env knobs:
+`ab`, `concurrent`, `transfer`. Useful env knobs:
 
 ```bash
 ML_B=4 ML_M=1024 ML_N=1024 ML_K=1024 cargo run --release -p ml-bench -- single
@@ -270,7 +270,20 @@ ML_DEVICE=discrete cargo run --release -p ml-bench -- self-check
 ML_OUTPUT=csv ML_SWEEP=smoke cargo run --release -p ml-bench -- sweep
 ML_OUTPUT=csv cargo run --release -p ml-bench -- cases \
   square,1,512,512,512 edge,1,511,513,515
+ML_AB_KERNELS=k64_bda_v4_tm8_tn4,m128n64k64_bda_v4,auto \
+  cargo run --release -p ml-bench -- ab square_512,1,512,512,512
 ```
+
+`ab` compares several kernels on several shapes in one process so GPU clock
+drift between processes does not pollute A/B numbers. `ML_AB_KERNELS` is a
+comma-separated list of catalog names/aliases or `auto` (the normal router);
+each entry gets its own pipeline and executor on a shared `VulkanContext`,
+tensors are allocated once per case, and each round rotates which kernel
+runs first. The table reports median and min GPU milliseconds across rounds,
+TF/s, and the ratio versus the first kernel; `ML_OUTPUT=csv` adds `b,m,n,k`.
+A kernel that cannot run a case (strict `_aligned` tiles, f16w mismatch,
+dispatch limits) is `n/a` rather than a fatal error. Built-in burn-in is
+~300 ms of 4096³ on the first kernel unless `ML_AB_NO_BURN=1`.
 
 Timed runs validate sampled outputs outside the measurement window and report
 paired wall/GPU minimum, median, and p95 values. TFLOPS uses the median; CSV

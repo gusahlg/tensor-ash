@@ -114,13 +114,31 @@ pub(super) fn cases(
     Ok(())
 }
 
-pub(super) fn run_case(
+/// Device tensors plus the host fixtures used to fill them and to
+/// sample-validate C. Shared by `cases` and `ab` so both paths upload
+/// the same deterministic A/B.
+pub(super) struct CaseTensors {
+    pub(super) a: Tensor,
+    pub(super) b: Tensor,
+    pub(super) c: Tensor,
+    pub(super) h_a: Vec<f32>,
+    pub(super) h_b: Vec<f32>,
+}
+
+/// Allocate A/B/C for `case`, fill from the same seeds `cases` has
+/// always used, and upload through `exec`.
+///
+/// When `requantize_a_for_tensor_core` is true and the executor's
+/// route for this f16w shape is a tensor-core kernel, A is rounded to
+/// f16 and re-uploaded so the CPU reference matches in-shader
+/// quantization. `ab` passes false and keeps a single f32 A shared
+/// across kernels; it rounds a copy at validation time instead.
+pub(super) fn prepare_case_tensors(
     ctx: &Arc<VulkanContext>,
     exec: &Executor,
-    case: BenchCase,
-    iters: u32,
-    warmup: u32,
-) -> Result<BenchResult> {
+    case: &BenchCase,
+    requantize_a_for_tensor_core: bool,
+) -> Result<CaseTensors> {
     let bsz = case.b;
     let m = case.m;
     let n = case.n;
@@ -143,16 +161,57 @@ pub(super) fn run_case(
         for value in &mut h_b {
             *value = tensor_ash::dtype::round_f32_via_f16(*value);
         }
-        // The tensor-core routes also quantize A (coopmat1 while
-        // staging, cm2 in its tensor-load decode callback).
-        let kernel = exec.dispatch_info_for(bsz, m, n, k, true).kernel;
-        if kernel.contains("coopmat") || kernel.contains("cm2") {
-            for value in &mut h_a {
-                *value = tensor_ash::dtype::round_f32_via_f16(*value);
+        if requantize_a_for_tensor_core {
+            // The tensor-core routes also quantize A (coopmat1 while
+            // staging, cm2 in its tensor-load decode callback).
+            let kernel = exec.dispatch_info_for(bsz, m, n, k, true).kernel;
+            if kernel_quantizes_a(kernel) {
+                for value in &mut h_a {
+                    *value = tensor_ash::dtype::round_f32_via_f16(*value);
+                }
+                exec.upload(&h_a, &a)?;
             }
-            exec.upload(&h_a, &a)?;
         }
     }
+    Ok(CaseTensors { a, b, c, h_a, h_b })
+}
+
+pub(super) fn kernel_quantizes_a(kernel: &str) -> bool {
+    kernel.contains("coopmat") || kernel.contains("cm2")
+}
+
+/// CPU-side A for [`validate_samples`]. Tensor-core routes quantize A
+/// in-shader; when the shared device tensor was left as f32, round a
+/// copy so the reference matches.
+pub(super) fn reference_a_for_kernel<'a>(
+    h_a: &'a [f32],
+    kernel: &str,
+    b_f16: bool,
+) -> Cow<'a, [f32]> {
+    if b_f16 && kernel_quantizes_a(kernel) {
+        Cow::Owned(
+            h_a.iter()
+                .copied()
+                .map(tensor_ash::dtype::round_f32_via_f16)
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(h_a)
+    }
+}
+
+pub(super) fn run_case(
+    ctx: &Arc<VulkanContext>,
+    exec: &Executor,
+    case: BenchCase,
+    iters: u32,
+    warmup: u32,
+) -> Result<BenchResult> {
+    let CaseTensors { a, b, c, h_a, h_b } = prepare_case_tensors(ctx, exec, &case, true)?;
+    let bsz = case.b;
+    let m = case.m;
+    let n = case.n;
+    let k = case.k;
 
     let flops = 2.0f64 * bsz as f64 * m as f64 * n as f64 * k as f64;
     let split_k2 = env_u32("ML_SPLIT_K2", 0);
@@ -225,7 +284,7 @@ pub(super) fn run_case(
 /// Validate a fixed number of well-spaced outputs after timing. This catches
 /// broken kernels without turning large benchmark cases into full CPU GEMMs.
 #[allow(clippy::too_many_arguments)]
-fn validate_samples(
+pub(super) fn validate_samples(
     exec: &Executor,
     c: &Tensor,
     a: &[f32],
@@ -592,4 +651,33 @@ fn command_path(command: &str) -> String {
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "<missing>".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_quantizes_a_detects_tensor_core_routes() {
+        assert!(kernel_quantizes_a("f16w_coopmat_aligned"));
+        assert!(kernel_quantizes_a("f16w_cm2"));
+        assert!(!kernel_quantizes_a("k64_bda_v4_tm8_tn4"));
+        assert!(!kernel_quantizes_a("f16w_row_bda_k16"));
+    }
+
+    #[test]
+    fn reference_a_for_kernel_only_rounds_tensor_core_f16w() {
+        let a = [0.1f32, 0.2];
+        assert!(matches!(
+            reference_a_for_kernel(&a, "large_bda_v4", true),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            reference_a_for_kernel(&a, "f16w_coopmat_aligned", false),
+            Cow::Borrowed(_)
+        ));
+        let rounded = reference_a_for_kernel(&a, "f16w_coopmat_aligned", true);
+        assert!(matches!(rounded, Cow::Owned(_)));
+        assert_ne!(rounded[0], 0.1);
+    }
 }

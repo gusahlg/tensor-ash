@@ -25,6 +25,14 @@
 
 ### Added
 
+- **`ml_bench ab`**: interleaved multi-kernel A/B benchmark in one process.
+  `ML_AB_KERNELS` lists catalog names or `auto`; each entry gets its own
+  pipeline and executor on a shared `VulkanContext`, tensors are allocated
+  once per case, and rounds rotate which kernel runs first. Output is
+  median/min GPU milliseconds across rounds, TF/s, and ratio versus the
+  first kernel (`ML_OUTPUT=csv` adds `b,m,n,k`). A kernel that cannot run
+  a case is `n/a` rather than a fatal error.
+
 - **Shared-memory budget gate**: every catalog kernel's workgroup
   declaration is now read from its SPIR-V (`KernelSpec::
   shared_memory_bytes`) and checked against `VulkanContext::
