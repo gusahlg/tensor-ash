@@ -13,6 +13,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=TENSOR_ASH_GLSLC_LOWMEM");
 
     let entries = std::fs::read_dir(&shader_dir)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", shader_dir.display()));
@@ -42,8 +43,14 @@ fn main() {
         } else {
             "--target-env=vulkan1.2"
         };
+        // glslc's performance passes need >6 GB on the fully-unrolled
+        // BK=64 TM=8/TN=8 tiles; on memory-constrained hosts
+        // TENSOR_ASH_GLSLC_LOWMEM=1 compiles just those with -Os
+        // (138 MB, same SPIR-V semantics; the driver re-optimizes).
+        let lowmem = std::env::var_os("TENSOR_ASH_GLSLC_LOWMEM").is_some_and(|v| v != "0");
+        let opt = if lowmem && stem.contains("tm8_tn8") { "-Os" } else { "-O" };
         let status = Command::new("glslc")
-            .args([target_env, "-O"])
+            .args([target_env, opt])
             .arg(&path)
             .arg("-o")
             .arg(&out)
