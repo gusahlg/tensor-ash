@@ -15,7 +15,7 @@ use tensor_ash::{
 
 use super::cases::{BenchCase, SampleSummary};
 use super::commands::{
-    prepare_case_tensors, reference_a_for_kernel, validate_samples, CaseTensors,
+    CaseTensors, prepare_case_tensors, reference_a_for_kernel, validate_samples,
 };
 use super::env::{OutputMode, env_bool, env_string, env_u32, env_usize};
 use super::report::csv_escape;
@@ -48,9 +48,7 @@ pub(super) fn rotate_kernel_indices(n_kernels: usize, round: usize) -> Vec<usize
     if n_kernels == 0 {
         return Vec::new();
     }
-    (0..n_kernels)
-        .map(|i| (i + round) % n_kernels)
-        .collect()
+    (0..n_kernels).map(|i| (i + round) % n_kernels).collect()
 }
 
 struct AbKernel {
@@ -333,10 +331,8 @@ mod tests {
 
     #[test]
     fn parse_ab_kernels_accepts_catalog_names_and_auto() {
-        let parsed = parse_ab_kernels(
-            "k64_bda_v4_tm8_tn4, m128n64k64_bda_v4, large_bda_v4, auto",
-        )
-        .unwrap();
+        let parsed =
+            parse_ab_kernels("k64_bda_v4_tm8_tn4, m128n64k64_bda_v4, large_bda_v4, auto").unwrap();
         assert_eq!(parsed.len(), 4);
         assert_eq!(parsed[0].0, "k64_bda_v4_tm8_tn4");
         assert_eq!(parsed[0].1, KernelSelection::K64BdaV4Tm8Tn4);
@@ -357,11 +353,16 @@ mod tests {
 
     #[test]
     fn parse_ab_kernels_rejects_empty_and_unknown() {
-        for invalid in ["", "   ", ",", "auto,", ",auto", "not_a_kernel", "auto,,k64"] {
-            assert!(
-                parse_ab_kernels(invalid).is_err(),
-                "accepted {invalid:?}"
-            );
+        for invalid in [
+            "",
+            "   ",
+            ",",
+            "auto,",
+            ",auto",
+            "not_a_kernel",
+            "auto,,k64",
+        ] {
+            assert!(parse_ab_kernels(invalid).is_err(), "accepted {invalid:?}");
         }
     }
 
