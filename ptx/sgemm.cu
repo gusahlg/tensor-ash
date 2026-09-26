@@ -5,12 +5,13 @@
 //   C[M,N] = alpha * A[M,K] * B[K,N]   (+ beta * C when beta != 0)
 //   row-major, batch = gridDim.z with dense per-batch strides.
 //
-// Tiling: CTA 128x128, BK=8, 256 threads (8 warps as 4(M) x 2(N)), warp
+// Tiling: CTA 128x128, BK=8 or 16, 256 threads (8 warps as 4(M) x 2(N)), warp
 // tile 32x64 as 4x8 threads, thread tile 8x8.  A is kept [m][k] in
-// shared memory (cp.async cannot transpose) with a 12-float row stride:
+// shared memory (cp.async cannot transpose) with a (BK+4)-float row stride:
 // a thread's 8 rows are interleaved (row = i*4 + ty), so one LDS.128
 // of A (4 consecutive k of one row) touches 4 distinct rows whose
-// 16-byte groups land in distinct banks (offsets 0/12/24/36 floats).
+// 16-byte groups land in distinct banks (BK=8: offsets 0/12/24/36 floats;
+// BK=16: 0/20/40/60).
 // B is [k][n], LDS.128 along n.  Per 4 k-steps a thread issues 8 A +
 // 8 B LDS.128 for 256 FFMA.
 //
@@ -22,59 +23,81 @@
 
 namespace {
 
-constexpr int BM = 128, BN = 128, BK = 8;
+constexpr int BM = 128, BN = 128;
 constexpr int THREADS = 256;
-constexpr int AS_STRIDE = BK + 4;  // floats per A row in smem (48 B)
-constexpr int BS_STRIDE = BN;      // floats per B row in smem
-constexpr int A_STAGE = BM * AS_STRIDE;
-constexpr int B_STAGE = BK * BS_STRIDE;
 
-template <int STAGES, bool VEC>
+template <int BK>
+struct SCfg {
+    static constexpr int AS_STRIDE = BK + 4;  // floats per A row in smem
+    static constexpr int BS_STRIDE = BN;      // floats per B row in smem
+    static constexpr int A_STAGE = BM * AS_STRIDE;
+    static constexpr int B_STAGE = BK * BS_STRIDE;
+};
+
+template <int BK, bool VEC>
 TA_DEVICE void load_tile(float* As, float* Bs, const float* __restrict__ A,
                          const float* __restrict__ B, int M, int N, int K, int m0, int n0, int k0,
                          int tid) {
+    using G = SCfg<BK>;
     if (VEC) {
-        {  // A: 128 rows x 2 chunks of 4 floats = 256 chunks, one per thread
-            const int row = tid >> 1, ch = tid & 1;
+        constexpr int ACH = BK / 4;  // 16-byte chunks per A row
+#pragma unroll
+        for (int r = 0; r < BM * ACH / THREADS; ++r) {
+            const int c = tid + r * THREADS;
+            const int row = c / ACH, ch = c % ACH;
             const int gm = m0 + row, gk = k0 + ch * 4;
             const bool ok = gm < M && gk < K;
             const float* src = ok ? A + (size_t)gm * K + gk : A;
-            cp_async16(smem_u32(As + row * AS_STRIDE + ch * 4), src, ok ? 16u : 0u);
+            cp_async16(smem_u32(As + row * G::AS_STRIDE + ch * 4), src, ok ? 16u : 0u);
         }
-        {  // B: 8 rows x 32 chunks = 256 chunks
-            const int row = tid >> 5, ch = tid & 31;
+#pragma unroll
+        for (int r = 0; r < BK * 32 / THREADS; ++r) {  // B: BK rows x 32 chunks
+            const int c = tid + r * THREADS;
+            const int row = c >> 5, ch = c & 31;
             const int gk = k0 + row, gn = n0 + ch * 4;
             const bool ok = gk < K && gn < N;
             const float* src = ok ? B + (size_t)gk * N + gn : B;
-            cp_async16(smem_u32(Bs + row * BS_STRIDE + ch * 4), src, ok ? 16u : 0u);
+            cp_async16(smem_u32(Bs + row * G::BS_STRIDE + ch * 4), src, ok ? 16u : 0u);
         }
     } else {
 #pragma unroll
-        for (int r = 0; r < 4; ++r) {  // A: 1024 floats, 4 per thread
+        for (int r = 0; r < BM * BK / THREADS; ++r) {
             const int e = tid + r * THREADS;
-            const int row = e >> 3, col = e & 7;
+            const int row = e / BK, col = e % BK;
             const int gm = m0 + row, gk = k0 + col;
             const bool ok = gm < M && gk < K;
             const float* src = ok ? A + (size_t)gm * K + gk : A;
-            cp_async4(smem_u32(As + row * AS_STRIDE + col), src, ok ? 4u : 0u);
+            cp_async4(smem_u32(As + row * G::AS_STRIDE + col), src, ok ? 4u : 0u);
         }
 #pragma unroll
-        for (int r = 0; r < 4; ++r) {  // B: 1024 floats, 4 per thread
+        for (int r = 0; r < BK * BN / THREADS; ++r) {
             const int e = tid + r * THREADS;
             const int row = e >> 7, col = e & 127;
             const int gk = k0 + row, gn = n0 + col;
             const bool ok = gk < K && gn < N;
             const float* src = ok ? B + (size_t)gk * N + gn : B;
-            cp_async4(smem_u32(Bs + row * BS_STRIDE + col), src, ok ? 4u : 0u);
+            cp_async4(smem_u32(Bs + row * G::BS_STRIDE + col), src, ok ? 4u : 0u);
         }
     }
 }
 
-template <int STAGES, bool VEC>
+// Shared memory: STAGES * (A_STAGE + B_STAGE) floats — a static array
+// when it fits the 48 KiB static limit (lets ptxas fold stage offsets:
+// the dynamic form spilled 4 B at BK=8/4 stages), dynamic otherwise.
+template <int BK, int STAGES>
+struct SmemBytes {
+    static constexpr int value = STAGES * (SCfg<BK>::A_STAGE + SCfg<BK>::B_STAGE) * 4;
+};
+
+template <int BK, int STAGES, bool VEC>
 TA_DEVICE void sgemm_body(const float* __restrict__ A, const float* __restrict__ B,
                           float* __restrict__ C, int M, int N, int K, float alpha, float beta) {
-    __shared__ __align__(16) float As[STAGES][A_STAGE];
-    __shared__ __align__(16) float Bs[STAGES][B_STAGE];
+    using G = SCfg<BK>;
+    constexpr bool kStatic = SmemBytes<BK, STAGES>::value <= 48 * 1024;
+    __shared__ __align__(16) float smem_s[kStatic ? SmemBytes<BK, STAGES>::value / 4 : 4];
+    extern __shared__ __align__(16) float smem_f[];
+    float* As = kStatic ? smem_s : smem_f;
+    float* Bs = As + STAGES * G::A_STAGE;
 
     const int tid = threadIdx.x;
     const int lane = tid & 31, warp = tid >> 5;
@@ -90,7 +113,9 @@ TA_DEVICE void sgemm_body(const float* __restrict__ A, const float* __restrict__
 
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
-        if (s < KT) load_tile<STAGES, VEC>(As[s], Bs[s], A, B, M, N, K, m0, n0, s * BK, tid);
+        if (s < KT)
+            load_tile<BK, VEC>(As + s * G::A_STAGE, Bs + s * G::B_STAGE, A, B, M, N, K, m0, n0,
+                               s * BK, tid);
         cp_async_commit();
     }
 
@@ -110,22 +135,25 @@ TA_DEVICE void sgemm_body(const float* __restrict__ A, const float* __restrict__
             const int nk = kt + STAGES - 1;
             if (nk < KT) {
                 const int s = nk % STAGES;
-                load_tile<STAGES, VEC>(As[s], Bs[s], A, B, M, N, K, m0, n0, nk * BK, tid);
+                load_tile<BK, VEC>(As + s * G::A_STAGE, Bs + s * G::B_STAGE, A, B, M, N, K, m0,
+                                   n0, nk * BK, tid);
             }
             cp_async_commit();
         }
-        const float* as = As[kt % STAGES];
-        const float* bs = Bs[kt % STAGES];
+        const float* as = As + (kt % STAGES) * G::A_STAGE;
+        const float* bs = Bs + (kt % STAGES) * G::B_STAGE;
 #pragma unroll
         for (int kk = 0; kk < BK; kk += 4) {
             float4 a[8];
 #pragma unroll
             for (int i = 0; i < 8; ++i)
-                a[i] = *reinterpret_cast<const float4*>(as + (a_row + i * 4) * AS_STRIDE + kk);
+                a[i] = *reinterpret_cast<const float4*>(as + (a_row + i * 4) * G::AS_STRIDE + kk);
 #pragma unroll
             for (int k4 = 0; k4 < 4; ++k4) {
-                const float4 b0 = *reinterpret_cast<const float4*>(bs + (kk + k4) * BS_STRIDE + b_col);
-                const float4 b1 = *reinterpret_cast<const float4*>(bs + (kk + k4) * BS_STRIDE + b_col + 32);
+                const float4 b0 =
+                    *reinterpret_cast<const float4*>(bs + (kk + k4) * G::BS_STRIDE + b_col);
+                const float4 b1 =
+                    *reinterpret_cast<const float4*>(bs + (kk + k4) * G::BS_STRIDE + b_col + 32);
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
                     const float av = k4 == 0 ? a[i].x : k4 == 1 ? a[i].y : k4 == 2 ? a[i].z : a[i].w;
@@ -175,24 +203,17 @@ TA_DEVICE void sgemm_body(const float* __restrict__ A, const float* __restrict__
 
 }  // namespace
 
-extern "C" {
+#define TA_SGEMM(NAME, BK, ST, VEC)                                                          \
+    extern "C" __global__ void __launch_bounds__(THREADS, 2)                                    \
+        NAME(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,   \
+             int M, int N, int K, float alpha, float beta) {                                    \
+        sgemm_body<BK, ST, VEC>(A, B, C, M, N, K, alpha, beta);                                \
+    }
 
-__global__ void __launch_bounds__(THREADS, 2)
-ta_sgemm_128x128x8_s4_v4(const float* __restrict__ A, const float* __restrict__ B,
-                         float* __restrict__ C, int M, int N, int K, float alpha, float beta) {
-    sgemm_body<4, true>(A, B, C, M, N, K, alpha, beta);
-}
-
-__global__ void __launch_bounds__(THREADS, 2)
-ta_sgemm_128x128x8_s4_s1(const float* __restrict__ A, const float* __restrict__ B,
-                         float* __restrict__ C, int M, int N, int K, float alpha, float beta) {
-    sgemm_body<4, false>(A, B, C, M, N, K, alpha, beta);
-}
-
-__global__ void __launch_bounds__(THREADS, 2)
-ta_sgemm_128x128x8_s3_v4(const float* __restrict__ A, const float* __restrict__ B,
-                         float* __restrict__ C, int M, int N, int K, float alpha, float beta) {
-    sgemm_body<3, true>(A, B, C, M, N, K, alpha, beta);
-}
-
-}  // extern "C"
+// name: ta_sgemm_128x128x<BK>_s<stages>_<v4|s1>; shared memory =
+// stages * (128*(BK+4) + BK*128) * 4 bytes (dynamic above 48 KiB).
+TA_SGEMM(ta_sgemm_128x128x8_s4_v4, 8, 4, true)
+TA_SGEMM(ta_sgemm_128x128x8_s3_v4, 8, 3, true)
+TA_SGEMM(ta_sgemm_128x128x8_s4_s1, 8, 4, false)
+TA_SGEMM(ta_sgemm_128x128x16_s3_v4, 16, 3, true)
+TA_SGEMM(ta_sgemm_128x128x16_s2_v4, 16, 2, true)

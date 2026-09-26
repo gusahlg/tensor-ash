@@ -14,38 +14,48 @@ pub struct SgemmKernel {
     pub name: &'static str,
     pub bm: u32,
     pub bn: u32,
+    pub bk: u32,
+    pub stages: u32,
     pub threads: u32,
     /// 16-byte cp.async + vector stores: needs K % 4 == 0, N % 4 == 0.
     pub vec4: bool,
 }
 
+const fn sk(name: &'static str, bk: u32, stages: u32, vec4: bool) -> SgemmKernel {
+    SgemmKernel {
+        name,
+        bm: 128,
+        bn: 128,
+        bk,
+        stages,
+        threads: 256,
+        vec4,
+    }
+}
+
 pub const SGEMM_KERNELS: &[SgemmKernel] = &[
-    SgemmKernel {
-        name: "ta_sgemm_128x128x8_s4_v4",
-        bm: 128,
-        bn: 128,
-        threads: 256,
-        vec4: true,
-    },
-    SgemmKernel {
-        name: "ta_sgemm_128x128x8_s3_v4",
-        bm: 128,
-        bn: 128,
-        threads: 256,
-        vec4: true,
-    },
-    SgemmKernel {
-        name: "ta_sgemm_128x128x8_s4_s1",
-        bm: 128,
-        bn: 128,
-        threads: 256,
-        vec4: false,
-    },
+    sk("ta_sgemm_128x128x8_s4_v4", 8, 4, true),
+    sk("ta_sgemm_128x128x8_s3_v4", 8, 3, true),
+    sk("ta_sgemm_128x128x16_s3_v4", 16, 3, true),
+    sk("ta_sgemm_128x128x16_s2_v4", 16, 2, true),
+    sk("ta_sgemm_128x128x8_s4_s1", 8, 4, false),
 ];
 
 impl SgemmKernel {
     pub fn supports(&self, _m: u32, n: u32, k: u32) -> bool {
         !self.vec4 || (k % 4 == 0 && n % 4 == 0)
+    }
+
+    /// Total shared memory: `stages * (BM*(BK+4) + BK*BN)` floats.
+    pub fn smem_bytes(&self) -> u32 {
+        self.stages * (self.bm * (self.bk + 4) + self.bk * self.bn) * 4
+    }
+
+    /// Dynamic shared memory to request at launch: the kernel uses a
+    /// static array up to 48 KiB and dynamic memory above.
+    pub fn launch_smem_bytes(&self) -> u32 {
+        let total = self.smem_bytes();
+        if total <= 48 * 1024 { 0 } else { total }
     }
 }
 
@@ -186,7 +196,15 @@ impl PtxGemm {
             KernelArg::F32(alpha),
             KernelArg::F32(beta),
         ];
-        unsafe { func.cmd_launch(cb, grid, [kern.threads, 1, 1], 0, &args) };
+        unsafe {
+            func.cmd_launch(
+                cb,
+                grid,
+                [kern.threads, 1, 1],
+                kern.launch_smem_bytes(),
+                &args,
+            )
+        };
     }
 
     /// Record `C = alpha*A*B` with f16 A/B (row-major, dense batch).
