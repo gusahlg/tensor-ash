@@ -1,0 +1,49 @@
+# ISA census: odd.m128n64k64_bda_v4.v2.sm86
+
+label                odd
+shape                b=1 m=1023 n=1025 k=1027
+device               NVIDIA GeForce RTX 3070
+arch                 SM86
+kernel               m128n64k64_bda_v4
+variant              KernelVariant { accumulate: false, alpha_is_one: true, interior_only: false, k_multiple: false }
+spec_constants       [0, 1, 0, 0]
+spirv                embedded
+local_size           [16, 16, 1]
+shared_bytes         49664
+registers            128
+barriers             4
+capture_flags_code   identical
+in_production_cache  yes
+stat.register_count = 128
+stat.binary_size = 95872
+stat.stack_size = 0
+stat.local_memory_size = 68719476736
+stat.shared_memory_size = 49664
+occupancy            2 blocks/SM = 16 warps/SM (33.3% of 48), limiter regs (regs 2 / smem 2 / threads 6 / block cap 16) [SM86 limits, max carveout]
+control-bit sanity   var-latency writers with W-scoreboard 476/489; fixed-latency ALU with W-scoreboard 0/4941; NOP pad == B------:R-:W-:Y:S00 10/10
+
+## Whole kernel (5982 live instructions, 5992 incl. padding)
+
+classes: ffma 4096, int 1002, lds 388, move/pred 183, ldg 96, sts 72, stg 64, control 40, special-reg 33, uniform 8
+opcodes: FFMA 4096, IADD3 408, LDS 388, MOV 180, LEA 178, ISETP 168, IMAD 157, LDG 96, SHF 86, STS 72, STG 64, CS2R 28, BRA 13, BSSY 7, BSYNC 7, LOP3 5, S2R 5, ULDC 5, BAR 4, EXIT 4, NOP 4, P2R 3, USHF 3, CALL 1
+memory (count x bits): LDG 96x32 | STG 64x32 | LDS 388x128 | STS 64x32 8x128 | LDSM 0 | LDL 0 | STL 0
+bytes/thread: global load 384 store 256; shared load 6208 (+LDSM 0) store 384
+math FFMA 4096 HMMA 0 HFMA2 0 -> density 68.5%; int overhead (int+uniform) 1010 (16.9%); BAR 4 BRA 13 DEPBAR 0 S2R/CS2R/S2UR 33
+
+## Loops (backward branches)
+
+loop 0: 0x03e0..0xaef0 2738 instrs innermost math 2048 (74.8%) stall-sum 3134 (excess 396) waits 237; LDG 48x32 LDS 194x128 LDSM 0
+
+## Main loop 0x03e0..0xaef0 (one iteration)
+
+classes: ffma 2048, int 349, lds 194, move/pred 56, ldg 48, sts 36, control 6, uniform 1
+opcodes: FFMA 2048, LDS 194, IADD3 119, LEA 89, IMAD 69, MOV 56, LDG 48, ISETP 36, SHF 36, STS 36, BAR 2, NOP 2, BRA 1, CALL 1, ULDC 1
+memory (count x bits): LDG 48x32 | STG 0 | LDS 194x128 | STS 32x32 4x128 | LDSM 0 | LDL 0 | STL 0
+bytes/thread: global load 192 store 0; shared load 3104 (+LDSM 0) store 192
+math FFMA 2048 HMMA 0 HFMA2 0 -> density 74.8%; int overhead (int+uniform) 350 (12.8%); BAR 2 BRA 1 DEPBAR 0 S2R/CS2R/S2UR 0
+
+static issue cycles/iteration (sum of stall fields) 3134; instructions 2738; dependency stalls (sum - n) 396; instrs waiting on a scoreboard 237; yield hints 78; reuse-flagged 1489
+LDG->first use (in-warp latency cover), 48 loads with a scoreboard: min 30 instrs/42 cycles, median 109/198, max 308/490
+LDS->first use (in-warp latency cover), 191 loads with a scoreboard: min 6 instrs/21 cycles, median 40/40, max 65/65
+pipe lower bounds (cycles/iter/warp on one SMSP): issue 2738 | FP32 2048 | tensor 0 (HMMA FMAs/warp 0 / 64)
+annotated main-loop listing ([wait:R:W:yield:stall] per instr): odd.m128n64k64_bda_v4.v2.sm86.loop.sass

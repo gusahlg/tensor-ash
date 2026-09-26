@@ -1,0 +1,31 @@
+label = sq384
+shape = b=1 m=384 n=384 k=384
+b_f16 = false
+packed_b = false
+device = NVIDIA GeForce RTX 3070
+driver = 0x94d8c080
+arch = SM86
+kernel = k64_bda_v4_tm8_tn4
+tile = [64, 64, 64]
+variant = KernelVariant { accumulate: false, alpha_is_one: true, interior_only: true, k_multiple: true }
+variant_index = 14
+spec_constants = [0, 1, 1, 1, 0, 0, 0]
+spirv = spv/matmul_f32_k64_bda_v4_tm8_tn4.O.spv (glslc --target-env=vulkan1.2, shaderc v2026.1)
+spirv_bytes = 332924
+spirv_hash = 3f8e8dd4722d38f7
+local_size = [16, 8, 1]
+threads = 128
+shared_bytes = 33024
+registers = 121
+registers_cap = 255
+barriers = 2
+symbol = __id4_4
+ucode_bytes = 40448
+ucode_hash = b8ad218c4c351725
+capture_flags_code = identical
+in_production_cache = yes
+stat.register_count = 121
+stat.binary_size = 40448
+stat.stack_size = 0
+stat.local_memory_size = 68719476736
+stat.shared_memory_size = 34048
