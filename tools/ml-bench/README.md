@@ -14,7 +14,7 @@ cargo run --release -p ml-bench -- correctness
 cargo run --release -p ml-bench -- sweep
 ```
 
-Other subcommands are `single`, `cases`, `concurrent`, `transfer`,
+Other subcommands are `single`, `cases`, `ab`, `concurrent`, `transfer`,
 `prepared` (which compares synchronous dispatch, prepared replay, and
 pipelined prepared submission for one repeated shape), and `thesis` —
 the performance-thesis harness: it re-measures the campaign's explicit
@@ -26,9 +26,13 @@ model-level theses T1/T5/T7 load a llama-family GGUF through the
 `llama-ash` library); `ml_bench thesis t2 t3 t4 t6` runs the
 kernel-level subset without a model. `cases`
 runs multiple `label,b,m,n,k[,f16w][,packed]` arguments in one process, avoiding repeated
-pipeline startup and GPU clock perturbation in automation. The environment
+pipeline startup and GPU clock perturbation in automation. `ab` does the same
+for a multi-kernel comparison: `ML_AB_KERNELS` lists catalog names or `auto`,
+one context is shared, tensors are allocated once per case, and `ML_ROUNDS`
+(default 5) interleaved rounds rotate which kernel runs first. The environment
 knobs are documented in the workspace `README.md`; `ML_DEVICE`, `ML_KERNEL`,
-`ML_TUNE`, `ML_B`/`ML_M`/`ML_N`/`ML_K`, and `ML_OUTPUT` are the common ones.
+`ML_TUNE`, `ML_B`/`ML_M`/`ML_N`/`ML_K`, `ML_AB_KERNELS`, `ML_ROUNDS`, and
+`ML_OUTPUT` are the common ones.
 
 The executable remains named `ml_bench`, so release builds still produce
 `target/release/ml_bench` and existing benchmark automation can keep using that
@@ -53,4 +57,8 @@ ML_OUTPUT=csv target/release/ml_bench cases \
   square_512,1,512,512,512 odd_255,1,255,257,263
 ML_OUTPUT=csv target/release/ml_bench cases \
   lm_head,1,1,32000,2048,packed kv,1,1,256,2048,f16w,packed
+
+ML_AB_KERNELS=k64_bda_v4_tm8_tn4,m128n64k64_bda_v4,auto \
+  target/release/ml_bench ab \
+  square_512,1,512,512,512 medium_768,1,768,768,768
 ```
