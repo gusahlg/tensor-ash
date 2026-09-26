@@ -451,7 +451,7 @@ fn analyze(nvdisasm: &str, dir: &Path, stem: &str) -> Result<String> {
         let _ = writeln!(
             rep,
             "loop {i}: 0x{:04x}..0x{:04x} {} instrs{} math {} ({:.1}%) stall-sum {} \
-             (excess {}) waits {}",
+             (excess {}) waits {}; LDG {} LDS {} LDSM {}",
             l.start,
             l.end,
             m.total,
@@ -460,10 +460,18 @@ fn analyze(nvdisasm: &str, dir: &Path, stem: &str) -> Result<String> {
             100.0 * m.math_density(),
             m.stall_sum,
             m.stall_sum as i64 - m.total as i64,
-            m.waiting
+            m.waiting,
+            m.widths("LDG"),
+            m.widths("LDS"),
+            m.widths("LDSM"),
         );
     }
-    let main = census.main_loop.map(|i| &census.loops[i]);
+    let main_index = std::env::var("ML_ISA_LOOP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&i| i < census.loops.len())
+        .or(census.main_loop);
+    let main = main_index.map(|i| &census.loops[i]);
     let main_mix = main.map(|l| census.loop_mix(l));
     if let (Some(l), Some(m)) = (main, main_mix.as_ref()) {
         let _ = writeln!(

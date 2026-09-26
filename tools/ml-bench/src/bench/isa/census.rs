@@ -401,18 +401,17 @@ impl Census {
                 .any(|&(s, e)| (s, e) != (l.start, l.end) && s >= l.start && e <= l.end);
         }
         // Main loop: the innermost loop doing the most math; ties go to
-        // the one with more total instructions (the unrolled K-loop).
+        // the leanest body.  Kernels with runtime-selected paths (the
+        // row GEMVs compile normed-A x vector/scalar-B K-loops) have
+        // several equal-math loops, and the leanest is the plain vector
+        // path a plain dispatch executes.  `ML_ISA_LOOP=<n>` overrides.
         let main_loop = loops
             .iter()
             .enumerate()
             .filter(|(_, l)| l.innermost)
             .max_by_key(|(_, l)| {
                 let m = Mix::of(&instrs[l.range.clone()]);
-                (
-                    m.math(),
-                    m.class("lds") + m.class("ldsm") + m.class("ldg"),
-                    m.total,
-                )
+                (m.math(), std::cmp::Reverse(m.total))
             })
             .map(|(i, _)| i);
         Self {
