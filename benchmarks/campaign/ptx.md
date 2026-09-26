@@ -24,7 +24,7 @@ interleaved same-process A/Bs against tensor-ash's own route):
 |---|---|---|
 | **TinyLlama-1.1B f16 pp512, PTX f16-accumulate route** (`ML_PTX_GEMM=f16`) vs tensor-ash base | **1.39x** (12.9k -> 17.8-17.9k t/s) | **1.63x** (15.4k -> 24.3-25.4k t/s) |
 | same vs llama.cpp b9503 CUDA (same accumulate precision: cuBLAS `COMPUTE_16F`) | **1.39x** (same-day 12.9k) | ~1.5x vs the Sept scoreboard 16.7k (same-day re-measure blocked by the desktop embargo) |
-| pp512 with `ML_PTX_GEMM=f16p` (f16-rate mma, f32 promotion per k-tile; GEMM error 3.4-6x *lower* than llama.cpp's cuBLAS path) | **1.28x** (16.5-16.7k t/s = 1.28x llama.cpp CUDA) | pending (embargo) |
+| pp512 with `ML_PTX_GEMM=f16p` (f16-rate mma, f32 promotion per k-tile; GEMM error ~3-7x *lower* than llama.cpp's cuBLAS path) | **1.28x** (16.5-16.7k t/s = 1.28x llama.cpp CUDA) | pending (embargo) |
 | f16 tensor-core GEMM, f16 accumulate, vs coopmat1 on the same f16 A/B/C (prefill shapes + squares) | 1.43-2.05x (40-53 TF/s) = 80-104% of cuBLAS 16F (4096^3 with grouped raster beats it) | 1.50-1.97x (48-68 TF/s) = 75-100% of cuBLAS 16F |
 | same, f32 accumulate (numerics identical to coopmat1) | 1.00-1.12x | 0.98-1.13x |
 | f32 SIMT SGEMM with a 3/4-stage `cp.async` pipeline vs tensor-ash's best GLSL route | 0.86-1.08x (ties on large) | 0.73-1.01x (ties at 2048/4096) |
@@ -349,7 +349,7 @@ registers and zero them.  4060, round 3 (`ml_bench ptx hgemm`, TF/s and
 rel-RMS vs f64; ratios vs coopmat1 measured interleaved in the same
 process, TA itself at 26-29 TF/s):
 
-| shape | f16p 128x64 BK=32 | f16p 128x64 BK=64 | f16 acc 128x128 | rel-RMS: f32 acc / f16p BK32 / f16p BK64 / f16 acc / cuBLAS 16F |
+| shape | f16p 128x64 BK=32 | f16p 128x64 BK=64 | f16 acc 128x128 | rel-RMS: f32 acc / f16p BK32 / f16p BK64 / f16 acc / cuBLAS 16F (3070 run) |
 |---|---:|---:|---:|---|
 | 512x2048x2048 | 33.4 (1.19x) | 38.3 (1.37x) | 40.2 (1.43x) | 2.05e-4 / 3.81e-4 / 4.98e-4 / 2.41e-3 / 1.65e-3 |
 | 512x5632x2048 | 35.6 (1.27x) | 42.1 (1.50x) | 46.4 (1.62x) | 2.14e-4 / 3.85e-4 / 4.62e-4 / 2.39e-3 / 1.61e-3 |
@@ -357,8 +357,8 @@ process, TA itself at 26-29 TF/s):
 | 2048^3 | 36.8 (1.38x) | 43.0 (1.62x) | 46.6 (1.74x) | 2.16e-4 / 3.88e-4 / 4.88e-4 / 2.27e-3 / 1.62e-3 |
 | 4096^3 | 33.0 (1.28x) | 34.0 (1.29x) | 44.0 (1.69x) | 1.99e-4 / 3.80e-4 / 4.70e-4 / 3.19e-3 / 1.94e-3 |
 
-f16p with BK=64 keeps ~90% of the f16-accumulate speed (1.29-1.62x
-coopmat1) at **5-8x lower error than f16 accumulate and 3.4-6x lower
+f16p with BK=64 keeps 77-95% of the f16-accumulate speed (1.29-1.62x
+coopmat1) at **5-8x lower error than f16 accumulate and ~3-7x lower
 than what llama.cpp's cuBLAS `COMPUTE_16F` path delivers**, 2.2-2.4x
 the f32-accumulate error (itself dominated by the final f16 rounding of
 C).  It is the tensor-ash-only option cuBLAS does not offer: the route
@@ -399,7 +399,7 @@ for pp512, the f16-accumulate PTX route - the same accumulation
 precision llama.cpp uses - puts tensor-ash prefill at **1.39x llama.cpp
 CUDA** (17.9k vs 12.9k; ~1.28x the Aug-15 llama.cpp Vulkan CM2 number,
 14,003), and the f16p route is **1.28x llama.cpp CUDA while computing
-its GEMMs 3.4-6x more accurately than llama.cpp does**.
+its GEMMs ~3-7x more accurately than llama.cpp does**.
 
 Token exactness: `llama_ash generate` with a 128-token prompt (which
 takes the a16 prefill path) and 32 greedy tokens produced identical ids
