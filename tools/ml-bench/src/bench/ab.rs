@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tensor_ash::{
-    Executor, ExecutorConfig, KERNEL_SPECS, KernelSelection, MatmulCall, MatmulPipeline, Tensor,
-    VulkanContext,
+    CoopmatAcc, Executor, ExecutorConfig, KERNEL_SPECS, KernelSelection, MatmulCall,
+    MatmulPipeline, Tensor, VulkanContext,
 };
 
 use super::cases::{BenchCase, SampleSummary};
@@ -20,8 +20,20 @@ use super::commands::{
 use super::env::{OutputMode, env_bool, env_string, env_u32, env_usize};
 use super::report::csv_escape;
 
-/// Parse `ML_AB_KERNELS` (comma-separated catalog names / aliases / `auto`).
-pub(super) fn parse_ab_kernels(raw: &str) -> Result<Vec<(String, KernelSelection)>> {
+/// One `ML_AB_KERNELS` entry: the token as typed, its kernel
+/// selection, and the executor's coopmat accumulator policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AbEntry {
+    pub label: String,
+    pub selection: KernelSelection,
+    pub acc: CoopmatAcc,
+}
+
+/// Parse `ML_AB_KERNELS` (comma-separated catalog names / aliases /
+/// `auto`, each optionally `@f32|@f16|@promote` to set that entry's
+/// executor accumulator policy — e.g. `auto,auto@f16` A/Bs the routed
+/// tile at both precisions; explicit kernels carry their own class).
+pub(super) fn parse_ab_kernels(raw: &str) -> Result<Vec<AbEntry>> {
     let raw = raw.trim();
     if raw.is_empty() {
         bail!(
@@ -35,9 +47,21 @@ pub(super) fn parse_ab_kernels(raw: &str) -> Result<Vec<(String, KernelSelection
         if token.is_empty() {
             bail!("ML_AB_KERNELS has an empty entry; expected a kernel name or auto");
         }
-        let selection = KernelSelection::parse(token)
+        let (name, acc) = match token.split_once('@') {
+            Some((name, acc)) => (
+                name,
+                CoopmatAcc::parse(acc)
+                    .with_context(|| format!("ML_AB_KERNELS entry '{token}'"))?,
+            ),
+            None => (token, CoopmatAcc::F32),
+        };
+        let selection = KernelSelection::parse(name)
             .with_context(|| format!("ML_AB_KERNELS entry '{token}'"))?;
-        out.push((token.to_string(), selection));
+        out.push(AbEntry {
+            label: token.to_string(),
+            selection,
+            acc,
+        });
     }
     Ok(out)
 }
@@ -79,8 +103,11 @@ pub(super) fn run(
     let mode = OutputMode::from_env();
 
     let mut entries = Vec::with_capacity(kernels.len());
-    for (label, selection) in &kernels {
-        let pipe = Arc::new(MatmulPipeline::new_with_kernel_selection(ctx, *selection)?);
+    for entry in &kernels {
+        let pipe = Arc::new(MatmulPipeline::new_with_kernel_selection(
+            ctx,
+            entry.selection,
+        )?);
         let exec = Executor::new_with_config(
             ctx.clone(),
             pipe,
@@ -88,11 +115,12 @@ pub(super) fn run(
                 n_slots: n_slots.max(1),
                 max_calls_per_submit: 8,
                 tune: false,
+                coopmat_acc: entry.acc,
             },
         )?;
         entries.push(AbKernel {
-            label: label.clone(),
-            selection: *selection,
+            label: entry.label.clone(),
+            selection: entry.selection,
             exec,
         });
     }
@@ -103,7 +131,7 @@ pub(super) fn run(
 
     let kernel_list = kernels
         .iter()
-        .map(|(label, _)| label.as_str())
+        .map(|entry| entry.label.as_str())
         .collect::<Vec<_>>()
         .join(",");
     println!(
@@ -162,18 +190,24 @@ pub(super) fn run(
 
 fn burn_in(ctx: &Arc<VulkanContext>, first: &AbKernel) -> Result<()> {
     const DIM: u32 = 4096;
-    let f16_b = first
-        .selection
-        .index()
-        .map(|i| KERNEL_SPECS[i].weights_f16())
-        .unwrap_or(false);
-    let a = Tensor::uninit_device(ctx, &[1, DIM, DIM])?;
+    let spec = first.selection.index().map(|i| &KERNEL_SPECS[i]);
+    let f16_b = spec.is_some_and(|s| s.weights_f16());
+    // An a16 kernel pin only accepts f16 A/C (the f16-activation route).
+    let a16 = spec.is_some_and(|s| s.a_f16());
+    let act = |shape: &[u32]| {
+        if a16 {
+            Tensor::uninit_device_f16(ctx, shape)
+        } else {
+            Tensor::uninit_device(ctx, shape)
+        }
+    };
+    let a = act(&[1, DIM, DIM])?;
     let b = if f16_b {
         Tensor::uninit_device_f16(ctx, &[1, DIM, DIM])?
     } else {
         Tensor::uninit_device(ctx, &[1, DIM, DIM])?
     };
-    let c = Tensor::uninit_device(ctx, &[1, DIM, DIM])?;
+    let c = act(&[1, DIM, DIM])?;
     let call = MatmulCall {
         a: &a,
         b: &b,
@@ -246,6 +280,7 @@ fn validate_round_zero(exec: &Executor, case: &BenchCase, tensors: &CaseTensors)
         case.n,
         case.k,
         case.a16,
+        CoopmatAcc::of_kernel_name(kernel),
     )
     .with_context(|| {
         format!(
@@ -348,21 +383,33 @@ mod tests {
         let parsed =
             parse_ab_kernels("k64_bda_v4_tm8_tn4, m128n64k64_bda_v4, large_bda_v4, auto").unwrap();
         assert_eq!(parsed.len(), 4);
-        assert_eq!(parsed[0].0, "k64_bda_v4_tm8_tn4");
-        assert_eq!(parsed[0].1, KernelSelection::K64BdaV4Tm8Tn4);
-        assert_eq!(parsed[1].0, "m128n64k64_bda_v4");
-        assert_eq!(parsed[1].1, KernelSelection::M128N64K64BdaV4);
-        assert_eq!(parsed[2].0, "large_bda_v4");
-        assert_eq!(parsed[2].1, KernelSelection::LargeBdaV4);
-        assert_eq!(parsed[3].0, "auto");
-        assert_eq!(parsed[3].1, KernelSelection::Auto);
+        assert_eq!(parsed[0].label, "k64_bda_v4_tm8_tn4");
+        assert_eq!(parsed[0].selection, KernelSelection::K64BdaV4Tm8Tn4);
+        assert_eq!(parsed[1].label, "m128n64k64_bda_v4");
+        assert_eq!(parsed[1].selection, KernelSelection::M128N64K64BdaV4);
+        assert_eq!(parsed[2].label, "large_bda_v4");
+        assert_eq!(parsed[2].selection, KernelSelection::LargeBdaV4);
+        assert_eq!(parsed[3].label, "auto");
+        assert_eq!(parsed[3].selection, KernelSelection::Auto);
+        assert!(parsed.iter().all(|e| e.acc == CoopmatAcc::F32));
     }
 
     #[test]
     fn parse_ab_kernels_is_case_insensitive_and_keeps_the_token() {
         let parsed = parse_ab_kernels(" AUTO ").unwrap();
-        assert_eq!(parsed[0].0, "AUTO");
-        assert_eq!(parsed[0].1, KernelSelection::Auto);
+        assert_eq!(parsed[0].label, "AUTO");
+        assert_eq!(parsed[0].selection, KernelSelection::Auto);
+    }
+
+    #[test]
+    fn parse_ab_kernels_reads_an_accumulator_suffix() {
+        let parsed = parse_ab_kernels("auto,auto@f16,a16_coopmat_m64_acc16p").unwrap();
+        assert_eq!(parsed[0].acc, CoopmatAcc::F32);
+        assert_eq!(parsed[1].label, "auto@f16");
+        assert_eq!(parsed[1].selection, KernelSelection::Auto);
+        assert_eq!(parsed[1].acc, CoopmatAcc::F16);
+        assert_eq!(parsed[2].selection, KernelSelection::F16wA16CoopmatM64Acc16p);
+        assert!(parse_ab_kernels("auto@bf16").is_err());
     }
 
     #[test]
