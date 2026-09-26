@@ -383,6 +383,18 @@ RTX 3070 (before the desktop embargo; first base run was a cold outlier):
 llama.cpp CUDA pp512 (16.7k) - pending a same-day llama.cpp re-measure,
 which the embargo blocked.
 
+### Correctness gates (4060)
+
+`cargo test --release --test correctness -- --ignored --test-threads=1 <filter>`:
+
+| run | result |
+|---|---|
+| `ML_PTX=1 ... ptx::` (Vulkan<->CUDA ordering chain; every hgemm entry incl. split-K vs f64 on 200x328x488) | 2 / 2 pass |
+| `ML_PTX=1 ML_PTX_GEMM=off ... f16::` (control) | 13 / 13 pass |
+| `ML_PTX=1 ML_PTX_GEMM=f32 ... f16::` (a16 suite through the PTX route: alpha, accumulate fallback, graph path, QKV concat, asymmetric tiles) | **13 / 13 pass** |
+| `ML_PTX=1 ML_PTX_GEMM=f32 ... graph:: prepared:: replay::` | 12 / 12 pass |
+| `ML_PTX=1 ML_PTX_GEMM=f16p` / `f16` ... `f16::` | 9 / 13 each: the four a16 max-abs tests fail their f32-accumulate tolerance - expected, these are the reduced-precision modes (quantified above); every non-a16 test still passes |
+
 ## 7. Design proposal: a PTX accelerator backend
 
 Status on this branch: the pieces below marked (done) exist as opt-in
