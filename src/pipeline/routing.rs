@@ -65,7 +65,24 @@ pub(crate) enum CoopmatTile {
     T128x64,
 }
 
-pub(crate) fn coopmat_tile(batch: u32, m: u32, n: u32) -> Option<CoopmatTile> {
+/// SM-count-aware coopmat tile pick.  `sm_count` is the device's
+/// shader-core count ([`crate::VulkanContext::sm_count`]); `None`
+/// keeps the SM-agnostic rule ([`coopmat_tile_fallback`]).
+pub(crate) fn coopmat_tile(
+    batch: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    sm_count: Option<u32>,
+) -> Option<CoopmatTile> {
+    let _ = (k, sm_count);
+    coopmat_tile_fallback(batch, m, n)
+}
+
+/// The SM-agnostic rule (exp/grokmerge): calibrated on the 46-SM
+/// RTX 3070 for large squares and the 24-SM RTX 4060 for M=512
+/// prefill.  Used when the device reports no shader-core count.
+pub(crate) fn coopmat_tile_fallback(batch: u32, m: u32, n: u32) -> Option<CoopmatTile> {
     if !m.is_multiple_of(64) || !n.is_multiple_of(64) {
         return None;
     }
@@ -101,37 +118,44 @@ pub(crate) fn coopmat_tile(batch: u32, m: u32, n: u32) -> Option<CoopmatTile> {
     })
 }
 
-pub(crate) fn coopmat_selection(batch: u32, m: u32, n: u32, a16: bool) -> Option<KernelSelection> {
-    Some(match coopmat_tile(batch, m, n)? {
-        CoopmatTile::T128 => {
-            if a16 {
-                KernelSelection::F16wA16Coopmat
-            } else {
-                KernelSelection::F16wCoopmat
-            }
+impl CoopmatTile {
+    /// The f16w (f32-A) or a16 (f16-A/C) kernel for this tile.
+    pub(crate) fn selection(self, a16: bool) -> KernelSelection {
+        use KernelSelection as K;
+        match (self, a16) {
+            (Self::T128, false) => K::F16wCoopmat,
+            (Self::T128, true) => K::F16wA16Coopmat,
+            (Self::T64, false) => K::F16wCoopmatM64,
+            (Self::T64, true) => K::F16wA16CoopmatM64,
+            (Self::T64x128, false) => K::F16wCoopmatM64N128,
+            (Self::T64x128, true) => K::F16wA16CoopmatM64N128,
+            (Self::T128x64, false) => K::F16wCoopmatM128N64,
+            (Self::T128x64, true) => K::F16wA16CoopmatM128N64,
         }
-        CoopmatTile::T64 => {
-            if a16 {
-                KernelSelection::F16wA16CoopmatM64
-            } else {
-                KernelSelection::F16wCoopmatM64
-            }
-        }
-        CoopmatTile::T64x128 => {
-            if a16 {
-                KernelSelection::F16wA16CoopmatM64N128
-            } else {
-                KernelSelection::F16wCoopmatM64N128
-            }
-        }
-        CoopmatTile::T128x64 => {
-            if a16 {
-                KernelSelection::F16wA16CoopmatM128N64
-            } else {
-                KernelSelection::F16wCoopmatM128N64
-            }
-        }
-    })
+    }
+
+    /// The tile of a coopmat1 kernel selection (either A storage).
+    pub(crate) fn of_selection(selection: KernelSelection) -> Option<Self> {
+        use KernelSelection as K;
+        Some(match selection {
+            K::F16wCoopmat | K::F16wA16Coopmat => Self::T128,
+            K::F16wCoopmatM64 | K::F16wA16CoopmatM64 => Self::T64,
+            K::F16wCoopmatM64N128 | K::F16wA16CoopmatM64N128 => Self::T64x128,
+            K::F16wCoopmatM128N64 | K::F16wA16CoopmatM128N64 => Self::T128x64,
+            _ => return None,
+        })
+    }
+}
+
+pub(crate) fn coopmat_selection(
+    batch: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    sm_count: Option<u32>,
+    a16: bool,
+) -> Option<KernelSelection> {
+    Some(coopmat_tile(batch, m, n, k, sm_count)?.selection(a16))
 }
 
 pub(crate) fn to_f16w(tile: KernelSelection) -> KernelSelection {
@@ -214,18 +238,19 @@ mod bda_tests {
     fn coopmat_tile_tracks_4060_prefill_ab() {
         use CoopmatTile::*;
         // q/o 512x2048: 4:1 is not strictly wider than 4:1 → 64x64.
-        assert_eq!(coopmat_tile(1, 512, 2048), Some(T64));
-        assert_eq!(coopmat_tile(1, 128, 2048), Some(T64));
-        assert_eq!(coopmat_tile(1, 256, 384), Some(T64));
+        let tile = coopmat_tile_fallback;
+        assert_eq!(tile(1, 512, 2048), Some(T64));
+        assert_eq!(tile(1, 128, 2048), Some(T64));
+        assert_eq!(tile(1, 256, 384), Some(T64));
         // Concat QKV 512x2560 and gate/up 512x5632: 128x64 won.
-        assert_eq!(coopmat_tile(1, 512, 2560), Some(T128x64));
-        assert_eq!(coopmat_tile(1, 512, 5632), Some(T128x64));
+        assert_eq!(tile(1, 512, 2560), Some(T128x64));
+        assert_eq!(tile(1, 512, 5632), Some(T128x64));
         // Large squares keep 128x128 (3070 4096³ winner, untested here).
-        assert_eq!(coopmat_tile(1, 2048, 2048), Some(T128));
-        assert_eq!(coopmat_tile(1, 1024, 1024), Some(T64));
+        assert_eq!(tile(1, 2048, 2048), Some(T128));
+        assert_eq!(tile(1, 1024, 1024), Some(T64));
         // 64-aligned but not 128-aligned has no 128-tile route.
-        assert_eq!(coopmat_tile(1, 192, 320), Some(T64));
-        assert_eq!(coopmat_tile(1, 192, 300), None);
+        assert_eq!(tile(1, 192, 320), Some(T64));
+        assert_eq!(tile(1, 192, 300), None);
     }
 
     #[test]

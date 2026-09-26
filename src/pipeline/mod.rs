@@ -32,7 +32,8 @@ pub use runtime::MatmulKernel;
 pub(crate) use tuning::{SPLITK2_SPIRV, TuneEntry, TuneKey};
 
 pub(crate) use routing::{
-    coopmat_selection, f16w_row_packed_selection, f16w_row_selection, maybe_to_bda, to_f16w,
+    CoopmatTile, coopmat_selection, f16w_row_packed_selection, f16w_row_selection, maybe_to_bda,
+    to_f16w,
 };
 pub use routing::{f16w_row_tile_n, f16w_row_uses_k16};
 
@@ -339,7 +340,8 @@ impl MatmulPipeline {
                 && m.is_multiple_of(64)
                 && n.is_multiple_of(64)
             {
-                coopmat_selection(batch, m, n, false).expect("M/N are 64-aligned")
+                coopmat_selection(batch, m, n, k, self.ctx.sm_count(), false)
+                    .expect("M/N are 64-aligned")
             } else {
                 // f16-storage B is validated as BDA-capable upstream;
                 // map the tile class onto the nearest f16w sibling.
@@ -413,6 +415,24 @@ impl MatmulPipeline {
                 ),
             };
         }
+    }
+
+    /// Registry index of the f16-activations (a16) coopmat kernel for
+    /// an aligned shape (M, N % 64 == 0, K % 32 == 0; resolution
+    /// enforces it).  An explicit coopmat1 selection — either A
+    /// storage, e.g. `ML_KERNEL=f16w_coopmat_m128n64` — pins the same
+    /// tile on this route, so tile A/Bs cover the f16-activation
+    /// prefill path too; every other selection takes the SM-aware
+    /// heuristic.  The tile's own alignment is still checked at
+    /// record time, so a pinned tile that does not divide the shape
+    /// fails rather than reading out of bounds.
+    pub(crate) fn a16_coopmat_index(&self, batch: u32, m: u32, n: u32, k: u32) -> usize {
+        let tile = CoopmatTile::of_selection(self.selection)
+            .or_else(|| routing::coopmat_tile(batch, m, n, k, self.ctx.sm_count()))
+            .expect("a16 resolution already requires 64-aligned M/N");
+        tile.selection(true)
+            .index()
+            .expect("a16 coopmat selection is concrete")
     }
 
     /// Epilogue-capable kernel for this shape: the normal heuristic

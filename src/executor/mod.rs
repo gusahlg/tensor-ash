@@ -171,6 +171,20 @@ impl Executor {
         }
     }
 
+    /// Route of an f16-activations matmul (A, B, C all f16; M, N % 64
+    /// == 0, K % 32 == 0): always an a16 coopmat tile, chosen by the
+    /// SM-aware heuristic unless the pipeline pins a coopmat tile.
+    pub fn dispatch_info_a16(&self, batch: u32, m: u32, n: u32, k: u32) -> DispatchInfo {
+        let kernel = self
+            .pipeline
+            .kernel_at(self.pipeline.a16_coopmat_index(batch, m, n, k));
+        DispatchInfo {
+            kernel: kernel.name,
+            tile: [kernel.tile_m, kernel.tile_n, kernel.tile_k],
+            split_k2_splits: None,
+        }
+    }
+
     /// Fail-closed packed-B row-GEMV route used when
     /// [`crate::MatmulOp::with_packed_b`] is set. Packed B is f16
     /// `[N/tile_n][K][tile_n]` (see [`crate::pack_f16w_row_tiles`]);
@@ -229,10 +243,11 @@ impl Executor {
 
     /// Resolve the complete route for one resolved matmul, including
     /// the f16-activations short-circuit: f16-A ops pick one of the
-    /// two aligned a16 coopmat tiles (128x128 or wave-fill 64x64), so
-    /// they bypass tuning, the shape heuristic, and split-K entirely
-    /// — but only on devices with the cooperative-matrix + f16-storage
-    /// features those kernels need.
+    /// four aligned a16 coopmat tiles (SM-aware, see
+    /// `MatmulPipeline::a16_coopmat_index`), so they bypass tuning,
+    /// the SIMT heuristic, and split-K entirely — but only on devices
+    /// with the cooperative-matrix + f16-storage features those
+    /// kernels need.
     pub(super) fn plan_matmul(
         &self,
         dims: &crate::matmul::ResolvedMatmul,
@@ -255,12 +270,10 @@ impl Executor {
                      support, which this device lacks"
                 );
             }
-            let selection = crate::pipeline::coopmat_selection(dims.batch, dims.m, dims.n, true)
-                .expect("a16 resolution already requires 64-aligned M/N");
             return Ok(OpPlan {
-                kernel: selection
-                    .index()
-                    .expect("a16 coopmat selection is concrete"),
+                kernel: self
+                    .pipeline
+                    .a16_coopmat_index(dims.batch, dims.m, dims.n, dims.k),
                 splitk2: None,
             });
         }
