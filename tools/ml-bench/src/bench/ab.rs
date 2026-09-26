@@ -221,11 +221,21 @@ fn time_round(exec: &Executor, tensors: &CaseTensors, iters: u32, warmup: u32) -
         .context("benchmark produced no GPU-time samples")
 }
 
+/// The kernel `exec` dispatches for `case` (auto resolves per shape).
+fn route_kernel(exec: &Executor, case: &BenchCase) -> &'static str {
+    if case.a16 {
+        exec.dispatch_info_a16(case.b, case.m, case.n, case.k)
+            .kernel
+    } else {
+        exec.dispatch_info_for(case.b, case.m, case.n, case.k, case.b_f16)
+            .kernel
+    }
+}
+
 fn validate_round_zero(exec: &Executor, case: &BenchCase, tensors: &CaseTensors) -> Result<()> {
-    let kernel = exec
-        .dispatch_info_for(case.b, case.m, case.n, case.k, case.b_f16)
-        .kernel;
-    let h_a = reference_a_for_kernel(&tensors.h_a, kernel, case.b_f16);
+    let kernel = route_kernel(exec, case);
+    // a16 fixtures are already f16-rounded (the device A is half).
+    let h_a = reference_a_for_kernel(&tensors.h_a, kernel, case.b_f16 && !case.a16);
     validate_samples(
         exec,
         &tensors.c,
@@ -235,6 +245,7 @@ fn validate_round_zero(exec: &Executor, case: &BenchCase, tensors: &CaseTensors)
         case.m,
         case.n,
         case.k,
+        case.a16,
     )
     .with_context(|| {
         format!(
@@ -253,13 +264,13 @@ fn print_results(
     match mode {
         OutputMode::Table => {
             println!(
-                "{:<24} {:<28} {:>10} {:>10} {:>8} {:>8}",
-                "case", "kernel", "gpu_ms", "gpu_ms_min", "TF/s", "ratio"
+                "{:<24} {:<28} {:>10} {:>10} {:>8} {:>8}  {}",
+                "case", "kernel", "gpu_ms", "gpu_ms_min", "TF/s", "ratio", "route"
             );
-            println!("{}", "-".repeat(92));
+            println!("{}", "-".repeat(120));
         }
         OutputMode::Csv => {
-            println!("case,kernel,gpu_ms,gpu_ms_min,tflops,ratio,b,m,n,k");
+            println!("case,kernel,gpu_ms,gpu_ms_min,tflops,ratio,b,m,n,k,route");
         }
     }
 
@@ -272,18 +283,20 @@ fn print_results(
                 (Some(tf), Some(base)) if base > 0.0 => Some(tf / base),
                 _ => None,
             };
+            let route = route_kernel(&entry.exec, case);
             match mode {
                 OutputMode::Table => println!(
-                    "{:<24} {:<28} {:>10} {:>10} {:>8} {:>8}",
+                    "{:<24} {:<28} {:>10} {:>10} {:>8} {:>8}  {}",
                     case.label,
                     entry.label,
                     fmt_num(stats.map(|s| s.gpu_ms), 3),
                     fmt_num(stats.map(|s| s.gpu_ms_min), 3),
                     fmt_num(stats.and_then(|s| s.tflops), 2),
                     fmt_num(ratio, 3),
+                    route,
                 ),
                 OutputMode::Csv => println!(
-                    "{},{},{},{},{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{},{},{},{},{}",
                     csv_escape(&case.label),
                     csv_escape(&entry.label),
                     fmt_num(stats.map(|s| s.gpu_ms), 6),
@@ -294,6 +307,7 @@ fn print_results(
                     case.m,
                     case.n,
                     case.k,
+                    route,
                 ),
             }
         }

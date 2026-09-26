@@ -146,17 +146,31 @@ pub(super) fn prepare_case_tensors(
     let m = case.m;
     let n = case.n;
     let k = case.k;
-    let a = Tensor::uninit_device(ctx, &[bsz, m, k])?;
+    // `a16`: A and C are f16 storage (the f16-activations route).
+    let act = |shape: &[u32]| {
+        if case.a16 {
+            Tensor::uninit_device_f16(ctx, shape)
+        } else {
+            Tensor::uninit_device(ctx, shape)
+        }
+    };
+    let a = act(&[bsz, m, k])?;
     let b = if case.b_f16 {
         Tensor::uninit_device_f16(ctx, &[bsz, k, n])?
     } else {
         Tensor::uninit_device(ctx, &[bsz, k, n])?
     };
-    let c = Tensor::uninit_device(ctx, &[bsz, m, n])?;
+    let c = act(&[bsz, m, n])?;
     let mut h_a = vec![0.0f32; host_len(&[bsz, m, k])?];
     let mut h_b = vec![0.0f32; host_len(&[bsz, k, n])?];
     fill_det(&mut h_a, 7);
     fill_det(&mut h_b, 11);
+    if case.a16 {
+        // The device holds halves; the reference must see the same A.
+        for value in &mut h_a {
+            *value = tensor_ash::dtype::round_f32_via_f16(*value);
+        }
+    }
 
     let split_k2 = env_u32("ML_SPLIT_K2", 0);
     if case.packed_b {
@@ -194,7 +208,7 @@ pub(super) fn prepare_case_tensors(
     } else {
         exec.upload(&h_b, &b)?;
     }
-    if case.b_f16 && requantize_a_for_tensor_core {
+    if case.b_f16 && !case.a16 && requantize_a_for_tensor_core {
         // The tensor-core routes also quantize A (coopmat1 while
         // staging, cm2 in its tensor-load decode callback).
         let kernel = if case.packed_b {
@@ -284,7 +298,7 @@ pub(super) fn run_case(
             stats.gpu_time_ns.map(|ns| ns as f64 / 1e6),
         ));
     }
-    validate_samples(exec, &c, &h_a, &h_b, bsz, m, n, k)?;
+    validate_samples(exec, &c, &h_a, &h_b, bsz, m, n, k, case.a16)?;
     let wall_ms = SampleSummary::new(samples.iter().map(|(wall, _)| *wall))
         .context("benchmark produced no wall-time samples")?;
     let gpu_ms = SampleSummary::new(samples.iter().filter_map(|(_, gpu)| *gpu));
@@ -304,6 +318,8 @@ pub(super) fn run_case(
     // Split factors below 2 execute the normal dispatch path, so report it.
     let dispatch = if case.packed_b {
         exec.dispatch_info_packed(n, k)
+    } else if case.a16 {
+        exec.dispatch_info_a16(bsz, m, n, k)
     } else if split_k2 < 2 {
         exec.dispatch_info_for(bsz, m, n, k, case.b_f16)
     } else {
@@ -323,6 +339,8 @@ pub(super) fn run_case(
 
 /// Validate a fixed number of well-spaced outputs after timing. This catches
 /// broken kernels without turning large benchmark cases into full CPU GEMMs.
+/// `c_f16` widens the budget by the f16 store's rounding (2^-11 relative,
+/// doubled like the accumulation term).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_samples(
     exec: &Executor,
@@ -333,6 +351,7 @@ pub(super) fn validate_samples(
     m: u32,
     n: u32,
     k: u32,
+    c_f16: bool,
 ) -> Result<()> {
     const CHECKS: usize = 8;
     let mut output = vec![0.0; host_len(&[batch, m, n])?];
@@ -340,6 +359,7 @@ pub(super) fn validate_samples(
     let checks = output.len().min(CHECKS);
     let plane = m as usize * n as usize;
     let mut max_error = 0.0f32;
+    let mut max_budget = 2.0 * tolerance(k);
     let mut worst = 0;
     for sample in 0..checks {
         let index = if checks == 1 {
@@ -357,16 +377,23 @@ pub(super) fn validate_samples(
                     * b[(batch_index * k as usize + inner) * n as usize + col]
             })
             .sum::<f32>();
+        // Excess error over this sample's budget; the worst one fails.
+        let budget = 2.0 * tolerance(k)
+            + if c_f16 {
+                expected.abs() * 2.0f32.powi(-10)
+            } else {
+                0.0
+            };
         let error = (output[index] - expected).abs();
-        if !error.is_finite() || error > max_error {
+        if !error.is_finite() || error - budget > max_error - max_budget {
             max_error = error;
+            max_budget = budget;
             worst = index;
         }
     }
-    let budget = 2.0 * tolerance(k);
     anyhow::ensure!(
-        max_error <= budget,
-        "sampled correctness failed at output {worst}: error {max_error:.3e} > {budget:.3e}"
+        max_error <= max_budget,
+        "sampled correctness failed at output {worst}: error {max_error:.3e} > {max_budget:.3e}"
     );
     Ok(())
 }
@@ -379,6 +406,7 @@ pub(super) fn single(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
     let case = BenchCase {
         b_f16: false,
         packed_b: false,
+        a16: false,
         label: Cow::Owned(format!("B={b} M={m} N={n} K={k}")),
         b,
         m,
