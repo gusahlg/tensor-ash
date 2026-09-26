@@ -540,7 +540,20 @@ ML_PTX=1 target/release/ml_bench ptx overhead
 ML_PTX=1 ML_PTX_DUMP_DIR=jit target/release/ml_bench ptx dump
 ML_PTX=1 target/release/ml_bench ptx sgemm [MxNxK ...]   # ML_PTX_KERNELS=a,b ML_ROUNDS ML_ITERS
 ML_PTX=1 target/release/ml_bench ptx hgemm [MxNxK ...]   # (do NOT set ML_PTX_GEMM here)
+ML_PTX=1 ML_PTX_SPLITS=2,3,4 ML_PTX_KERNELS=ta_hgemm_f16_128x128_s3_splitk,... \
+  target/release/ml_bench ptx hgemm 512x2048x5632          # split-K entries
+# integrated route, end to end (one process per run; alternate modes)
+ML_PTX=1 ML_PTX_GEMM=f16  target/release/llama_ash bench -m tinyllama-1.1b-chat-v1.0.f16.gguf --pp 512 --tg 32
+ML_PTX=1 ML_PTX_GEMM=f16p target/release/llama_ash generate -m ... --ids "<128 ids>" -n 32
+# correctness
+ML_PTX=1 cargo test --release --test correctness -- --ignored --test-threads=1 ptx::
+ML_PTX=1 ML_PTX_GEMM=f32 cargo test --release --test correctness -- --ignored --test-threads=1 f16::
 # cuBLAS references (desktop build; louise has the same nix store paths)
 LD_LIBRARY_PATH=<libcublas-12.9.1.4-lib>/lib:/run/opengl-driver/lib \
   cublas_hgemm_bench --iters 30 --warmup 8 512x2048x2048 ...
+~/models/llama-cpp-cuda/bin/llama-bench -m tinyllama-1.1b-chat-v1.0.f16.gguf -p 512 -n 32 -fa 1 -r 5
 ```
+
+Raw logs of every run quoted here are in the session scratchpad
+(`results/4060_*.log`, `results/3070_*.log`); the louise run scripts
+are `~/ta-wt/c-ptx-art/run_*.sh`.
