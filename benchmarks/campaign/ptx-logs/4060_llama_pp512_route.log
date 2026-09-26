@@ -1,0 +1,50 @@
+heavy(louise): waiting for lock held by: tensor-ash: gpu4060 (since 18:04, pid 191744)
+    Finished `release` profile [optimized] target(s) in 5.29s
+## base
+[2026-09-26T16:31:07Z INFO  llama_ash] prefill timing: 39.260 ms GPU vs 39.533 ms wall (0.273 ms host)
+| pp512       |    512 |    0.040 | 12951.20 |
+## ptx_f32
+[2026-09-26T16:31:08Z INFO  tensor_ash::ptx::route] tensor-ash: PTX a16 route on: accum=F32 forced=None sm_count=24 (modules ready in 5.4 ms)
+[2026-09-26T16:31:28Z INFO  llama_ash] prefill timing: 39.819 ms GPU vs 40.094 ms wall (0.275 ms host)
+| pp512       |    512 |    0.040 | 12769.95 |
+## ptx_f16
+[2026-09-26T16:31:30Z INFO  tensor_ash::ptx::route] tensor-ash: PTX a16 route on: accum=F16 forced=None sm_count=24 (modules ready in 4.2 ms)
+[2026-09-26T16:31:50Z INFO  llama_ash] prefill timing: 28.481 ms GPU vs 28.557 ms wall (0.076 ms host)
+| pp512       |    512 |    0.029 | 17929.28 |
+## ptx_f16p
+[2026-09-26T16:31:51Z INFO  tensor_ash::ptx::route] tensor-ash: PTX a16 route on: accum=F16Promoted forced=None sm_count=24 (modules ready in 4.1 ms)
+[2026-09-26T16:32:11Z INFO  llama_ash] prefill timing: 33.937 ms GPU vs 34.240 ms wall (0.303 ms host)
+| pp512       |    512 |    0.034 | 14953.44 |
+## base
+[2026-09-26T16:32:32Z INFO  llama_ash] prefill timing: 39.279 ms GPU vs 39.567 ms wall (0.288 ms host)
+| pp512       |    512 |    0.040 | 12940.01 |
+## ptx_f32
+[2026-09-26T16:32:34Z INFO  tensor_ash::ptx::route] tensor-ash: PTX a16 route on: accum=F32 forced=None sm_count=24 (modules ready in 4.1 ms)
+[2026-09-26T16:32:54Z INFO  llama_ash] prefill timing: 40.472 ms GPU vs 40.541 ms wall (0.069 ms host)
+| pp512       |    512 |    0.041 | 12629.33 |
+## ptx_f16
+[2026-09-26T16:32:55Z INFO  tensor_ash::ptx::route] tensor-ash: PTX a16 route on: accum=F16 forced=None sm_count=24 (modules ready in 4.1 ms)
+[2026-09-26T16:33:14Z INFO  llama_ash] prefill timing: 28.750 ms GPU vs 29.062 ms wall (0.312 ms host)
+| pp512       |    512 |    0.029 | 17617.58 |
+## ptx_f16p
+[2026-09-26T16:33:15Z INFO  tensor_ash::ptx::route] tensor-ash: PTX a16 route on: accum=F16Promoted forced=None sm_count=24 (modules ready in 4.2 ms)
+[2026-09-26T16:33:35Z INFO  llama_ash] prefill timing: 33.849 ms GPU vs 34.149 ms wall (0.300 ms host)
+| pp512       |    512 |    0.034 | 14993.20 |
+## generate token ids (24 greedy)
+# off
+prompt_ids   : 1,15043,3186,338,263,1243
+generated_ids: 2643,29889,13,13,29945,29889,15043,29892,2787,29991,13,13,29953,29889,15043,29892,2787,29991,13,13,29955,29889,15043,29892
+timings      : load 19.30 s | prefill 6 tok in 0.301 s (19.94 t/s) | decode 23 tok in 0.282 s (81.65 t/s)
+# f32
+prompt_ids   : 1,15043,3186,338,263,1243
+generated_ids: 2643,29889,13,13,29945,29889,15043,29892,2787,29991,13,13,29953,29889,15043,29892,2787,29991,13,13,29955,29889,15043,29892
+timings      : load 18.79 s | prefill 6 tok in 0.245 s (24.49 t/s) | decode 23 tok in 0.217 s (106.01 t/s)
+# f16
+prompt_ids   : 1,15043,3186,338,263,1243
+generated_ids: 2643,29889,13,13,29945,29889,15043,29892,2787,29991,13,13,29953,29889,15043,29892,2787,29991,13,13,29955,29889,15043,29892
+timings      : load 19.03 s | prefill 6 tok in 0.227 s (26.45 t/s) | decode 23 tok in 0.218 s (105.73 t/s)
+# f16p
+prompt_ids   : 1,15043,3186,338,263,1243
+generated_ids: 2643,29889,13,13,29945,29889,15043,29892,2787,29991,13,13,29953,29889,15043,29892,2787,29991,13,13,29955,29889,15043,29892
+timings      : load 18.94 s | prefill 6 tok in 0.295 s (20.35 t/s) | decode 23 tok in 0.241 s (95.27 t/s)
+exit=0

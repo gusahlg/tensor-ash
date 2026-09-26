@@ -1,0 +1,41 @@
+heavy(louise): waiting for lock held by: sighurt: servo build (m0 run + clippy) (since 18:58, pid 281876)
+    Finished `release` profile [optimized] target(s) in 0.03s
+# off
+[2026-09-26T17:28:01Z INFO  llama_ash] prefill timing: 39.382 ms GPU vs 39.671 ms wall (0.289 ms host)
+| pp512       |    512 |    0.040 | 12906.11 |
+# f16
+[2026-09-26T17:28:22Z INFO  llama_ash] prefill timing: 28.735 ms GPU vs 28.800 ms wall (0.065 ms host)
+| pp512       |    512 |    0.029 | 17777.74 |
+# f16p
+[2026-09-26T17:28:43Z INFO  llama_ash] prefill timing: 30.718 ms GPU vs 31.019 ms wall (0.300 ms host)
+| pp512       |    512 |    0.031 | 16506.09 |
+# f32
+[2026-09-26T17:29:04Z INFO  llama_ash] prefill timing: 39.973 ms GPU vs 40.246 ms wall (0.272 ms host)
+| pp512       |    512 |    0.040 | 12721.85 |
+# off
+[2026-09-26T17:29:25Z INFO  llama_ash] prefill timing: 39.368 ms GPU vs 39.653 ms wall (0.285 ms host)
+| pp512       |    512 |    0.040 | 12912.16 |
+# f16
+[2026-09-26T17:29:46Z INFO  llama_ash] prefill timing: 28.436 ms GPU vs 28.597 ms wall (0.161 ms host)
+| pp512       |    512 |    0.029 | 17904.10 |
+# f16p
+[2026-09-26T17:30:08Z INFO  llama_ash] prefill timing: 30.508 ms GPU vs 30.602 ms wall (0.094 ms host)
+| pp512       |    512 |    0.031 | 16730.91 |
+# f32
+[2026-09-26T17:30:29Z INFO  llama_ash] prefill timing: 40.064 ms GPU vs 40.267 ms wall (0.203 ms host)
+| pp512       |    512 |    0.040 | 12715.16 |
+# off
+[2026-09-26T17:30:50Z INFO  llama_ash] prefill timing: 39.310 ms GPU vs 39.588 ms wall (0.278 ms host)
+| pp512       |    512 |    0.040 | 12933.27 |
+# f16
+[2026-09-26T17:31:11Z INFO  llama_ash] prefill timing: 28.455 ms GPU vs 28.549 ms wall (0.094 ms host)
+| pp512       |    512 |    0.029 | 17934.11 |
+# f16p
+[2026-09-26T17:31:32Z INFO  llama_ash] prefill timing: 30.711 ms GPU vs 30.993 ms wall (0.283 ms host)
+| pp512       |    512 |    0.031 | 16519.70 |
+# f32
+[2026-09-26T17:31:53Z INFO  llama_ash] prefill timing: 40.063 ms GPU vs 40.349 ms wall (0.286 ms host)
+| pp512       |    512 |    0.040 | 12689.25 |
+## generate 128-token prompt (f16p BK=64)
+generated_ids: 29879,29871,29896,29929,29929,29929,29871,29896,29929,29929,29947,29871,29896,29929,29929,29955,29871,29896,29929,29929,29953,29871,29896,29929,29929,29945,29871,29896,29929,29929,29946,29871
+exit=0

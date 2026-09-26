@@ -1,0 +1,19 @@
+[2026-09-26T15:36:21Z INFO  ml_bench::bench] device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2497233024, compute_family=2, timestamps=true (64 bits)) slots=2 kernel=auto
+== ptx probe on device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2497233024, compute_family=2, timestamps=true (64 bits))
+cuda_kernel_launch=on compute_capability=Some((8, 6)) nvx_binary_import=true
+PTX module JIT: 63.61 ms (6157 B PTX); function lookup 0.002 ms
+lookup of a missing entry: error as expected (vkCreateCudaFunctionNV(no_such_kernel): Initialization of an object has failed)
+PTX probe_fill into a tensor-ash buffer (BDA param, 1M u32): mismatches=0 gpu=0.0137 ms  (param storage freed at record time)
+vkGetCudaModuleCacheNV: 12832 bytes, head 7f454c46020101410800000000000000, written to probe_cache_3070.bin
+module from its own cache blob: create 0.11 ms, fill mismatches=0
+NVX PTX text: accepted (0.10 ms), fill mismatches=0
+NVX NV module cache blob: accepted (0.04 ms), fill mismatches=0
+NV  /tmp/claude-1000/-home-gusahlg-repos-tensor-ash/36c7b90e-5e00-4f5c-86e3-41f713a8da23/scratchpad/ptxw/probe_sm86.cubin (10528 B, head 7f454c4602010133): accepted in 0.05 ms, fill mismatches=0
+NVX /tmp/claude-1000/-home-gusahlg-repos-tensor-ash/36c7b90e-5e00-4f5c-86e3-41f713a8da23/scratchpad/ptxw/probe_sm86.cubin: accepted (0.05 ms), fill mismatches=0
+NV  /tmp/claude-1000/-home-gusahlg-repos-tensor-ash/36c7b90e-5e00-4f5c-86e3-41f713a8da23/scratchpad/ptxw/probe.fatbin (23024 B, head 50ed55ba01001000): accepted in 0.05 ms, fill mismatches=0
+NVX /tmp/claude-1000/-home-gusahlg-repos-tensor-ash/36c7b90e-5e00-4f5c-86e3-41f713a8da23/scratchpad/ptxw/probe.fatbin: accepted (0.05 ms), fill mismatches=0
+bound-state reuse across a CUDA launch (pipeline + push constants not re-recorded): mismatches=0/1048576
+dynamic smem  16384 B: launched, gpu 0.0048 ms, bad blocks 0/48
+dynamic smem  49152 B: launched, gpu 0.0060 ms, bad blocks 0/48
+dynamic smem  65536 B: launched, gpu 0.0102 ms, bad blocks 0/48
+dynamic smem 101376 B: launched, gpu 0.0136 ms, bad blocks 0/48

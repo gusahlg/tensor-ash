@@ -1,0 +1,46 @@
+heavy: waiting for lock held by: sighurt: servo build (m1 local) (since 17:44, pid 323290)
+[2026-09-26T15:49:30Z INFO  ml_bench::bench] device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2497233024, compute_family=2, timestamps=true (64 bits)) slots=2 kernel=auto
+== ptx sgemm on NVIDIA GeForce RTX 3070 (JIT 6.1 ms)
+shape            tensor-ash route                 ta_ms    TF/s | ptx kernel                    ptx_ms    TF/s  ptx/ta |    ta_err   ptx_err
+4096x4096x4096   large_bda_v4                   11.4668   11.99 | ta_sgemm_128x128x8_s4_v4     12.2645   11.21   0.935 |   1.10e-4   1.10e-4
+[2026-09-26T15:49:31Z INFO  ml_bench::bench::ptx] 4096x4096x4096 spread: ta min 9.9628 p90 11.5364 | ptx min 12.1566 p90 12.5582 (ms)
+4096x4096x4096   large_bda_v4                   11.4612   11.99 | ta_sgemm_128x128x8_s3_v4     11.3921   12.06   1.006 |   1.10e-4   1.10e-4
+[2026-09-26T15:49:32Z INFO  ml_bench::bench::ptx] 4096x4096x4096 spread: ta min 10.0338 p90 11.5287 | ptx min 11.2895 p90 11.3944 (ms)
+4096x4096x4096   large_bda_v4                   11.4412   12.01 | ta_sgemm_128x128x16_s2_v4    11.5841   11.86   0.988 |   1.10e-4   1.10e-4
+[2026-09-26T15:49:33Z INFO  ml_bench::bench::ptx] 4096x4096x4096 spread: ta min 10.1077 p90 11.4796 | ptx min 11.3870 p90 11.8407 (ms)
+4096x4096x4096   large_bda_v4                   11.3821   12.08 | ta_sgemm_128x128x8_s4_s1     14.2844    9.62   0.797 |   1.10e-4   1.10e-4
+[2026-09-26T15:49:34Z INFO  ml_bench::bench::ptx] 4096x4096x4096 spread: ta min 10.0998 p90 11.9859 | ptx min 14.1547 p90 15.5047 (ms)
+2048x2048x2048   large_bda_v4                    1.4587   11.78 | ta_sgemm_128x128x8_s4_v4      1.5947   10.77   0.915 |   6.55e-5   6.55e-5
+[2026-09-26T15:49:34Z INFO  ml_bench::bench::ptx] 2048x2048x2048 spread: ta min 1.3309 p90 1.4788 | ptx min 1.4567 p90 1.6005 (ms)
+2048x2048x2048   large_bda_v4                    1.4654   11.72 | ta_sgemm_128x128x8_s3_v4      1.4574   11.79   1.005 |   6.55e-5   6.55e-5
+[2026-09-26T15:49:34Z INFO  ml_bench::bench::ptx] 2048x2048x2048 spread: ta min 1.4151 p90 1.4689 | ptx min 1.4046 p90 1.4612 (ms)
+2048x2048x2048   large_bda_v4                    1.4537   11.82 | ta_sgemm_128x128x16_s2_v4     1.4780   11.62   0.984 |   6.55e-5   6.55e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 2048x2048x2048 spread: ta min 1.4144 p90 1.4668 | ptx min 1.4412 p90 1.4913 (ms)
+2048x2048x2048   large_bda_v4                    1.4538   11.82 | ta_sgemm_128x128x8_s4_s1      1.8547    9.26   0.784 |   6.55e-5   6.55e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 2048x2048x2048 spread: ta min 1.4160 p90 1.4668 | ptx min 1.8073 p90 1.8568 (ms)
+1024x1024x1024   m128n64k64_bda_v4               0.2008   10.69 | ta_sgemm_128x128x8_s4_v4      0.2624    8.18   0.765 |   2.13e-5   2.13e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 1024x1024x1024 spread: ta min 0.1938 p90 0.2021 | ptx min 0.2534 p90 0.2633 (ms)
+1024x1024x1024   m128n64k64_bda_v4               0.1942   11.06 | ta_sgemm_128x128x8_s3_v4      0.2321    9.25   0.837 |   2.13e-5   2.13e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 1024x1024x1024 spread: ta min 0.1930 p90 0.1950 | ptx min 0.2305 p90 0.2329 (ms)
+1024x1024x1024   m128n64k64_bda_v4               0.1929   11.13 | ta_sgemm_128x128x16_s2_v4     0.2358    9.11   0.818 |   2.13e-5   2.13e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 1024x1024x1024 spread: ta min 0.1917 p90 0.1939 | ptx min 0.2347 p90 0.2363 (ms)
+1024x1024x1024   m128n64k64_bda_v4               0.1951   11.01 | ta_sgemm_128x128x8_s4_s1      0.2996    7.17   0.651 |   2.13e-5   2.13e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 1024x1024x1024 spread: ta min 0.1939 p90 0.1958 | ptx min 0.2975 p90 0.3003 (ms)
+1024x3072x512    m128n64k64_bda_v4               0.2788   11.55 | ta_sgemm_128x128x8_s4_v4      0.3148   10.23   0.886 |   1.26e-5   1.26e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 1024x3072x512 spread: ta min 0.2772 p90 0.2819 | ptx min 0.3130 p90 0.3194 (ms)
+1024x3072x512    m128n64k64_bda_v4               0.2876   11.20 | ta_sgemm_128x128x8_s3_v4      0.2986   10.79   0.963 |   1.26e-5   1.26e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 1024x3072x512 spread: ta min 0.2853 p90 0.2893 | ptx min 0.2971 p90 0.3000 (ms)
+1024x3072x512    m128n64k64_bda_v4               0.2872   11.22 | ta_sgemm_128x128x16_s2_v4     0.3029   10.64   0.948 |   1.26e-5   1.26e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 1024x3072x512 spread: ta min 0.2859 p90 0.2881 | ptx min 0.3009 p90 0.3035 (ms)
+1024x3072x512    m128n64k64_bda_v4               0.2983   10.80 | ta_sgemm_128x128x8_s4_s1      0.3996    8.06   0.746 |   1.26e-5   1.26e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 1024x3072x512 spread: ta min 0.2869 p90 0.2996 | ptx min 0.3844 p90 0.4017 (ms)
+768x768x768      m128n64k64_bda_v4               0.1013    8.94 | ta_sgemm_128x128x8_s4_v4      0.1121    8.08   0.904 |   1.97e-5   1.97e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 768x768x768 spread: ta min 0.1005 p90 0.1019 | ptx min 0.1092 p90 0.1127 (ms)
+768x768x768      m128n64k64_bda_v4               0.0989    9.16 | ta_sgemm_128x128x8_s3_v4      0.1024    8.84   0.965 |   1.97e-5   1.97e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 768x768x768 spread: ta min 0.0979 p90 0.0994 | ptx min 0.1013 p90 0.1027 (ms)
+768x768x768      m128n64k64_bda_v4               0.0991    9.14 | ta_sgemm_128x128x16_s2_v4     0.0997    9.08   0.994 |   1.97e-5   1.97e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 768x768x768 spread: ta min 0.0985 p90 0.0997 | ptx min 0.0986 p90 0.1000 (ms)
+768x768x768      m128n64k64_bda_v4               0.0982    9.23 | ta_sgemm_128x128x8_s4_s1      0.1372    6.60   0.715 |   1.97e-5   1.97e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 768x768x768 spread: ta min 0.0976 p90 0.0988 | ptx min 0.1357 p90 0.1380 (ms)
+1023x1025x1027   m128n64k64_bda_v4               0.2255    9.55 | ta_sgemm_128x128x8_s4_s1      0.3089    6.97   0.730 |   3.00e-5   3.00e-5
+[2026-09-26T15:49:35Z INFO  ml_bench::bench::ptx] 1023x1025x1027 spread: ta min 0.2236 p90 0.2261 | ptx min 0.3061 p90 0.3096 (ms)

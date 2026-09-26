@@ -554,6 +554,8 @@ LD_LIBRARY_PATH=<libcublas-12.9.1.4-lib>/lib:/run/opengl-driver/lib \
 ~/models/llama-cpp-cuda/bin/llama-bench -m tinyllama-1.1b-chat-v1.0.f16.gguf -p 512 -n 32 -fa 1 -r 5
 ```
 
-Raw logs of every run quoted here are in the session scratchpad
-(`results/4060_*.log`, `results/3070_*.log`); the louise run scripts
-are `~/ta-wt/c-ptx-art/run_*.sh`.
+Raw logs of every run quoted here are checked in under
+`benchmarks/campaign/ptx-logs/` (`4060_*.log`, `3070_*.log`), with the
+exact louise run scripts in `ptx-logs/scripts/run_*.sh` (executed via
+`lgpu c-ptx 'timeout N ~/ta-wt/c-ptx-art/run_X.sh'`; the 3070 batches
+ran the same `ml_bench` / `llama_ash` commands under `gpu3070`).
