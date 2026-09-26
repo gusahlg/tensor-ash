@@ -50,13 +50,19 @@ use crate::bench::env::env_u32;
 /// (`Layer::wq_p`..`w_up_p`, `lm_head_p`): q, k/v, gate/up, and lm_head
 /// use `[N/tile][K][tile]`; o and down stay row-major (packing them
 /// was measured-neutral).
-const GEMV_SHAPES: &[(&str, u32, u32, bool)] = &[
-    ("q 2048x2048", 2048, 2048, true),
-    ("o 2048x2048", 2048, 2048, false),
-    ("k/v 2048x256", 2048, 256, true),
-    ("gate/up 2048x5632", 2048, 5632, true),
-    ("down 5632x2048", 5632, 2048, false),
-    ("lm_head 2048x32000", 2048, 32000, true),
+///
+/// The last field names an optional per-class expectation key that
+/// overrides `t2_min_bw_frac`: the 1 MB k/v class is launch-bound, not
+/// bandwidth-bound (its floor is 2.4-3.9 us; one dispatch costs more),
+/// so it is guarded at its own measured level.  In decode its cost
+/// hides behind the concurrent q GEMV (no barrier between q/k/v).
+const GEMV_SHAPES: &[(&str, u32, u32, bool, Option<&str>)] = &[
+    ("q 2048x2048", 2048, 2048, true, None),
+    ("o 2048x2048", 2048, 2048, false, None),
+    ("k/v 2048x256", 2048, 256, true, Some("t2_kv_min_bw_frac")),
+    ("gate/up 2048x5632", 2048, 5632, true, None),
+    ("down 5632x2048", 5632, 2048, false, None),
+    ("lm_head 2048x32000", 2048, 32000, true, None),
 ];
 
 /// Elements of each f32 L2-scrub tensor: the scrub reads two and
@@ -165,11 +171,14 @@ pub(crate) fn t2_gemv_efficiency(
     let iters = env_u32("ML_ITERS", 50).max(1);
     let warmup = env_u32("ML_WARMUP", 5);
     let bw_gbps = key(section, "mem_bw_gbps");
-    let min_frac = key(section, "t2_min_bw_frac");
+    let default_min_frac = key(section, "t2_min_bw_frac");
 
     let scrub = L2Scrub::new(ctx, exec)?;
     let mut rows = Vec::new();
-    for &(label, k, n, packed_b) in GEMV_SHAPES {
+    for &(label, k, n, packed_b, class_key) in GEMV_SHAPES {
+        let min_frac = class_key
+            .and_then(|name| key(section, name))
+            .or(default_min_frac);
         let case = BenchCase {
             label: Cow::Owned(format!("gemv {label}")),
             b: 1,
