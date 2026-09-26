@@ -174,6 +174,19 @@ pub const HGEMM_KERNELS: &[HgemmKernel] = &[
         true,
         true,
     ),
+    hk("ta_hgemm_f16p_128x64_s3", 128, 64, 32, 4, 3, true, true),
+    hk(
+        "ta_hgemm_f16p_128x128_w64x32_s3",
+        128,
+        128,
+        32,
+        8,
+        3,
+        true,
+        true,
+    ),
+    hk("ta_hgemm_f16p_64x64_s4", 64, 64, 32, 4, 4, true, true),
+    hk("ta_hgemm_f16p_128x64_k64_s2", 128, 64, 64, 4, 2, true, true),
 ];
 
 /// Split-K partial kernels (f32 partials into a `[splits][M][N]`
