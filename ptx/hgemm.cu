@@ -12,8 +12,9 @@
 //
 // Shared layout (per stage), 16-byte chunks XOR-swizzled so every
 // ldmatrix phase (8 rows x 16 B) hits 8 distinct bank groups:
-//   A: BM rows x BK=32 halves (4 chunks/row): chunk' = c ^ ((row>>1)&3)
-//   B: BK=32 rows x BN halves (BN/8 chunks):  chunk' = c ^ (row & 7)
+//   A: BM rows x BK halves: BK=32 (4 chunks/row): chunk' = c ^ ((row>>1)&3)
+//                           BK=64 (8 chunks/row): chunk' = c ^ (row & 7)
+//   B: BK rows x BN halves    (BN/8 chunks):  chunk' = c ^ (row & 7)
 // B fragments come from ldmatrix.x4.trans on the [k][n] tile (B is not
 // pre-transposed; f16 weights stay in their [K,N] layout).
 //
@@ -26,23 +27,30 @@
 
 namespace {
 
-constexpr int BK = 32;
-
-template <int BM, int BN, int WM, int WN, int STAGES, int ACC>
+template <int BM, int BN, int WM, int WN, int STAGES, int ACC, int BK_ = 32>
 struct Cfg {
+    static constexpr int BK = BK_;
     static constexpr int WARPS_M = BM / WM, WARPS_N = BN / WN;
     static constexpr int THREADS = WARPS_M * WARPS_N * 32;
     static constexpr int MI = WM / 16, NI = WN / 8;
     static constexpr int A_STAGE = BM * BK;  // halves
     static constexpr int B_STAGE = BK * BN;  // halves
     static constexpr int A_CHUNKS = BM * BK / 8, B_CHUNKS = BK * BN / 8;
+    static constexpr int ACH = BK / 8;  // chunks per A row
     static constexpr int BCH = BN / 8;  // chunks per B row
+    static_assert(BK == 32 || BK == 64, "A swizzle handles 4 or 8 chunks per row");
     static_assert(BN >= 64, "B swizzle needs >= 8 chunks per row");
     static_assert(A_CHUNKS % THREADS == 0 && B_CHUNKS % THREADS == 0, "chunk split");
     static_assert(NI % 2 == 0, "B ldmatrix.x4 covers two n8 tiles");
 };
 
-TA_DEVICE int a_off(int row, int ch) { return row * BK + ((ch ^ ((row >> 1) & 3)) << 3); }
+// A rows are BK halves = 4 (BK=32) or 8 (BK=64) chunks; the XOR keeps
+// the 8 rows of one ldmatrix phase on 8 distinct 16-byte bank groups.
+template <int BK>
+TA_DEVICE int a_off(int row, int ch) {
+    const int sw = BK == 32 ? ((row >> 1) & 3) : (row & 7);
+    return row * BK + ((ch ^ sw) << 3);
+}
 template <int BCH>
 TA_DEVICE int b_off(int row, int ch) {
     return row * (BCH * 8) + ((ch ^ (row & 7)) << 3);
@@ -55,11 +63,11 @@ TA_DEVICE void load_stage(__half* As, __half* Bs, const __half* __restrict__ A,
 #pragma unroll
     for (int r = 0; r < G::A_CHUNKS / G::THREADS; ++r) {
         const int c = tid + r * G::THREADS;
-        const int row = c >> 2, ch = c & 3;
+        const int row = c / G::ACH, ch = c % G::ACH;
         const int gm = m0 + row, gk = k0 + ch * 8;
         const bool ok = gm < M && gk < K;
         const __half* src = ok ? A + (size_t)gm * K + gk : A;
-        cp_async16(smem_u32(As + a_off(row, ch)), src, ok ? 16u : 0u);
+        cp_async16(smem_u32(As + a_off<G::BK>(row, ch)), src, ok ? 16u : 0u);
     }
 #pragma unroll
     for (int r = 0; r < G::B_CHUNKS / G::THREADS; ++r) {
@@ -72,10 +80,11 @@ TA_DEVICE void load_stage(__half* As, __half* Bs, const __half* __restrict__ A,
     }
 }
 
-template <int BM, int BN, int WM, int WN, int STAGES, int ACC, int OUT>
+template <int BM, int BN, int WM, int WN, int STAGES, int ACC, int OUT, int BK_>
 TA_DEVICE void hgemm_body(const __half* __restrict__ A, const __half* __restrict__ B,
                           void* __restrict__ Cv, int M, int N, int K, float alpha) {
-    using G = Cfg<BM, BN, WM, WN, STAGES, ACC>;
+    using G = Cfg<BM, BN, WM, WN, STAGES, ACC, BK_>;
+    constexpr int BK = G::BK;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __half* As = reinterpret_cast<__half*>(smem_raw);
     __half* Bs = As + STAGES * G::A_STAGE;
@@ -140,7 +149,7 @@ TA_DEVICE void hgemm_body(const __half* __restrict__ A, const __half* __restrict
             uint32_t bf[G::NI][2];
 #pragma unroll
             for (int mi = 0; mi < G::MI; ++mi)
-                ldmatrix_x4(af[mi], smem_u32(as + a_off(a_lrow + mi * 16, ks * 2 + a_lch)));
+                ldmatrix_x4(af[mi], smem_u32(as + a_off<BK>(a_lrow + mi * 16, ks * 2 + a_lch)));
 #pragma unroll
             for (int nj = 0; nj < G::NI / 2; ++nj)
                 ldmatrix_x4_trans(bf[2 * nj][0], bf[2 * nj][1], bf[2 * nj + 1][0],
@@ -195,15 +204,18 @@ TA_DEVICE void hgemm_body(const __half* __restrict__ A, const __half* __restrict
 
 }  // namespace
 
-#define TA_HGEMM(NAME, BM, BN, WM, WN, ST, ACC, OUT, MINB)                                     \
-    extern "C" __global__ void __launch_bounds__(Cfg<BM, BN, WM, WN, ST, ACC>::THREADS, MINB)  \
+#define TA_HGEMM_K(NAME, BM, BN, WM, WN, ST, ACC, OUT, MINB, BK)                              \
+    extern "C" __global__ void __launch_bounds__(Cfg<BM, BN, WM, WN, ST, ACC, BK>::THREADS, MINB) \
         NAME(const __half* __restrict__ A, const __half* __restrict__ B, void* __restrict__ C,  \
              int M, int N, int K, float alpha) {                                               \
-        hgemm_body<BM, BN, WM, WN, ST, ACC, OUT>(A, B, C, M, N, K, alpha);                    \
+        hgemm_body<BM, BN, WM, WN, ST, ACC, OUT, BK>(A, B, C, M, N, K, alpha);                \
     }
+#define TA_HGEMM(NAME, BM, BN, WM, WN, ST, ACC, OUT, MINB) \
+    TA_HGEMM_K(NAME, BM, BN, WM, WN, ST, ACC, OUT, MINB, 32)
 
-// name: ta_hgemm_<acc>_<BM>x<BN>_s<stages>[_o32]; warp tile 64x64 for
-// BN >= 128, 64x32 for 128x64, 32x32 for 64x64.  C is f16 unless _o32.
+// name: ta_hgemm_<acc>_<BM>x<BN>[_w<WM>x<WN>][_k64]_s<stages>[_o32]; the
+// default warp tile is 64x64 for BN >= 128, 64x32 for 128x64, 32x32
+// for 64x64; BK = 32 unless _k64.  C is f16 unless _o32.
 TA_HGEMM(ta_hgemm_f32_128x128_s3, 128, 128, 64, 64, 3, 0, 1, 2)
 TA_HGEMM(ta_hgemm_f32_128x128_s4, 128, 128, 64, 64, 4, 0, 1, 1)
 TA_HGEMM(ta_hgemm_f32_128x256_s3, 128, 256, 64, 64, 3, 0, 1, 1)
@@ -211,9 +223,17 @@ TA_HGEMM(ta_hgemm_f32_128x64_s3, 128, 64, 64, 32, 3, 0, 1, 2)
 TA_HGEMM(ta_hgemm_f32_128x64_s4, 128, 64, 64, 32, 4, 0, 1, 2)
 TA_HGEMM(ta_hgemm_f32_64x64_s4, 64, 64, 32, 32, 4, 0, 1, 3)
 TA_HGEMM(ta_hgemm_f32_128x128_s3_o32, 128, 128, 64, 64, 3, 0, 0, 2)
+TA_HGEMM(ta_hgemm_f32_128x128_w64x32_s3, 128, 128, 64, 32, 3, 0, 1, 2)
+TA_HGEMM(ta_hgemm_f32_256x128_s3, 256, 128, 64, 64, 3, 0, 1, 1)
 TA_HGEMM(ta_hgemm_f16_128x128_s3, 128, 128, 64, 64, 3, 1, 1, 2)
 TA_HGEMM(ta_hgemm_f16_128x128_s4, 128, 128, 64, 64, 4, 1, 1, 1)
 TA_HGEMM(ta_hgemm_f16_128x256_s3, 128, 256, 64, 64, 3, 1, 1, 1)
 TA_HGEMM(ta_hgemm_f16_128x64_s3, 128, 64, 64, 32, 3, 1, 1, 2)
 TA_HGEMM(ta_hgemm_f16_128x64_s4, 128, 64, 64, 32, 4, 1, 1, 2)
 TA_HGEMM(ta_hgemm_f16_64x64_s4, 64, 64, 32, 32, 4, 1, 1, 3)
+TA_HGEMM(ta_hgemm_f16_128x128_w64x32_s3, 128, 128, 64, 32, 3, 1, 1, 2)
+TA_HGEMM(ta_hgemm_f16_128x128_w32x64_s3, 128, 128, 32, 64, 3, 1, 1, 2)
+TA_HGEMM(ta_hgemm_f16_256x128_s3, 256, 128, 64, 64, 3, 1, 1, 1)
+TA_HGEMM_K(ta_hgemm_f16_128x128_k64_s2, 128, 128, 64, 64, 2, 1, 1, 1, 64)
+TA_HGEMM_K(ta_hgemm_f16_128x64_k64_s2, 128, 64, 64, 32, 2, 1, 1, 2, 64)
+TA_HGEMM_K(ta_hgemm_f16_128x128_w64x32_k64_s2, 128, 128, 64, 32, 2, 1, 1, 1, 64)

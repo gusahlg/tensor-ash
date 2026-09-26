@@ -65,6 +65,7 @@ pub struct HgemmKernel {
     pub name: &'static str,
     pub bm: u32,
     pub bn: u32,
+    pub bk: u32,
     pub threads: u32,
     pub stages: u32,
     /// f16 accumulate (`mma ...f16.f16.f16.f16`) instead of f32.
@@ -73,11 +74,13 @@ pub struct HgemmKernel {
     pub out_f16: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 const fn hk(
     name: &'static str,
     bm: u32,
     bn: u32,
-    threads: u32,
+    bk: u32,
+    warps: u32,
     stages: u32,
     f16_acc: bool,
     out_f16: bool,
@@ -86,7 +89,8 @@ const fn hk(
         name,
         bm,
         bn,
-        threads,
+        bk,
+        threads: warps * 32,
         stages,
         f16_acc,
         out_f16,
@@ -94,33 +98,87 @@ const fn hk(
 }
 
 pub const HGEMM_KERNELS: &[HgemmKernel] = &[
-    hk("ta_hgemm_f32_128x128_s3", 128, 128, 128, 3, false, true),
-    hk("ta_hgemm_f32_128x128_s4", 128, 128, 128, 4, false, true),
-    hk("ta_hgemm_f32_128x256_s3", 128, 256, 256, 3, false, true),
-    hk("ta_hgemm_f32_128x64_s3", 128, 64, 128, 3, false, true),
-    hk("ta_hgemm_f32_128x64_s4", 128, 64, 128, 4, false, true),
-    hk("ta_hgemm_f32_64x64_s4", 64, 64, 128, 4, false, true),
+    hk("ta_hgemm_f32_128x128_s3", 128, 128, 32, 4, 3, false, true),
+    hk("ta_hgemm_f32_128x128_s4", 128, 128, 32, 4, 4, false, true),
+    hk("ta_hgemm_f32_128x256_s3", 128, 256, 32, 8, 3, false, true),
+    hk("ta_hgemm_f32_128x64_s3", 128, 64, 32, 4, 3, false, true),
+    hk("ta_hgemm_f32_128x64_s4", 128, 64, 32, 4, 4, false, true),
+    hk("ta_hgemm_f32_64x64_s4", 64, 64, 32, 4, 4, false, true),
     hk(
         "ta_hgemm_f32_128x128_s3_o32",
         128,
         128,
-        128,
+        32,
+        4,
         3,
         false,
         false,
     ),
-    hk("ta_hgemm_f16_128x128_s3", 128, 128, 128, 3, true, true),
-    hk("ta_hgemm_f16_128x128_s4", 128, 128, 128, 4, true, true),
-    hk("ta_hgemm_f16_128x256_s3", 128, 256, 256, 3, true, true),
-    hk("ta_hgemm_f16_128x64_s3", 128, 64, 128, 3, true, true),
-    hk("ta_hgemm_f16_128x64_s4", 128, 64, 128, 4, true, true),
-    hk("ta_hgemm_f16_64x64_s4", 64, 64, 128, 4, true, true),
+    hk(
+        "ta_hgemm_f32_128x128_w64x32_s3",
+        128,
+        128,
+        32,
+        8,
+        3,
+        false,
+        true,
+    ),
+    hk("ta_hgemm_f32_256x128_s3", 256, 128, 32, 8, 3, false, true),
+    hk("ta_hgemm_f16_128x128_s3", 128, 128, 32, 4, 3, true, true),
+    hk("ta_hgemm_f16_128x128_s4", 128, 128, 32, 4, 4, true, true),
+    hk("ta_hgemm_f16_128x256_s3", 128, 256, 32, 8, 3, true, true),
+    hk("ta_hgemm_f16_128x64_s3", 128, 64, 32, 4, 3, true, true),
+    hk("ta_hgemm_f16_128x64_s4", 128, 64, 32, 4, 4, true, true),
+    hk("ta_hgemm_f16_64x64_s4", 64, 64, 32, 4, 4, true, true),
+    hk(
+        "ta_hgemm_f16_128x128_w64x32_s3",
+        128,
+        128,
+        32,
+        8,
+        3,
+        true,
+        true,
+    ),
+    hk(
+        "ta_hgemm_f16_128x128_w32x64_s3",
+        128,
+        128,
+        32,
+        8,
+        3,
+        true,
+        true,
+    ),
+    hk("ta_hgemm_f16_256x128_s3", 256, 128, 32, 8, 3, true, true),
+    hk(
+        "ta_hgemm_f16_128x128_k64_s2",
+        128,
+        128,
+        64,
+        4,
+        2,
+        true,
+        true,
+    ),
+    hk("ta_hgemm_f16_128x64_k64_s2", 128, 64, 64, 4, 2, true, true),
+    hk(
+        "ta_hgemm_f16_128x128_w64x32_k64_s2",
+        128,
+        128,
+        64,
+        8,
+        2,
+        true,
+        true,
+    ),
 ];
 
 impl HgemmKernel {
-    /// Dynamic shared memory: `stages * (BM*32 + 32*BN)` halves.
+    /// Dynamic shared memory: `stages * (BM*BK + BK*BN)` halves.
     pub fn smem_bytes(&self) -> u32 {
-        self.stages * (self.bm * 32 + 32 * self.bn) * 2
+        self.stages * (self.bm * self.bk + self.bk * self.bn) * 2
     }
 
     pub fn supports(&self, _m: u32, n: u32, k: u32) -> bool {
