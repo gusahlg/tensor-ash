@@ -308,7 +308,7 @@ version + shader build. Persisted winners are applied on **every** run —
 tuning enabled or not — whenever `ML_KERNEL` is `auto`. Delete the store (or
 update the driver / rebuild shaders) to reset it.
 
-`ML_KERNEL=auto` is the default. `KERNEL_SPECS` currently contains 37 concrete
+`ML_KERNEL=auto` is the default. `KERNEL_SPECS` currently contains 57 concrete
 choices. They include the
 descriptor-bound tiles (`large`, `small`, `m64n128`, `m128n64`,
 `m128n64k64`, `m64n32`, `k64`, `bk16`, `v2`, `m64n128k64`,
@@ -321,6 +321,13 @@ and aliases live together in `src/pipeline/catalog.rs`.
 library entry point (`VulkanContext::new`), so the test suite, `llama_ash`,
 and `ml_bench` all obey it on multi-GPU hosts; unset means `auto`
 (discrete first). The selected device is logged at init.
+
+Tensor-core (coopmat) tile routing is SM-count-aware: the SM count comes
+from `VK_NV_shader_sm_builtins` (or the AMD / ARM core-count queries) and an
+L2 lower bound from an NVIDIA device-ID family table.  `ML_SM_COUNT=N` /
+`ML_L2_MB=N` override them for what-if runs; `ML_SM_COUNT=0` restores the
+SM-agnostic rule.  Both values appear in the device diagnostics line.  See
+`benchmarks/campaign/coopmat-sm.md`.
 
 Kernels whose workgroup (shared-memory) tiles exceed the device's
 `maxComputeSharedMemorySize` are gated off at pipeline build and routing

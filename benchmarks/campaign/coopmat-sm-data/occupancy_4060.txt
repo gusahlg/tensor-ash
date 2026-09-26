@@ -1,0 +1,12 @@
+device #0: NVIDIA GeForce RTX 4060 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2882, driver=2496921600, compute_family=2, timestamps=true (64 bits), shader_cores=24 (VK_NV_shader_sm_builtins))
+occupancy limits: 48 warps/SM, 24 CTAs/SM, 65536 regs/SM, 102400 B shared/SM (+1024 B/CTA reserved)
+
+kernel                            tile threads   smem  regs  ctas  byReg bySmem byWarp  driver statistics
+f16w_coopmat_aligned           128x128     256  18944   128     2      2      5      6  Register Count=128; Binary Size=16128; Stack Size=0; Local Memory Size=68719476736; Shared Memory Size=18944
+f16w_a16_coopmat_aligned       128x128     256  18944   128     2      2      5      6  Register Count=128; Binary Size=15616; Stack Size=0; Local Memory Size=68719476736; Shared Memory Size=18944
+f16w_coopmat_m64n64              64x64     128   9728    72     7      7      9     12  Register Count=72; Binary Size=12928; Stack Size=0; Local Memory Size=68719476736; Shared Memory Size=9728
+f16w_a16_coopmat_m64n64          64x64     128   9728    72     7      7      9     12  Register Count=72; Binary Size=12032; Stack Size=0; Local Memory Size=68719476736; Shared Memory Size=9728
+f16w_coopmat_m64n128            64x128     128  13824   168     3      3      6     12  Register Count=168; Binary Size=20864; Stack Size=0; Local Memory Size=68719476736; Shared Memory Size=13824
+f16w_a16_coopmat_m64n128        64x128     128  13824   155     3      3      6     12  Register Count=155; Binary Size=21248; Stack Size=0; Local Memory Size=68719476736; Shared Memory Size=13824
+f16w_coopmat_m128n64            128x64     128  14848   128     4      4      6     12  Register Count=128; Binary Size=20224; Stack Size=0; Local Memory Size=68719476736; Shared Memory Size=16384
+f16w_a16_coopmat_m128n64        128x64     128  14848   128     4      4      6     12  Register Count=128; Binary Size=18688; Stack Size=0; Local Memory Size=68719476736; Shared Memory Size=16384

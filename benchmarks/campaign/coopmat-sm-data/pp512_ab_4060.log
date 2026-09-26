@@ -1,0 +1,11 @@
+# louise 2026-09-26T19:37:25+02:00 A=/home/gusahlg/ta-wt/cm-base/target/release/llama_ash B=/home/gusahlg/ta-wt/cm-sm/target/release/llama_ash pairs=5 pp=512 model=/home/gusahlg/models/tinyllama-1.1b-chat-v1.0.f16.gguf
+run=1 tag=A prefill_gpu_ms=39.431 prefill_wall_ms=39.704 pp_tps=12895.37 argmax 29872
+run=1 tag=B prefill_gpu_ms=39.888 prefill_wall_ms=40.065 pp_tps=12779.09 argmax 29872
+run=2 tag=A prefill_gpu_ms=39.134 prefill_wall_ms=39.214 pp_tps=13056.68 argmax 29872
+run=2 tag=B prefill_gpu_ms=39.903 prefill_wall_ms=40.191 pp_tps=12739.03 argmax 29872
+run=3 tag=A prefill_gpu_ms=39.460 prefill_wall_ms=39.520 pp_tps=12955.51 argmax 29872
+run=3 tag=B prefill_gpu_ms=39.829 prefill_wall_ms=40.118 pp_tps=12762.36 argmax 29872
+run=4 tag=A prefill_gpu_ms=39.408 prefill_wall_ms=39.738 pp_tps=12884.42 argmax 29872
+run=4 tag=B prefill_gpu_ms=40.025 prefill_wall_ms=40.315 pp_tps=12700.12 argmax 29872
+run=5 tag=A prefill_gpu_ms=39.646 prefill_wall_ms=39.922 pp_tps=12825.07 argmax 29872
+run=5 tag=B prefill_gpu_ms=40.329 prefill_wall_ms=40.730 pp_tps=12570.66 argmax 29872

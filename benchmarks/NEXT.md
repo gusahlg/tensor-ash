@@ -56,13 +56,17 @@ Two numbers that looked like levers were not:
 
 ## Next experiments (need 3070 to land)
 
-1. **128×64 as the large-square default?** +8% on 4060 2048³
-   (24.5 vs 22.7).  The 3070 4096³ 128×128 number (34.6 TF/s) is the
-   veto.  One interleaved A/B on the 3070 decides it.
-2. **SM-count-aware coopmat heuristic.** 96-tile threshold is 2 waves
-   on 46 SM.  4060 has 24 SM; a `shaderSMCount` query would pick 64×64
-   / 128×64 earlier without a 3070 regression if keyed by SM count.
-3. **BK / WM retune of 128×64** on 512×5632 (the fattest prefill GEMM).
+1. ~~**128×64 as the large-square default?**~~ Done
+   (`campaign/coopmat-sm`): 3070 4096³ 128×64 34.38 = 128×128 34.38
+   TF/s in one interleaved run; 128×64 is the large-grid tile when the
+   SM count is known.
+2. ~~**SM-count-aware coopmat heuristic.**~~ Done: `shaderSMCount` +
+   an L2 lower bound drive `routing::coopmat_tile`
+   (`benchmarks/campaign/coopmat-sm.md`).  3070 verification sweep and
+   pp512 A/B were blocked by a desktop embargo — rerun them.
+3. ~~**BK / WM retune of 128×64**~~ Falsified (BK=64 −2..−15%, 256
+   threads −5.5..−19%); the 512×5632 lever was the 64×64 M-fastest
+   raster (3070 a16 gate/up 33.8 → 35.2 TF/s).
 4. **ml-bench `cases` packed_b flag** so T2 can see packed lm_head.
    Landed on `grok/packed-b-cases` (CPU-side): `,packed` on `cases`,
    T2 packs k/v + gate/up + lm_head, C ABI `ta_pack_f16w_row_tiles` /
