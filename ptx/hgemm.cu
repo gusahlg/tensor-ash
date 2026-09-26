@@ -89,7 +89,10 @@ TA_DEVICE void load_stage(__half* As, __half* Bs, const __half* __restrict__ A,
 // K range [z*k_chunk, min(K, (z+1)*k_chunk)) and stores the raw partial
 // (OUT must be 0, f32) to Cv + z*M*N; `ta_splitk_reduce_f16` finishes.
 // k_chunk == 0: blockIdx.z is the batch index (dense strides).
-template <int BM, int BN, int WM, int WN, int STAGES, int ACC, int OUT, int BK_>
+// GROUP_M > 1: grouped CTA rasterization (GROUP_M tile-rows swept
+// column by column) so concurrently resident CTAs share A and B panels
+// in L2 — matters when a B panel row (K x N f16) outgrows L2.
+template <int BM, int BN, int WM, int WN, int STAGES, int ACC, int OUT, int BK_, int GROUP_M = 1>
 TA_DEVICE void hgemm_body(const __half* __restrict__ A, const __half* __restrict__ B,
                           void* __restrict__ Cv, int M, int N, int K, float alpha,
                           int k_chunk = 0) {
@@ -112,7 +115,17 @@ TA_DEVICE void hgemm_body(const __half* __restrict__ A, const __half* __restrict
         B += bz * (size_t)K * N;
     }
     const size_t c_base = bz * (size_t)M * N;
-    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    int tile_m = blockIdx.y, tile_n = blockIdx.x;
+    if (GROUP_M > 1) {
+        const int grid_n = gridDim.x, grid_m = gridDim.y;
+        const int pid = blockIdx.y * grid_n + blockIdx.x;
+        const int per_group = GROUP_M * grid_n;
+        const int first_m = (pid / per_group) * GROUP_M;
+        const int group_rows = min(grid_m - first_m, GROUP_M);
+        tile_m = first_m + (pid % per_group) % group_rows;
+        tile_n = (pid % per_group) / group_rows;
+    }
+    const int m0 = tile_m * BM, n0 = tile_n * BN;
     const int KT = max(0, (kend - kbeg + BK - 1) / BK);
 
 #pragma unroll
@@ -275,6 +288,16 @@ TA_HGEMM(ta_hgemm_f16p_128x64_s3, 128, 64, 64, 32, 3, 2, 1, 2)
 TA_HGEMM(ta_hgemm_f16p_128x128_w64x32_s3, 128, 128, 64, 32, 3, 2, 1, 1)
 TA_HGEMM(ta_hgemm_f16p_64x64_s4, 64, 64, 32, 32, 4, 2, 1, 3)
 TA_HGEMM_K(ta_hgemm_f16p_128x64_k64_s2, 128, 64, 64, 32, 2, 2, 1, 2, 64)
+
+#define TA_HGEMM_G(NAME, BM, BN, WM, WN, ST, ACC, MINB, GM)                                    \
+    extern "C" __global__ void __launch_bounds__(Cfg<BM, BN, WM, WN, ST, ACC>::THREADS, MINB)  \
+        NAME(const __half* __restrict__ A, const __half* __restrict__ B, void* __restrict__ C,  \
+             int M, int N, int K, float alpha) {                                               \
+        hgemm_body<BM, BN, WM, WN, ST, ACC, 1, 32, GM>(A, B, C, M, N, K, alpha);              \
+    }
+TA_HGEMM_G(ta_hgemm_f16_128x128_s3_g8, 128, 128, 64, 64, 3, 1, 2, 8)
+TA_HGEMM_G(ta_hgemm_f32_128x128_s3_g8, 128, 128, 64, 64, 3, 0, 2, 8)
+TA_HGEMM_G(ta_hgemm_f16p_128x64_s3_g8, 128, 64, 64, 32, 3, 2, 2, 8)
 
 // Split-K partial kernels: f32 partials into W[split][M][N] (see
 // hgemm_body), finished by ta_splitk_reduce_f16.
