@@ -26,6 +26,17 @@ __global__ void probe_affine(const uint32_t* __restrict__ src, uint32_t* __restr
     }
 }
 
+// Reverse-order twin of probe_affine (block 0 handles the LAST
+// elements), so a CUDA->CUDA chain can alternate traversal directions
+// and still detect a missing dependency.
+__global__ void probe_affine_rev(const uint32_t* __restrict__ src, uint32_t* __restrict__ dst,
+                                 uint32_t n, uint32_t mul, uint32_t add) {
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const uint32_t j = n - 1u - i;
+        dst[j] = src[j] * mul + add;
+    }
+}
+
 // Launch-overhead probe: a single thread bumps one counter.
 __global__ void probe_bump(uint32_t* __restrict__ counter) {
     if (threadIdx.x == 0 && blockIdx.x == 0) counter[0] += 1;

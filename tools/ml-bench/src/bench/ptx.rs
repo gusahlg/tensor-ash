@@ -501,6 +501,9 @@ enum Chain {
     /// alternate Vulkan (even steps) and CUDA (odd steps)
     VkCuda,
     CudaOnly,
+    /// CUDA only, alternating forward / reverse traversal (has power to
+    /// detect a missing CUDA->CUDA dependency; `CudaOnly` does not)
+    CudaAlt,
     VkOnly,
 }
 
@@ -511,6 +514,7 @@ fn sync(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
     let rec = Rec::new(ctx, 4)?;
     let module = CudaModule::from_ptx(ctx, kernels::PROBE_PTX)?;
     let cu = module.function("probe_affine")?;
+    let cu_rev = module.function("probe_affine_rev")?;
     let vk_affine = ProbeAffine::new(ctx)?;
     let dev = &ctx.device;
 
@@ -530,7 +534,12 @@ fn sync(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
         "{:<10} {:<12} {:>9} {:>12} {:>10}",
         "chain", "barrier", "trial", "mismatches", "gpu_ms"
     );
-    let chains = [Chain::VkCuda, Chain::CudaOnly, Chain::VkOnly];
+    let chains = [
+        Chain::VkCuda,
+        Chain::CudaAlt,
+        Chain::CudaOnly,
+        Chain::VkOnly,
+    ];
     let kinds = [
         BarrierKind::Compute,
         BarrierKind::AllCommands,
@@ -577,12 +586,17 @@ fn sync(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
                         }
                         let use_cuda = match chain {
                             Chain::VkCuda => s % 2 == 1,
-                            Chain::CudaOnly => true,
+                            Chain::CudaOnly | Chain::CudaAlt => true,
                             Chain::VkOnly => false,
+                        };
+                        let func = if chain == Chain::CudaAlt && s % 2 == 1 {
+                            &cu_rev
+                        } else {
+                            &cu
                         };
                         unsafe {
                             if use_cuda {
-                                cu.cmd_launch(
+                                func.cmd_launch(
                                     cb,
                                     [groups, 1, 1],
                                     [256, 1, 1],
