@@ -29,7 +29,9 @@ runs multiple `label,b,m,n,k[,f16w][,packed]` arguments in one process, avoiding
 pipeline startup and GPU clock perturbation in automation. `ab` does the same
 for a multi-kernel comparison: `ML_AB_KERNELS` lists catalog names or `auto`,
 one context is shared, tensors are allocated once per case, and `ML_ROUNDS`
-(default 5) interleaved rounds rotate which kernel runs first. The environment
+(default 5) interleaved rounds rotate which kernel runs first; `ML_AB_COLD_MB=N`
+evicts L2 with an N MiB buffer pass and re-reads A before every timed GEMM
+(cold weights, warm activations — what a model forward sees). The environment
 knobs are documented in the workspace `README.md`; `ML_DEVICE`, `ML_KERNEL`,
 `ML_TUNE`, `ML_B`/`ML_M`/`ML_N`/`ML_K`, `ML_AB_KERNELS`, `ML_ROUNDS`, and
 `ML_OUTPUT` are the common ones.

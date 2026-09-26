@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tensor_ash::{
-    Executor, ExecutorConfig, KERNEL_SPECS, KernelSelection, MatmulCall, MatmulPipeline, Tensor,
-    VulkanContext,
+    BinaryOp, Executor, ExecutorConfig, KERNEL_SPECS, KernelSelection, MatmulCall, MatmulPipeline,
+    Tensor, VulkanContext,
 };
 
 use super::cases::{BenchCase, SampleSummary};
@@ -76,6 +76,13 @@ pub(super) fn run(
     let iters = env_u32("ML_ITERS", 20).max(1);
     let warmup = env_u32("ML_WARMUP", 5);
     let no_burn = env_bool("ML_AB_NO_BURN");
+    // ML_AB_COLD_MB=N: before every timed GEMM, stream an N MiB f32
+    // buffer pair through the GPU (evicting L2) and re-read A, so B
+    // (the weights) is cold and A (the activations) warm — how a model
+    // forward sees each layer's GEMM.  Default off: back-to-back
+    // repeats keep a B that fits the L2 resident, which flatters
+    // x-fastest small tiles on big-L2 parts.
+    let cold_mb = env_u32("ML_AB_COLD_MB", 0);
     let mode = OutputMode::from_env();
 
     let mut entries = Vec::with_capacity(kernels.len());
@@ -109,18 +116,45 @@ pub(super) fn run(
     println!(
         "ab protocol: burn-in {}~300ms 4096^3 on first kernel; rounds={rounds} \
          iters={iters} warmup={warmup}; kernels={kernel_list}; per-round kernel \
-         start rotated by round index; gpu_ms = median of per-round GPU medians",
+         start rotated by round index; gpu_ms = median of per-round GPU medians; \
+         cold_l2={}",
         if no_burn { "skipped; " } else { "" },
+        if cold_mb > 0 {
+            format!("{cold_mb} MiB flush + A re-read before each GEMM")
+        } else {
+            "off".into()
+        },
     );
+    let flush = if cold_mb > 0 {
+        let elems = cold_mb.saturating_mul(1 << 18); // MiB of f32
+        Some((
+            Tensor::uninit_device(ctx, &[elems])?,
+            Tensor::uninit_device(ctx, &[elems])?,
+        ))
+    } else {
+        None
+    };
 
     let mut prepared = Vec::with_capacity(cases.len());
+    let mut a_scratch = Vec::with_capacity(cases.len());
     for case in &cases {
-        prepared.push(prepare_case_tensors(
+        let tensors = prepare_case_tensors(
             ctx,
             &entries[0].exec,
             case,
             /*requantize_a_for_tensor_core=*/ false,
-        )?);
+        )?;
+        a_scratch.push(if flush.is_some() {
+            let shape = [tensors.a.len() as u32];
+            Some(if case.a16 {
+                Tensor::uninit_device_f16(ctx, &shape)?
+            } else {
+                Tensor::uninit_device(ctx, &shape)?
+            })
+        } else {
+            None
+        });
+        prepared.push(tensors);
     }
 
     // `None` = this (case, kernel) cannot run; skip remaining rounds.
@@ -134,7 +168,11 @@ pub(super) fn run(
                     continue;
                 }
                 let entry = &entries[ki];
-                match time_round(&entry.exec, tensors, iters, warmup) {
+                let cold = flush
+                    .as_ref()
+                    .zip(a_scratch[ci].as_ref())
+                    .map(|((f0, f1), a_copy)| Cold { f0, f1, a_copy });
+                match time_round(&entry.exec, tensors, iters, warmup, cold) {
                     Ok(median_ms) => {
                         if round == 0 {
                             validate_round_zero(&entry.exec, case, tensors)?;
@@ -197,7 +235,32 @@ fn burn_in(ctx: &Arc<VulkanContext>, first: &AbKernel) -> Result<()> {
     Ok(())
 }
 
-fn time_round(exec: &Executor, tensors: &CaseTensors, iters: u32, warmup: u32) -> Result<f64> {
+/// L2-eviction buffers for `ML_AB_COLD_MB` plus an A-sized scratch the
+/// re-read of A writes to.
+struct Cold<'t> {
+    f0: &'t Tensor,
+    f1: &'t Tensor,
+    a_copy: &'t Tensor,
+}
+
+impl Cold<'_> {
+    /// Evict L2 (stream both flush buffers), then pull A back in.
+    /// Separate submissions: none of this is inside the GEMM's GPU
+    /// timestamps.
+    fn prime(&self, exec: &Executor, a: &Tensor) -> Result<()> {
+        exec.run_binary(self.f0, self.f1, self.f0, BinaryOp::AddScaled { beta: 0.0 })?;
+        exec.run_binary(a, a, self.a_copy, BinaryOp::AddScaled { beta: 0.0 })?;
+        Ok(())
+    }
+}
+
+fn time_round(
+    exec: &Executor,
+    tensors: &CaseTensors,
+    iters: u32,
+    warmup: u32,
+    cold: Option<Cold<'_>>,
+) -> Result<f64> {
     let call = MatmulCall {
         a: &tensors.a,
         b: &tensors.b,
@@ -206,10 +269,16 @@ fn time_round(exec: &Executor, tensors: &CaseTensors, iters: u32, warmup: u32) -
         accumulate: false,
     };
     for _ in 0..warmup {
+        if let Some(cold) = &cold {
+            cold.prime(exec, &tensors.a)?;
+        }
         exec.run_matmuls(std::slice::from_ref(&call))?;
     }
     let mut gpu_ms = Vec::with_capacity(iters as usize);
     for _ in 0..iters {
+        if let Some(cold) = &cold {
+            cold.prime(exec, &tensors.a)?;
+        }
         let stats = exec.run_matmuls(std::slice::from_ref(&call))?;
         let Some(ns) = stats.gpu_time_ns else {
             bail!("GPU timestamps unavailable");
