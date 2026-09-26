@@ -476,7 +476,7 @@ code; the rest is the proposal.
   512-row prefill shapes on either GPU; it only reduces f16-acc error.
 * **8-warp 128x128, BK=64, 256x128 f16 tiles**: no general win over the
   4-warp 128x128 3-stage kernel (BK=64 helps 512x2048x2048 slightly).
-* **4-stage / 64 KiB+ shared memory** hurts: one CTA per SM (s4 variants
+* **128x128 with 4 stages (64 KiB shared)** hurts: one CTA per SM (s4
   -10 to -25% vs s3).
 
 ## Pending (blocked or not done)
