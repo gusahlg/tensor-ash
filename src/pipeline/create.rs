@@ -16,8 +16,10 @@ pub(crate) fn create_shader_module(
 ) -> Result<vk::ShaderModule> {
     assert!(spv.len().is_multiple_of(4), "SPIR-V size not 4-aligned");
     let words: Vec<u32> = spv
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
     unsafe {
         ctx.device

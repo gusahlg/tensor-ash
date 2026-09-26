@@ -258,16 +258,20 @@ impl GgufFile {
                 let mut bytes = vec![0u8; count * 4];
                 read_exact(&mut self.reader, &mut bytes)?;
                 Ok(bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
                     .collect())
             }
             GGML_TYPE_F16 => {
                 let mut bytes = vec![0u8; count * 2];
                 read_exact(&mut self.reader, &mut bytes)?;
                 Ok(bytes
-                    .chunks_exact(2)
-                    .map(|b| tensor_ash::dtype::f16_bits_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| tensor_ash::dtype::f16_bits_to_f32(u16::from_le_bytes(*b)))
                     .collect())
             }
             other => bail!(

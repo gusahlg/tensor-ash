@@ -57,8 +57,10 @@ fn workgroup_shared_bytes(spv: &[u8]) -> u32 {
     const STORAGE_CLASS_WORKGROUP: u32 = 4;
 
     let words: Vec<u32> = spv
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().expect("4-byte chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
     // build.rs embeds glslc output, which is always little-endian.
     assert_eq!(words[0], 0x0723_0203, "embedded SPIR-V has bad magic");
