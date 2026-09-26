@@ -23,3 +23,15 @@ Louise trees: `~/ta-wt/cm-base` (7cfca58 grokmerge build), `cm-sm`
 - Desktop embargo lifted (no embargo file at 20:37).
 - NEXT: cold-L2 sweeps on the 4060 (then 3070), refit/drop the large-L2
   branch, 3070 verify sweep + pp512 A/B, 4060 pp512 re-check.
+
+## 2026-09-26 (successor #4, from 20:53)
+
+- Successor #3 (20:44-20:50) only queued a 4060 cold sweep that never
+  started (died waiting for the lock).  Nothing else lost.
+- Queued: 4060 cold sweep (`ML_AB_COLD_MB=64`, all 77 shapes, cm-var
+  binary = 34ad9f1 code) -> louise `~/ta-wt/cm-results/4060cold`;
+  3070 warm verify sweep (desktop binary copy
+  `$SP/cm4/bin/ml_bench-34ad9f1`) -> `$SP/cm4/results/verify-3070`,
+  then a 3070 cold subset (a16 + m512 + t128) -> `cold-3070`.
+- Desktop grokmerge build for the 3070 pp512 A/B: `git archive 7cfca58`
+  into `target/cm-base-src/` (ignored), `tabuild build --release -p llama-ash`.
