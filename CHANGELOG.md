@@ -4,6 +4,15 @@
 
 ### Changed
 
+- **`llama_ash bench` tg is per-token again by default**: the packed-
+  GEMV leg had silently switched tg to `decode_unrolled` (all `tg`
+  steps baked into ONE submission, no per-token host round-trip),
+  which is not comparable to llama-bench's tg (one `llama_decode` +
+  sync per token) or to earlier scoreboards.  The one-submit replay
+  stays available as `--tg-unrolled` (an upper bound).  `decode_many`
+  keeps its fence-only replay; `Model::time_decode_steps` opts back
+  into per-token GPU timestamps (the thesis harness's T1 needs them —
+  T1 had been SKIPping since the fence-only change).
 - **Module splits, no new crates**: `elementwise.rs` (2116) and
   `llama-ash` `model.rs` (1667) are directories; coopmat/packed-row
   routing lives in `pipeline/routing.rs`; host u32 cells

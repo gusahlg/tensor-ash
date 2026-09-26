@@ -2,7 +2,7 @@
 //! and measure prefill / decode throughput.
 //!
 //! Subcommands:
-//!   bench    -m <gguf> [--pp 512] [--tg 128] [--ctx 2048]
+//!   bench    -m <gguf> [--pp 512] [--tg 128] [--ctx 2048] [--tg-unrolled]
 //!   generate -m <gguf> --ids "1,15043,3186" -n 24 [--ctx 2048]
 
 use std::path::{Path, PathBuf};
@@ -21,6 +21,9 @@ struct Args {
     ctx: u32,
     ids: Vec<u32>,
     n: u32,
+    /// Time tg as ONE submission of `tg` baked-position decode steps
+    /// instead of one submission per token.
+    tg_unrolled: bool,
 }
 
 fn parse_args(mut args: std::env::Args) -> Result<(String, Args)> {
@@ -32,6 +35,7 @@ fn parse_args(mut args: std::env::Args) -> Result<(String, Args)> {
         ctx: 2048,
         ids: Vec::new(),
         n: 24,
+        tg_unrolled: false,
     };
     while let Some(flag) = args.next() {
         let mut value = || {
@@ -44,6 +48,7 @@ fn parse_args(mut args: std::env::Args) -> Result<(String, Args)> {
             "--tg" => parsed.tg = value()?.parse().context("--tg")?,
             "--ctx" => parsed.ctx = value()?.parse().context("--ctx")?,
             "-n" => parsed.n = value()?.parse().context("-n")?,
+            "--tg-unrolled" => parsed.tg_unrolled = true,
             "--ids" => {
                 parsed.ids = value()?
                     .split(',')
@@ -59,7 +64,7 @@ fn parse_args(mut args: std::env::Args) -> Result<(String, Args)> {
     Ok((cmd, parsed))
 }
 
-const USAGE: &str = "usage:\n  llama_ash bench -m <gguf> [--pp 512] [--tg 128] [--ctx 2048]\n  llama_ash generate -m <gguf> --ids \"1,15043,3186\" -n 24 [--ctx 2048]";
+const USAGE: &str = "usage:\n  llama_ash bench -m <gguf> [--pp 512] [--tg 128] [--ctx 2048] [--tg-unrolled]\n  llama_ash generate -m <gguf> --ids \"1,15043,3186\" -n 24 [--ctx 2048]";
 
 fn make_model(path: &Path, ctx_len: u32) -> Result<Model> {
     // Honors ML_DEVICE so multi-GPU hosts can pick the device.
@@ -100,7 +105,13 @@ fn bench(args: &Args) -> Result<()> {
     if !warm_logits.iter().all(|v| v.is_finite()) {
         bail!("warmup prefill produced non-finite logits");
     }
-    model.decode_unrolled(warm_id, 128)?;
+    // The unrolled tg path records its `tg`-step command buffer here,
+    // outside the timed region (it is keyed by start position + count).
+    if args.tg_unrolled {
+        model.decode_unrolled(warm_id, args.tg)?;
+    } else {
+        model.decode_many(warm_id, 16)?;
+    }
     log::info!("warmup prefill + decode done (argmax {warm_id}); resetting caches");
     model.reset()?;
 
@@ -130,7 +141,13 @@ fn bench(args: &Args) -> Result<()> {
 
     model.breakdown.borrow_mut().clear();
     let t1 = Instant::now();
-    let generated = if args.tg >= 32 {
+    // Default: one submission + fence per token, like llama-bench's
+    // tg (one llama_decode + sync per token) and every interactive
+    // caller that must see each token.  `--tg-unrolled` replays one
+    // pre-recorded submission of all `tg` steps — no per-token host
+    // round-trip at all, so it is an upper bound, not comparable to
+    // llama.cpp's tg numbers.
+    let generated = if args.tg_unrolled {
         model.decode_unrolled(next, args.tg)?
     } else {
         model.decode_many(next, args.tg)?
