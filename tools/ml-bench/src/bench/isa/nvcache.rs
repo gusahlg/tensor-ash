@@ -12,8 +12,9 @@
 //!   0x20  u32 entry_count
 //!   0x24  entry[entry_count]:
 //!           key[16] | u32 len | "CPKV" | u32 0 | key[16] | u64 hash
-//!           | u32 len | u32 flags(0) | u32 raw_size | zstd frame (len-4 B)
-//!                                                  -> 60 + len bytes
+//!           | u32 len | u32 flags(0) | value (len B)  -> 60 + len bytes
+//!         value = u32 raw_size | zstd frame (len-4 B), or, for the
+//!         `_NVDICT_` entry, a zstd dictionary the other frames use
 //! zstd frame -> payload (raw_size bytes) holding one or more
 //!   "NVDANVVM" + NVuc container (+ pipeline-level records we do not
 //!   decode: workgroup size, knob hash dump, the SPIR-V itself)
@@ -36,16 +37,16 @@ use anyhow::{Context, Result, bail, ensure};
 
 const VK_HEADER_BYTES: usize = 32;
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+const ZSTD_DICT_MAGIC: [u8; 4] = [0x37, 0xa4, 0x30, 0xec];
 const NVDA_MAGIC: &[u8; 8] = b"NVDANVVM";
 const NVUC_MAGIC: &[u8; 4] = b"NVuc";
 
-/// One cache entry after decompression.  Some entries' zstd frames
-/// reference a dictionary the driver keeps internally (seen in fresh
-/// single-pipeline caches on AD107: a second, small entry next to the
-/// ISA entry); those cannot be decoded here and carry `Err(reason)`.
+/// One cache entry after decompression.
 pub(crate) struct CacheEntry {
+    /// Decompressed value, or why it was not decoded (the driver's
+    /// zstd dictionary entry itself, or an unknown encoding).
     pub(crate) payload: Result<Vec<u8>, String>,
-    /// Stored (possibly compressed) bytes and the declared raw size.
+    /// Stored (possibly compressed) value bytes and the declared raw size.
     pub(crate) stored_bytes: usize,
     pub(crate) raw_bytes: usize,
 }
@@ -66,6 +67,13 @@ pub(crate) fn cache_device_id(blob: &[u8]) -> Option<u32> {
 }
 
 /// Parse a NVIDIA pipeline-cache blob into its decompressed entries.
+///
+/// Entry values are `[u32 raw_size][zstd frame]`, except the driver's
+/// zstd dictionary, stored as its own entry (key bytes 8..16 =
+/// `_NVDICT_`, value = a standard zstd dictionary, magic `37 a4 30 ec`,
+/// ~2 MB).  AD107 / driver 595.80 compresses fresh entries against it;
+/// the 3070's long-lived cache (595.99) holds none.  Dictionaries are
+/// loaded first, then every frame is decoded with them available.
 pub(crate) fn parse_cache_blob(blob: &[u8]) -> Result<Vec<CacheEntry>> {
     ensure!(
         blob.len() >= VK_HEADER_BYTES + 4,
@@ -80,7 +88,7 @@ pub(crate) fn parse_cache_blob(blob: &[u8]) -> Result<Vec<CacheEntry>> {
     );
     let count = u32_at(blob, VK_HEADER_BYTES)? as usize;
     let mut pos = VK_HEADER_BYTES + 4;
-    let mut entries = Vec::with_capacity(count);
+    let mut values: Vec<&[u8]> = Vec::with_capacity(count);
     for index in 0..count {
         let len = u32_at(blob, pos + 16)? as usize;
         let body = pos + 20;
@@ -92,18 +100,42 @@ pub(crate) fn parse_cache_blob(blob: &[u8]) -> Result<Vec<CacheEntry>> {
             u32_at(blob, body + 32)? as usize == len,
             "cache entry {index}: inner length disagrees with outer"
         );
-        // [u32 flags] then `len` bytes: [u32 raw_size][data (len - 4)]
-        let raw_size = u32_at(blob, body + 40)? as usize;
-        let data_start = body + 44;
-        let data = blob
-            .get(data_start..data_start + len - 4)
-            .with_context(|| format!("cache entry {index}: truncated data"))?;
+        // [u32 flags (0)] then the `len`-byte value.
+        values.push(
+            blob.get(body + 40..body + 40 + len)
+                .with_context(|| format!("cache entry {index}: truncated value"))?,
+        );
+        // key+len (20) + CPKV..len (36) + flags (4) + len.
+        pos += 60 + len;
+    }
+
+    let mut decoder = ruzstd::decoding::FrameDecoder::new();
+    for value in values.iter().filter(|v| v.starts_with(&ZSTD_DICT_MAGIC)) {
+        let dict = ruzstd::decoding::Dictionary::decode_dict(value)
+            .map_err(|err| anyhow::anyhow!("zstd dictionary entry: {err}"))?;
+        decoder
+            .add_dict(dict)
+            .map_err(|err| anyhow::anyhow!("zstd dictionary entry: {err}"))?;
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    for (index, value) in values.into_iter().enumerate() {
+        if value.starts_with(&ZSTD_DICT_MAGIC) {
+            entries.push(CacheEntry {
+                payload: Err(format!("zstd dictionary ({} B)", value.len())),
+                stored_bytes: value.len(),
+                raw_bytes: value.len(),
+            });
+            continue;
+        }
+        let raw_size = u32_at(value, 0)? as usize;
+        let data = &value[4..];
         let payload = if data.starts_with(&ZSTD_MAGIC) {
             let mut out = Vec::with_capacity(raw_size);
             let mut cursor = data;
-            match ruzstd::decoding::StreamingDecoder::new(&mut cursor) {
-                Ok(mut decoder) => {
-                    decoder
+            match ruzstd::decoding::StreamingDecoder::new_with_decoder(&mut cursor, &mut decoder) {
+                Ok(mut stream) => {
+                    stream
                         .read_to_end(&mut out)
                         .with_context(|| format!("cache entry {index}: zstd decode"))?;
                     ensure!(
@@ -123,8 +155,6 @@ pub(crate) fn parse_cache_blob(blob: &[u8]) -> Result<Vec<CacheEntry>> {
             stored_bytes: data.len(),
             raw_bytes: raw_size,
         });
-        // key+len (20) + CPKV..len (36) + flags (4) + len.
-        pos += 60 + len;
     }
     Ok(entries)
 }
