@@ -317,24 +317,26 @@ ratios, not absolute TF/s, across tables.
 
 ### f16p: f16-rate mma with f32 promotion
 
-`ACC=2` kernels run `mma ...f16.f16.f16.f16` inside one BK=32 k-tile
-(two m16n8k16 steps), then add the f16 partials into f32 registers and
-zero them.  Error (rel-RMS vs f64, 4060, split-K harness numbers where
-the non-split run is pending):
+`ACC=2` kernels run `mma ...f16.f16.f16.f16` inside one k-tile (BK=32:
+two m16n8k16 steps; BK=64: four), then add the f16 partials into f32
+registers and zero them.  4060, round 3 (`ml_bench ptx hgemm`, TF/s and
+rel-RMS vs f64; TA = coopmat1 in the same process):
 
-| shape | f32 acc | f16p | f16 acc | cuBLAS 16F |
-|---|---:|---:|---:|---:|
-| 512x2048x2048 | 2.05e-4 | 3.81e-4 | 2.41e-3 | 1.65e-3 |
-| 512x5632x2048 | 2.14e-4 | 3.85e-4 | 2.39e-3 | 1.61e-3 |
-| 512x2048x5632 | 2.15e-4 | 3.87e-4 | 3.81e-3 | 2.83e-3 |
-| 2048^3 | 2.16e-4 | 3.88e-4 | 2.27e-3 | 1.62e-3 |
+| shape | TA | f16p 128x64 BK=32 | f16p 128x64 BK=64 | f16 acc 128x128 | rel-RMS: f32 acc / f16p BK32 / f16p BK64 / f16 acc / cuBLAS 16F |
+|---|---:|---:|---:|---:|---|
+| 512x2048x2048 | 28.0 | 33.4 (1.19x) | 38.3 (1.37x) | 40.2 (1.43x) | 2.05e-4 / 3.81e-4 / 4.98e-4 / 2.41e-3 / 1.65e-3 |
+| 512x5632x2048 | 28.1 | 35.6 (1.27x) | 42.1 (1.50x) | 46.4 (1.62x) | 2.14e-4 / 3.85e-4 / 4.62e-4 / 2.39e-3 / 1.61e-3 |
+| 512x2048x5632 | 26.0 | 34.5 (1.19x) | 36.2 (1.40x) | 43.2 (1.48x) | 2.15e-4 / 3.87e-4 / 4.72e-4 / 3.81e-3 / 2.83e-3 |
+| 2048^3 | 26.5 | 36.8 (1.38x) | 43.0 (1.62x) | 46.6 (1.74x) | 2.16e-4 / 3.88e-4 / 4.88e-4 / 2.27e-3 / 1.62e-3 |
+| 4096^3 | 26.3 | 33.0 (1.28x) | 34.0 (1.29x) | 44.0 (1.69x) | 1.99e-4 / 3.80e-4 / 4.70e-4 / 3.19e-3 / 1.94e-3 |
 
-f16p is 6-10x more accurate than f16 accumulate (and 4-7x more accurate
-than what llama.cpp's cuBLAS path delivers), 1.8x the f32-accumulate
-error (which is itself dominated by the final f16 rounding of C).  Its
-cost is the promotion adds: in the kernel sweep it runs ~15% behind the
-f16 kernels (e.g. 4060 512x2048x2048 split/2: 33.7 vs 38.7 TF/s), still
-1.2x coopmat1.
+f16p with BK=64 keeps ~90% of the f16-accumulate speed (1.29-1.62x
+coopmat1) at **5-8x lower error than f16 accumulate and 3.4-6x lower
+than what llama.cpp's cuBLAS `COMPUTE_16F` path delivers**, 2.2-2.4x
+the f32-accumulate error (itself dominated by the final f16 rounding of
+C).  It is the tensor-ash-only option cuBLAS does not offer: the route
+uses it for `ML_PTX_GEMM=f16p`.  Split-K f16p (two-stage) gave the same
+3.8e-4 error but no speed.
 
 ### End-to-end: TinyLlama-1.1B f16 prefill (pp512) through the integrated route
 

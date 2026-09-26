@@ -17,7 +17,7 @@
 //! * `f16`  — mma f16 x f16 -> f16, 2x tensor rate on GeForce parts;
 //!   what llama.cpp's CUDA backend gets from cuBLAS
 //!   (`CUBLAS_COMPUTE_16F`) for f16 weights.
-//! * `f16p` — f16-rate mma within one BK=32 k-tile, promoted into f32
+//! * `f16p` — f16-rate mma within one k-tile (BK=64 pick), promoted into f32
 //!   registers after every k-tile (tensor-ash-only; near-f32 error).
 //!
 //! `ML_PTX_GEMM_KERNEL=<entry name>` forces one kernel for every
@@ -126,7 +126,7 @@ impl PtxRoute {
                     "ta_hgemm_f16_128x64_s3"
                 }
             }
-            PtxAccum::F16Promoted => "ta_hgemm_f16p_128x64_s3",
+            PtxAccum::F16Promoted => "ta_hgemm_f16p_128x64_k64_s2",
         };
         self.gemm.hgemm_index(name)
     }
