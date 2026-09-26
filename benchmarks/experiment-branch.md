@@ -317,7 +317,9 @@ reads barrier correctly).
 `RopeScatter(k)`, `CopyStrided(v)` deleted from the decode graph —
 12 -> 9 ops/layer, 66 fewer dispatches/token (269 -> 203), and the
 k-append hazard barrier is gone (8 -> 7 barriers/layer, −22
-barriers/token ≈ −170 µs of drain at the measured ~7.7 µs/barrier).
+barriers/token ≈ −170 µs of drain at the then-assumed ~7.7 µs/barrier —
+*falsified 2026-08-15*: T3's direct chain-slope measurement is ~0.9 µs,
+so the 22 barriers were worth ~20 µs; see `THESES.md` T3).
 The standalone Rope / RopeScatter / CopyStrided ExecOps stay — prefill
 and the perop path still use them.
 
@@ -535,7 +537,11 @@ coverage (f16 activations end-to-end, epilogue-capable coopmat).
 
 **Failure analysis that drove it** (LLAMA_ASH_BREAKDOWN per-op GPU timing):
 kernels 7.26 ms vs whole-CB 9.97 ms exposed ~2.7 ms of full-barrier drain
-(~7.7 µs each); kernel table showed FFN GEMVs at 58-72% of bandwidth
+(~7.7 µs each — an inference, *falsified 2026-08-15* by T3's direct
+measurement of ~0.9 µs/barrier: at that price ~350 barriers explain
+~0.3 ms, so most of the 2.7 ms gap was something else that was never
+re-attributed; see `THESES.md` T3); kernel table showed FFN GEMVs at
+58-72% of bandwidth
 (deep-K serial chains, narrow-N occupancy starvation) while attention was
 only 12% of the token. The naive "submission overhead dominates" theory
 was half-wrong: one submission alone bought +6%; the rest came from
@@ -556,7 +562,8 @@ every step. 85/85 GPU tests.
 
 ### Remaining path to the goal (tensor-ash > CUDA), ranked
 
-Decode budget now ≈ 8.9 ms: ~6.9 ms kernels + ~1.6 ms barrier drain +
+Decode budget now ≈ 8.9 ms: ~6.9 ms kernels + ~1.6 ms barrier drain (the
+barrier term rests on the falsified 7.7 µs/barrier figure; T3) +
 ~0.5 ms host. Target 5.7 ms (175 t/s), stretch below.
 1. **Op fusion to cut barrier count**: RoPE-into-cache (write the cache
    from the rope kernel; −44 ops), norm+matmul pairs; a decode-attention

@@ -113,7 +113,7 @@ mod tests {
 # top comment
 ["NVIDIA GeForce RTX 3070"]
 mem_bw_gbps = 448.0   # spec sheet
-t3_barrier_us = 7.7
+t3_barrier_us = 0.92
 
 [bare-name]
 x = 1
@@ -121,7 +121,7 @@ x = 1
         let parsed = parse(text).unwrap();
         let ga104 = parsed.device("NVIDIA GeForce RTX 3070").unwrap();
         assert_eq!(ga104.get("mem_bw_gbps"), Some(&448.0));
-        assert_eq!(ga104.get("t3_barrier_us"), Some(&7.7));
+        assert_eq!(ga104.get("t3_barrier_us"), Some(&0.92));
         assert_eq!(parsed.device("bare-name").unwrap().get("x"), Some(&1.0));
         assert!(parsed.device("unknown").is_none());
     }

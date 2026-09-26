@@ -55,8 +55,9 @@ impl Executor {
 
         // Header: arrived[2] + phase + pad, then 80-byte jobs.  Device-local
         // so the quorum atomics stay on the GPU; a host-visible sync
-        // cell would bounce every arrival over PCIe and lose the
-        // 7.7 µs pipeline-barrier win.
+        // cell would bounce every arrival over PCIe and cost far more
+        // than the pipeline barrier it replaces (~0.9 µs on GA104, T3
+        // in benchmarks/THESES.md).
         let header = [0u32; 4];
         let nbytes = std::mem::size_of_val(&header) + packed.len() * std::mem::size_of::<GemvJob>();
         let buf = Buffer::new(

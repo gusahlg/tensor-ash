@@ -108,7 +108,7 @@ const DESCRIPTIONS: &[(&str, &str)] = &[
     ),
     (
         "t3",
-        "barrier cost: a full compute barrier drains ~7.7 us (trivial-kernel chain slopes)",
+        "barrier cost: a full compute barrier drains ~0.9 us (trivial-kernel chain slopes)",
     ),
     (
         "t4",
@@ -383,8 +383,8 @@ mod tests {
         assert_eq!(check_min(0.85, Some(0.80)), Verdict::Pass);
         assert_eq!(check_min(0.75, Some(0.80)), Verdict::Fail);
         assert_eq!(check_min(0.75, None), Verdict::Info);
-        assert_eq!(check_within(8.0, Some(7.7), 0.5), Verdict::Pass);
-        assert_eq!(check_within(20.0, Some(7.7), 0.5), Verdict::Fail);
-        assert_eq!(check_within(20.0, None, 0.5), Verdict::Info);
+        assert_eq!(check_within(1.3, Some(0.92), 0.5), Verdict::Pass);
+        assert_eq!(check_within(7.7, Some(0.92), 1.0), Verdict::Fail);
+        assert_eq!(check_within(7.7, None, 1.0), Verdict::Info);
     }
 }

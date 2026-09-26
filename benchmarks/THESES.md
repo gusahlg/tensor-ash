@@ -87,11 +87,27 @@ post-timing validation.
 bandwidth.  The tiny k/v class is the canary — launch overhead bites
 fixed-cost-first.  Keys: `mem_bw_gbps`, `t2_min_bw_frac`.
 
-## T3 — a full compute barrier drains ~7.7 µs
+## T3 — a full compute barrier drains ~0.9 µs
 
 **Claim.** One compute-to-compute barrier inside a recorded graph
-costs ~7.7 µs on GA104 (drain + lost overlap), which is what makes
-barrier-elimination legs (leg 15: −22 barriers/token ≈ −170 µs) pay.
+costs ~0.9 µs of fixed drain + refill (GA104/595.x: 0.92 µs).  Decode
+records ~158 hazard barriers per token (7 per layer × 22 layers plus
+the tail; T1's census row reports the live count), so barriers cost
+~0.15 ms of a ~5.5-6 ms token — **barrier elimination is not a decode
+lever**.  A fusion pays for the dispatches, bytes and kernel time it
+removes, not for the barriers.
+
+**Falsification history.** The campaign carried ~7.7 µs/barrier for
+months: leg 5 divided a 2.7 ms gap (summed per-op GPU times 7.26 ms vs
+the whole command buffer 9.97 ms) by the ~350 barriers of that era,
+and leg 15 credited −22 barriers/token with ≈ −170 µs.  The figure
+was an attribution, never a measurement.  The first `ml_bench thesis`
+baseline (RTX 3070, driver 595.80, 2026-08-15) measured it directly —
+serialized chain 34 → 266 µs vs overlapped chain 6 → 31 µs over
+32 → 256 dispatches = **0.92 µs/barrier**, 8× below the claim — and
+the expectations file was re-recorded (commit c52cd16).  What the
+2.7 ms leg-5 gap actually was was never re-attributed; at 0.92 µs the
+barriers explain ~0.3 ms of it.
 
 **Measurement.** Two GPU-timestamped `run_exec_ops` chains of the
 same trivial kernel at N=32 and N=256, interleaved:
@@ -108,9 +124,18 @@ new shader was needed: an empty kernel cannot force hazard barriers
 `op_binary_f32` at one workgroup already is that kernel wired through
 the normal pipeline machinery.
 
-**Provenance.** Leg 15 accounting (~7.7 µs/barrier inferred from the
-22-barrier elimination).  Keys: `t3_barrier_us`, `t3_rel_tol`
-(±50% — the slope-difference definition is noisy at the µs level).
+**Scope.** With a trivial predecessor this is the barrier's *fixed*
+cost.  Behind a real kernel a barrier also exposes the predecessor's
+tail (the last partial wave idles SMs until it drains); that loss is
+kernel-dependent and already sits inside every kernel's standalone
+single-dispatch timing (T2, T5 pieces), so T5's accounting charges
+barriers at this fixed price only.
+
+**Provenance.** Direct measurement, 2026-08-15 baseline (above);
+re-measured per GPU in the regression-target table.  Keys:
+`t3_barrier_us`, `t3_rel_tol` (±100% — a slope difference at the
+sub-µs level is noisy; the gate exists to catch a return to
+multi-µs drains, not to resolve 0.1 µs).
 
 ## T4 — a submission round-trip costs ~30-60 µs
 
