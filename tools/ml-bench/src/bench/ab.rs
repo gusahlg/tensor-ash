@@ -264,8 +264,8 @@ fn print_results(
     match mode {
         OutputMode::Table => {
             println!(
-                "{:<24} {:<28} {:>10} {:>10} {:>8} {:>8}  {}",
-                "case", "kernel", "gpu_ms", "gpu_ms_min", "TF/s", "ratio", "route"
+                "{:<24} {:<28} {:>10} {:>10} {:>8} {:>8}  route",
+                "case", "kernel", "gpu_ms", "gpu_ms_min", "TF/s", "ratio"
             );
             println!("{}", "-".repeat(120));
         }
