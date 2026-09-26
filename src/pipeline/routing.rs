@@ -106,8 +106,9 @@ const CTAS_PER_SM_64: u64 = 7;
 ///    x-fastest order re-streams B `xp = ceil(rows / max(1, W/cols))`
 ///    times; M-fastest re-streams A `mp = ceil(cols / max(1, W/rows))`
 ///    times.  M-fast when it moves clearly fewer bytes
-///    (`|A| mp + |B| < 0.75 (|B| xp + |A|)`) and its A re-reads stay
-///    small (`|A| (mp - 1) <= 8 MiB`).
+///    (`|A| mp + |B| < 0.75 (|B| xp + |A|)`), its A re-reads stay
+///    small (`|A| (mp - 1) <= 8 MiB`), and B does not already fit a
+///    large L2 (then re-streams hit in L2 and x-fast is as good).
 /// 2. **Wave balance.**  Per tile, `n = ceil(tiles / S)` CTAs land on
 ///    the busiest SM; `score = tiles/(S n) * min(1, n/3) * rho`, i.e.
 ///    SM load balance times an occupancy term (fewer than 3 CTAs per SM
@@ -145,7 +146,11 @@ pub(crate) fn coopmat_tile(
     let b_bytes = k * n * 2;
     let xp = passes(rows, cols);
     let mp = passes(cols, rows);
-    let m_fast = a_bytes * (mp - 1) <= 8 * MIB
+    let l2 = device.l2_bytes.unwrap_or(0);
+    let large_l2 = l2 >= LARGE_L2_BYTES;
+    // An L2 that holds all of B makes x-fast re-streams free.
+    let m_fast = !(large_l2 && b_bytes <= l2)
+        && a_bytes * (mp - 1) <= 8 * MIB
         && ((a_bytes * mp + b_bytes) as f64) < 0.75 * (b_bytes * xp + a_bytes) as f64;
     let t64 = if m_fast {
         CoopmatTile::T64Mfast
@@ -155,7 +160,6 @@ pub(crate) fn coopmat_tile(
     if !m.is_multiple_of(128) {
         return Some(t64);
     }
-    let large_l2 = device.l2_bytes.is_some_and(|bytes| bytes >= LARGE_L2_BYTES);
     let rho = match (large_l2, a16) {
         (true, true) => 1.02,
         (true, false) => 0.92,
@@ -396,11 +400,11 @@ mod bda_tests {
         use CoopmatTile::*;
         let tile = |m, n, k, a16| coopmat_tile(1, m, n, k, a16, RTX4060);
         // TinyLlama pp512 (f16 activations): 64x64 won all four GEMMs;
-        // M-fast is neutral here (24 MiB L2) and chosen by traffic.
-        assert_eq!(tile(512, 2048, 2048, true), Some(T64Mfast)); // q/o
-        assert_eq!(tile(512, 2560, 2048, true), Some(T64Mfast)); // concat QKV
-        assert_eq!(tile(512, 5632, 2048, true), Some(T64Mfast)); // gate/up
-        assert_eq!(tile(512, 2048, 5632, true), Some(T64Mfast)); // down
+        // B fits the 24 MiB L2, so the raster stays x-fast.
+        assert_eq!(tile(512, 2048, 2048, true), Some(T64)); // q/o
+        assert_eq!(tile(512, 2560, 2048, true), Some(T64)); // concat QKV
+        assert_eq!(tile(512, 5632, 2048, true), Some(T64)); // gate/up
+        assert_eq!(tile(512, 2048, 5632, true), Some(T64)); // down
         // Long prompts: 64x64 x-fast keeps winning a16 on the big L2.
         assert_eq!(tile(1920, 5632, 2048, true), Some(T64));
         assert_eq!(tile(128, 2048, 2048, true), Some(T64));
