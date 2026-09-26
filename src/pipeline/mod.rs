@@ -79,6 +79,10 @@ pub struct MatmulPipeline {
     tune_save: Mutex<()>,
     /// Hash binding persisted winners to this exact shader build.
     shader_hash: u64,
+    /// Opt-in PTX route for the a16 family (`ML_PTX=1` +
+    /// `ML_PTX_GEMM=f32|f16|f16p`); `None` keeps every matmul on the
+    /// Vulkan kernels.  See [`crate::ptx::PtxRoute`].
+    pub(crate) ptx_route: Option<crate::ptx::PtxRoute>,
 }
 
 impl MatmulPipeline {
@@ -240,8 +244,21 @@ impl MatmulPipeline {
                 tuned: RwLock::new(tuned),
                 tune_save: Mutex::new(()),
                 shader_hash,
+                // A failed PTX JIT must not take the Vulkan path down.
+                ptx_route: crate::ptx::PtxRoute::from_env(ctx).unwrap_or_else(|err| {
+                    log::warn!("tensor-ash: PTX a16 route disabled: {err:#}");
+                    None
+                }),
             })
         }
+    }
+
+    /// The PTX kernel an a16 (f16 A/B/C) batch-1 matmul of this shape
+    /// would record instead of its coopmat kernel, when the opt-in PTX
+    /// route is on.
+    pub fn ptx_a16_kernel(&self, m: u32, n: u32, k: u32) -> Option<&'static str> {
+        let route = self.ptx_route.as_ref()?;
+        route.select(m, n, k).map(|i| route.kernel_name(i))
     }
 
     pub fn select_kernel(&self, batch: u32, m: u32, n: u32, k: u32) -> &MatmulKernel {
@@ -596,6 +613,7 @@ impl Drop for MatmulPipeline {
     fn drop(&mut self) {
         unsafe {
             let _ = self.ctx.device.device_wait_idle();
+            self.ptx_route = None;
             for (_, pipeline) in self.epilogue_pipelines.lock().drain() {
                 if pipeline != vk::Pipeline::null() {
                     self.ctx.device.destroy_pipeline(pipeline, None);

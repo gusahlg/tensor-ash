@@ -25,8 +25,10 @@
 pub mod gemm;
 pub mod kernels;
 mod probe;
+mod route;
 
 pub use probe::ProbeAffine;
+pub use route::{PtxAccum, PtxRoute};
 
 use std::ffi::{CString, c_void};
 use std::sync::Arc;
@@ -45,6 +47,22 @@ fn launch_fns(ctx: &VulkanContext) -> Result<&ash::nv::cuda_kernel_launch::Devic
     ctx.cuda_launch.as_ref().ok_or_else(|| {
         anyhow!("VK_NV_cuda_kernel_launch is not enabled (set ML_PTX=1 on an NVIDIA driver)")
     })
+}
+
+fn module_cache_path(ctx: &VulkanContext, label: &str, ptx: &str) -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in ptx.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let s = &ctx.device_summary;
+    Some(base.join("tensor-ash").join(format!(
+        "ptx_{label}_v{:04x}_{:04x}_d{}_{h:016x}.cubin",
+        s.vendor_id, s.device_id, s.driver_version
+    )))
 }
 
 /// One kernel parameter, passed by value like a `cuLaunchKernel`
@@ -94,6 +112,47 @@ impl CudaModule {
             ctx: Arc::clone(ctx),
             raw,
         }))
+    }
+
+    /// [`Self::from_ptx`] through a persistent per-device cache of the
+    /// driver-compiled cubin (`vkGetCudaModuleCacheNV`), keyed by
+    /// device, driver version and a hash of the PTX text.  A cold JIT
+    /// of the GEMM modules costs 0.4-0.7 s; reloading the cubin costs
+    /// ~0.1 ms.  Any cache miss/corruption falls back to the JIT.
+    /// Returns the module and whether it came from the cache.
+    pub fn from_ptx_cached(
+        ctx: &Arc<VulkanContext>,
+        label: &str,
+        ptx: &str,
+    ) -> Result<(Arc<Self>, bool)> {
+        let path = module_cache_path(ctx, label, ptx);
+        if let Some(path) = path.as_ref()
+            && let Ok(blob) = std::fs::read(path)
+        {
+            match Self::from_data(ctx, &blob) {
+                Ok(module) => return Ok((module, true)),
+                Err(err) => log::warn!(
+                    "tensor-ash: ignoring PTX module cache {} ({err})",
+                    path.display()
+                ),
+            }
+        }
+        let module = Self::from_ptx(ctx, ptx)?;
+        if let Some(path) = path
+            && let Ok(blob) = module.cache_data()
+        {
+            let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+            let written = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&tmp, &blob))
+                .and_then(|()| std::fs::rename(&tmp, &path));
+            if let Err(err) = written {
+                log::warn!("tensor-ash: could not persist PTX module cache ({err})");
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+        Ok((module, false))
     }
 
     /// `vkGetCudaModuleCacheNV`: the driver's compiled form of the

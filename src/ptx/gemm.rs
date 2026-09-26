@@ -204,12 +204,14 @@ pub struct PtxGemm {
 }
 
 impl PtxGemm {
+    /// JIT (or reload from the per-device cubin cache, see
+    /// [`CudaModule::from_ptx_cached`]) both GEMM modules.
     pub fn new(ctx: &Arc<VulkanContext>) -> Result<Self> {
         let t = std::time::Instant::now();
-        let sm = CudaModule::from_ptx(ctx, kernels::SGEMM_PTX)?;
+        let (sm, _) = CudaModule::from_ptx_cached(ctx, "sgemm", kernels::SGEMM_PTX)?;
         let s_ms = t.elapsed().as_secs_f64() * 1e3;
         let t = std::time::Instant::now();
-        let hm = CudaModule::from_ptx(ctx, kernels::HGEMM_PTX)?;
+        let (hm, _) = CudaModule::from_ptx_cached(ctx, "hgemm", kernels::HGEMM_PTX)?;
         let h_ms = t.elapsed().as_secs_f64() * 1e3;
         let sgemm = SGEMM_KERNELS
             .iter()

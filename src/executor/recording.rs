@@ -150,6 +150,33 @@ pub(super) fn record_one_matmul(
     }
 
     let call = &op.call;
+    // Opt-in PTX route: an a16 matmul (f16 A/B/C, batch 1, plain
+    // C = alpha*A*B) records vkCmdCudaLaunchKernelNV instead of the
+    // coopmat dispatch.  Barriers around it are the caller's usual
+    // compute barriers, which order CUDA launches too.
+    if kernel.a_f16()
+        && dims.batch == 1
+        && !call.accumulate
+        && op.epilogue.is_none()
+        && op.normed_a.is_none()
+        && op.store.is_none()
+        && ctx.buffer_device_address_enabled
+        && let Some(route) = pipeline.ptx_route.as_ref()
+        && let Some(index) = route.select(dims.m, dims.n, dims.k)
+    {
+        unsafe {
+            route.record(
+                cb,
+                index,
+                call.a.device_address(),
+                call.b.device_address(),
+                call.c.device_address(),
+                (dims.m, dims.n, dims.k),
+                call.alpha,
+            );
+        }
+        return Ok(());
+    }
     let max_groups = ctx.device_properties.limits.max_compute_work_group_count;
     let (a_ptr, b_ptr, c_ptr) = if ctx.buffer_device_address_enabled {
         (
