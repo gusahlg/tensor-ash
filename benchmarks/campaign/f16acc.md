@@ -188,6 +188,41 @@ reaches 54.5 TF/s.  On GA104 promote sometimes beats pure f16 at 64x128 —
 lower occupancy (161 vs 80 registers) helps there; a per-GPU tile/occupancy
 search is the natural follow-up, see §7.)
 
+### 4b. Route level, a32 (f32 activations converted while staging; `f16w` cases), RTX 4060
+
+`results/ab-auto3-f16w-4060.txt`, same protocol with `,f16w` cases:
+
+| shape | f32 (route) | f16 acc | promote |
+|---|---|---|---|
+| 512x2048x2048 | 0.184 ms, 23.3 TF/s | 0.130 ms, **1.42x** | 0.127 ms, **1.45x** |
+| 512x2560x2048 | 0.223 ms, 24.1 TF/s | 0.177 ms, **1.26x** | 0.182 ms, 1.23x |
+| 512x5632x2048 | 0.470 ms, 25.1 TF/s | 0.358 ms, **1.31x** | 0.388 ms, 1.21x |
+| 512x2048x5632 | 0.518 ms, 22.8 TF/s | 0.364 ms, **1.42x** | 0.360 ms, **1.44x** |
+| 2048³ | 0.771 ms, 22.3 TF/s | 0.486 ms, **1.59x** | 0.554 ms, **1.39x** |
+| 4096³ | 5.431 ms, 25.3 TF/s | 3.793 ms, **1.43x** | 4.600 ms, 1.18x |
+
+### 4c. Per tile (why the tile rule changes), RTX 4060, a16
+
+`results/ab-tiles-a16-4060.txt` (12 kernels, one process, 7 rounds; GPU ms):
+
+| shape | 64x64 f32 / f16 / prom | 128x64 f32 / f16 / prom | 64x128 f32 / f16 / prom | 128x128 f32 / f16 / prom |
+|---|---|---|---|---|
+| 512x2048x2048 | 0.162 / 0.140 / 0.147 | 0.189 / 0.140 / 0.130 | 0.211 / 0.123 / 0.128 | 0.218 / **0.121** / 0.153 |
+| 512x2560x2048 | 0.199 / 0.160 / 0.178 | 0.205 / **0.144** / 0.158 | 0.231 / 0.148 / 0.161 | 0.247 / 0.164 / 0.185 |
+| 512x5632x2048 | 0.433 / 0.346 / 0.377 | 0.458 / 0.310 / 0.327 | 0.456 / **0.287** / 0.321 | 0.483 / 0.321 / 0.387 |
+| 512x2048x5632 | 0.427 / 0.362 / 0.377 | 0.508 / 0.364 / 0.353 | 0.568 / **0.316** / 0.340 | 0.602 / 0.318 / 0.435 |
+| 2048³ | 0.598 / 0.478 / 0.538 | 0.639 / 0.448 / 0.452 | 0.702 / **0.416** / 0.461 | 0.688 / 0.425 / 0.510 |
+| 4096³ | 5.497 / 4.664 / 5.091 | 5.011 / 3.459 / 4.345 | 5.745 / 3.568 / 4.443 | 5.177 / **3.320** / 4.285 |
+
+With f32 accumulation the small 64x64 tile wins on M=512 (register-limited
+occupancy); with f16 accumulation the wide tiles win by 12-25%.  On the a32
+path f16 accumulation on the *same* 64x64 tile is even slower (0.82-0.98x,
+`ab-tiles-f16w-4060.txt`) while 64x128/128x128 f16 are 1.33-1.79x faster than
+the f32 64x64 — the accumulator class and the tile must be chosen together.
+The RTX 3070 per-tile table is `results/ab-tiles-a16-3070.txt` (there
+128x64/64x128 f16 and promote are within ~7% of each other; the 4060 rule is
+never >7% off the 3070 per-shape best).
+
 ## 5. SASS evidence
 
 Method: `ml_bench isa` (campaign/sass) — compile the routed pipeline into a
@@ -263,16 +298,19 @@ a warm-up prefill + 128 decode steps; GPU = the prefill graph's timestamps.
 | RTX 4060 | f32 acc | 39.45 (39.23-39.53) | 12,882 (12,860-12,963) | 1.000 |
 | RTX 4060 | **f16 acc** | 31.57 (31.32-31.66) | **16,066** (16,027-16,200) | **1.247** |
 | RTX 4060 | f16 promote | 34.24 (33.79-34.36) | 14,836 (14,786-15,025) | 1.152 |
-| RTX 3070 | f32 acc | 32.08 (31.47-32.11) | 15,897 (15,879-16,200) | 1.000 |
-| RTX 3070 | **f16 acc** | 24.80 (24.52-24.80) | **20,543** (20,540-20,794) | **1.292** |
-| RTX 3070 | f16 promote | 24.55 (24.54-24.57) | 20,728 (20,720-20,750) | 1.304 |
+| RTX 3070 | f32 acc | 31.81 (31.62-32.06) | 16,030 (15,897-16,156) | 1.000 |
+| RTX 3070 | **f16 acc** | 24.79 (24.61-25.06) | **20,555** (20,312-20,683) | **1.282** |
+| RTX 3070 | f16 promote | 24.68 (24.57-24.70) | 20,670 (20,610-20,739) | 1.289 |
 
 4060: `results/pp512-4060-v2.txt` (6 rounds).  An earlier 6-round run with the
 f32 tile rule for all classes (`pp512-4060-v1-oldtiles.txt`) gave f16 1.216x /
 promote 1.144x, so the accumulator-aware tiles add ~3%.  3070:
-`results/pp512-3070-b1.txt`, **3 rounds only**: a second batch was contaminated
-(the user started a game on the display GPU; runs 2x slower, file kept as
-`pp512-3070-b2-CONTAMINATED.txt`) and all 3070 work stopped.
+`results/pp512-3070-b3.txt` (6 rounds, same alternating order, desktop binary
+built 17:56 from ec23a77 = the acc-aware tile rule; idle 3070, only the
+compositor on it).  An earlier 3-round batch (`pp512-3070-b1.txt`: f16
+1.292x, promote 1.304x) agrees within 1%; a second batch was contaminated (the
+user started a game on the display GPU; runs 2x slower, kept as
+`pp512-3070-b2-CONTAMINATED.txt`).
 
 **vs llama.cpp CUDA b9503 (llama-bench -p 512 -n 0 -r 10 -ngl 99, one warm-up
 invocation first, median of the 10 per-rep samples):**
@@ -280,7 +318,7 @@ invocation first, median of the 10 per-rep samples):**
 | GPU | llama.cpp CUDA pp512 | tensor-ash f32 acc | tensor-ash f16 acc | tensor-ash promote |
 |---|---|---|---|---|
 | RTX 4060 | 13,684 (reps 13,396-14,045 after a 10,284 cold rep) | 12,882 (0.94x) | **16,066 (1.17x)** | 14,836 (1.08x) |
-| RTX 3070 | 16,802 (reps 16,674-17,131 after a 12,931 cold rep) | 15,897 (0.95x) | **20,543 (1.22x)** | 20,728 (1.23x) |
+| RTX 3070 | 16,802 (reps 16,674-17,131 after a 12,931 cold rep) | 16,030 (0.95x) | **20,555 (1.22x)** | 20,670 (1.23x) |
 
 (Method caveat: llama-bench times `llama_decode` of 512 tokens; llama-ash times
 one prefill call; both exclude model load, both include the last-token LM head.)
@@ -317,40 +355,17 @@ Prefill logits (32000, `LLAMA_ASH_LOGITS_OUT`) vs the f32-accumulate run:
 | p4 | 0.085 / 0.016 | 0.020 / 0.0041 | 20.3 | same | 5/5 / 5/5 |
 | p5 | 0.091 / 0.021 | 0.015 / 0.0039 | 11.1 | same | 5/5 / 5/5 |
 
-### 4b. Route level, a32 (f32 activations converted while staging; `f16w` cases), RTX 4060
+**RTX 3070** (`results/gen-3070-b3.txt`, desktop binary of ec23a77, one short
+batch; llama.cpp reference `prompts/ref_3070.json` = llama-server b9503 CUDA on
+the 3070 with the same token ids): **identical to the 4060 in every cell** —
+all three tensor-ash modes give the same 32-token streams on p1-p5, 32/32 vs
+llama.cpp on p1/p2/p4/p5, and p3 matches up to and including EOS at step 8
+(llama.cpp's `ignore_eos` then continues with id 306).  The prefill logits of
+every prompt x mode are **bit-identical between the RTX 3070 and the RTX 4060**
+(`cmp` of the 15 dumps; the tile rule is SM-agnostic and the driver emits the
+same SASS on both GPUs, so the accumulation order is the same), hence the
+logit-delta table above holds for the 3070 digit for digit.
 
-`results/ab-auto3-f16w-4060.txt`, same protocol with `,f16w` cases:
-
-| shape | f32 (route) | f16 acc | promote |
-|---|---|---|---|
-| 512x2048x2048 | 0.184 ms, 23.3 TF/s | 0.130 ms, **1.42x** | 0.127 ms, **1.45x** |
-| 512x2560x2048 | 0.223 ms, 24.1 TF/s | 0.177 ms, **1.26x** | 0.182 ms, 1.23x |
-| 512x5632x2048 | 0.470 ms, 25.1 TF/s | 0.358 ms, **1.31x** | 0.388 ms, 1.21x |
-| 512x2048x5632 | 0.518 ms, 22.8 TF/s | 0.364 ms, **1.42x** | 0.360 ms, **1.44x** |
-| 2048³ | 0.771 ms, 22.3 TF/s | 0.486 ms, **1.59x** | 0.554 ms, **1.39x** |
-| 4096³ | 5.431 ms, 25.3 TF/s | 3.793 ms, **1.43x** | 4.600 ms, 1.18x |
-
-### 4c. Per tile (why the tile rule changes), RTX 4060, a16
-
-`results/ab-tiles-a16-4060.txt` (12 kernels, one process, 7 rounds; GPU ms):
-
-| shape | 64x64 f32 / f16 / prom | 128x64 f32 / f16 / prom | 64x128 f32 / f16 / prom | 128x128 f32 / f16 / prom |
-|---|---|---|---|---|
-| 512x2048x2048 | 0.162 / 0.140 / 0.147 | 0.189 / 0.140 / 0.130 | 0.211 / 0.123 / 0.128 | 0.218 / **0.121** / 0.153 |
-| 512x2560x2048 | 0.199 / 0.160 / 0.178 | 0.205 / **0.144** / 0.158 | 0.231 / 0.148 / 0.161 | 0.247 / 0.164 / 0.185 |
-| 512x5632x2048 | 0.433 / 0.346 / 0.377 | 0.458 / 0.310 / 0.327 | 0.456 / **0.287** / 0.321 | 0.483 / 0.321 / 0.387 |
-| 512x2048x5632 | 0.427 / 0.362 / 0.377 | 0.508 / 0.364 / 0.353 | 0.568 / **0.316** / 0.340 | 0.602 / 0.318 / 0.435 |
-| 2048³ | 0.598 / 0.478 / 0.538 | 0.639 / 0.448 / 0.452 | 0.702 / **0.416** / 0.461 | 0.688 / 0.425 / 0.510 |
-| 4096³ | 5.497 / 4.664 / 5.091 | 5.011 / 3.459 / 4.345 | 5.745 / 3.568 / 4.443 | 5.177 / **3.320** / 4.285 |
-
-With f32 accumulation the small 64x64 tile wins on M=512 (register-limited
-occupancy); with f16 accumulation the wide tiles win by 12-25%.  On the a32
-path f16 accumulation on the *same* 64x64 tile is even slower (0.82-0.98x,
-`ab-tiles-f16w-4060.txt`) while 64x128/128x128 f16 are 1.33-1.79x faster than
-the f32 64x64 — the accumulator class and the tile must be chosen together.
-The RTX 3070 per-tile table is `results/ab-tiles-a16-3070.txt` (there
-128x64/64x128 f16 and promote are within ~7% of each other; the 4060 rule is
-never >7% off the 3070 per-shape best).
 
 ## 7. Generator milestone M1 (spec-constant coopmat1 module)
 
