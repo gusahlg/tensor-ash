@@ -415,10 +415,11 @@ per-thread load index math (needs registers: the kernel is at 128).
 - NVIDIA's `Registers requested` (NVuc REG word 2) is 255 for 128/256-
   thread CTAs and 128 for the 512-thread row GEMVs (the per-CTA
   hardware limit). The routed 256-thread kernels land at or just below
-  128 (118-128: the 2-CTA/SM point) without spilling; the heavier
-  catalog tiles probed for Q(a) do not (large_bda 144, m256n64 165,
-  m128n64k64 tm16_tn4 196 / tm8_tn8 197, k64 tm8_tn8 236 registers:
-  1 CTA/SM for 256 threads).
+  128 (118-128: the 2-CTA/SM point) without spilling. The heavier
+  catalog tiles probed for Q(a) do not: large_bda (144 regs) and
+  m256n64 (165), both 256 threads, and the 128-thread m128n64k64
+  tm16_tn4 / tm8_tn8 (196 / 197) all drop to 8 warps/SM; k64 tm8_tn8
+  (236 regs, 64 threads, 34 KB shared) runs 4 warps/SM (8%).
 - None of the 11 kernels contains `LDGSTS`, `DEPBAR`, `LDL`/`STL` or
   `SHFL`. The only `CALL` in each GEMM loop is `@P CALL.REL.NOINC
   <after the loop>` right before the back-branch `BRA <loop start>`:
