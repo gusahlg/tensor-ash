@@ -270,21 +270,23 @@ f32 C it is 29.0 / 39.0 / 30.7 TF/s.)
 
 Relative RMS error vs an f64 reference (512 sampled outputs):
 
-| shape (K) | TA coopmat1 (f32 acc, f16 C) | PTX f32 acc (f16 C) | PTX f32 acc (f32 C) | PTX f16 acc | cuBLAS 16F (TN / NN) | cuBLAS 32F f16 C |
-|---|---:|---:|---:|---:|---:|---:|
-| 512x2048x2048 | 2.05e-4 | 2.05e-4 | 4.2e-5 | 2.41e-3 | 1.65e-3 / 1.65e-3 | 2.03e-4 |
-| 512x5632x2048 | 2.14e-4 | 2.14e-4 | 4.8e-5 | 2.39e-3 | 1.61e-3 / 1.61e-3 | 2.08e-4 |
-| 512x2048x5632 | 2.15e-4 | 2.15e-4 | 4.4e-5 | 3.81e-3 | 2.83e-3 / 2.83e-3 | 2.14e-4 |
-| 2048^3 | 2.16e-4 | 2.16e-4 | 4.0e-5 | 2.27e-3 | 1.62e-3 / 1.62e-3 | 2.17e-4 |
-| 4096^3 | 1.99e-4 | 1.99e-4 | 4.8e-5 | 3.19e-3 | 1.94e-3 / 3.19e-3 | 1.95e-4 |
+| shape (K) | TA coopmat1 (f32 acc, f16 C) | PTX f32 acc (f16 C) | PTX f32 acc (f32 C) | PTX f16 acc | cuBLAS 16F 3070 (TN / NN) | cuBLAS 16F 4060 (TN = NN) | cuBLAS 32F f16 C |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 512x2048x2048 | 2.05e-4 | 2.05e-4 | 4.2e-5 | 2.41e-3 | 1.65e-3 / 1.65e-3 | 1.38e-3 | 2.03e-4 |
+| 512x5632x2048 | 2.14e-4 | 2.14e-4 | 4.8e-5 | 2.39e-3 | 1.61e-3 / 1.61e-3 | **2.39e-3** | 2.08e-4 |
+| 512x2048x5632 | 2.15e-4 | 2.15e-4 | 4.4e-5 | 3.81e-3 | 2.83e-3 / 2.83e-3 | 1.95e-3 | 2.14e-4 |
+| 2048^3 | 2.16e-4 | 2.16e-4 | 4.0e-5 | 2.27e-3 | 1.62e-3 / 1.62e-3 | **2.26e-3** | 2.17e-4 |
+| 4096^3 | 1.99e-4 | 1.99e-4 | 4.8e-5 | 3.19e-3 | 1.94e-3 / 3.19e-3 | **3.19e-3** | 1.95e-4 |
 
 * f32 accumulate: the PTX kernel is bit-for-bit the same error class as
   coopmat1 (identical rel-RMS to 3 digits); both are dominated by the f16
   rounding of C (f32 C: 4e-5).
 * f16 accumulate is ~10-18x noisier than f32 accumulate; our kernel is
-  within 1.0-1.5x of cuBLAS `COMPUTE_16F` (cuBLAS NN at 4096^3 matches
-  ours exactly; on K=2048 shapes cuBLAS's k-ordering is ~1.45x better).
-  That is the precision llama.cpp's CUDA prefill already runs at.
+  within 1.0-2.0x of cuBLAS `COMPUTE_16F`, and on the 4060 cuBLAS's
+  error is *identical* to ours on three of five shapes (bold: same
+  sequential-k f16 accumulation; where cuBLAS is lower it picked a
+  split-K kernel).  That is the precision llama.cpp's CUDA prefill
+  already runs at.
 
 ## 6. Round 2 kernels, split-K, f16p, and end-to-end prefill
 
@@ -315,6 +317,24 @@ best cuBLAS `COMPUTE_16F` layout):
   K=2048).  The weak 512x2048x5632 shape vs cuBLAS on the 3070 stays open.
 * f32 accumulate: the 8-warp 128x128 f32 kernel is +6-7% over coopmat1
   at 2048^3/4096^3 on the 4060, below 64x64_s4 / 128x128_s3 elsewhere.
+
+**Grouped CTA rasterization (round 4, 4060).**  `_g8` variants sweep
+GROUP_M=8 tile-rows column by column so resident CTAs share A/B panels
+in L2.  At 4096^3 a 4096 x 128 f16 B column panel set (32 MB) outgrows
+the 4060's 24 MB L2, and grouping pays big:
+
+| shape | f16 acc plain -> g8 | f16p BK=32 plain -> g8 | f32 acc plain -> g8 | cuBLAS 16F (NN / TN, same lock hold) |
+|---|---|---|---|---|
+| 512x5632x2048 | 46.2 -> 46.7 | 35.9 -> 37.2 | 27.5 -> 27.2 | 49.9 / 46.3 |
+| 2048^3 | 48.2 -> 46.7 | 36.9 -> 38.2 | 26.9 -> 28.8 | 54.7 / 54.8 |
+| 4096^3 | 42.7 -> **52.8** (2.05x TA) | 32.2 -> 39.8 | 29.2 -> 29.9 | 50.9 / 49.9 |
+
+With grouping the PTX f16-accumulate kernel **beats cuBLAS
+`COMPUTE_16F` at 4096^3 on the 4060** (52.8 vs 50.9 TF/s).  The route
+now picks the `_g8` kernels when the grid has >= 16 x SM-count 128x128
+tiles (a CTA swizzle was a dead end for the f32 SIMT kernels on the 3070;
+it is not one for f16 tensor-core GEMM on a 24 MB-L2 part).  Not yet
+measured on the 3070 (embargo).
 
 Run-to-run note: the same kernel/shape moved by up to ~10% between
 processes (3070 512x2048x5632 128x128_s3: 48.6 in round 1, 53.4 in round
