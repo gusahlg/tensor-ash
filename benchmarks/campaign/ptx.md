@@ -22,10 +22,10 @@ interleaved same-process A/Bs against tensor-ash's own route):
 
 | lever | 4060 | 3070 |
 |---|---|---|
-| **TinyLlama-1.1B f16 pp512, PTX f16-accumulate route** (`ML_PTX_GEMM=f16`) vs tensor-ash base | **1.36-1.38x** (12.9k -> 17.5-17.9k t/s) | **1.63x** (15.4k -> 24.3-25.4k t/s) |
-| same vs llama.cpp b9503 CUDA (same accumulate precision: cuBLAS `COMPUTE_16F`) | **1.36x** (same-day 12.9k) | ~1.5x vs the Sept scoreboard 16.7k (same-day re-measure blocked by the desktop embargo) |
-| pp512 with `ML_PTX_GEMM=f16p` (f16-rate mma, f32 promotion per k-tile; 5-8x lower error than f16 acc) | 1.16x (BK=32 kernel; BK=64 pick pending) | - |
-| f16 tensor-core GEMM, f16 accumulate, vs coopmat1 on the same f16 A/B/C (prefill shapes + squares) | 1.43-1.79x (40-48 TF/s) = 80-94% of cuBLAS 16F | 1.50-1.97x (48-68 TF/s) = 75-100% of cuBLAS 16F |
+| **TinyLlama-1.1B f16 pp512, PTX f16-accumulate route** (`ML_PTX_GEMM=f16`) vs tensor-ash base | **1.39x** (12.9k -> 17.8-17.9k t/s) | **1.63x** (15.4k -> 24.3-25.4k t/s) |
+| same vs llama.cpp b9503 CUDA (same accumulate precision: cuBLAS `COMPUTE_16F`) | **1.39x** (same-day 12.9k) | ~1.5x vs the Sept scoreboard 16.7k (same-day re-measure blocked by the desktop embargo) |
+| pp512 with `ML_PTX_GEMM=f16p` (f16-rate mma, f32 promotion per k-tile; GEMM error 3.4-6x *lower* than llama.cpp's cuBLAS path) | **1.28x** (16.5-16.7k t/s = 1.28x llama.cpp CUDA) | pending (embargo) |
+| f16 tensor-core GEMM, f16 accumulate, vs coopmat1 on the same f16 A/B/C (prefill shapes + squares) | 1.43-2.05x (40-53 TF/s) = 80-104% of cuBLAS 16F (4096^3 with grouped raster beats it) | 1.50-1.97x (48-68 TF/s) = 75-100% of cuBLAS 16F |
 | same, f32 accumulate (numerics identical to coopmat1) | 1.00-1.12x | 0.98-1.13x |
 | f32 SIMT SGEMM with a 3/4-stage `cp.async` pipeline vs tensor-ash's best GLSL route | 0.86-1.08x (ties on large) | 0.73-1.01x (ties at 2048/4096) |
 
@@ -370,14 +370,19 @@ uses it for `ML_PTX_GEMM=f16p`.  Split-K f16p (two-stage) gave the same
 `ML_PTX=1 ML_PTX_GEMM=<mode> llama_ash bench -m tinyllama-1.1b-chat-v1.0.f16.gguf --pp 512 --tg 32`
 (one process per run, modes alternated; "GPU" = timestamped prefill graph):
 
-RTX 4060 (two alternating passes):
+RTX 4060, final route picks (f16p = BK=64 promoted kernel), three
+alternating passes (`run_llama3`):
 
 | mode | prefill GPU ms | pp512 t/s | vs base |
 |---|---:|---:|---:|
-| base (Vulkan coopmat1) | 39.26 / 39.28 | 12,951 / 12,940 | 1.00 |
-| PTX f32 acc | 39.82 / 40.47 | 12,770 / 12,629 | 0.98 |
-| PTX f16p | 33.94 / 33.85 | 14,953 / 14,993 | **1.16** |
-| PTX f16 acc | 28.48 / 28.75 | 17,929 / 17,618 | **1.37** |
+| base (Vulkan coopmat1) | 39.38 / 39.37 / 39.31 | 12,906 / 12,912 / 12,933 | 1.00 |
+| PTX f32 acc | 39.97 / 40.06 / 40.06 | 12,722 / 12,715 / 12,689 | 0.98 |
+| PTX f16p (BK=64) | 30.72 / 30.51 / 30.71 | 16,506 / 16,731 / 16,520 | **1.28** |
+| PTX f16 acc | 28.74 / 28.44 / 28.46 | 17,778 / 17,904 / 17,934 | **1.39** |
+
+(An earlier pass with the BK=32 f16p kernel gave 14,953 / 14,993 t/s,
+1.16x.)  The f16p pick generated the same 32 greedy tokens as base on
+the 128-token prompt.
 
 Second session, same day, same lock hold as a llama.cpp re-measure
 (`llama-bench -m ... -p 512 -n 32 -fa 1 -r 5`, b9503 CUDA):
@@ -390,9 +395,11 @@ Second session, same day, same lock hold as a llama.cpp re-measure
 | tensor-ash PTX f16 acc (x2) | 17,491 / 17,568 |
 
 So on the 4060 the campaign base is already at llama.cpp CUDA parity
-for pp512, and the f16-accumulate PTX route - the same accumulation
-precision llama.cpp uses - puts tensor-ash prefill at **1.36x llama.cpp
-CUDA** (and ~1.25x the Aug-15 llama.cpp Vulkan CM2 number, 14,003).
+for pp512, the f16-accumulate PTX route - the same accumulation
+precision llama.cpp uses - puts tensor-ash prefill at **1.39x llama.cpp
+CUDA** (17.9k vs 12.9k; ~1.28x the Aug-15 llama.cpp Vulkan CM2 number,
+14,003), and the f16p route is **1.28x llama.cpp CUDA while computing
+its GEMMs 3.4-6x more accurately than llama.cpp does**.
 
 Token exactness: `llama_ash generate` with a 128-token prompt (which
 takes the a16 prefill path) and 32 greedy tokens produced identical ids
