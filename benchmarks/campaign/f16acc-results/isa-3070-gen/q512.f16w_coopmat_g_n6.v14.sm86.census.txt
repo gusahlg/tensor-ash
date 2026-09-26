@@ -1,0 +1,121 @@
+# ISA census: q512.f16w_coopmat_g_n6.v14.sm86
+
+label                q512
+shape                b=1 m=512 n=2048 k=2048
+device               NVIDIA GeForce RTX 3070
+arch                 SM86
+kernel               f16w_coopmat_g_n6
+variant              KernelVariant { accumulate: false, alpha_is_one: true, interior_only: true, k_multiple: true }
+spec_constants       [(0, 0), (1, 1), (2, 1), (3, 1), (16, 64), (17, 128), (18, 32), (19, 32), (20, 32), (21, 256), (22, 1), (23, 1)]
+spirv                embedded
+local_size           [1, 1, 1]
+shared_bytes         13824
+registers            64
+barriers             2
+capture_flags_code   identical
+in_production_cache  no
+stat.register_count = 64
+stat.binary_size = 4352
+stat.stack_size = 0
+stat.local_memory_size = 68719476736
+stat.shared_memory_size = 13824
+occupancy            6 blocks/SM = 6 warps/SM (12.5% of 48), limiter smem (regs 32 / smem 6 / threads 48 / block cap 16) [SM86 limits, max carveout]
+control-bit sanity   var-latency writers with W-scoreboard 20/23; fixed-latency ALU with W-scoreboard 0/76; NOP pad == B------:R-:W-:Y:S00 11/11
+
+## Whole kernel (261 live instructions, 272 incl. padding)
+
+classes: int 154, stg 32, special-reg 27, mma 16, control 8, ldsm 8, uniform 5, convert 4, ldg 4, sts 3
+opcodes: IMAD 78, IADD3 52, STG 32, CS2R 16, HMMA 16, LOP3 12, S2R 11, LDSM 8, LEA 5, SHF 5, F2FP 4, LDG 4, BRA 3, STS 3, ULDC 3, BAR 2, ISETP 2, NOP 2, EXIT 1, ULOP3 1, USHF 1
+memory (count x bits): LDG 4x128 | STG 32x32 | LDS 0 | STS 3x128 | LDSM 8x128 | LDL 0 | STL 0
+bytes/thread: global load 64 store 128; shared load 0 (+LDSM 128) store 48
+math FFMA 0 HMMA 16 HFMA2 0 -> density 6.1%; int overhead (int+uniform) 159 (60.9%); BAR 2 BRA 3 DEPBAR 0 S2R/CS2R/S2UR 27
+
+## Loops (backward branches)
+
+loop 0: 0x0260..0x06d0 72 instrs innermost math 16 (22.2%) stall-sum 262 (excess 190) waits 12
+
+## Main loop 0x0260..0x06d0 (one iteration)
+
+classes: int 28, mma 16, ldsm 8, control 5, convert 4, ldg 4, special-reg 3, sts 3, uniform 1
+opcodes: HMMA 16, IMAD 15, LDSM 8, LEA 5, LOP3 5, F2FP 4, LDG 4, S2R 3, STS 3, BAR 2, IADD3 2, NOP 2, BRA 1, ISETP 1, ULDC 1
+memory (count x bits): LDG 4x128 | STG 0 | LDS 0 | STS 3x128 | LDSM 8x128 | LDL 0 | STL 0
+bytes/thread: global load 64 store 0; shared load 0 (+LDSM 128) store 48
+math FFMA 0 HMMA 16 HFMA2 0 -> density 22.2%; int overhead (int+uniform) 29 (40.3%); BAR 2 BRA 1 DEPBAR 0 S2R/CS2R/S2UR 3
+
+static issue cycles/iteration (sum of stall fields) 262; instructions 72; dependency stalls (sum - n) 190; instrs waiting on a scoreboard 12; yield hints 12; reuse-flagged 10
+pipe lower bounds (cycles/iter/warp on one SMSP): issue 72 | FP32 0 | tensor 512 (HMMA FMAs/warp 32768 / 64)
+
+```
+/*0260*/ [B------:R-:W0:-:S01] S2R R37, SR_CTAID.X;
+/*0270*/ [B------:R-:W-:-:S01] IMAD R3, R2, 0x20, R48;
+/*0280*/ [B------:R-:W-:Y:S03] ULDC.64 UR6, c[0x0][0x650];
+/*0290*/ [B------:R-:W-:-:S02] IMAD R0, R56, 0x8, R3;
+/*02a0*/ [B------:R-:W-:-:S02] IMAD R36, R2, 0x20, R51;
+/*02b0*/ [B------:R-:W-:-:S02] IMAD.SHL.U32 R0, R0, 0x4, RZ;
+/*02c0*/ [B------:R-:W-:-:S02] IMAD R36, R36, c[0x0][0x634], R61;
+/*02d0*/ [B------:R-:W-:-:S01] IMAD R38, R2, 0x20, R50;
+/*02e0*/ [B------:R-:W-:Y:S03] LOP3.LUT R0, R0, 0xfffffff0, RZ, 0xc0, !PT;
+/*02f0*/ [B------:R-:W-:-:S01] IMAD R38, R38, c[0x0][0x634], R61;
+/*0300*/ [B------:R-:W-:-:S01] IADD3 R40, R0, 0x10, RZ;
+/*0310*/ [B------:R-:W2:-:S01] LDG.E.128.CONSTANT R52, [R0.U32+UR6];
+/*0320*/ [B0-----:R-:W-:Y:S04] IMAD R36, R37, 0x80, R36;
+/*0330*/ [B------:R-:W3:-:S01] LDG.E.128.CONSTANT R40, [R40.U32+UR6];
+/*0340*/ [B------:R-:W-:-:S02] LEA R38, R37, R38, 0x7;
+/*0350*/ [B------:R-:W-:-:S02] LEA.HI R36, R36, R49.reuse, RZ, 0x1d;
+/*0360*/ [B------:R-:W-:-:S02] LEA.HI R38, R38, R49, RZ, 0x1d;
+/*0370*/ [B------:R-:W-:Y:S05] LEA R44, P0, R36, c[0x0][0x658], 0x4;
+/*0380*/ [B------:R-:W-:-:S01] IMAD.X R45, RZ, RZ, c[0x0][0x65c], P0;
+/*0390*/ [B------:R-:W-:Y:S05] LEA R36, P0, R38, c[0x0][0x658], 0x4;
+/*03a0*/ [B------:R-:W-:-:S01] IMAD.X R37, RZ, RZ, c[0x0][0x65c], P0;
+/*03b0*/ [B------:R-:W4:-:S05] LDG.E.128.CONSTANT R44, [R44];
+/*03c0*/ [B------:R-:W5:-:S01] LDG.E.128.CONSTANT R36, [R36];
+/*03d0*/ [B--2---:R-:W-:-:S02] F2FP.PACK_AB R52, R53, R52;
+/*03e0*/ [B------:R-:W-:-:S02] F2FP.PACK_AB R53, R55, R54;
+/*03f0*/ [B---3--:R-:W-:Y:S02] F2FP.PACK_AB R54, R41, R40;
+/*0400*/ [B------:R-:W0:-:S01] S2R R40, SR_LANEID;
+/*0410*/ [B------:R-:W-:Y:S03] F2FP.PACK_AB R55, R43, R42;
+/*0420*/ [B------:R-:W1:-:S04] S2R R43, SR_TID.X;
+/*0430*/ [B------:R-:W-:-:S04] STS.128 [R57.X16+0x2200], R52;
+/*0440*/ [B----4-:R-:W-:-:S04] STS.128 [R59.X16], R44;
+/*0450*/ [B-----5:R-:W-:-:S01] STS.128 [R58.X16], R36;
+/*0460*/ [B0-----:R-:W-:Y:S02] LOP3.LUT R0, R40, 0x8, RZ, 0xc0, !PT;
+/*0470*/ [B------:R-:W-:Y:S05] LOP3.LUT R3, R40, 0x7, RZ, 0xc0, !PT;
+/*0480*/ [B------:R-:W-:-:S01] IMAD.IADD R0, R0, 0x1, R3;
+/*0490*/ [B------:R-:W-:-:S02] LOP3.LUT R3, R40, 0x10, RZ, 0xc0, !PT;
+/*04a0*/ [B-1----:R-:W-:Y:S03] LOP3.LUT R43, R43, 0x60, RZ, 0xc0, !PT;
+/*04b0*/ [B------:R-:W-:-:S02] IMAD R41, R0.reuse, 0x50, R3.reuse;
+/*04c0*/ [B------:R-:W-:-:S02] IMAD R3, R0, 0x110, R3;
+/*04d0*/ [B------:R-:W-:-:S02] IMAD R0, R60, 0x50, R41;
+/*04e0*/ [B------:R-:W-:-:S01] IMAD R3, R43, 0x2, R3;
+/*04f0*/ [B------:R-:W-:-:S06] BAR.SYNC 0x0;
+/*0500*/ [B------:R-:W-:-:S02] NOP ;
+/*0510*/ [B------:R-:W-:-:S04] LDSM.16.M88.4 R36, [R0+0x2200];
+/*0520*/ [B------:R-:W0:-:S04] LDSM.16.MT88.4 R44, [R3];
+/*0530*/ [B------:R-:W1:-:S01] LDSM.16.M88.4 R40, [R0+0x2700];
+/*0540*/ [B0-----:R-:W-:-:S08] HMMA.16816.F32 R4, R36, R44.reuse, R4;
+/*0550*/ [B-1----:R-:W-:-:S08] HMMA.16816.F32 R8, R40, R44, R8;
+/*0560*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R12, R36, R46.reuse, R12;
+/*0570*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R16, R40, R46, R16;
+/*0580*/ [B------:R-:W0:-:S07] LDSM.16.MT88.4 R44, [R3+0x20];
+/*0590*/ [B0-----:R-:W-:-:S08] HMMA.16816.F32 R20, R36.reuse, R44, R20;
+/*05a0*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R24, R36, R46, R24;
+/*05b0*/ [B------:R-:W-:-:S07] LDSM.16.M88.4 R36, [R0+0x2220];
+/*05c0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R28, R40.reuse, R44, R28;
+/*05d0*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R32, R40, R46, R32;
+/*05e0*/ [B------:R-:W-:-:S04] LDSM.16.M88.4 R40, [R0+0x2720];
+/*05f0*/ [B------:R-:W0:-:S03] LDSM.16.MT88.4 R44, [R3+0x1100];
+/*0600*/ [B0-----:R-:W-:-:S08] HMMA.16816.F32 R4, R36, R44.reuse, R4;
+/*0610*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R8, R40, R44, R8;
+/*0620*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R12, R36, R46.reuse, R12;
+/*0630*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R16, R40, R46, R16;
+/*0640*/ [B------:R-:W0:-:S07] LDSM.16.MT88.4 R44, [R3+0x1120];
+/*0650*/ [B0-----:R-:W-:-:S08] HMMA.16816.F32 R20, R36.reuse, R44, R20;
+/*0660*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R24, R36, R46, R24;
+/*0670*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R28, R40.reuse, R44, R28;
+/*0680*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R32, R40, R46, R32;
+/*0690*/ [B------:R-:W-:-:S06] BAR.SYNC 0x0;
+/*06a0*/ [B------:R-:W-:-:S04] NOP ;
+/*06b0*/ [B------:R-:W-:Y:S04] IADD3 R2, R2, 0x1, RZ;
+/*06c0*/ [B------:R-:W-:Y:S13] ISETP.GE.U32.AND P0, PT, R2, UR4, PT;
+/*06d0*/ [B------:R-:W-:-:S05] @!P0 BRA 0x260;
+```

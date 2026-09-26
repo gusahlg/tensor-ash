@@ -1,0 +1,209 @@
+# ISA census: s2k.f16w_a16_coopmat_g_n8.v14.sm86
+
+label                s2k
+shape                b=1 m=2048 n=2048 k=2048
+device               NVIDIA GeForce RTX 3070
+arch                 SM86
+kernel               f16w_a16_coopmat_g_n8
+variant              KernelVariant { accumulate: false, alpha_is_one: true, interior_only: true, k_multiple: true }
+spec_constants       [(0, 0), (1, 1), (2, 1), (3, 1), (16, 128), (17, 128), (18, 64), (19, 64), (20, 32), (21, 256), (22, 1), (23, 1)]
+spirv                embedded
+local_size           [1, 1, 1]
+shared_bytes         35840
+registers            157
+barriers             2
+capture_flags_code   identical
+in_production_cache  no
+stat.register_count = 157
+stat.binary_size = 9728
+stat.stack_size = 0
+stat.local_memory_size = 68719476736
+stat.shared_memory_size = 35840
+occupancy            2 blocks/SM = 2 warps/SM (4.2% of 48), limiter smem (regs 12 / smem 2 / threads 48 / block cap 16) [SM86 limits, max carveout]
+control-bit sanity   var-latency writers with W-scoreboard 29/38; fixed-latency ALU with W-scoreboard 0/123; NOP pad == B------:R-:W-:Y:S00 8/8
+
+## Whole kernel (600 live instructions, 608 incl. padding)
+
+classes: int 319, special-reg 69, mma 64, stg 64, convert 32, ldsm 24, control 8, ldg 8, sts 8, uniform 4
+opcodes: IMAD 164, IADD3 87, HMMA 64, STG 64, CS2R 63, F2FP 32, PRMT 32, LDSM 24, LEA 16, SHF 10, LDG 8, LOP3 8, STS 8, S2R 6, BRA 3, BAR 2, ISETP 2, NOP 2, ULDC 2, EXIT 1, ULOP3 1, USHF 1
+memory (count x bits): LDG 8x128 | STG 64x16 | LDS 0 | STS 8x128 | LDSM 24x128 | LDL 0 | STL 0
+bytes/thread: global load 128 store 128; shared load 0 (+LDSM 384) store 128
+math FFMA 0 HMMA 64 HFMA2 0 -> density 10.7%; int overhead (int+uniform) 323 (53.8%); BAR 2 BRA 3 DEPBAR 0 S2R/CS2R/S2UR 69
+
+## Loops (backward branches)
+
+loop 0: 0x06c0..0x10b0 160 instrs innermost math 64 (40.0%) stall-sum 711 (excess 551) waits 18
+
+## Main loop 0x06c0..0x10b0 (one iteration)
+
+classes: mma 64, int 50, ldsm 24, ldg 8, sts 8, control 5, special-reg 1
+opcodes: HMMA 64, IMAD 29, LDSM 24, LEA 16, LDG 8, STS 8, LOP3 3, BAR 2, NOP 2, BRA 1, IADD3 1, ISETP 1, S2R 1
+memory (count x bits): LDG 8x128 | STG 0 | LDS 0 | STS 8x128 | LDSM 24x128 | LDL 0 | STL 0
+bytes/thread: global load 128 store 0; shared load 0 (+LDSM 384) store 128
+math FFMA 0 HMMA 64 HFMA2 0 -> density 40.0%; int overhead (int+uniform) 50 (31.2%); BAR 2 BRA 1 DEPBAR 0 S2R/CS2R/S2UR 1
+
+static issue cycles/iteration (sum of stall fields) 711; instructions 160; dependency stalls (sum - n) 551; instrs waiting on a scoreboard 18; yield hints 8; reuse-flagged 63
+pipe lower bounds (cycles/iter/warp on one SMSP): issue 160 | FP32 0 | tensor 2048 (HMMA FMAs/warp 131072 / 64)
+
+```
+/*06c0*/ [B------:R-:W-:-:S02] IMAD R80, R136.reuse, 0x40, R74;
+/*06d0*/ [B------:R-:W-:-:S02] IMAD R82, R136.reuse, 0x40, R72;
+/*06e0*/ [B------:R-:W-:-:S02] IMAD R81, R136.reuse, 0x40, R103;
+/*06f0*/ [B------:R-:W-:-:S02] IMAD R84, R136.reuse, 0x40, R70;
+/*0700*/ [B------:R-:W-:-:S01] IMAD R83, R136.reuse, 0x40, R101;
+/*0710*/ [B------:R-:W-:-:S01] LEA.HI R81, R81, R124, RZ, 0x1d;
+/*0720*/ [B------:R-:W-:Y:S02] IMAD R86, R136, 0x40, R68;
+/*0730*/ [B------:R-:W-:-:S01] IMAD R85, R136, 0x40, R79;
+/*0740*/ [B------:R-:W-:-:S01] LEA.HI R83, R83, R124.reuse, RZ, 0x1d;
+/*0750*/ [B------:R-:W-:-:S01] IMAD R89, R80, c[0x0][0x634], R127;
+/*0760*/ [B------:R-:W-:-:S01] LEA R80, P0, R81, c[0x0][0x650], 0x4;
+/*0770*/ [B------:R-:W-:-:S01] IMAD R87, R136, 0x40, R77;
+/*0780*/ [B------:R-:W-:-:S01] LEA.HI R85, R85, R124.reuse, RZ, 0x1d;
+/*0790*/ [B------:R-:W-:-:S01] IMAD R91, R82, c[0x0][0x634], R127.reuse;
+/*07a0*/ [B------:R-:W-:-:S01] LEA R82, P1, R83, c[0x0][0x650], 0x4;
+/*07b0*/ [B------:R-:W-:-:S01] IMAD R93, R84, c[0x0][0x634], R127.reuse;
+/*07c0*/ [B------:R-:W-:-:S01] LEA.HI R87, R87, R124, RZ, 0x1d;
+/*07d0*/ [B------:R-:W-:-:S01] IMAD R95, R86, c[0x0][0x634], R127;
+/*07e0*/ [B------:R-:W-:-:S01] LEA R84, P2, R85, c[0x0][0x650], 0x4;
+/*07f0*/ [B------:R-:W-:-:S01] IMAD R88, R66.reuse, 0x80, R89;
+/*0800*/ [B------:R-:W-:-:S01] LEA R86, P3, R87, c[0x0][0x650], 0x4;
+/*0810*/ [B------:R-:W-:Y:S02] IMAD R90, R66, 0x80, R91;
+/*0820*/ [B------:R-:W-:-:S01] IMAD R92, R66, 0x80, R93;
+/*0830*/ [B------:R-:W-:-:S01] LEA.HI R88, R88, R75.reuse, RZ, 0x1d;
+/*0840*/ [B------:R-:W-:-:S01] IMAD R94, R66, 0x80, R95;
+/*0850*/ [B------:R-:W-:-:S01] LEA.HI R90, R90, R75.reuse, RZ, 0x1d;
+/*0860*/ [B------:R-:W-:-:S01] IMAD.X R81, RZ, RZ, c[0x0][0x654], P0;
+/*0870*/ [B------:R-:W-:-:S01] LEA.HI R92, R92, R75.reuse, RZ, 0x1d;
+/*0880*/ [B------:R-:W-:-:S01] IMAD.X R83, RZ, RZ, c[0x0][0x654], P1;
+/*0890*/ [B------:R-:W-:-:S01] LEA.HI R94, R94, R75, RZ, 0x1d;
+/*08a0*/ [B------:R-:W-:-:S01] IMAD.X R85, RZ, RZ, c[0x0][0x654], P2;
+/*08b0*/ [B------:R-:W-:-:S01] LEA R88, P0, R88, c[0x0][0x658], 0x4;
+/*08c0*/ [B------:R-:W-:-:S01] IMAD.X R87, RZ, RZ, c[0x0][0x654], P3;
+/*08d0*/ [B------:R-:W-:-:S01] LEA R90, P1, R90, c[0x0][0x658], 0x4;
+/*08e0*/ [B------:R0:W2:-:S01] LDG.E.128.CONSTANT R96, [R80];
+/*08f0*/ [B------:R-:W-:-:S01] LEA R92, P2, R92, c[0x0][0x658], 0x4;
+/*0900*/ [B------:R-:W-:-:S01] IMAD.X R89, RZ, RZ, c[0x0][0x65c], P0;
+/*0910*/ [B------:R-:W-:-:S01] LEA R94, P3, R94, c[0x0][0x658], 0x4;
+/*0920*/ [B------:R-:W-:-:S01] IMAD.X R91, RZ, RZ, c[0x0][0x65c], P1;
+/*0930*/ [B------:R-:W3:-:S01] LDG.E.128.CONSTANT R104, [R82];
+/*0940*/ [B------:R-:W-:Y:S02] IMAD.X R93, RZ, RZ, c[0x0][0x65c], P2;
+/*0950*/ [B------:R-:W-:-:S01] IMAD.X R95, RZ, RZ, c[0x0][0x65c], P3;
+/*0960*/ [B------:R-:W4:-:S04] LDG.E.128.CONSTANT R108, [R84];
+/*0970*/ [B------:R-:W5:-:S04] LDG.E.128.CONSTANT R112, [R86];
+/*0980*/ [B------:R-:W5:-:S04] LDG.E.128.CONSTANT R116, [R88];
+/*0990*/ [B------:R-:W5:-:S04] LDG.E.128.CONSTANT R120, [R90];
+/*09a0*/ [B------:R-:W5:-:S04] LDG.E.128.CONSTANT R128, [R92];
+/*09b0*/ [B------:R-:W5:-:S04] LDG.E.128.CONSTANT R132, [R94];
+/*09c0*/ [B------:R-:W1:-:S02] S2R R139, SR_LANEID;
+/*09d0*/ [B-1----:R-:W-:Y:S02] LOP3.LUT R137, R139, 0x8, RZ, 0xc0, !PT;
+/*09e0*/ [B------:R-:W-:-:S02] LOP3.LUT R138, R139.reuse, 0x7, RZ, 0xc0, !PT;
+/*09f0*/ [B0-----:R-:W-:Y:S03] LOP3.LUT R80, R139, 0x10, RZ, 0xc0, !PT;
+/*0a00*/ [B------:R-:W-:Y:S04] IMAD.IADD R137, R137, 0x1, R138;
+/*0a10*/ [B------:R-:W-:-:S02] IMAD R81, R137.reuse, 0x90, R80.reuse;
+/*0a20*/ [B------:R-:W-:-:S02] IMAD R138, R137, 0x110, R80;
+/*0a30*/ [B------:R-:W-:-:S02] IMAD R137, R126, 0x90, R81;
+/*0a40*/ [B------:R-:W-:-:S01] IMAD R138, R125, 0x2, R138;
+/*0a50*/ [B--2---:R-:W-:-:S04] STS.128 [R102.X16+0x4400], R96;
+/*0a60*/ [B---3--:R-:W-:-:S04] STS.128 [R100.X16+0x4400], R104;
+/*0a70*/ [B----4-:R-:W-:-:S04] STS.128 [R78.X16+0x4400], R108;
+/*0a80*/ [B-----5:R-:W-:-:S04] STS.128 [R76.X16+0x4400], R112;
+/*0a90*/ [B------:R-:W-:-:S04] STS.128 [R73.X16], R116;
+/*0aa0*/ [B------:R-:W-:-:S04] STS.128 [R71.X16], R120;
+/*0ab0*/ [B------:R-:W-:-:S04] STS.128 [R69.X16], R128;
+/*0ac0*/ [B------:R-:W-:-:S04] STS.128 [R67.X16], R132;
+/*0ad0*/ [B------:R-:W-:-:S06] BAR.SYNC 0x0;
+/*0ae0*/ [B------:R-:W-:-:S02] NOP ;
+/*0af0*/ [B------:R-:W-:-:S04] LDSM.16.M88.4 R96, [R137+0x4400];
+/*0b00*/ [B------:R-:W0:-:S04] LDSM.16.MT88.4 R116, [R138];
+/*0b10*/ [B------:R-:W1:-:S04] LDSM.16.MT88.4 R92, [R138+0x20];
+/*0b20*/ [B------:R-:W2:-:S04] LDSM.16.M88.4 R128, [R137+0x4d00];
+/*0b30*/ [B------:R-:W3:-:S04] LDSM.16.M88.4 R120, [R137+0x5600];
+/*0b40*/ [B------:R-:W4:-:S04] LDSM.16.M88.4 R112, [R137+0x5f00];
+/*0b50*/ [B------:R-:W-:-:S04] LDSM.16.M88.4 R88, [R137+0x4420];
+/*0b60*/ [B------:R-:W5:-:S04] LDSM.16.MT88.4 R84, [R138+0x1100];
+/*0b70*/ [B------:R-:W2:-:S04] LDSM.16.MT88.4 R80, [R138+0x1120];
+/*0b80*/ [B------:R-:W2:-:S04] LDSM.16.M88.4 R108, [R137+0x4d20];
+/*0b90*/ [B------:R-:W3:-:S01] LDSM.16.M88.4 R104, [R137+0x5620];
+/*0ba0*/ [B0-----:R-:W-:-:S03] HMMA.16816.F32 R0, R96.reuse, R116, R0;
+/*0bb0*/ [B------:R-:W-:-:S05] LDSM.16.M88.4 R132, [R137+0x4d40];
+/*0bc0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R4, R96.reuse, R118, R4;
+/*0bd0*/ [B-1----:R-:W-:-:S08] HMMA.16816.F32 R8, R96.reuse, R92, R8;
+/*0be0*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R12, R96, R94, R12;
+/*0bf0*/ [B------:R-:W0:-:S07] LDSM.16.M88.4 R96, [R137+0x5f20];
+/*0c00*/ [B--2---:R-:W-:-:S08] HMMA.16816.F32 R16, R128.reuse, R116, R16;
+/*0c10*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R20, R128.reuse, R118, R20;
+/*0c20*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R24, R128.reuse, R92, R24;
+/*0c30*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R28, R128, R94, R28;
+/*0c40*/ [B------:R-:W-:-:S07] LDSM.16.M88.4 R128, [R137+0x5640];
+/*0c50*/ [B---3--:R-:W-:-:S08] HMMA.16816.F32 R32, R120.reuse, R116, R32;
+/*0c60*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R36, R120.reuse, R118, R36;
+/*0c70*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R40, R120.reuse, R92, R40;
+/*0c80*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R44, R120, R94, R44;
+/*0c90*/ [B------:R-:W-:-:S07] LDSM.16.M88.4 R120, [R137+0x4460];
+/*0ca0*/ [B----4-:R-:W-:-:S08] HMMA.16816.F32 R48, R112.reuse, R116, R48;
+/*0cb0*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R52, R112.reuse, R118, R52;
+/*0cc0*/ [B------:R-:W-:-:S07] LDSM.16.M88.4 R116, [R137+0x5f40];
+/*0cd0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R56, R112.reuse, R92, R56;
+/*0ce0*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R60, R112, R94, R60;
+/*0cf0*/ [B------:R-:W-:-:S04] LDSM.16.M88.4 R112, [R137+0x4440];
+/*0d00*/ [B------:R-:W1:-:S03] LDSM.16.MT88.4 R92, [R138+0x2200];
+/*0d10*/ [B-----5:R-:W-:-:S08] HMMA.16816.F32 R0, R88.reuse, R84, R0;
+/*0d20*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R4, R88.reuse, R86, R4;
+/*0d30*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R8, R88.reuse, R80, R8;
+/*0d40*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R12, R88, R82, R12;
+/*0d50*/ [B------:R-:W2:-:S07] LDSM.16.MT88.4 R88, [R138+0x2220];
+/*0d60*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R16, R108.reuse, R84, R16;
+/*0d70*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R20, R108.reuse, R86, R20;
+/*0d80*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R24, R108.reuse, R80, R24;
+/*0d90*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R28, R108, R82, R28;
+/*0da0*/ [B------:R-:W-:-:S07] LDSM.16.M88.4 R108, [R137+0x4d60];
+/*0db0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R32, R104.reuse, R84, R32;
+/*0dc0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R36, R104.reuse, R86, R36;
+/*0dd0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R40, R104.reuse, R80, R40;
+/*0de0*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R44, R104, R82, R44;
+/*0df0*/ [B------:R-:W-:-:S07] LDSM.16.M88.4 R104, [R137+0x5660];
+/*0e00*/ [B0-----:R-:W-:-:S08] HMMA.16816.F32 R48, R96.reuse, R84, R48;
+/*0e10*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R52, R96.reuse, R86, R52;
+/*0e20*/ [B------:R-:W0:-:S07] LDSM.16.MT88.4 R84, [R138+0x3300];
+/*0e30*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R56, R96.reuse, R80, R56;
+/*0e40*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R60, R96, R82, R60;
+/*0e50*/ [B------:R-:W3:-:S04] LDSM.16.MT88.4 R80, [R138+0x3320];
+/*0e60*/ [B------:R-:W4:-:S03] LDSM.16.M88.4 R96, [R137+0x5f60];
+/*0e70*/ [B-1----:R-:W-:-:S08] HMMA.16816.F32 R0, R112.reuse, R92, R0;
+/*0e80*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R4, R112.reuse, R94, R4;
+/*0e90*/ [B--2---:R-:W-:-:S08] HMMA.16816.F32 R8, R112.reuse, R88, R8;
+/*0ea0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R12, R112, R90, R12;
+/*0eb0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R16, R132.reuse, R92, R16;
+/*0ec0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R20, R132.reuse, R94, R20;
+/*0ed0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R24, R132.reuse, R88, R24;
+/*0ee0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R28, R132, R90, R28;
+/*0ef0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R32, R128.reuse, R92, R32;
+/*0f00*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R36, R128.reuse, R94, R36;
+/*0f10*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R40, R128.reuse, R88, R40;
+/*0f20*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R44, R128, R90, R44;
+/*0f30*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R48, R116.reuse, R92, R48;
+/*0f40*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R52, R116.reuse, R94, R52;
+/*0f50*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R56, R116.reuse, R88, R56;
+/*0f60*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R60, R116, R90, R60;
+/*0f70*/ [B0-----:R-:W-:-:S08] HMMA.16816.F32 R0, R120.reuse, R84, R0;
+/*0f80*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R4, R120.reuse, R86, R4;
+/*0f90*/ [B---3--:R-:W-:-:S08] HMMA.16816.F32 R8, R120.reuse, R80, R8;
+/*0fa0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R12, R120, R82, R12;
+/*0fb0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R16, R108.reuse, R84, R16;
+/*0fc0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R20, R108.reuse, R86, R20;
+/*0fd0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R24, R108.reuse, R80, R24;
+/*0fe0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R28, R108, R82, R28;
+/*0ff0*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R32, R104.reuse, R84, R32;
+/*1000*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R36, R104.reuse, R86, R36;
+/*1010*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R40, R104.reuse, R80, R40;
+/*1020*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R44, R104, R82, R44;
+/*1030*/ [B----4-:R-:W-:-:S08] HMMA.16816.F32 R48, R96.reuse, R84, R48;
+/*1040*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R52, R96.reuse, R86, R52;
+/*1050*/ [B------:R-:W-:-:S08] HMMA.16816.F32 R56, R96.reuse, R80, R56;
+/*1060*/ [B------:R-:W-:-:S01] HMMA.16816.F32 R60, R96, R82, R60;
+/*1070*/ [B------:R-:W-:-:S06] BAR.SYNC 0x0;
+/*1080*/ [B------:R-:W-:-:S04] NOP ;
+/*1090*/ [B------:R-:W-:Y:S04] IADD3 R136, R136, 0x1, RZ;
+/*10a0*/ [B------:R-:W-:Y:S13] ISETP.GE.U32.AND P0, PT, R136, UR4, PT;
+/*10b0*/ [B------:R-:W-:-:S05] @!P0 BRA 0x6c0;
+```

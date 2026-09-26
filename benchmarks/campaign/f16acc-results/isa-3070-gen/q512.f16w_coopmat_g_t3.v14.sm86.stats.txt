@@ -1,0 +1,19 @@
+NVuc container: 7728 B, header u16s [10, 14, 14, 208, 5, 2], 10 sections
+  type 0x0003 REG                size      8 @0x000160 vals [0, 0, 0, 0]
+  type 0x0001 UCODE              size   7168 @0x000170 vals [0, 0, 0, 0]
+  type 0x0045 PROGRAM_INFO       size      0 @0x000000 vals [1, 0, 0, 0]
+  type 0x0018 BARRIER            size      8 @0x001d70 vals [0, 2, 0, 0]
+  type 0x0037 DEBUG_FRAME_TABLE  size     88 @0x001d80 vals [1, 1, 1, 1]
+  type 0x0053 unknown            size      0 @0x001de0 vals [0, 9, 0, 0]
+  type 0x003a DEBUG_FUNCTION_MAP size     16 @0x001de0 vals [1, 9, 0, 0]
+  type 0x1204 CTAID_INFO         size      0 @0x000000 vals [1, 0, 0, 0]
+  type 0x0039 SYMBOL_TABLE       size     36 @0x001df0 vals [1, 9, 1, 0]
+  type 0x0021 STRING_TABLE       size      8 @0x001e20 vals [1, 0, 0, 0]
+
+executable 0: 'CS' — Compute Shader (stages COMPUTE, subgroup 32)
+  stat Register Count                   = 125          (Number of temporary registers used by this shader stage)
+  stat Binary Size                      = 7168         (Size in bytes of the executable for this stage)
+  stat Stack Size                       = 0            (Size in bytes required for the shader stack)
+  stat Local Memory Size                = 68719476736  (Size in bytes required per-thread for local memory)
+  stat Shared Memory Size               = 13824        (Size in bytes used for shared memory)
+  internal representations: 0

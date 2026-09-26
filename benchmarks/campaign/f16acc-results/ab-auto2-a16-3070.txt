@@ -1,0 +1,22 @@
+heavy: waiting for lock held by: sighurt: m1 headless checks (pixman) (since 17:57, pid 375776)
+ab protocol: burn-in ~300ms 4096^3 on first kernel; rounds=7 iters=20 warmup=5; kernels=auto,auto@f16,auto@promote; per-round kernel start rotated by round index; gpu_ms = median of per-round GPU medians
+case                     kernel                           gpu_ms gpu_ms_min     TF/s    ratio  route
+------------------------------------------------------------------------------------------------------------------------
+qo                       auto                              0.133      0.128    32.33    1.000  f16w_a16_coopmat_m64n64
+qo                       auto@f16                          0.094      0.091    45.86    1.418  f16w_a16_coopmat_m64n128_acc16
+qo                       auto@promote                      0.086      0.083    49.76    1.539  f16w_a16_coopmat_m64n128_acc16p
+qkv                      auto                              0.182      0.174    29.57    1.000  f16w_a16_coopmat_m128n64
+qkv                      auto@f16                          0.118      0.113    45.45    1.537  f16w_a16_coopmat_m64n128_acc16
+qkv                      auto@promote                      0.152      0.147    35.41    1.198  f16w_a16_coopmat_m64n128_acc16p
+gu                       auto                              0.350      0.325    33.75    1.000  f16w_a16_coopmat_m128n64
+gu                       auto@f16                          0.251      0.242    46.97    1.392  f16w_a16_coopmat_m64n128_acc16
+gu                       auto@promote                      0.257      0.249    45.91    1.361  f16w_a16_coopmat_m64n128_acc16p
+dn                       auto                              0.370      0.348    31.95    1.000  f16w_a16_coopmat_m64n64
+dn                       auto@f16                          0.243      0.224    48.69    1.524  f16w_a16_coopmat_m64n128_acc16
+dn                       auto@promote                      0.217      0.203    54.52    1.707  f16w_a16_coopmat_m64n128_acc16p
+s2k                      auto                              0.563      0.523    30.51    1.000  f16w_a16_coopmat_aligned
+s2k                      auto@f16                          0.320      0.296    53.73    1.761  f16w_a16_coopmat_m64n128_acc16
+s2k                      auto@promote                      0.341      0.315    50.42    1.653  f16w_a16_coopmat_m64n128_acc16p
+s4k                      auto                              3.779      3.732    36.37    1.000  f16w_a16_coopmat_aligned
+s4k                      auto@f16                          2.709      2.702    50.74    1.395  f16w_a16_coopmat_acc16
+s4k                      auto@promote                      2.957      2.950    46.47    1.278  f16w_a16_coopmat_acc16p

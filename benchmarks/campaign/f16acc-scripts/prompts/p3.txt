@@ -1,0 +1,5 @@
+<|system|>
+You are a helpful assistant who answers questions about cooking clearly and concisely.</s>
+<|user|>
+I want to bake bread at home for the first time. I have flour, water, salt, and dry yeast, but no stand mixer and no special equipment except a normal oven and a large bowl. Can you walk me through a simple recipe, explain how long the dough needs to rise, how I can tell when it has risen enough, and what temperature I should use for baking? Also, what are the most common mistakes beginners make, and how can I avoid a dense loaf with a hard crust that is difficult to cut?</s>
+<|assistant|>
