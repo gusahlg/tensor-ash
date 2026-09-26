@@ -202,10 +202,28 @@ fn main() -> Result<()> {
                 .collect();
             let module = device
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)?;
+            // Generator configs (spec-constant modules) need their tile
+            // specialization; literal wrappers take the spec defaults.
+            let spec_entries: Vec<vk::SpecializationMapEntry> = spec
+                .spec
+                .iter()
+                .enumerate()
+                .map(|(i, &(id, _))| {
+                    vk::SpecializationMapEntry::default()
+                        .constant_id(id)
+                        .offset(i as u32 * 4)
+                        .size(4)
+                })
+                .collect();
+            let spec_values: Vec<u32> = spec.spec.iter().map(|&(_, v)| v).collect();
+            let spec_info = vk::SpecializationInfo::default()
+                .map_entries(&spec_entries)
+                .data(bytemuck::cast_slice(&spec_values));
             let stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(module)
-                .name(c"main");
+                .name(c"main")
+                .specialization_info(&spec_info);
             let ci = vk::ComputePipelineCreateInfo::default()
                 .flags(vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR)
                 .stage(stage)
@@ -225,7 +243,14 @@ fn main() -> Result<()> {
             let executables = exec_fn.get_pipeline_executable_properties(
                 &vk::PipelineInfoKHR::default().pipeline(pipeline),
             )?;
-            let threads = local_size(spec.spv).map_or(0, |[x, y, z]| x * y * z);
+            // local_size_x_id = 21 on the generator modules.
+            let threads = spec
+                .spec
+                .iter()
+                .find(|&&(id, _)| id == 21)
+                .map(|&(_, v)| v)
+                .or_else(|| local_size(spec.spv).map(|[x, y, z]| x * y * z))
+                .unwrap_or(0);
             let smem = spec.shared_memory_bytes();
             for index in 0..executables.len() as u32 {
                 let stats = exec_fn.get_pipeline_executable_statistics(
