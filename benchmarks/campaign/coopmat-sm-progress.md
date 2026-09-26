@@ -1,0 +1,25 @@
+# coopmat-sm progress log (resumable state)
+
+Report: `coopmat-sm.md`.  Data + scripts: `coopmat-sm-data/`.
+Louise trees: `~/ta-wt/cm-base` (7cfca58 grokmerge build), `cm-sm`
+(100df0d), `cm-var` (100df0d + ML_AB_COLD_MB); results `~/ta-wt/cm-results/`.
+
+## 2026-09-26 (successor #2, from 20:37)
+
+- Predecessor stopped ~20:00 (usage limit).  Its last completed
+  measurements: 4060 warm verify sweep at 100df0d (`verify-4060/`,
+  geomean x1.083 vs grokmerge, 1 shape slower by 2.3%), and the 4060
+  pp512 A/Bs:
+  - `pp512_ab_4060.log`: grokmerge 39.42 ms vs 100df0d 40.00 ms GPU
+    prefill (medians of 5 alternating pairs): **branch 1.5% slower**.
+  - `pp512_variants_4060.log` (4 rotated rounds): base 39.71,
+    ML_SM_COUNT=0 fallback 39.65, new (large-L2 rule) 40.08,
+    ML_L2_MB=1 (small-L2 rule) 38.36 ms.
+  - Reading: the large-L2 branch of the rule was fitted on warm-L2 `ab`
+    (B stays resident across back-to-back repeats); in a model forward
+    the weights are cold and the small-L2 rule (64x64 M-fast on all
+    four pp512 GEMMs) wins by 3.4%.
+- 34ad9f1: `ML_AB_COLD_MB` (L2 flush + A re-read before each timed GEMM).
+- Desktop embargo lifted (no embargo file at 20:37).
+- NEXT: cold-L2 sweeps on the 4060 (then 3070), refit/drop the large-L2
+  branch, 3070 verify sweep + pp512 A/B, 4060 pp512 re-check.

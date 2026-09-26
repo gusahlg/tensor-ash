@@ -1,0 +1,17 @@
+# louise 2026-09-26T20:10:40+02:00 model=/home/gusahlg/models/tinyllama-1.1b-chat-v1.0.f16.gguf pp=512 variants: base=ML_X=0:/home/gusahlg/ta-wt/cm-base/target/release/llama_ash fallback=ML_SM_COUNT=0:/home/gusahlg/ta-wt/cm-sm/target/release/llama_ash new=ML_X=0:/home/gusahlg/ta-wt/cm-sm/target/release/llama_ash smallL2=ML_L2_MB=1:/home/gusahlg/ta-wt/cm-sm/target/release/llama_ash
+round=1 variant=fallback prefill_gpu_ms=39.182 pp_tps=12969.77 shader_cores=unknown
+round=1 variant=new prefill_gpu_ms=40.142 pp_tps=12666.48 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=1 variant=smallL2 prefill_gpu_ms=38.267 pp_tps=13282.65 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=1 variant=base prefill_gpu_ms=39.703 pp_tps=12804.07 
+round=2 variant=new prefill_gpu_ms=40.018 pp_tps=12705.44 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=2 variant=smallL2 prefill_gpu_ms=38.351 pp_tps=13263.47 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=2 variant=base prefill_gpu_ms=39.674 pp_tps=12737.69 
+round=2 variant=fallback prefill_gpu_ms=39.563 pp_tps=12905.82 shader_cores=unknown
+round=3 variant=smallL2 prefill_gpu_ms=38.376 pp_tps=13212.74 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=3 variant=base prefill_gpu_ms=39.714 pp_tps=12836.10 
+round=3 variant=fallback prefill_gpu_ms=39.736 pp_tps=12793.80 shader_cores=unknown
+round=3 variant=new prefill_gpu_ms=40.149 pp_tps=12687.55 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=4 variant=base prefill_gpu_ms=39.854 pp_tps=12753.63 
+round=4 variant=fallback prefill_gpu_ms=39.879 pp_tps=12749.65 shader_cores=unknown
+round=4 variant=new prefill_gpu_ms=39.767 pp_tps=12785.34 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=4 variant=smallL2 prefill_gpu_ms=38.926 pp_tps=13122.09 shader_cores=24 (VK_NV_shader_sm_builtins)
