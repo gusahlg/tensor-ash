@@ -59,16 +59,18 @@ TA_DEVICE int b_off(int row, int ch) {
     return row * (BCH * 8) + ((ch ^ (row & 7)) << 3);
 }
 
+// K is the row stride of A (and the column count of the problem);
+// `kend` bounds this CTA's K range (== K unless split-K).
 template <class G>
 TA_DEVICE void load_stage(__half* As, __half* Bs, const __half* __restrict__ A,
-                          const __half* __restrict__ B, int M, int N, int K, int m0, int n0,
-                          int k0, int tid) {
+                          const __half* __restrict__ B, int M, int N, int K, int kend, int m0,
+                          int n0, int k0, int tid) {
 #pragma unroll
     for (int r = 0; r < G::A_CHUNKS / G::THREADS; ++r) {
         const int c = tid + r * G::THREADS;
         const int row = c / G::ACH, ch = c % G::ACH;
         const int gm = m0 + row, gk = k0 + ch * 8;
-        const bool ok = gm < M && gk < K;
+        const bool ok = gm < M && gk < kend;
         const __half* src = ok ? A + (size_t)gm * K + gk : A;
         cp_async16(smem_u32(As + a_off<G::BK>(row, ch)), src, ok ? 16u : 0u);
     }
@@ -77,15 +79,20 @@ TA_DEVICE void load_stage(__half* As, __half* Bs, const __half* __restrict__ A,
         const int c = tid + r * G::THREADS;
         const int row = c / G::BCH, ch = c % G::BCH;
         const int gk = k0 + row, gn = n0 + ch * 8;
-        const bool ok = gk < K && gn < N;
+        const bool ok = gk < kend && gn < N;
         const __half* src = ok ? B + (size_t)gk * N + gn : B;
         cp_async16(smem_u32(Bs + b_off<G::BCH>(row, ch)), src, ok ? 16u : 0u);
     }
 }
 
+// k_chunk > 0: split-K — blockIdx.z is the split index, this CTA sums
+// K range [z*k_chunk, min(K, (z+1)*k_chunk)) and stores the raw partial
+// (OUT must be 0, f32) to Cv + z*M*N; `ta_splitk_reduce_f16` finishes.
+// k_chunk == 0: blockIdx.z is the batch index (dense strides).
 template <int BM, int BN, int WM, int WN, int STAGES, int ACC, int OUT, int BK_>
 TA_DEVICE void hgemm_body(const __half* __restrict__ A, const __half* __restrict__ B,
-                          void* __restrict__ Cv, int M, int N, int K, float alpha) {
+                          void* __restrict__ Cv, int M, int N, int K, float alpha,
+                          int k_chunk = 0) {
     using G = Cfg<BM, BN, WM, WN, STAGES, ACC, BK_>;
     constexpr int BK = G::BK;
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -96,17 +103,23 @@ TA_DEVICE void hgemm_body(const __half* __restrict__ A, const __half* __restrict
     const int wm = warp % G::WARPS_M, wn = warp / G::WARPS_M;
 
     const size_t bz = blockIdx.z;
-    A += bz * (size_t)M * K;
-    B += bz * (size_t)K * N;
+    int kbeg = 0, kend = K;
+    if (k_chunk > 0) {
+        kbeg = (int)bz * k_chunk;
+        kend = min(K, kbeg + k_chunk);
+    } else {
+        A += bz * (size_t)M * K;
+        B += bz * (size_t)K * N;
+    }
     const size_t c_base = bz * (size_t)M * N;
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
-    const int KT = (K + BK - 1) / BK;
+    const int KT = max(0, (kend - kbeg + BK - 1) / BK);
 
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < KT)
-            load_stage<G>(As + s * G::A_STAGE, Bs + s * G::B_STAGE, A, B, M, N, K, m0, n0, s * BK,
-                          tid);
+            load_stage<G>(As + s * G::A_STAGE, Bs + s * G::B_STAGE, A, B, M, N, K, kend, m0, n0,
+                          kbeg + s * BK, tid);
         cp_async_commit();
     }
 
@@ -142,8 +155,8 @@ TA_DEVICE void hgemm_body(const __half* __restrict__ A, const __half* __restrict
             const int nk = kt + STAGES - 1;
             if (nk < KT) {
                 const int s = nk % STAGES;
-                load_stage<G>(As + s * G::A_STAGE, Bs + s * G::B_STAGE, A, B, M, N, K, m0, n0,
-                              nk * BK, tid);
+                load_stage<G>(As + s * G::A_STAGE, Bs + s * G::B_STAGE, A, B, M, N, K, kend, m0,
+                              n0, kbeg + nk * BK, tid);
             }
             cp_async_commit();
         }
@@ -262,3 +275,31 @@ TA_HGEMM(ta_hgemm_f16p_128x64_s3, 128, 64, 64, 32, 3, 2, 1, 2)
 TA_HGEMM(ta_hgemm_f16p_128x128_w64x32_s3, 128, 128, 64, 32, 3, 2, 1, 1)
 TA_HGEMM(ta_hgemm_f16p_64x64_s4, 64, 64, 32, 32, 4, 2, 1, 3)
 TA_HGEMM_K(ta_hgemm_f16p_128x64_k64_s2, 128, 64, 64, 32, 2, 2, 1, 2, 64)
+
+// Split-K partial kernels: f32 partials into W[split][M][N] (see
+// hgemm_body), finished by ta_splitk_reduce_f16.
+#define TA_HGEMM_SPLIT(NAME, BM, BN, WM, WN, ST, ACC, MINB)                                    \
+    extern "C" __global__ void __launch_bounds__(Cfg<BM, BN, WM, WN, ST, ACC>::THREADS, MINB)  \
+        NAME(const __half* __restrict__ A, const __half* __restrict__ B, float* __restrict__ W, \
+             int M, int N, int K, int k_chunk) {                                               \
+        hgemm_body<BM, BN, WM, WN, ST, ACC, 0, 32>(A, B, W, M, N, K, 1.0f, k_chunk);          \
+    }
+TA_HGEMM_SPLIT(ta_hgemm_f16_128x128_s3_splitk, 128, 128, 64, 64, 3, 1, 2)
+TA_HGEMM_SPLIT(ta_hgemm_f16_128x64_s3_splitk, 128, 64, 64, 32, 3, 1, 2)
+TA_HGEMM_SPLIT(ta_hgemm_f32_128x128_s3_splitk, 128, 128, 64, 64, 3, 0, 2)
+TA_HGEMM_SPLIT(ta_hgemm_f16p_128x64_s3_splitk, 128, 64, 64, 32, 3, 2, 2)
+
+// C[i] = f16(alpha * sum_s W[s][i]), 4 elements per thread (MN % 4 == 0).
+extern "C" __global__ void ta_splitk_reduce_f16(const float* __restrict__ W, __half* __restrict__ C,
+                                                int mn, int splits, float alpha) {
+    const int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= mn) return;
+    float4 acc = *reinterpret_cast<const float4*>(W + i);
+    for (int s = 1; s < splits; ++s) {
+        const float4 v = *reinterpret_cast<const float4*>(W + (size_t)s * mn + i);
+        acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;
+    }
+    __half2* dst = reinterpret_cast<__half2*>(C + i);
+    dst[0] = __floats2half2_rn(alpha * acc.x, alpha * acc.y);
+    dst[1] = __floats2half2_rn(alpha * acc.z, alpha * acc.w);
+}

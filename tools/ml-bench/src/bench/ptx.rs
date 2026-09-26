@@ -1223,6 +1223,73 @@ fn hgemm(ctx: &Arc<VulkanContext>, exec: &Executor, args: &[String]) -> Result<(
                 e_px.rms_ref
             );
         }
+
+        // Split-K variants (ML_PTX_SPLITS, default "2,3,4"; "0" skips).
+        let splits_list: Vec<u32> = env_string("ML_PTX_SPLITS", "2,3,4")
+            .split(',')
+            .filter_map(|v| v.parse().ok())
+            .filter(|&v| v >= 2)
+            .collect();
+        if (m * n) % 4 != 0 || splits_list.is_empty() {
+            continue;
+        }
+        let max_splits = *splits_list.iter().max().unwrap();
+        let w = Tensor::uninit_device(ctx, &[max_splits, m, n])?;
+        let wa = addr(ctx, &w);
+        let ca = addr(ctx, &c_px);
+        for (idx, (kern, _)) in gemm.hgemm_splitk.iter().enumerate() {
+            if !kern.supports(m, n, k)
+                || (!only.is_empty() && !only.split(',').any(|s| s == kern.name))
+            {
+                continue;
+            }
+            for &splits in &splits_list {
+                let label = format!("{}/{splits}", kern.name.trim_end_matches("_splitk"));
+                exec.upload_f16(&vec![0x7e00u16; (m * n) as usize], &c_px)?;
+                let run_px = || {
+                    rec.timed(|cb| unsafe {
+                        gemm.cmd_hgemm_splitk(cb, idx, aa, ba, wa, ca, (m, n, k), splits, 1.0)
+                    })
+                };
+                run_px()?;
+                let mut h_px = vec![0f32; (m * n) as usize];
+                exec.download(&c_px, &mut h_px)?;
+                let e_px = err_stats(&h_px, &refs);
+                let rel = |e: &ErrStats| e.rms_err / e.rms_ref.max(1e-30);
+                let gate = if kern.f16_acc && !kern.promoted() {
+                    0.05
+                } else {
+                    (4.0 * rel(&e_ta)).max(2e-3)
+                };
+                if !(rel(&e_px) <= gate) {
+                    println!(
+                        "{m}x{n}x{k} {label}: VALIDATION FAILED rel_rms {:.3e} — not timed",
+                        rel(&e_px)
+                    );
+                    continue;
+                }
+                let (t_ta, t_px) = interleave(
+                    rounds,
+                    iters,
+                    || tensor_ash_run(exec, &a, &b, &c_ta),
+                    run_px,
+                )?;
+                let (s_ta, s_px) = (summarize(t_ta), summarize(t_px));
+                println!(
+                    "{:<16} {:>9.4} {:>7.2} | {:<26} {:>9.4} {:>7.2} {:>7.3} | {:>9.2e} {:>9.2e} {:>9.2e}",
+                    format!("{m}x{n}x{k}"),
+                    s_ta.med,
+                    flops / s_ta.med * 1e-9,
+                    label,
+                    s_px.med,
+                    flops / s_px.med * 1e-9,
+                    s_ta.med / s_px.med,
+                    rel(&e_ta),
+                    rel(&e_px),
+                    e_px.max_abs
+                );
+            }
+        }
     }
     Ok(())
 }

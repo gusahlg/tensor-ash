@@ -176,6 +176,51 @@ pub const HGEMM_KERNELS: &[HgemmKernel] = &[
     ),
 ];
 
+/// Split-K partial kernels (f32 partials into a `[splits][M][N]`
+/// workspace), finished by `ta_splitk_reduce_f16`.
+pub const HGEMM_SPLITK_KERNELS: &[HgemmKernel] = &[
+    hk(
+        "ta_hgemm_f16_128x128_s3_splitk",
+        128,
+        128,
+        32,
+        4,
+        3,
+        true,
+        false,
+    ),
+    hk(
+        "ta_hgemm_f16_128x64_s3_splitk",
+        128,
+        64,
+        32,
+        4,
+        3,
+        true,
+        false,
+    ),
+    hk(
+        "ta_hgemm_f32_128x128_s3_splitk",
+        128,
+        128,
+        32,
+        4,
+        3,
+        false,
+        false,
+    ),
+    hk(
+        "ta_hgemm_f16p_128x64_s3_splitk",
+        128,
+        64,
+        32,
+        4,
+        3,
+        true,
+        false,
+    ),
+];
+
 impl HgemmKernel {
     /// `f16p`: f16-accumulate mma within one k-tile, promoted into f32
     /// registers after every k-tile.
@@ -195,10 +240,13 @@ impl HgemmKernel {
 
 /// Both GEMM modules, JIT-compiled once, with every entry resolved.
 pub struct PtxGemm {
+    ctx: Arc<VulkanContext>,
     pub sgemm_module: Arc<CudaModule>,
     pub hgemm_module: Arc<CudaModule>,
     pub sgemm: Vec<(SgemmKernel, CudaFunction)>,
     pub hgemm: Vec<(HgemmKernel, CudaFunction)>,
+    pub hgemm_splitk: Vec<(HgemmKernel, CudaFunction)>,
+    splitk_reduce: CudaFunction,
     /// Driver JIT time for (sgemm, hgemm) modules.
     pub jit_ms: (f64, f64),
 }
@@ -221,11 +269,19 @@ impl PtxGemm {
             .iter()
             .map(|k| Ok((*k, hm.function(k.name)?)))
             .collect::<Result<Vec<_>>>()?;
+        let hgemm_splitk = HGEMM_SPLITK_KERNELS
+            .iter()
+            .map(|k| Ok((*k, hm.function(k.name)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let splitk_reduce = hm.function("ta_splitk_reduce_f16")?;
         Ok(Self {
+            ctx: Arc::clone(ctx),
             sgemm_module: sm,
             hgemm_module: hm,
             sgemm,
             hgemm,
+            hgemm_splitk,
+            splitk_reduce,
             jit_ms: (s_ms, h_ms),
         })
     }
@@ -276,6 +332,75 @@ impl PtxGemm {
                 &args,
             )
         };
+    }
+
+    /// K range per split for `splits`-way split-K (a multiple of 32).
+    pub fn splitk_chunk(k: u32, splits: u32) -> u32 {
+        k.div_ceil(splits.max(1)).div_ceil(32) * 32
+    }
+
+    /// Record split-K `C(f16) = alpha*A*B`: the partial kernel writes
+    /// `splits` f32 planes to `w`, a compute barrier, then the reduce
+    /// sums them and rounds to f16.  Deterministic (fixed split order).
+    ///
+    /// # Safety
+    /// As [`Self::cmd_hgemm`]; `w` holds `splits*M*N` f32 and
+    /// `M*N % 4 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn cmd_hgemm_splitk(
+        &self,
+        cb: vk::CommandBuffer,
+        index: usize,
+        a: u64,
+        b: u64,
+        w: u64,
+        c: u64,
+        (m, n, k): (u32, u32, u32),
+        splits: u32,
+        alpha: f32,
+    ) {
+        let (kern, func) = &self.hgemm_splitk[index];
+        let chunk = Self::splitk_chunk(k, splits);
+        let splits = k.div_ceil(chunk);
+        let grid = [n.div_ceil(kern.bn), m.div_ceil(kern.bm), splits];
+        let args = [
+            KernelArg::U64(a),
+            KernelArg::U64(b),
+            KernelArg::U64(w),
+            KernelArg::I32(m as i32),
+            KernelArg::I32(n as i32),
+            KernelArg::I32(k as i32),
+            KernelArg::I32(chunk as i32),
+        ];
+        let mn = m * n;
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+        unsafe {
+            func.cmd_launch(cb, grid, [kern.threads, 1, 1], kern.smem_bytes(), &args);
+            self.ctx.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&barrier),
+                &[],
+                &[],
+            );
+            self.splitk_reduce.cmd_launch(
+                cb,
+                [(mn / 4).div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
+                &[
+                    KernelArg::U64(w),
+                    KernelArg::U64(c),
+                    KernelArg::I32(mn as i32),
+                    KernelArg::I32(splits as i32),
+                    KernelArg::F32(alpha),
+                ],
+            );
+        }
     }
 
     /// Record `C = alpha*A*B` with f16 A/B (row-major, dense batch).
