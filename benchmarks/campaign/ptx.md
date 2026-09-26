@@ -110,16 +110,17 @@ walks the buffer in *reverse*, the CUDA `probe_affine` forward, and
 `CudaAlt` alternates CUDA forward/reverse kernels, so a missing
 dependency races on exactly the elements the producer writes last.
 
-Mismatches (sum over 3 trials x 16.8M elements; GPU ms per 32-step chain):
+Mismatches per trial (of 16.8M elements; 3 trials each) and GPU ms per
+32-step chain:
 
 | chain | barrier between steps | 4060 mismatches | 4060 ms | 3070 mismatches | 3070 ms |
 |---|---|---:|---:|---:|---:|
 | Vulkan<->CUDA alternating | `COMPUTE->COMPUTE`, `SHADER_WRITE -> SHADER_READ\|WRITE` | 0 | 15.07 | 0 | 10.29 |
 | Vulkan<->CUDA alternating | `ALL_COMMANDS`, `MEMORY_WRITE -> MEMORY_READ\|WRITE` | 0 | 15.32 | 0 | 10.33 |
 | Vulkan<->CUDA alternating | `COMPUTE->COMPUTE`, execution only (no memory barrier) | 0 | 15.05 | 0 | 10.29-10.66 |
-| Vulkan<->CUDA alternating | none | **74-80 K per trial** | 15.06 | **131-146 K** | 10.18 |
-| CUDA fwd/rev alternating | compute barrier | 0 | - | 0 | 10.30 |
-| CUDA fwd/rev alternating | none | - | - | **98-109 K** | 10.20-10.92 |
+| Vulkan<->CUDA alternating | none | **74-85 K** | 15.06 | **131-146 K** | 10.18 |
+| CUDA fwd/rev alternating | compute barrier (also ALL_COMMANDS, exec-only: 0) | 0 | 15.08 | 0 | 10.30 |
+| CUDA fwd/rev alternating | none | **68-76 K** | 15.08 | **98-109 K** | 10.20-10.92 |
 | CUDA only / Vulkan only (same direction) | none | 0 (no power: same traversal order) | 16.6 | 0 | 10.3-10.5 |
 
 Conclusions:
