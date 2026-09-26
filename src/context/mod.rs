@@ -74,6 +74,13 @@ pub struct VulkanContext {
     /// device-scope quorum atomics.  Default off (`ML_DEVICE_SCOPE=1`
     /// opts in): enabling it globally scrambled CM2 flash numerics.
     pub memory_model_device_scope_enabled: bool,
+    /// Whether `VK_KHR_pipeline_executable_properties` was enabled with
+    /// its `pipelineExecutableInfo` feature.  Opt-in introspection only
+    /// (`ML_PIPELINE_EXEC_INFO=1`, set by `ml_bench isa`): pipelines
+    /// created with `CAPTURE_STATISTICS_KHR` then report the driver's
+    /// per-executable statistics (registers, spills, ...).  Default off
+    /// so production device creation is unchanged.
+    pub pipeline_executable_info_enabled: bool,
     /// Pipeline cache, seeded from disk on init and flushed back on drop.
     /// Persisting it avoids the SPIR-V -> ISA recompile (50-200 ms on
     /// NVIDIA) on every cold start.

@@ -21,7 +21,10 @@ use scopeguard::ScopeGuard;
 
 use crate::context::VulkanContext;
 
-use create::{create_epilogue_pipeline, create_kernel, destroy_kernel};
+use create::{
+    create_epilogue_pipeline, create_kernel, create_shader_module, create_specialized_pipeline_in,
+    destroy_kernel, spec_data_for,
+};
 use selection::{auto_min_large_tiles_for, auto_select_kernel};
 use tuning::{load_tuned, save_tuned, shader_registry_hash};
 
@@ -550,6 +553,82 @@ impl MatmulPipeline {
             tuned.clone()
         };
         save_tuned(&self.ctx, self.shader_hash, &snapshot);
+    }
+
+    /// Registry index of the kernel named `name` when its slot is
+    /// built on this device (`None` for unknown or gated-off kernels).
+    pub fn kernel_index(&self, name: &str) -> Option<usize> {
+        let index = KERNEL_SPECS.iter().position(|spec| spec.name == name)?;
+        self.kernels[index].is_some().then_some(index)
+    }
+
+    /// The built kernel at registry `index`, if its slot is populated.
+    pub fn kernel(&self, index: usize) -> Option<&MatmulKernel> {
+        self.kernels.get(index).and_then(Option::as_ref)
+    }
+
+    /// Specialization constants (ids `0..len`) of the pipeline a
+    /// dispatch of this (kernel, variant, epilogue) triple binds.
+    pub fn pipeline_spec_constants(
+        &self,
+        kernel_index: usize,
+        variant: KernelVariant,
+        epilogue: EpilogueKey,
+    ) -> Vec<u32> {
+        spec_data_for(self.kernel_at(kernel_index), variant, epilogue)
+    }
+
+    /// ISA-introspection probe: compile, into the caller's `cache` and
+    /// with the caller's create `flags` (e.g. the
+    /// `VK_KHR_pipeline_executable_properties` capture bits), the same
+    /// module + layout + specialization constants a dispatch of this
+    /// (kernel, variant, epilogue) triple uses.  `spv_override`
+    /// replaces only the SPIR-V (e.g. a `glslc -Os` build of the same
+    /// shader) and must declare the same interface.  The pipeline is
+    /// NOT registered anywhere: the caller owns and destroys it.
+    /// Creating a pipeline dispatches no GPU work.
+    pub fn create_probe_pipeline(
+        &self,
+        kernel_index: usize,
+        variant: KernelVariant,
+        epilogue: EpilogueKey,
+        cache: vk::PipelineCache,
+        flags: vk::PipelineCreateFlags,
+        spv_override: Option<&[u8]>,
+    ) -> Result<vk::Pipeline> {
+        let kernel = self.kernel_at(kernel_index);
+        let spec_data = spec_data_for(kernel, variant, epilogue);
+        let label = format!("probe {variant:?} {epilogue:?} on {}", kernel.name);
+        let Some(spv) = spv_override else {
+            return create_specialized_pipeline_in(
+                &self.ctx,
+                cache,
+                flags,
+                kernel.shader_module,
+                kernel.pipeline_layout,
+                &spec_data,
+                &label,
+            );
+        };
+        anyhow::ensure!(
+            spv.len() >= 20 && spv.len().is_multiple_of(4),
+            "SPIR-V override for {} is not a SPIR-V module ({} bytes)",
+            kernel.name,
+            spv.len()
+        );
+        let module = create_shader_module(&self.ctx, spv, &label)?;
+        let result = create_specialized_pipeline_in(
+            &self.ctx,
+            cache,
+            flags,
+            module,
+            kernel.pipeline_layout,
+            &spec_data,
+            &label,
+        );
+        // A pipeline does not reference its module after creation.
+        unsafe { self.ctx.device.destroy_shader_module(module, None) };
+        result
     }
 
     /// Pipeline for a (kernel, base-variant, epilogue) triple. Fully
