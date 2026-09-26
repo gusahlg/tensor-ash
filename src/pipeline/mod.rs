@@ -161,7 +161,32 @@ impl MatmulPipeline {
                 }
             });
             let shared_budget = ctx.workgroup_shared_budget();
+            // Generator configs (spec-constant modules, M1) are opt-in:
+            // ML_GEN=1 builds all of them, an ML_KERNEL pin builds that
+            // one.  Their pipelines are created on first use either way.
+            let gen_enabled =
+                std::env::var("ML_GEN").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+            // A pinned config also builds its other-A-storage twin, so
+            // the a16 route of an a32 pin (and vice versa) resolves.
+            let pinned_gen: Vec<String> = selection
+                .index()
+                .map(|i| &KERNEL_SPECS[i])
+                .filter(|spec| spec.is_generated())
+                .map(|spec| {
+                    let twin = if spec.a_f16() {
+                        spec.name.replacen("f16w_a16_coopmat_g_", "f16w_coopmat_g_", 1)
+                    } else {
+                        spec.name.replacen("f16w_coopmat_g_", "f16w_a16_coopmat_g_", 1)
+                    };
+                    vec![spec.name.to_string(), twin]
+                })
+                .unwrap_or_default();
             for spec in KERNEL_SPECS {
+                let generated = spec.is_generated();
+                if generated && !gen_enabled && !pinned_gen.iter().any(|n| n == spec.name) {
+                    kernels_guard.push(None);
+                    continue;
+                }
                 // f16-storage kernels declare SPIR-V capabilities the
                 // device may not have; leave their registry slots empty
                 // instead of failing the whole pipeline. Routing and
@@ -203,10 +228,11 @@ impl MatmulPipeline {
                 } else {
                     pipeline_layout_bda
                 };
-                // Opt-in f16-accumulator twins build no eager fallbacks
-                // (aligned coopmat dispatches never bind them anyway):
-                // their first dispatch compiles the exact variant.
-                let kernel = if f16_acc {
+                // Opt-in f16-accumulator twins and generator configs
+                // build no eager fallbacks (aligned coopmat dispatches
+                // never bind them anyway): their first dispatch
+                // compiles the exact variant.
+                let kernel = if f16_acc || generated {
                     create_kernel_lazy(ctx, layout, spec)
                 } else {
                     create_kernel(ctx, layout, spec)
@@ -455,6 +481,19 @@ impl MatmulPipeline {
         k: u32,
         acc: CoopmatAcc,
     ) -> usize {
+        // A pinned generator config: its a16 module twin.
+        if let Some(index) = self.selection.index()
+            && KERNEL_SPECS[index].is_generated()
+        {
+            let spec = &KERNEL_SPECS[index];
+            if spec.a_f16() {
+                return index;
+            }
+            let twin = spec.name.replacen("f16w_coopmat_g_", "f16w_a16_coopmat_g_", 1);
+            if let Some(twin) = self.kernel_index(&twin) {
+                return twin;
+            }
+        }
         let (tile, acc) = match routing::coopmat1_parts(self.selection) {
             Some((tile, _, pinned_acc)) => (tile, pinned_acc),
             None => (
@@ -650,14 +689,14 @@ impl MatmulPipeline {
         self.kernels.get(index).and_then(Option::as_ref)
     }
 
-    /// Specialization constants (ids `0..len`) of the pipeline a
+    /// Specialization constants `(id, value)` of the pipeline a
     /// dispatch of this (kernel, variant, epilogue) triple binds.
     pub fn pipeline_spec_constants(
         &self,
         kernel_index: usize,
         variant: KernelVariant,
         epilogue: EpilogueKey,
-    ) -> Vec<u32> {
+    ) -> Vec<(u32, u32)> {
         spec_data_for(self.kernel_at(kernel_index), variant, epilogue)
     }
 
