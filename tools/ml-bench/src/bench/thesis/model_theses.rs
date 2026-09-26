@@ -219,7 +219,7 @@ pub(crate) fn t5_prefill_accounting(
         })
     };
 
-    let mm_us = |m: u32, n: u32, k: u32| -> Result<Option<f64>> {
+    let mm_us = |m: u32, n: u32, k: u32, packed_b: bool| -> Result<Option<f64>> {
         let case = BenchCase {
             label: Cow::Owned(format!("t5 mm {m}x{n}x{k} f16w")),
             b: 1,
@@ -227,7 +227,7 @@ pub(crate) fn t5_prefill_accounting(
             n,
             k,
             b_f16: true,
-            packed_b: false,
+            packed_b,
         };
         Ok(run_case(ctx, exec, case, 10, 2)?
             .gpu_ms
@@ -242,11 +242,11 @@ pub(crate) fn t5_prefill_accounting(
         cfg.t_max,
     );
     let kv_dim = kv * dh;
-    let qkv = term(mm_us(T, embd + 2 * kv_dim, embd)?);
-    let qo = term(mm_us(T, embd, embd)?);
-    let upgate = term(mm_us(T, ffn, embd)?);
-    let down = term(mm_us(T, embd, ffn)?);
-    let lm_head = term(mm_us(1, cfg.vocab, embd)?);
+    let qkv = term(mm_us(T, embd + 2 * kv_dim, embd, false)?);
+    let qo = term(mm_us(T, embd, embd, false)?);
+    let upgate = term(mm_us(T, ffn, embd, false)?);
+    let down = term(mm_us(T, embd, ffn, false)?);
+    let lm_head = term(mm_us(1, cfg.vocab, embd, true)?);
 
     fn med_gpu_us(mut op: impl FnMut() -> Result<RunStats>) -> Result<Option<f64>> {
         const ITERS: usize = 10;
@@ -398,8 +398,8 @@ pub(crate) fn t5_prefill_accounting(
     // 1 attn rmsnorm + 1 concatenated QKV GEMM + fused QKV pack +
     // flash (token-major O) + [o matmul + residual add + ffn rmsnorm +
     // up/gate matmuls + silu-mul + down matmul + residual add], then
-    // the LM-head tail (last-row copy, rmsnorm, UNPACKED M=1 lm_head
-    // GEMV — prefill does not use the packed decode copy).
+    // the LM-head tail (last-row copy, rmsnorm, packed M=1 lm_head
+    // GEMV — the same packed copy decode uses).
     let layers = cfg.n_layers as f64;
     let gemm_total = (qkv + qo + 2.0 * upgate + down) * layers + lm_head;
     let flash_total = flash * layers;

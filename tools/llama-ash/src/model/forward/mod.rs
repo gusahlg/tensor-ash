@@ -110,8 +110,9 @@ impl Model {
             )?;
             self.exec
                 .run_rms_norm(&s.last, &self.output_norm, &s.last_n, self.cfg.rms_eps)?;
-            self.exec
-                .run_matmuls(&[mm(&s.last_n, &self.lm_head, &s.logits)])?
+            self.exec.run_ops(&[
+                MatmulOp::new(mm(&s.last_n, &self.lm_head_p, &s.logits)).with_packed_b()
+            ])?
         };
         self.note("lm_head_mm", &stats);
         let mut logits = vec![0.0_f32; self.cfg.vocab as usize];
@@ -259,11 +260,11 @@ impl Model {
             output: &s.last_n,
             eps: self.cfg.rms_eps,
         });
-        ops.push(ExecOp::Matmul(MatmulOp::new(mm(
-            &s.last_n,
-            &self.lm_head,
-            &s.logits,
-        ))));
+        // Same packed M=1 GEMV as decode: the unpacked N=32000 row
+        // walk strides 64 KiB per K step (7.4x slower on AD107).
+        ops.push(ExecOp::Matmul(
+            MatmulOp::new(mm(&s.last_n, &self.lm_head_p, &s.logits)).with_packed_b(),
+        ));
     }
 
     /// Per-op decode MLP block, `x_in -> x_out` (the graph paths emit

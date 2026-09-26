@@ -229,14 +229,11 @@ impl Model {
         exec.upload(&embd_cpu, &embd_gpu)?;
         let output_norm = load_norm(&mut gguf, "output_norm.weight")?;
         // Some GGUFs tie the LM head to the embeddings.
-        let (lm_head, lm_host) = if gguf.tensors.contains_key("output.weight") {
-            load_linear(&mut gguf, "output.weight", embd, vocab)?
+        let lm_host = if gguf.tensors.contains_key("output.weight") {
+            load_linear_host(&mut gguf, "output.weight", embd, vocab)?
         } else {
             log::info!("output.weight absent; using tied token_embd.weight");
-            let t = transpose(&embd_cpu, vocab as usize, embd as usize);
-            let tensor = Tensor::uninit_device_f16(ctx, &[embd, vocab])?;
-            exec.upload(&t, &tensor)?;
-            (tensor, t)
+            transpose(&embd_cpu, vocab as usize, embd as usize)
         };
         let lm_head_p = pack(&lm_host, embd, vocab)?;
 
@@ -284,7 +281,6 @@ impl Model {
             embd_cpu,
             embd_gpu,
             output_norm,
-            lm_head,
             lm_head_p,
             rope_table,
             pos: 0,

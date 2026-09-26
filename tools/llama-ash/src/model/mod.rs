@@ -202,7 +202,9 @@ pub struct Model {
     /// storage precision) for the decode loop's on-GPU row gather.
     embd_gpu: Tensor,
     output_norm: Tensor,
-    lm_head: Tensor,
+    /// LM head `[embd, vocab]` in the packed `[N/tile][K][tile]` row-GEMV
+    /// layout — the only copy: both the decode step and the prefill
+    /// tail run it as an M=1 packed GEMV.
     lm_head_p: Tensor,
     rope_table: Tensor,
     /// Tokens currently in the KV caches.
