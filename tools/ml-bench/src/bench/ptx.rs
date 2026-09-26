@@ -1179,7 +1179,7 @@ fn hgemm(ctx: &Arc<VulkanContext>, exec: &Executor, args: &[String]) -> Result<(
             let rel = |e: &ErrStats| e.rms_err / e.rms_ref.max(1e-30);
             // f32-acc must match coopmat's error class; f16-acc gets a
             // looser gate (its error IS the finding, reported below).
-            let gate = if kern.f16_acc {
+            let gate = if kern.f16_acc && !kern.promoted() {
                 0.05
             } else {
                 (4.0 * rel(&e_ta)).max(2e-3)

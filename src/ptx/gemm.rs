@@ -68,7 +68,8 @@ pub struct HgemmKernel {
     pub bk: u32,
     pub threads: u32,
     pub stages: u32,
-    /// f16 accumulate (`mma ...f16.f16.f16.f16`) instead of f32.
+    /// f16 accumulate (`mma ...f16.f16.f16.f16`) instead of f32 — also
+    /// true for the promoted `f16p` kernels ([`Self::promoted`]).
     pub f16_acc: bool,
     /// C stored as f16 (the a16 route contract) instead of f32.
     pub out_f16: bool,
@@ -176,6 +177,12 @@ pub const HGEMM_KERNELS: &[HgemmKernel] = &[
 ];
 
 impl HgemmKernel {
+    /// `f16p`: f16-accumulate mma within one k-tile, promoted into f32
+    /// registers after every k-tile.
+    pub fn promoted(&self) -> bool {
+        self.name.contains("_f16p_")
+    }
+
     /// Dynamic shared memory: `stages * (BM*BK + BK*BN)` halves.
     pub fn smem_bytes(&self) -> u32 {
         self.stages * (self.bm * self.bk + self.bk * self.bn) * 2

@@ -22,6 +22,9 @@
 // ACC = 1: f16 accumulate (mma ...f16.f16.f16.f16) — 2x the tensor
 //          throughput on GeForce Ampere/Ada; what cuBLAS does under
 //          CUBLAS_COMPUTE_16F.  Converted to f32 at the store.
+// ACC = 2: "f16p" — f16-accumulate mma within one BK k-tile, promoted
+//          into f32 registers after every k-tile: the f16-rate tensor
+//          pipe with each f16 partial sum spanning only BK products.
 #include <cuda_fp16.h>
 #include "common.cuh"
 
@@ -107,20 +110,23 @@ TA_DEVICE void hgemm_body(const __half* __restrict__ A, const __half* __restrict
         cp_async_commit();
     }
 
-    float accf[ACC == 0 ? G::MI : 1][ACC == 0 ? G::NI : 1][4];
-    uint32_t acch[ACC == 1 ? G::MI : 1][ACC == 1 ? G::NI : 1][2];
-    if (ACC == 0) {
+    // FA: f32 accumulators live (ACC 0, 2); HA: f16 accumulators live (ACC 1, 2).
+    constexpr bool FA = ACC != 1, HA = ACC != 0;
+    float accf[FA ? G::MI : 1][FA ? G::NI : 1][4];
+    uint32_t acch[HA ? G::MI : 1][HA ? G::NI : 1][2];
+    if (FA) {
 #pragma unroll
         for (int i = 0; i < G::MI; ++i)
 #pragma unroll
             for (int j = 0; j < G::NI; ++j)
 #pragma unroll
-                for (int q = 0; q < 4; ++q) accf[i][j][q] = 0.f;
-    } else {
+                for (int q = 0; q < 4; ++q) accf[FA ? i : 0][FA ? j : 0][q] = 0.f;
+    }
+    if (HA) {
 #pragma unroll
         for (int i = 0; i < G::MI; ++i)
 #pragma unroll
-            for (int j = 0; j < G::NI; ++j) acch[i][j][0] = acch[i][j][1] = 0u;
+            for (int j = 0; j < G::NI; ++j) acch[HA ? i : 0][HA ? j : 0][0] = acch[HA ? i : 0][HA ? j : 0][1] = 0u;
     }
 
     // Per-lane ldmatrix row/chunk selectors.
@@ -160,9 +166,24 @@ TA_DEVICE void hgemm_body(const __half* __restrict__ A, const __half* __restrict
 #pragma unroll
                 for (int ni = 0; ni < G::NI; ++ni) {
                     if (ACC == 0)
-                        mma_f32(accf[ACC == 0 ? mi : 0][ACC == 0 ? ni : 0], af[mi], bf[ni]);
+                        mma_f32(accf[FA ? mi : 0][FA ? ni : 0], af[mi], bf[ni]);
                     else
-                        mma_f16(acch[ACC == 1 ? mi : 0][ACC == 1 ? ni : 0], af[mi], bf[ni]);
+                        mma_f16(acch[HA ? mi : 0][HA ? ni : 0], af[mi], bf[ni]);
+                }
+        }
+        if (ACC == 2) {
+            // Promote: fold this k-tile's f16 partial sums (<= BK terms)
+            // into the f32 accumulators and restart them from zero.
+#pragma unroll
+            for (int mi = 0; mi < G::MI; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < G::NI; ++ni) {
+                    uint32_t* d = acch[HA ? mi : 0][HA ? ni : 0];
+                    float* f = accf[FA ? mi : 0][FA ? ni : 0];
+                    const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&d[0]));
+                    const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&d[1]));
+                    f[0] += lo.x; f[1] += lo.y; f[2] += hi.x; f[3] += hi.y;
+                    d[0] = d[1] = 0u;
                 }
         }
     }
@@ -175,11 +196,11 @@ TA_DEVICE void hgemm_body(const __half* __restrict__ A, const __half* __restrict
         for (int ni = 0; ni < G::NI; ++ni) {
             const int gn = n0 + wn * WN + ni * 8 + t * 2;
             float v[4];
-            if (ACC == 0) {
+            if (FA) {
 #pragma unroll
-                for (int q = 0; q < 4; ++q) v[q] = accf[ACC == 0 ? mi : 0][ACC == 0 ? ni : 0][q];
+                for (int q = 0; q < 4; ++q) v[q] = accf[FA ? mi : 0][FA ? ni : 0][q];
             } else {
-                const uint32_t* d = acch[ACC == 1 ? mi : 0][ACC == 1 ? ni : 0];
+                const uint32_t* d = acch[HA ? mi : 0][HA ? ni : 0];
                 const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&d[0]));
                 const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&d[1]));
                 v[0] = lo.x; v[1] = lo.y; v[2] = hi.x; v[3] = hi.y;
@@ -237,3 +258,7 @@ TA_HGEMM(ta_hgemm_f16_256x128_s3, 256, 128, 64, 64, 3, 1, 1, 1)
 TA_HGEMM_K(ta_hgemm_f16_128x128_k64_s2, 128, 128, 64, 64, 2, 1, 1, 1, 64)
 TA_HGEMM_K(ta_hgemm_f16_128x64_k64_s2, 128, 64, 64, 32, 2, 1, 1, 2, 64)
 TA_HGEMM_K(ta_hgemm_f16_128x128_w64x32_k64_s2, 128, 128, 64, 32, 2, 1, 1, 1, 64)
+TA_HGEMM(ta_hgemm_f16p_128x64_s3, 128, 64, 64, 32, 3, 2, 1, 2)
+TA_HGEMM(ta_hgemm_f16p_128x128_w64x32_s3, 128, 128, 64, 32, 3, 2, 1, 1)
+TA_HGEMM(ta_hgemm_f16p_64x64_s4, 64, 64, 32, 32, 4, 2, 1, 3)
+TA_HGEMM_K(ta_hgemm_f16p_128x64_k64_s2, 128, 64, 64, 32, 2, 2, 1, 2, 64)
