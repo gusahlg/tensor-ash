@@ -353,10 +353,24 @@ RTX 4060 (two alternating passes):
 | PTX f16p | 33.94 / 33.85 | 14,953 / 14,993 | **1.16** |
 | PTX f16 acc | 28.48 / 28.75 | 17,929 / 17,618 | **1.37** |
 
-llama.cpp b9503 on the same 4060 (scoreboard 2026-08-15): CUDA fa=1
-13,042 t/s, Vulkan CM2 fa=1 14,003 t/s.  With the f16-accumulate route
-tensor-ash prefill is **~1.36x llama.cpp CUDA** on this card (same-day
-llama.cpp re-measure: see below).
+Second session, same day, same lock hold as a llama.cpp re-measure
+(`llama-bench -m ... -p 512 -n 32 -fa 1 -r 5`, b9503 CUDA):
+
+| run | pp512 t/s |
+|---|---:|
+| llama.cpp CUDA b9503, fa=1 | 12,885 +- 1,576 |
+| tensor-ash base (x2) | 12,867 / 12,850 |
+| tensor-ash PTX f16p, BK=32 pick (x2) | 14,873 / 14,969 |
+| tensor-ash PTX f16 acc (x2) | 17,491 / 17,568 |
+
+So on the 4060 the campaign base is already at llama.cpp CUDA parity
+for pp512, and the f16-accumulate PTX route - the same accumulation
+precision llama.cpp uses - puts tensor-ash prefill at **1.36x llama.cpp
+CUDA** (and ~1.25x the Aug-15 llama.cpp Vulkan CM2 number, 14,003).
+
+Token exactness: `llama_ash generate` with a 128-token prompt (which
+takes the a16 prefill path) and 32 greedy tokens produced identical ids
+for `ML_PTX_GEMM=off`, `f32`, `f16p` and `f16`.
 
 RTX 3070 (before the desktop embargo; first base run was a cold outlier):
 
