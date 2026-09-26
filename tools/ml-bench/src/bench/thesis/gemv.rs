@@ -6,8 +6,8 @@
 //! the recorded device bandwidth.  Packed-B is used where llama-ash
 //! packs (q, k/v, gate/up, lm_head) so T2 sees the sequential K-walk
 //! that made lm_head hit 94% of device BW; o and down stay unpacked.
-//! The verdict is taken on a DRAM-cold measurement: a 192 MiB L2
-//! scrub runs before every timed dispatch, because decode streams
+//! The verdict is taken on a DRAM-cold measurement: a 192 MiB
+//! read-mostly GEMV scrub runs before every timed dispatch, because decode streams
 //! ~2 GB of weights per token and never sees a weight L2-hot — while a
 //! repeated standalone dispatch of an 8 MB q/o weight is served from
 //! AD107's 24 MB L2 (and the 1 MB k/v weight even from GA104's 4 MB),
@@ -34,8 +34,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tensor_ash::{
-    BinaryOp, Executor, MatmulCall, MatmulOp, Tensor, VulkanContext, f16w_row_tile_n,
-    pack_f16w_row_tiles,
+    Executor, MatmulCall, MatmulOp, Tensor, VulkanContext, f16w_row_tile_n, pack_f16w_row_tiles,
 };
 use tensor_ash_test_support::fill_det;
 
@@ -65,39 +64,53 @@ const GEMV_SHAPES: &[(&str, u32, u32, bool, Option<&str>)] = &[
     ("lm_head 2048x32000", 2048, 32000, true, None),
 ];
 
-/// Elements of each f32 L2-scrub tensor: the scrub reads two and
-/// writes one 64 MiB tensor (192 MiB of traffic) between timed GEMVs —
-/// 8x AD107's 24 MB L2, 48x GA104's 4 MB.
-const T2_SCRUB_SHAPE: [u32; 2] = [4096, 4096];
+/// The L2 scrub is itself a decode-style GEMV: a packed f16w
+/// `[1,2048] @ [2048, 49152]` (192 MiB of weights — 8x AD107's 24 MB
+/// L2, 48x GA104's 4 MB) that writes only a 192 KiB row.  It must be
+/// READ-mostly: a first version (an elementwise add writing 64 MiB)
+/// left the L2 full of dirty lines whose write-back then competed
+/// with the timed GEMV (4060: q 49 us, gate/up 129 us vs 34 / 91 us
+/// inside a real decode step).
+const T2_SCRUB_K: u32 = 2048;
+const T2_SCRUB_N: u32 = 49152;
 
 /// Clock warm-up before each timed series (see `run_case_warm`).
 pub(crate) const THESIS_WARM: Duration = Duration::from_millis(200);
 
-/// The L2 scrub: one big elementwise add over tensors unrelated to the
-/// GEMV, run as its own submission right before each timed dispatch.
+/// The L2 scrub: a big packed GEMV over weights unrelated to the timed
+/// one, run as its own submission right before each timed dispatch —
+/// exactly what precedes every weight read in decode.  Its weights are
+/// never uploaded (values do not affect a GEMV's timing).
 struct L2Scrub {
-    x: Tensor,
-    y: Tensor,
+    a: Tensor,
+    b: Tensor,
+    c: Tensor,
 }
 
 impl L2Scrub {
     fn new(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<Self> {
-        let x = Tensor::uninit_device(ctx, &T2_SCRUB_SHAPE)?;
-        let y = Tensor::uninit_device(ctx, &T2_SCRUB_SHAPE)?;
-        let zeros = vec![0.0f32; x.len() as usize];
-        exec.upload(&zeros, &x)?;
-        exec.upload(&zeros, &y)?;
-        Ok(Self { x, y })
+        let a = Tensor::uninit_device(ctx, &[1, 1, T2_SCRUB_K])?;
+        exec.upload(&vec![0.0f32; T2_SCRUB_K as usize], &a)?;
+        let b = Tensor::uninit_device_f16(ctx, &[1, T2_SCRUB_K, T2_SCRUB_N])?;
+        let c = Tensor::uninit_device(ctx, &[1, 1, T2_SCRUB_N])?;
+        Ok(Self { a, b, c })
     }
 
     fn run(&self, exec: &Executor) -> Result<()> {
-        exec.run_binary(&self.x, &self.y, &self.x, BinaryOp::AddScaled { beta: 1.0 })?;
+        let call = MatmulCall {
+            a: &self.a,
+            b: &self.b,
+            c: &self.c,
+            alpha: 1.0,
+            accumulate: false,
+        };
+        exec.run_ops(&[MatmulOp::new(call).with_packed_b()])?;
         Ok(())
     }
 }
 
 /// Median GPU time (us) of an M=1 f16w row GEMV whose weights are NOT
-/// in L2: an unrelated 192 MiB scrub runs before every timed dispatch,
+/// in L2: an unrelated 192 MiB GEMV scrub runs before every timed dispatch,
 /// so B streams from DRAM exactly as it does in decode (one weight
 /// allocation, evicted by the rest of the token's traffic).  A and C
 /// are tiny and L2-resident, as in decode.  `None` without GPU
