@@ -8,8 +8,9 @@
 //! independently measured op-class terms (GEMM + flash attention +
 //! elementwise + barrier drain) whose sum lands within tolerance of
 //! the measured whole.  The piecewise inventory mirrors
-//! `llama-ash/src/model.rs::prefill_ops` (wide T >= 128 branch); if that
-//! structure drifts, THIS THESIS FAILING IS THE ALARM.
+//! `llama-ash/src/model/forward/prefill.rs::prefill_ops` (wide
+//! T >= 128 f16 branch); if that structure drifts, THIS THESIS
+//! FAILING IS THE ALARM.
 //!
 //! T7 (token exactness): every decode mode x KV dtype x prefill width
 //! emits bit-identical greedy tokens — the correctness invariant all
@@ -202,7 +203,7 @@ pub(crate) fn t5_prefill_accounting(
         .unwrap_or(f64::NAN);
     let census = model.prefill_graph_stats(T)?;
 
-    // The pieces: every op class of prefill_ops' T >= 256 branch,
+    // The pieces: every op class of prefill_ops' wide (T >= 128) branch,
     // measured standalone at the model's own shapes on synthetic
     // tensors (rates don't depend on values).
     let mut missing = false;
@@ -236,8 +237,8 @@ pub(crate) fn t5_prefill_accounting(
         cfg.t_max,
     );
     let kv_dim = kv * dh;
+    let qkv = term(mm_us(T, embd + 2 * kv_dim, embd)?);
     let qo = term(mm_us(T, embd, embd)?);
-    let kvp = term(mm_us(T, kv_dim, embd)?);
     let upgate = term(mm_us(T, ffn, embd)?);
     let down = term(mm_us(T, embd, ffn)?);
     let lm_head = term(mm_us(1, cfg.vocab, embd)?);
@@ -391,12 +392,11 @@ pub(crate) fn t5_prefill_accounting(
     // Per-layer inventory of prefill_ops' wide (T >= 128) branch:
     // 1 attn rmsnorm + 1 concatenated QKV GEMM + fused QKV pack +
     // flash (token-major O) + [o matmul + residual add + ffn rmsnorm +
-    // up/gate matmuls + silu-mul + down matmul + residual add].
-    // Standalone piece timings still use the older 3-projection +
-    // permute decomposition; the concat QKV GEMM is approximated as
-    // q/o + 2×k/v (same FLOPs, one dispatch).
+    // up/gate matmuls + silu-mul + down matmul + residual add], then
+    // the LM-head tail (last-row copy, rmsnorm, UNPACKED M=1 lm_head
+    // GEMV — prefill does not use the packed decode copy).
     let layers = cfg.n_layers as f64;
-    let gemm_total = (2.0 * qo + 2.0 * kvp + 2.0 * upgate + down) * layers + lm_head;
+    let gemm_total = (qkv + qo + 2.0 * upgate + down) * layers + lm_head;
     let flash_total = flash * layers;
     // Pack replaces 2 ropes + 2 KV copies + 2 permutes on the f16
     // wide path; keep the measured copies as an upper bound on that

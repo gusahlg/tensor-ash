@@ -4,8 +4,8 @@
 //! GEMVs) to a fraction of its bandwidth floor, where the floor is
 //! bytes moved (f16 weights, f32 activation row in, f32 row out) over
 //! the recorded device bandwidth.  Packed-B is used where llama-ash
-//! packs (k/v, gate/up, lm_head) so T2 sees the sequential K-walk
-//! that made lm_head hit 94% of device BW; q/o and down stay unpacked.
+//! packs (q, k/v, gate/up, lm_head) so T2 sees the sequential K-walk
+//! that made lm_head hit 94% of device BW; o and down stay unpacked.
 //! The verdict is taken on a DRAM-cold measurement: every timed
 //! dispatch reads a different copy of B from a rotation set far larger
 //! than any L2, because decode streams ~2 GB of weights per token and
@@ -40,11 +40,13 @@ use crate::bench::commands::run_case;
 use crate::bench::env::env_u32;
 
 /// Decode GEMV classes: `(label, K, N, packed)` for a `[1,K] @ [K,N]`
-/// f16w row GEMV (TinyLlama-1.1B geometry). `packed` follows llama-ash:
-/// k/v, gate/up, and lm_head use `[N/tile][K][tile]`; q/o and down stay
-/// row-major (already at the unpacked bandwidth floor).
+/// f16w row GEMV (TinyLlama-1.1B geometry). `packed` follows llama-ash
+/// (`Layer::wq_p`..`w_up_p`, `lm_head_p`): q, k/v, gate/up, and lm_head
+/// use `[N/tile][K][tile]`; o and down stay row-major (packing them
+/// was measured-neutral).
 const GEMV_SHAPES: &[(&str, u32, u32, bool)] = &[
-    ("q/o 2048x2048", 2048, 2048, false),
+    ("q 2048x2048", 2048, 2048, true),
+    ("o 2048x2048", 2048, 2048, false),
     ("k/v 2048x256", 2048, 256, true),
     ("gate/up 2048x5632", 2048, 5632, true),
     ("down 5632x2048", 5632, 2048, false),
@@ -206,9 +208,12 @@ pub(crate) fn t2_gemv_efficiency(
     Ok(rows)
 }
 
-/// Real aligned 2048-class prefill GEMM shapes `(label, M, N, K)`.
+/// Real aligned 2048-class prefill GEMM shapes `(label, M, N, K)`:
+/// every GEMM TinyLlama's pp512 prefill runs per layer (the q|k|v
+/// projections are one concatenated N=2560 GEMM).
 const COOPMAT_SHAPES: &[(&str, u32, u32, u32)] = &[
-    ("prefill q/o 512x2048x2048", 512, 2048, 2048),
+    ("prefill qkv 512x2560x2048", 512, 2560, 2048),
+    ("prefill o 512x2048x2048", 512, 2048, 2048),
     ("prefill gate/up 512x5632x2048", 512, 5632, 2048),
     ("prefill down 512x2048x5632", 512, 2048, 5632),
 ];
