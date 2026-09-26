@@ -10,6 +10,8 @@
 //! * `smem`     — dynamic shared memory above 48 KiB.
 //! * `sync`     — Vulkan<->CUDA ordering under several barrier kinds.
 //! * `state`    — does a CUDA launch clobber bound Vulkan compute state?
+//! * `dump`     — write the driver-JIT cubins (vkGetCudaModuleCacheNV)
+//!   of every module to `ML_PTX_DUMP_DIR` for nvdisasm.
 //! * `overhead` — launch cost vs a Vulkan dispatch; launch overlap.
 //! * `sgemm [MxNxK ...]` — PTX f32 SGEMM vs tensor-ash's f32 route.
 //! * `hgemm [MxNxK ...]` — PTX mma.sync GEMM vs tensor-ash a16 coopmat.
@@ -43,10 +45,11 @@ pub(super) fn run(
         "smem" => smem(ctx, exec),
         "sync" => sync(ctx, exec),
         "state" => state(ctx, exec),
+        "dump" => dump(ctx),
         "overhead" => overhead(ctx, exec),
         "sgemm" => sgemm(ctx, exec, &rest),
         "hgemm" => hgemm(ctx, exec, &rest),
-        _ => bail!("ptx: unknown mode '{mode}' (probe|smem|sync|state|overhead|sgemm|hgemm)"),
+        _ => bail!("ptx: unknown mode '{mode}' (probe|smem|sync|state|overhead|sgemm|hgemm|dump)"),
     }
 }
 
@@ -401,6 +404,32 @@ fn try_nvx(ctx: &Arc<VulkanContext>, exec: &Executor, rec: &Rec, label: &str, da
         }
         Err(e) => println!("NVX {label}: FAILED ({e})"),
     }
+}
+
+// ---------------------------------------------------------------------
+// dump
+
+fn dump(ctx: &Arc<VulkanContext>) -> Result<()> {
+    let dir = env_string("ML_PTX_DUMP_DIR", ".");
+    std::fs::create_dir_all(&dir)?;
+    let cc = ctx.cuda_compute_capability.unwrap_or((0, 0));
+    let probe = CudaModule::from_ptx(ctx, kernels::PROBE_PTX)?;
+    let gemm = PtxGemm::new(ctx)?;
+    for (name, module) in [
+        ("probe", &probe),
+        ("sgemm", &gemm.sgemm_module),
+        ("hgemm", &gemm.hgemm_module),
+    ] {
+        let blob = module.cache_data()?;
+        let path = format!("{dir}/{name}_jit_sm{}{}.cubin", cc.0, cc.1);
+        std::fs::write(&path, &blob)?;
+        println!("{path}: {} bytes", blob.len());
+    }
+    println!(
+        "JIT ms: sgemm {:.1}, hgemm {:.1}",
+        gemm.jit_ms.0, gemm.jit_ms.1
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------

@@ -130,6 +130,8 @@ impl HgemmKernel {
 
 /// Both GEMM modules, JIT-compiled once, with every entry resolved.
 pub struct PtxGemm {
+    pub sgemm_module: Arc<CudaModule>,
+    pub hgemm_module: Arc<CudaModule>,
     pub sgemm: Vec<(SgemmKernel, CudaFunction)>,
     pub hgemm: Vec<(HgemmKernel, CudaFunction)>,
     /// Driver JIT time for (sgemm, hgemm) modules.
@@ -153,6 +155,8 @@ impl PtxGemm {
             .map(|k| Ok((*k, hm.function(k.name)?)))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            sgemm_module: sm,
+            hgemm_module: hm,
             sgemm,
             hgemm,
             jit_ms: (s_ms, h_ms),
