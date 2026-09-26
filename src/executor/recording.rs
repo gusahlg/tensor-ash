@@ -162,19 +162,16 @@ pub(super) fn record_one_matmul(
     };
     let mut pc = dims.push_constants(call.alpha, call.accumulate, a_ptr, b_ptr, c_ptr);
 
-    // Pick the specialization variant whose constants match this call.
-    // `interior_only` is safe whenever M and N are tile-aligned to the
-    // selected kernel's tile size — the shader then skips all
-    // m_full/n_full bounds checks.  `tile_k == 1` divides every K and
-    // those kernels (row/col/outer) never read K_MULTIPLE; forcing the
-    // flag false lets their plain unaligned dispatches resolve to the
-    // eager fallback pipeline instead of the lazy-cache mutex.
-    let variant = KernelVariant {
-        accumulate: call.accumulate,
-        alpha_is_one: call.alpha == 1.0,
-        interior_only: dims.m.is_multiple_of(kernel.tile_m) && dims.n.is_multiple_of(kernel.tile_n),
-        k_multiple: kernel.tile_k > 1 && dims.k.is_multiple_of(kernel.tile_k),
-    };
+    // Pick the specialization variant whose constants match this call
+    // (see `KernelVariant::for_dispatch` for the alignment rules).
+    let variant = KernelVariant::for_dispatch(
+        [kernel.tile_m, kernel.tile_n, kernel.tile_k],
+        dims.m,
+        dims.n,
+        dims.k,
+        call.accumulate,
+        call.alpha,
+    );
 
     let epilogue = &op.epilogue;
     if !epilogue.is_none() {

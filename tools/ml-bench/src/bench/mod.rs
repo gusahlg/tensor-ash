@@ -2,6 +2,7 @@ mod ab;
 mod cases;
 mod commands;
 mod env;
+mod isa;
 mod report;
 mod thesis;
 
@@ -18,6 +19,18 @@ pub fn run() -> Result<()> {
 
     let mut args = std_env::args().skip(1);
     let cmd = args.next().unwrap_or_else(|| "all".into());
+    // Offline ISA census: no Vulkan device needed.
+    if cmd == "isa-analyze" {
+        return isa::isa_analyze(args);
+    }
+    if cmd == "isa-cache" {
+        return isa::isa_cache(args);
+    }
+    if cmd == "isa" {
+        // Ask the library to enable VK_KHR_pipeline_executable_properties.
+        // SAFETY: single-threaded here; no other thread reads the env yet.
+        unsafe { std_env::set_var("ML_PIPELINE_EXEC_INFO", "1") };
+    }
     let validate = env_bool("ML_VALIDATE");
     let n_slots = env_usize("ML_SLOTS", 2);
     let raw_kernel = env_string("ML_KERNEL", "auto");
@@ -39,7 +52,7 @@ pub fn run() -> Result<()> {
     )?);
     let exec = Arc::new(Executor::new(
         ctx.clone(),
-        pipe,
+        pipe.clone(),
         n_slots,
         /*max_calls=*/ 256,
     )?);
@@ -61,12 +74,13 @@ pub fn run() -> Result<()> {
         "transfer" => commands::transfer(&ctx, &exec)?,
         "prepared" => commands::prepared(&ctx, &exec)?,
         "thesis" => thesis::run(&ctx, &exec, args)?,
+        "isa" => isa::isa(&ctx, &pipe, &exec, args)?,
         "all" => {
             commands::correctness(&ctx, &exec)?;
             commands::sweep(&ctx, &exec)?;
         }
         _ => anyhow::bail!(
-            "unknown subcommand '{cmd}'; expected self-check, correctness, sweep, single, cases, ab, concurrent, transfer, prepared, thesis, or all"
+            "unknown subcommand '{cmd}'; expected self-check, correctness, sweep, single, cases, ab, concurrent, transfer, prepared, thesis, isa, isa-analyze, isa-cache, or all"
         ),
     }
     Ok(())

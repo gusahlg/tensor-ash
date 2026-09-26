@@ -11,8 +11,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+ash = "0.38"
 env_logger = "0.11"
 llama-ash = { path = "../llama-ash" }
 log = "0.4"
+# Pure-Rust zstd decoder for `ml_bench isa` (NVIDIA pipeline-cache
+# entries are zstd frames).  ml-bench only: the library stays lean.
+ruzstd = "0.8"
+scopeguard = "1.2"
 tensor-ash = { path = "../.." }
 tensor-ash-test-support = { path = "../test-support" }

@@ -92,6 +92,32 @@ impl KernelVariant {
         }
     }
 
+    /// The variant a dispatch of an `m x n x k` matmul on a kernel with
+    /// output tile `tile = [tile_m, tile_n, tile_k]` binds:
+    /// `interior_only` whenever M and N are tile-aligned (the shader then
+    /// skips all m_full/n_full bounds checks), `k_multiple` whenever K
+    /// is.  `tile_k == 1` divides every K and those kernels
+    /// (row/col/outer) never read K_MULTIPLE; forcing the flag false
+    /// lets their plain unaligned dispatches resolve to the eager
+    /// fallback pipeline instead of the lazy-cache mutex.
+    #[inline]
+    pub fn for_dispatch(
+        tile: [u32; 3],
+        m: u32,
+        n: u32,
+        k: u32,
+        accumulate: bool,
+        alpha: f32,
+    ) -> Self {
+        let [tile_m, tile_n, tile_k] = tile;
+        Self {
+            accumulate,
+            alpha_is_one: alpha == 1.0,
+            interior_only: m.is_multiple_of(tile_m) && n.is_multiple_of(tile_n),
+            k_multiple: tile_k > 1 && k.is_multiple_of(tile_k),
+        }
+    }
+
     /// Correctness-safe variant used while the aligned specialization is lazy.
     #[inline]
     pub(crate) const fn fallback(self) -> Self {
@@ -143,6 +169,18 @@ mod tests {
             seen[variant.index()] = true;
         }
         assert!(seen.into_iter().all(|value| value));
+    }
+
+    #[test]
+    fn for_dispatch_follows_tile_alignment() {
+        let v = KernelVariant::for_dispatch([128, 64, 64], 1024, 1024, 1024, false, 1.0);
+        assert!(v.interior_only && v.k_multiple && v.alpha_is_one && !v.accumulate);
+        let v = KernelVariant::for_dispatch([128, 64, 64], 1023, 1025, 1027, true, 0.5);
+        assert!(!v.interior_only && !v.k_multiple && !v.alpha_is_one && v.accumulate);
+        assert_eq!(v, v.fallback());
+        // tile_k == 1 (row/col/outer GEMVs) never claims k_multiple.
+        let v = KernelVariant::for_dispatch([1, 64, 1], 1, 5632, 2048, false, 1.0);
+        assert!(v.interior_only && !v.k_multiple);
     }
 
     #[test]
