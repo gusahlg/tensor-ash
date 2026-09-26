@@ -1,6 +1,6 @@
 #version 460
-// Raster candidate: the 64x64 tile in column-major (M-fastest) CTA
-// order, so wide-N GEMMs stream B from DRAM ~once.
+// 64x64 tile in column-major (M-fastest) CTA order (auto-routed by the
+// SM-aware rule when it cuts B re-streaming; see routing.rs).
 
 #define RASTER_M_FAST 1
 #define BM 64u

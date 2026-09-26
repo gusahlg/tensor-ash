@@ -16,8 +16,8 @@ use super::VulkanContext;
 use super::cache::{create_pipeline_cache, pipeline_cache_path_for};
 use super::debug::debug_callback;
 use super::device::{
-    DevicePreference, ShaderCoreSource, ShaderCores, device_summaries, parse_sm_count_override,
-    query_shader_cores, select_physical_device,
+    DevicePreference, ShaderCoreSource, ShaderCores, device_summaries, nvidia_l2_bytes_lower_bound,
+    parse_l2_override, parse_sm_count_override, query_shader_cores, select_physical_device,
 };
 
 /// Keep one bare `VkInstance` (and the loader library itself) alive for
@@ -229,6 +229,16 @@ pub(super) fn create(
             ),
             queried_cores.map_or_else(|| "none".to_string(), |cores| cores.count.to_string()),
         );
+        // L2 size is not queryable in Vulkan: a device-ID family lower
+        // bound (NVIDIA) or `ML_L2_MB`; routing treats unknown as small.
+        let table_l2 = (device_properties.vendor_id == 0x10de)
+            .then(|| nvidia_l2_bytes_lower_bound(device_properties.device_id))
+            .flatten();
+        let l2_bytes_estimate = match parse_l2_override(std::env::var("ML_L2_MB").ok().as_deref())?
+        {
+            None => table_l2,
+            Some(pinned) => pinned,
+        };
         let coopmat_name = ash::khr::cooperative_matrix::NAME;
         let coopmat_present = device_extensions
             .iter()
@@ -410,6 +420,7 @@ pub(super) fn create(
             driver_id,
             memory_properties,
             shader_cores,
+            l2_bytes_estimate,
             compute_family,
             queue: Mutex::new(queue),
             timestamp_period_ns: device_properties.limits.timestamp_period as f64,

@@ -46,6 +46,11 @@ pub struct VulkanContext {
     /// device exposes none of them.  Routing reads it through
     /// [`Self::sm_count`] to size tile grids against wave quantization.
     pub shader_cores: Option<ShaderCores>,
+    /// Lower-bound L2 size estimate in bytes (Vulkan cannot report it):
+    /// an NVIDIA device-ID family table, or `ML_L2_MB`; `None` when
+    /// unknown.  Coopmat routing uses it to decide whether a prefill
+    /// operand stays L2-resident (see `pipeline::routing`).
+    pub l2_bytes_estimate: Option<u64>,
     pub compute_family: u32,
     /// Compute queue.  Vulkan requires external sync on a queue, hence the mutex.
     pub queue: Mutex<vk::Queue>,
@@ -228,7 +233,7 @@ impl VulkanContext {
 
     pub fn diagnostics(&self) -> String {
         format!(
-            "device #{}: {} ({}, Vulkan {}, vendor=0x{:04x}, device=0x{:04x}, driver={}, compute_family={}, timestamps={} ({} bits), shader_cores={})",
+            "device #{}: {} ({}, Vulkan {}, vendor=0x{:04x}, device=0x{:04x}, driver={}, compute_family={}, timestamps={} ({} bits), shader_cores={}, l2>={})",
             self.device_summary.index,
             self.device_summary.name,
             self.device_summary.kind.as_str(),
@@ -243,6 +248,8 @@ impl VulkanContext {
                 Some(cores) => format!("{} ({})", cores.count, cores.source.as_str()),
                 None => "unknown".into(),
             },
+            self.l2_bytes_estimate
+                .map_or_else(|| "unknown".to_string(), |b| format!("{} MiB", b >> 20)),
         )
     }
 }

@@ -1,6 +1,6 @@
 #version 460
-// Raster candidate: f16-activation 64x64 tile in column-major
-// (M-fastest) CTA order.
+// f16-activation 64x64 tile in column-major (M-fastest) CTA order
+// (auto-routed for prefill by the SM-aware rule; see routing.rs).
 
 #define RASTER_M_FAST 1
 #define A_F16 1

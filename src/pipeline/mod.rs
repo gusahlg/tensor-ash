@@ -32,8 +32,8 @@ pub use runtime::MatmulKernel;
 pub(crate) use tuning::{SPLITK2_SPIRV, TuneEntry, TuneKey};
 
 pub(crate) use routing::{
-    CoopmatTile, coopmat_selection, f16w_row_packed_selection, f16w_row_selection, maybe_to_bda,
-    to_f16w,
+    CoopmatDevice, CoopmatTile, coopmat_selection, f16w_row_packed_selection, f16w_row_selection,
+    maybe_to_bda, to_f16w,
 };
 pub use routing::{f16w_row_tile_n, f16w_row_uses_k16};
 
@@ -340,7 +340,7 @@ impl MatmulPipeline {
                 && m.is_multiple_of(64)
                 && n.is_multiple_of(64)
             {
-                coopmat_selection(batch, m, n, k, self.ctx.sm_count(), false)
+                coopmat_selection(batch, m, n, k, false, self.coopmat_device())
                     .expect("M/N are 64-aligned")
             } else {
                 // f16-storage B is validated as BDA-capable upstream;
@@ -397,19 +397,13 @@ impl MatmulPipeline {
                 // gate empties them, fall back to the 128x128 sibling
                 // (same family, same alignment).
                 K::F16wCoopmatM64
-                | K::F16wCoopmatM64N128
-                | K::F16wCoopmatM128N64
-                | K::F16wCoopmatM128N64Bk64
-                | K::F16wCoopmatM128N64T256
-                | K::F16wCoopmatM64N128W64
-                | K::F16wCoopmatM64Bk64
                 | K::F16wCoopmatM64Mfast
-                | K::F16wCoopmatM128N64Mfast
-                | K::F16wCoopmatM128N128Mfast => K::F16wCoopmat,
+                | K::F16wCoopmatM64N128
+                | K::F16wCoopmatM128N64 => K::F16wCoopmat,
                 K::F16wA16CoopmatM64
+                | K::F16wA16CoopmatM64Mfast
                 | K::F16wA16CoopmatM64N128
-                | K::F16wA16CoopmatM128N64
-                | K::F16wA16CoopmatM64Mfast => K::F16wA16Coopmat,
+                | K::F16wA16CoopmatM128N64 => K::F16wA16Coopmat,
                 // Packed B is a different layout; falling back to the
                 // unpacked row kernel would silently read garbage.
                 K::F16wRowBdaK16Packed | K::F16wRowBdaK16V2Packed => {
@@ -424,6 +418,15 @@ impl MatmulPipeline {
                     KERNEL_SPECS[other.index().expect("selection is concrete")].name
                 ),
             };
+        }
+    }
+
+    /// The device inputs of the coopmat tile rule: SM count and the
+    /// L2 lower bound (both `None` off NVIDIA / unknown parts).
+    pub(crate) fn coopmat_device(&self) -> CoopmatDevice {
+        CoopmatDevice {
+            sm_count: self.ctx.sm_count(),
+            l2_bytes: self.ctx.l2_bytes_estimate,
         }
     }
 
@@ -444,7 +447,7 @@ impl MatmulPipeline {
             return index;
         }
         let tile = CoopmatTile::of_selection(self.selection)
-            .or_else(|| routing::coopmat_tile(batch, m, n, k, self.ctx.sm_count()))
+            .or_else(|| routing::coopmat_tile(batch, m, n, k, true, self.coopmat_device()))
             .expect("a16 resolution already requires 64-aligned M/N");
         tile.selection(true)
             .index()

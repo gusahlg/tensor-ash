@@ -271,6 +271,50 @@ pub(super) fn query_shader_cores(
     None
 }
 
+/// Last-level (L2) cache size estimate, in bytes, for devices whose
+/// size Vulkan cannot report (no core or vendor query exists).  A
+/// *family lower bound* from the PCI device ID, NVIDIA only:
+///
+/// | device IDs | family | L2 (smallest part) |
+/// |---|---|---|
+/// | 0x20B0-0x20FF | GA100 | 40 MiB |
+/// | 0x2320-0x233F | GH100 | 50 MiB |
+/// | 0x2680-0x2FFF | Ada AD10x, Blackwell GB10x/GB20x | 24 MiB (AD107) |
+/// | 0x1E00-0x25FF (other) | Turing TU10x/TU11x, Ampere GA10x | 1 MiB |
+///
+/// Routing only asks whether the L2 can hold a prefill-sized operand
+/// (>= 16 MiB), so a lower bound is the conservative answer; anything
+/// else reports `None` and routing assumes a small L2.
+pub(super) fn nvidia_l2_bytes_lower_bound(device_id: u32) -> Option<u64> {
+    const MIB: u64 = 1 << 20;
+    match device_id {
+        0x20B0..=0x20FF => Some(40 * MIB),
+        0x2320..=0x233F => Some(50 * MIB),
+        0x2680..=0x2FFF => Some(24 * MIB),
+        0x1E00..=0x25FF => Some(MIB),
+        _ => None,
+    }
+}
+
+/// Parse an `ML_L2_MB` value (MiB): `Ok(Some(Some(bytes)))` pins the
+/// estimate, `Ok(Some(None))` (`0` / `none`) forces unknown, and
+/// `Ok(None)` (unset / empty / `auto`) keeps the table's answer.
+pub(super) fn parse_l2_override(raw: Option<&str>) -> Result<Option<Option<u64>>> {
+    let Some(raw) = raw.map(str::trim) else {
+        return Ok(None);
+    };
+    if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    if raw.eq_ignore_ascii_case("none") {
+        return Ok(Some(None));
+    }
+    let mib = raw
+        .parse::<u64>()
+        .with_context(|| format!("invalid ML_L2_MB '{raw}' (expected MiB, 0/none, or auto)"))?;
+    Ok(Some((mib > 0).then_some(mib << 20)))
+}
+
 pub(super) fn device_summaries(
     instance: &ash::Instance,
     devices: &[vk::PhysicalDevice],
@@ -457,6 +501,24 @@ mod tests {
         assert_eq!(parse_sm_count_override(Some("none")).unwrap(), Some(None));
         assert!(parse_sm_count_override(Some("-3")).is_err());
         assert!(parse_sm_count_override(Some("many")).is_err());
+    }
+
+    #[test]
+    fn l2_estimate_table_and_override() {
+        const MIB: u64 = 1 << 20;
+        // The two measured cards: RTX 4060 (AD107) and RTX 3070 (GA104).
+        assert_eq!(nvidia_l2_bytes_lower_bound(0x2882), Some(24 * MIB));
+        assert_eq!(nvidia_l2_bytes_lower_bound(0x2488), Some(MIB));
+        assert_eq!(nvidia_l2_bytes_lower_bound(0x2684), Some(24 * MIB)); // AD102
+        assert_eq!(nvidia_l2_bytes_lower_bound(0x2B85), Some(24 * MIB)); // GB202
+        assert_eq!(nvidia_l2_bytes_lower_bound(0x20B0), Some(40 * MIB)); // GA100
+        assert_eq!(nvidia_l2_bytes_lower_bound(0x1B80), None); // Pascal: unknown
+        assert_eq!(parse_l2_override(None).unwrap(), None);
+        assert_eq!(parse_l2_override(Some("auto")).unwrap(), None);
+        assert_eq!(parse_l2_override(Some("4")).unwrap(), Some(Some(4 * MIB)));
+        assert_eq!(parse_l2_override(Some("0")).unwrap(), Some(None));
+        assert_eq!(parse_l2_override(Some("none")).unwrap(), Some(None));
+        assert!(parse_l2_override(Some("big")).is_err());
     }
 
     #[test]
