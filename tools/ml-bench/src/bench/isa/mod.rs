@@ -378,7 +378,10 @@ fn analyze(nvdisasm: &str, dir: &Path, stem: &str) -> Result<String> {
 
     let regs: u32 = get("registers").and_then(|v| v.parse().ok()).unwrap_or(0);
     let threads: u32 = get("threads").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let smem: u32 = get("shared_bytes")
+    // Prefer the driver's own figure (VK_KHR_pipeline_executable_properties
+    // "Shared Memory Size": declared bytes plus any driver allocation).
+    let smem: u32 = get("stat.shared_memory_size")
+        .or_else(|| get("shared_bytes"))
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let limits = SmLimits::for_arch(&arch);
@@ -492,6 +495,26 @@ fn analyze(nvdisasm: &str, dir: &Path, stem: &str) -> Result<String> {
             m.yields,
             m.reuse_flagged
         );
+        for base in ["LDG", "LDS", "LDSM"] {
+            let mut d = census.use_distances(l, base);
+            if d.is_empty() {
+                continue;
+            }
+            d.sort_by_key(|x| x.1);
+            let med = d[d.len() / 2];
+            let _ = writeln!(
+                rep,
+                "{base}->first use (in-warp latency cover), {} loads with a scoreboard: \
+                 min {} instrs/{} cycles, median {}/{}, max {}/{}",
+                d.len(),
+                d[0].0,
+                d[0].1,
+                med.0,
+                med.1,
+                d[d.len() - 1].0,
+                d[d.len() - 1].1
+            );
+        }
         // Pipe-time lower bounds for one warp's iteration on one SM
         // sub-partition: 1 issue/clk; FP32 = 32 lanes/clk (one warp FFMA
         // per clk on GA10x/AD10x); tensor = 64 f16-in/f32-acc FMA/clk
@@ -505,7 +528,14 @@ fn analyze(nvdisasm: &str, dir: &Path, stem: &str) -> Result<String> {
             m.mma_fmas / 64,
             m.mma_fmas
         );
-        let _ = writeln!(rep, "\n```\n{}```", census.loop_listing(l));
+        // The annotated listing (control bits per instruction) goes to
+        // its own file so the census stays a compact summary.
+        let listing = format!("{stem}.loop.sass");
+        std::fs::write(dir.join(&listing), census.loop_listing(l))?;
+        let _ = writeln!(
+            rep,
+            "annotated main-loop listing ([wait:R:W:yield:stall] per instr): {listing}"
+        );
     }
     std::fs::write(dir.join(format!("{stem}.census.txt")), &rep)?;
     println!("{rep}");

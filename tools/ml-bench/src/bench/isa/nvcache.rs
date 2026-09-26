@@ -26,7 +26,7 @@
 //!           u32 type | u32 size | u64 offset | u32 v0 | v1 | v2 | v3
 //! section types (names as nvdisasm prints them):
 //!   0x01 UCODE (raw SASS), 0x03 REG (u32 count, u32 requested),
-//!   0x18 BARRIER, 0x21 STRING_TABLE, 0x37 DEBUG_FRAME_TABLE,
+//!   0x17 STACK, 0x18 BARRIER, 0x21 STRING_TABLE, 0x3c SCRATCH, 0x37 DEBUG_FRAME_TABLE,
 //!   0x39 SYMBOL_TABLE, 0x3a DEBUG_FUNCTION_MAP, 0x45 PROGRAM_INFO,
 //!   0x1204 CTAID_INFO; others are printed as unknown.
 //! ```
@@ -173,6 +173,8 @@ impl Section {
         match self.kind {
             0x01 => "UCODE",
             0x03 => "REG",
+            0x17 => "STACK",
+            0x3c => "SCRATCH",
             0x18 => "BARRIER",
             0x21 => "STRING_TABLE",
             0x37 => "DEBUG_FRAME_TABLE",

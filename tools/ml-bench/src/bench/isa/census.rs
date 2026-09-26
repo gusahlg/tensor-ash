@@ -463,6 +463,34 @@ impl Census {
         [var, fixed, nops]
     }
 
+    /// Latency cover inside one warp: for every `base` load in the loop
+    /// that sets a write scoreboard, the distance to the first later
+    /// instruction (wrapping around the loop body once) that waits on
+    /// that scoreboard, as (instructions, static issue cycles).  Small
+    /// distances mean the load's latency is exposed unless other warps
+    /// cover it.
+    pub(crate) fn use_distances(&self, l: &Loop, base: &str) -> Vec<(usize, u64)> {
+        let body = &self.instrs[l.range.clone()];
+        let n = body.len();
+        let mut out = Vec::new();
+        for (i, ins) in body.iter().enumerate() {
+            if ins.base() != base || ins.ctrl.wbar == 7 {
+                continue;
+            }
+            let bit = 1u8 << ins.ctrl.wbar;
+            let mut cycles = u64::from(ins.ctrl.stall);
+            for d in 1..=n {
+                let next = &body[(i + d) % n];
+                if next.ctrl.wait & bit != 0 {
+                    out.push((d, cycles));
+                    break;
+                }
+                cycles += u64::from(next.ctrl.stall);
+            }
+        }
+        out
+    }
+
     /// Main-loop body as annotated SASS (address, control, text).
     pub(crate) fn loop_listing(&self, l: &Loop) -> String {
         let mut out = String::new();
@@ -508,6 +536,31 @@ mod tests {
         let code: u64 = (0b100001 << 11) | (0 << 8) | (5 << 5) | 5;
         let c = Ctrl::decode(&word(0, code << 41));
         assert_eq!(c.render(), "B0----5:R0:W5:Y:S05");
+    }
+
+    #[test]
+    fn load_use_distance_wraps_within_the_loop() {
+        let text = "\
+        /*0000*/                   FFMA R8, R4, R5, R8 ;
+        /*0010*/                   LDG.E R4, [R2.64] ;
+        /*0020*/                   IADD3 R2, R2, 0x4, RZ ;
+        /*0030*/               @P0 BRA 0x0 ;
+        /*0040*/                   EXIT ;
+";
+        let mut ucode = vec![0u8; 0x50];
+        for (i, chunk) in ucode.chunks_mut(16).enumerate() {
+            // LDG sets W1 (S02); the FFMA at the loop head waits on it.
+            let ctrl: u64 = match i {
+                1 => (7 << 8) | (1 << 5) | 2,
+                0 => (0b10 << 11) | (7 << 8) | (7 << 5) | 1,
+                _ => (7 << 8) | (7 << 5) | 3,
+            };
+            chunk[8..].copy_from_slice(&(ctrl << 41).to_le_bytes());
+        }
+        let c = Census::new(parse_sass(text, &ucode).unwrap());
+        let l = &c.loops[c.main_loop.unwrap()];
+        // LDG (S02) -> IADD3 (S03) -> BRA (S03) -> wraps to the FFMA.
+        assert_eq!(c.use_distances(l, "LDG"), vec![(3, 8)]);
     }
 
     #[test]
