@@ -17,7 +17,9 @@
 //! mean signed error (rounding bias) over 64 sampled rows x all columns.
 //!
 //! Run (4060 first):  cargo run --release --example coopmat_acc_numerics
-//! `ML_NUMERICS_ROWS` (default 64) sets the sampled rows of part 2.
+//! `ML_NUMERICS_ROWS` (default 64) sets the sampled rows of part 2;
+//! `ML_NUMERICS_GATE_ONLY=1` stops after part 1; `ML_NUMERICS_SKIP_GEN=1`
+//! leaves the generator configs out of part 1.
 
 use std::sync::Arc;
 
@@ -236,8 +238,11 @@ fn correctness_gate(ctx: &Arc<VulkanContext>) -> Result<usize> {
     println!("## part 1: every coopmat1 kernel, 256x256x1024 unif, full output vs f64");
     println!("| kernel | acc | max abs err | max err / (2^-11 l2) | rel rms | mean err | verdict |");
     println!("|---|---|---|---|---|---|---|");
+    // ML_NUMERICS_SKIP_GEN=1 leaves out the generator (spec-module)
+    // configs, e.g. on a GPU where they have not been validated yet.
+    let skip_gen = std::env::var("ML_NUMERICS_SKIP_GEN").is_ok_and(|v| v == "1");
     for (index, spec) in KERNEL_SPECS.iter().enumerate() {
-        if !spec.name.contains("coopmat") {
+        if !spec.name.contains("coopmat") || (skip_gen && spec.is_generated()) {
             continue;
         }
         let selection = KernelSelection::parse(spec.name)?;
