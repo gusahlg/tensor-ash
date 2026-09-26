@@ -17,7 +17,7 @@ use anyhow::{Result, bail};
 use ash::vk;
 use parking_lot::Mutex;
 
-pub use device::{DeviceKind, DevicePreference, DeviceSummary};
+pub use device::{DeviceKind, DevicePreference, DeviceSummary, ShaderCoreSource, ShaderCores};
 
 pub(crate) fn timestamp_delta(start: u64, end: u64, valid_bits: u32) -> u64 {
     let delta = end.wrapping_sub(start);
@@ -41,6 +41,11 @@ pub struct VulkanContext {
     /// [`Self::workgroup_shared_budget`].
     pub driver_id: Option<vk::DriverId>,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// Shader-core (NVIDIA SM / AMD CU / ARM core) count from the
+    /// vendor properties extensions, or `ML_SM_COUNT`; `None` when the
+    /// device exposes none of them.  Routing reads it through
+    /// [`Self::sm_count`] to size tile grids against wave quantization.
+    pub shader_cores: Option<ShaderCores>,
     pub compute_family: u32,
     /// Compute queue.  Vulkan requires external sync on a queue, hence the mutex.
     pub queue: Mutex<vk::Queue>,
@@ -206,6 +211,13 @@ impl VulkanContext {
         self.driver_id != Some(vk::DriverId::MESA_NVK)
     }
 
+    /// Shader cores a workgroup can be resident on (SMs on NVIDIA),
+    /// when known.  `ML_SM_COUNT=N` overrides it; `ML_SM_COUNT=0`
+    /// forces `None` (the SM-agnostic routing fallback).
+    pub fn sm_count(&self) -> Option<u32> {
+        self.shader_cores.map(|cores| cores.count)
+    }
+
     pub fn device_name(&self) -> &str {
         &self.device_summary.name
     }
@@ -216,7 +228,7 @@ impl VulkanContext {
 
     pub fn diagnostics(&self) -> String {
         format!(
-            "device #{}: {} ({}, Vulkan {}, vendor=0x{:04x}, device=0x{:04x}, driver={}, compute_family={}, timestamps={} ({} bits))",
+            "device #{}: {} ({}, Vulkan {}, vendor=0x{:04x}, device=0x{:04x}, driver={}, compute_family={}, timestamps={} ({} bits), shader_cores={})",
             self.device_summary.index,
             self.device_summary.name,
             self.device_summary.kind.as_str(),
@@ -227,6 +239,10 @@ impl VulkanContext {
             self.compute_family,
             self.timestamps_supported,
             self.timestamp_valid_bits,
+            match self.shader_cores {
+                Some(cores) => format!("{} ({})", cores.count, cores.source.as_str()),
+                None => "unknown".into(),
+            },
         )
     }
 }

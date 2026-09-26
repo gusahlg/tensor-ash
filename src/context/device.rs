@@ -126,6 +126,151 @@ impl DeviceSummary {
     }
 }
 
+/// Where [`ShaderCores::count`] came from.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ShaderCoreSource {
+    /// `VkPhysicalDeviceShaderSMBuiltinsPropertiesNV::shaderSMCount`
+    /// (`VK_NV_shader_sm_builtins`): streaming multiprocessors.
+    NvSmBuiltins,
+    /// `VkPhysicalDeviceShaderCoreProperties2AMD::activeComputeUnitCount`
+    /// (`VK_AMD_shader_core_properties2`): active compute units.
+    AmdActiveComputeUnits,
+    /// `shaderEngineCount * shaderArraysPerEngineCount *
+    /// computeUnitsPerShaderArray` (`VK_AMD_shader_core_properties`):
+    /// the physical CU count, an upper bound on the active count.
+    AmdPhysicalComputeUnits,
+    /// `VkPhysicalDeviceShaderCoreBuiltinsPropertiesARM::shaderCoreCount`
+    /// (`VK_ARM_shader_core_builtins`).
+    ArmShaderCores,
+    /// `ML_SM_COUNT=N` override (experiments and cross-GPU what-ifs).
+    EnvOverride,
+}
+
+impl ShaderCoreSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NvSmBuiltins => "VK_NV_shader_sm_builtins",
+            Self::AmdActiveComputeUnits => "VK_AMD_shader_core_properties2",
+            Self::AmdPhysicalComputeUnits => "VK_AMD_shader_core_properties",
+            Self::ArmShaderCores => "VK_ARM_shader_core_builtins",
+            Self::EnvOverride => "ML_SM_COUNT",
+        }
+    }
+}
+
+/// The device's count of independently scheduled shader cores (NVIDIA
+/// SMs, AMD CUs, ARM shader cores) — the unit a workgroup is resident
+/// on, and therefore the denominator of wave quantization.  Routing
+/// uses it to size tile grids (see `pipeline::routing::coopmat_tile`);
+/// devices exposing none of the vendor queries report `None` and
+/// routing keeps its SM-agnostic rules.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct ShaderCores {
+    pub count: u32,
+    /// Maximum resident warps (waves) per core when the driver reports
+    /// it (`shaderWarpsPerSM` / `shaderWarpsPerCore`).
+    pub warps_per_core: Option<u32>,
+    pub source: ShaderCoreSource,
+}
+
+/// Parse an `ML_SM_COUNT` value: `Ok(Some(Some(n)))` pins `n` cores,
+/// `Ok(Some(None))` (`0` / `none`) forces the unknown-count fallback,
+/// `Ok(None)` (unset / empty / `auto`) keeps the driver's answer.
+pub(super) fn parse_sm_count_override(raw: Option<&str>) -> Result<Option<Option<u32>>> {
+    let Some(raw) = raw.map(str::trim) else {
+        return Ok(None);
+    };
+    if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    if raw.eq_ignore_ascii_case("none") {
+        return Ok(Some(None));
+    }
+    let count = raw
+        .parse::<u32>()
+        .with_context(|| format!("invalid ML_SM_COUNT '{raw}' (expected N, 0/none, or auto)"))?;
+    Ok(Some((count > 0).then_some(count)))
+}
+
+/// Query the shader-core count through whichever vendor extension the
+/// device exposes.  A supported extension's properties struct may be
+/// chained into `vkGetPhysicalDeviceProperties2` without enabling the
+/// extension on the logical device, so this costs nothing at device
+/// creation.  Pre-1.1 devices (no properties2) report `None`.
+pub(super) fn query_shader_cores(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    api_version: u32,
+    device_extensions: &[vk::ExtensionProperties],
+) -> Option<ShaderCores> {
+    if api_version < vk::API_VERSION_1_1 {
+        return None;
+    }
+    let has = |name: &CStr| {
+        device_extensions
+            .iter()
+            .any(|ext| unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) } == name)
+    };
+    // SAFETY: each chained struct outlives its properties2 call and is
+    // the matching sType for an extension the device advertises.
+    unsafe {
+        if has(ash::nv::shader_sm_builtins::NAME) {
+            let mut sm = vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sm);
+            instance.get_physical_device_properties2(physical_device, &mut props2);
+            if sm.shader_sm_count > 0 {
+                return Some(ShaderCores {
+                    count: sm.shader_sm_count,
+                    warps_per_core: (sm.shader_warps_per_sm > 0).then_some(sm.shader_warps_per_sm),
+                    source: ShaderCoreSource::NvSmBuiltins,
+                });
+            }
+        }
+        if has(ash::amd::shader_core_properties2::NAME) {
+            let mut core2 = vk::PhysicalDeviceShaderCoreProperties2AMD::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut core2);
+            instance.get_physical_device_properties2(physical_device, &mut props2);
+            if core2.active_compute_unit_count > 0 {
+                return Some(ShaderCores {
+                    count: core2.active_compute_unit_count,
+                    warps_per_core: None,
+                    source: ShaderCoreSource::AmdActiveComputeUnits,
+                });
+            }
+        }
+        if has(ash::amd::shader_core_properties::NAME) {
+            let mut core = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut core);
+            instance.get_physical_device_properties2(physical_device, &mut props2);
+            let count = core
+                .shader_engine_count
+                .saturating_mul(core.shader_arrays_per_engine_count)
+                .saturating_mul(core.compute_units_per_shader_array);
+            if count > 0 {
+                return Some(ShaderCores {
+                    count,
+                    warps_per_core: None,
+                    source: ShaderCoreSource::AmdPhysicalComputeUnits,
+                });
+            }
+        }
+        if has(ash::arm::shader_core_builtins::NAME) {
+            let mut arm = vk::PhysicalDeviceShaderCoreBuiltinsPropertiesARM::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut arm);
+            instance.get_physical_device_properties2(physical_device, &mut props2);
+            if arm.shader_core_count > 0 {
+                return Some(ShaderCores {
+                    count: arm.shader_core_count,
+                    warps_per_core: (arm.shader_warps_per_core > 0)
+                        .then_some(arm.shader_warps_per_core),
+                    source: ShaderCoreSource::ArmShaderCores,
+                });
+            }
+        }
+    }
+    None
+}
+
 pub(super) fn device_summaries(
     instance: &ash::Instance,
     devices: &[vk::PhysicalDevice],
@@ -296,6 +441,22 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn parses_sm_count_override() {
+        assert_eq!(parse_sm_count_override(None).unwrap(), None);
+        assert_eq!(parse_sm_count_override(Some("")).unwrap(), None);
+        assert_eq!(parse_sm_count_override(Some(" AUTO ")).unwrap(), None);
+        assert_eq!(parse_sm_count_override(Some("24")).unwrap(), Some(Some(24)));
+        assert_eq!(
+            parse_sm_count_override(Some(" 46 ")).unwrap(),
+            Some(Some(46))
+        );
+        assert_eq!(parse_sm_count_override(Some("0")).unwrap(), Some(None));
+        assert_eq!(parse_sm_count_override(Some("none")).unwrap(), Some(None));
+        assert!(parse_sm_count_override(Some("-3")).is_err());
+        assert!(parse_sm_count_override(Some("many")).is_err());
     }
 
     #[test]

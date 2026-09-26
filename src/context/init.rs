@@ -15,7 +15,10 @@ use scopeguard::ScopeGuard;
 use super::VulkanContext;
 use super::cache::{create_pipeline_cache, pipeline_cache_path_for};
 use super::debug::debug_callback;
-use super::device::{DevicePreference, device_summaries, select_physical_device};
+use super::device::{
+    DevicePreference, ShaderCoreSource, ShaderCores, device_summaries, parse_sm_count_override,
+    query_shader_cores, select_physical_device,
+};
 
 /// Keep one bare `VkInstance` (and the loader library itself) alive for
 /// the remaining lifetime of the process.
@@ -199,6 +202,33 @@ pub(super) fn create(
         let device_extensions = instance
             .enumerate_device_extension_properties(physical_device)
             .context("enumerate_device_extension_properties")?;
+        // Shader-core count for wave-quantization-aware routing.
+        // `ML_SM_COUNT` pins it (what-if experiments) or, at 0 / none,
+        // forces the unknown-count fallback.
+        let queried_cores = query_shader_cores(
+            &instance,
+            physical_device,
+            device_properties.api_version,
+            &device_extensions,
+        );
+        let shader_cores =
+            match parse_sm_count_override(std::env::var("ML_SM_COUNT").ok().as_deref())? {
+                None => queried_cores,
+                Some(None) => None,
+                Some(Some(count)) => Some(ShaderCores {
+                    count,
+                    warps_per_core: queried_cores.and_then(|cores| cores.warps_per_core),
+                    source: ShaderCoreSource::EnvOverride,
+                }),
+            };
+        log::info!(
+            "tensor-ash: shader cores: {} (queried {})",
+            shader_cores.map_or_else(
+                || "unknown".to_string(),
+                |cores| format!("{} via {}", cores.count, cores.source.as_str())
+            ),
+            queried_cores.map_or_else(|| "none".to_string(), |cores| cores.count.to_string()),
+        );
         let coopmat_name = ash::khr::cooperative_matrix::NAME;
         let coopmat_present = device_extensions
             .iter()
@@ -379,6 +409,7 @@ pub(super) fn create(
             device_properties,
             driver_id,
             memory_properties,
+            shader_cores,
             compute_family,
             queue: Mutex::new(queue),
             timestamp_period_ns: device_properties.limits.timestamp_period as f64,
