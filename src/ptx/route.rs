@@ -108,25 +108,39 @@ impl PtxRoute {
         }
         let tiles128 = u64::from(m.div_ceil(128)) * u64::from(n.div_ceil(128));
         let sms = u64::from(self.sm_count.max(1));
+        // Grouped CTA rasterization (_g8) once the grid is large enough
+        // that a B panel row no longer stays L2-resident (4060 4096^3:
+        // f16 42.7 -> 52.8 TF/s; 2048^3 it costs ~3%).
+        let huge = tiles128 >= 16 * sms;
         let name = match self.accum {
             PtxAccum::F32 => {
                 // Few, big tiles win once there are enough of them to
-                // fill the device twice; below that 64x64 keeps more
-                // CTAs in flight.
-                if tiles128 >= 4 * sms {
+                // fill the device; below that 64x64 keeps more CTAs in
+                // flight.
+                if huge {
+                    "ta_hgemm_f32_128x128_s3_g8"
+                } else if tiles128 >= 4 * sms {
                     "ta_hgemm_f32_128x128_s3"
                 } else {
                     "ta_hgemm_f32_64x64_s4"
                 }
             }
             PtxAccum::F16 => {
-                if tiles128 >= 2 * sms {
+                if huge {
+                    "ta_hgemm_f16_128x128_s3_g8"
+                } else if tiles128 >= 2 * sms {
                     "ta_hgemm_f16_128x128_s3"
                 } else {
                     "ta_hgemm_f16_128x64_s3"
                 }
             }
-            PtxAccum::F16Promoted => "ta_hgemm_f16p_128x64_k64_s2",
+            PtxAccum::F16Promoted => {
+                if huge {
+                    "ta_hgemm_f16p_128x64_s3_g8"
+                } else {
+                    "ta_hgemm_f16p_128x64_k64_s2"
+                }
+            }
         };
         self.gemm.hgemm_index(name)
     }
