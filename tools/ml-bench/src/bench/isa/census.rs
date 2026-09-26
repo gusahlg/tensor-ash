@@ -152,7 +152,7 @@ impl Instr {
         }
         let tok = self
             .operands
-            .split(|c: char| c == ' ' || c == ',')
+            .split([' ', ','])
             .find(|t| t.starts_with("0x"))?;
         u32::from_str_radix(tok.trim_start_matches("0x"), 16).ok()
     }
