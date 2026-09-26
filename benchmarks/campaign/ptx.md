@@ -340,9 +340,8 @@ the embargo lifted): f16 4096^3 68.4 -> **70.1** (cuBLAS 16F 67.5 / 66.7),
 f16p `_g8` 53.2 at 4096^3; f32 g8 40.0 at 4096^3 (cuBLAS 32F 41.1).  The route
 now picks the `_g8` kernels when the grid has >= 16 x SM-count 128x128
 tiles (a CTA swizzle was a dead end for the f32 SIMT kernels on the 3070;
-it is not one for f16 tensor-core GEMM on a 24 MB-L2 part).  Not yet
-the picked heuristic threshold (>= 16 tiles/SM) selects `_g8` only at
-4096^3 on both GPUs.
+it is not one for f16 tensor-core GEMM, most of all on the 24 MB-L2
+4060); that threshold selects `_g8` only at 4096^3 on both GPUs.
 
 Run-to-run note: the same kernel/shape moved by up to ~10% between
 processes (3070 512x2048x5632 128x128_s3: 48.6 in round 1, 53.4 in round
