@@ -629,6 +629,26 @@ kernel_catalog! {
     F16wA16CoopmatGN11Acc16 => ("f16w_a16_coopmat_g_n11_acc16", 32, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
         ["f16w_a16_coopmat_g_n11_acc16", "a16_coopmat_g_n11_acc16"],
         spec [(16, 32), (17, 64), (18, 32), (19, 32), (20, 32), (21, 64), (22, 1), (23, 1)]),
+    // K_UNROLL=8 body axis on the a16 module (`_ku8`): the S1 parity
+    // rescue experiment for the twins plus the two best S2 configs.
+    F16wA16CoopmatGT1Ku8 => ("f16w_a16_coopmat_g_t1_ku8", 128, 128, 32, "matmul_f16w_a16_coopmat_spec_ku8.spv", false,
+        ["f16w_a16_coopmat_g_t1_ku8", "a16_coopmat_g_t1_ku8"],
+        spec [(16, 128), (17, 128), (18, 32), (19, 64), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT2Ku8 => ("f16w_a16_coopmat_g_t2_ku8", 64, 64, 32, "matmul_f16w_a16_coopmat_spec_ku8.spv", false,
+        ["f16w_a16_coopmat_g_t2_ku8", "a16_coopmat_g_t2_ku8"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT3Ku8 => ("f16w_a16_coopmat_g_t3_ku8", 64, 128, 32, "matmul_f16w_a16_coopmat_spec_ku8.spv", false,
+        ["f16w_a16_coopmat_g_t3_ku8", "a16_coopmat_g_t3_ku8"],
+        spec [(16, 64), (17, 128), (18, 32), (19, 32), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT4Ku8 => ("f16w_a16_coopmat_g_t4_ku8", 128, 64, 32, "matmul_f16w_a16_coopmat_spec_ku8.spv", false,
+        ["f16w_a16_coopmat_g_t4_ku8", "a16_coopmat_g_t4_ku8"],
+        spec [(16, 128), (17, 64), (18, 32), (19, 64), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN1Ku8 => ("f16w_a16_coopmat_g_n1_ku8", 64, 64, 64, "matmul_f16w_a16_coopmat_spec_ku8.spv", false,
+        ["f16w_a16_coopmat_g_n1_ku8", "a16_coopmat_g_n1_ku8"],
+        spec [(16, 64), (17, 64), (18, 64), (19, 32), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN10Ku8 => ("f16w_a16_coopmat_g_n10_ku8", 64, 64, 32, "matmul_f16w_a16_coopmat_spec_ku8.spv", false,
+        ["f16w_a16_coopmat_g_n10_ku8", "a16_coopmat_g_n10_ku8"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 2), (23, 2)]),
     // Tensor-core GEMM via NV_cooperative_matrix2 (workgroup-scope
     // matrices + tensor addressing) with the fused store epilogue the
     // coopmat1 kernel cannot implement (`coopMatPerElementNV` at
@@ -775,7 +795,7 @@ mod tests {
     #[test]
     fn generated_configs_are_legal_and_consistent() {
         let generated: Vec<&KernelSpec> = KERNEL_SPECS.iter().filter(|s| s.is_generated()).collect();
-        assert_eq!(generated.len(), 45, "15 configs x {{a32, a16, a16-acc16}}");
+        assert_eq!(generated.len(), 51, "15 configs x {{a32, a16, a16-acc16}} + 6 ku8");
         for spec in generated {
             let [bm, bn, bk, wm, wn, threads, skew_a, skew_b] =
                 [16, 17, 18, 19, 20, 21, 22, 23].map(|id| spec_value(spec, id));

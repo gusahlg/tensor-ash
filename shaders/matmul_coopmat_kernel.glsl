@@ -245,6 +245,15 @@ void main() {
     for (uint kc = 0u; kc < num_k; kc += PROMOTE_KT) {
     const uint kt_end = min(kc + PROMOTE_KT, num_k);
     for (uint kt = kc; kt < kt_end; ++kt) {
+#elif defined(K_UNROLL)
+    // Literal K-tile unroll (generator body axis): the driver unrolls the
+    // pre-unrolled literal kernels' runtime K loop 8x with exit checks but
+    // leaves a spec-constant module's loop rolled; this restores the
+    // straight-line K-tiles with uniform early exits.
+    for (uint kt0 = 0u; kt0 < num_k; kt0 += K_UNROLL) {
+    [[unroll]] for (uint ku = 0u; ku < K_UNROLL; ++ku) {
+    const uint kt = kt0 + ku;
+    if (kt >= num_k) break;
 #else
     for (uint kt = 0u; kt < num_k; ++kt) {
 #endif
@@ -277,6 +286,9 @@ void main() {
         }
         barrier();
     }
+#if defined(K_UNROLL) && !defined(ACC_F16_PROMOTE)
+    }
+#endif
 #ifdef ACC_F16_PROMOTE
     [[unroll]] for (uint i = 0u; i < FRAG_M; ++i) {
         [[unroll]] for (uint j = 0u; j < FRAG_N; ++j) {
