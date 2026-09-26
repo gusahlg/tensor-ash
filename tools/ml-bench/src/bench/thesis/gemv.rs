@@ -6,37 +6,43 @@
 //! the recorded device bandwidth.  Packed-B is used where llama-ash
 //! packs (q, k/v, gate/up, lm_head) so T2 sees the sequential K-walk
 //! that made lm_head hit 94% of device BW; o and down stay unpacked.
-//! The verdict is taken on a DRAM-cold measurement: every timed
-//! dispatch reads a different copy of B from a rotation set far larger
-//! than any L2, because decode streams ~2 GB of weights per token and
-//! never sees a weight L2-hot — while a repeated standalone dispatch
-//! of an 8 MB q/o weight is served from AD107's 24 MB L2 (and the
-//! 1 MB k/v weight even from GA104's 4 MB), which reported
-//! "efficiencies" above 100% of the DRAM floor.  The L2-hot
-//! `run_case` number is still reported alongside (it also validates
-//! numerics and names the routed kernel).
+//! The verdict is taken on a DRAM-cold measurement: a 192 MiB L2
+//! scrub runs before every timed dispatch, because decode streams
+//! ~2 GB of weights per token and never sees a weight L2-hot — while a
+//! repeated standalone dispatch of an 8 MB q/o weight is served from
+//! AD107's 24 MB L2 (and the 1 MB k/v weight even from GA104's 4 MB),
+//! which reported "efficiencies" above 100% of the DRAM floor.  (A
+//! first version rotated distinct B copies instead; with only two
+//! 131 MB lm_head copies it read 842 us vs 497 us for the same GEMV
+//! inside a real decode step, so the scrub keeps ONE allocation like
+//! the model does.)  The L2-hot `run_case` number is still reported
+//! alongside (it also validates numerics and names the routed kernel).
 //! T6 holds the f16w coopmat GEMM to a
 //! TFLOPS floor on REAL aligned prefill shapes (the 34.6 TF/s headline
 //! was 4096^3; what 512-row shapes sustain is the falsifiable claim),
 //! with 4096^3 kept as a regression reference.
 //!
-//! Both reuse the `cases` machinery (`run_case`): timestamped medians,
-//! post-timing sampled validation, auto kernel routing with the routed
-//! kernel reported per row.
+//! Both reuse the `cases` machinery (`run_case_warm`): timestamped
+//! medians, post-timing sampled validation, auto kernel routing with
+//! the routed kernel reported per row, and a 200 ms clock warm-up per
+//! series (without it T6 measured 10.7-15.7 TF/s instead of 22.8-26.4
+//! on the 4060 when it ran after T2's host-heavy setup).
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tensor_ash::{
-    Executor, MatmulCall, MatmulOp, Tensor, VulkanContext, f16w_row_tile_n, pack_f16w_row_tiles,
+    BinaryOp, Executor, MatmulCall, MatmulOp, Tensor, VulkanContext, f16w_row_tile_n,
+    pack_f16w_row_tiles,
 };
 use tensor_ash_test_support::fill_det;
 
 use super::expect::Section;
 use super::{Row, Verdict, check_min, key};
 use crate::bench::cases::{BenchCase, SampleSummary};
-use crate::bench::commands::run_case;
+use crate::bench::commands::run_case_warm;
 use crate::bench::env::env_u32;
 
 /// Decode GEMV classes: `(label, K, N, packed)` for a `[1,K] @ [K,N]`
@@ -53,28 +59,54 @@ const GEMV_SHAPES: &[(&str, u32, u32, bool)] = &[
     ("lm_head 2048x32000", 2048, 32000, true),
 ];
 
-/// Bytes of distinct B copies the DRAM-cold T2 measurement rotates
-/// through: 8x AD107's 24 MB L2 (48x GA104's 4 MB), so each timed
-/// dispatch reads weights the previous dispatches evicted.
-const T2_ROTATION_BYTES: f64 = 192.0 * 1024.0 * 1024.0;
-const T2_MAX_COPIES: usize = 256;
+/// Elements of each f32 L2-scrub tensor: the scrub reads two and
+/// writes one 64 MiB tensor (192 MiB of traffic) between timed GEMVs —
+/// 8x AD107's 24 MB L2, 48x GA104's 4 MB.
+const T2_SCRUB_SHAPE: [u32; 2] = [4096, 4096];
 
-/// Median GPU time (us) of an M=1 f16w row GEMV whose B cycles through
-/// enough distinct copies that no dispatch finds its weights in L2 —
-/// the decode condition.  A and C stay resident (as in decode, where
-/// the activation row is L2-hot).  `None` without GPU timestamps.
+/// Clock warm-up before each timed series (see `run_case_warm`).
+pub(crate) const THESIS_WARM: Duration = Duration::from_millis(200);
+
+/// The L2 scrub: one big elementwise add over tensors unrelated to the
+/// GEMV, run as its own submission right before each timed dispatch.
+struct L2Scrub {
+    x: Tensor,
+    y: Tensor,
+}
+
+impl L2Scrub {
+    fn new(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<Self> {
+        let x = Tensor::uninit_device(ctx, &T2_SCRUB_SHAPE)?;
+        let y = Tensor::uninit_device(ctx, &T2_SCRUB_SHAPE)?;
+        let zeros = vec![0.0f32; x.len() as usize];
+        exec.upload(&zeros, &x)?;
+        exec.upload(&zeros, &y)?;
+        Ok(Self { x, y })
+    }
+
+    fn run(&self, exec: &Executor) -> Result<()> {
+        exec.run_binary(&self.x, &self.y, &self.x, BinaryOp::AddScaled { beta: 1.0 })?;
+        Ok(())
+    }
+}
+
+/// Median GPU time (us) of an M=1 f16w row GEMV whose weights are NOT
+/// in L2: an unrelated 192 MiB scrub runs before every timed dispatch,
+/// so B streams from DRAM exactly as it does in decode (one weight
+/// allocation, evicted by the rest of the token's traffic).  A and C
+/// are tiny and L2-resident, as in decode.  `None` without GPU
+/// timestamps.
 fn gemv_dram_cold_us(
     ctx: &Arc<VulkanContext>,
     exec: &Executor,
+    scrub: &L2Scrub,
     k: u32,
     n: u32,
     packed_b: bool,
     iters: u32,
-    warmup: u32,
 ) -> Result<Option<f64>> {
-    let b_bytes = 2.0 * k as f64 * n as f64;
-    let copies = ((T2_ROTATION_BYTES / b_bytes).ceil() as usize).clamp(2, T2_MAX_COPIES);
     let a = Tensor::uninit_device(ctx, &[1, 1, k])?;
+    let b = Tensor::uninit_device_f16(ctx, &[1, k, n])?;
     let c = Tensor::uninit_device(ctx, &[1, 1, n])?;
     let mut h_a = vec![0.0f32; k as usize];
     fill_det(&mut h_a, 7);
@@ -85,17 +117,11 @@ fn gemv_dram_cold_us(
         let tile = f16w_row_tile_n(k, n) as usize;
         h_b = pack_f16w_row_tiles(&h_b, k as usize, n as usize, tile);
     }
-    let bs = (0..copies)
-        .map(|_| {
-            let b = Tensor::uninit_device_f16(ctx, &[1, k, n])?;
-            exec.upload(&h_b, &b)?;
-            Ok(b)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let run = |b: &Tensor| {
+    exec.upload(&h_b, &b)?;
+    let run = || {
         let call = MatmulCall {
             a: &a,
-            b,
+            b: &b,
             c: &c,
             alpha: 1.0,
             accumulate: false,
@@ -106,12 +132,15 @@ fn gemv_dram_cold_us(
             exec.run_matmuls(std::slice::from_ref(&call))
         }
     };
-    for i in 0..warmup as usize {
-        run(&bs[i % copies])?;
+    let warm_start = Instant::now();
+    while warm_start.elapsed() < THESIS_WARM {
+        scrub.run(exec)?;
+        run()?;
     }
     let mut samples = Vec::with_capacity(iters as usize);
-    for i in 0..iters as usize {
-        match run(&bs[(warmup as usize + i) % copies])?.gpu_time_ns {
+    for _ in 0..iters {
+        scrub.run(exec)?;
+        match run()?.gpu_time_ns {
             Some(ns) => samples.push(ns as f64 / 1e3),
             None => return Ok(None),
         }
@@ -138,6 +167,7 @@ pub(crate) fn t2_gemv_efficiency(
     let bw_gbps = key(section, "mem_bw_gbps");
     let min_frac = key(section, "t2_min_bw_frac");
 
+    let scrub = L2Scrub::new(ctx, exec)?;
     let mut rows = Vec::new();
     for &(label, k, n, packed_b) in GEMV_SHAPES {
         let case = BenchCase {
@@ -149,13 +179,13 @@ pub(crate) fn t2_gemv_efficiency(
             b_f16: true,
             packed_b,
         };
-        let result = run_case(ctx, exec, case, iters, warmup)?;
+        let result = run_case_warm(ctx, exec, case, iters, warmup, THESIS_WARM)?;
         let item = if packed_b {
             format!("GEMV {label} f16w packed")
         } else {
             format!("GEMV {label} f16w")
         };
-        let cold_us = gemv_dram_cold_us(ctx, exec, k, n, packed_b, iters, warmup)?;
+        let cold_us = gemv_dram_cold_us(ctx, exec, &scrub, k, n, packed_b, iters)?;
         let (Some(gpu), Some(cold_us)) = (result.gpu_ms, cold_us) else {
             rows.push(Row {
                 thesis: "T2",
@@ -249,7 +279,7 @@ pub(crate) fn t6_coopmat_ceiling(
             b_f16: true,
             packed_b: false,
         };
-        let result = run_case(ctx, exec, case, iters, warmup)?;
+        let result = run_case_warm(ctx, exec, case, iters, warmup, THESIS_WARM)?;
         let kernel = result.dispatch.kernel;
         let gpu_us = result
             .gpu_ms

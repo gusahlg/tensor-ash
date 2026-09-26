@@ -29,9 +29,10 @@ use tensor_ash::{
 use tensor_ash_test_support::fill_det;
 
 use super::expect::Section;
+use super::gemv::THESIS_WARM;
 use super::{Row, Verdict, check_min, key};
 use crate::bench::cases::{BenchCase, SampleSummary};
-use crate::bench::commands::run_case;
+use crate::bench::commands::run_case_warm;
 
 /// The same synthetic prompt family `llama_ash bench` uses: BOS then
 /// arbitrary in-vocab ids.
@@ -229,7 +230,7 @@ pub(crate) fn t5_prefill_accounting(
             b_f16: true,
             packed_b,
         };
-        Ok(run_case(ctx, exec, case, 10, 2)?
+        Ok(run_case_warm(ctx, exec, case, 10, 2, THESIS_WARM)?
             .gpu_ms
             .map(|summary| summary.median * 1e3))
     };

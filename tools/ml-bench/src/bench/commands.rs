@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::env;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tensor_ash::{
@@ -124,6 +124,24 @@ pub(super) fn run_case(
     iters: u32,
     warmup: u32,
 ) -> Result<BenchResult> {
+    run_case_warm(ctx, exec, case, iters, warmup, Duration::ZERO)
+}
+
+/// [`run_case`] whose warmup also lasts at least `warm_for` of GPU
+/// work.  The host-side setup (fills, packing, uploads) leaves the GPU
+/// idle long enough for the driver to drop to a low P-state (RTX 4060:
+/// 1.1-1.2 GHz SM / 5 GHz memory after ~1 s idle, vs 2.73 / 8.5 GHz
+/// under load), and a few warmup dispatches do not ramp it back:
+/// timing then starts on cold clocks and under-reports compute-bound
+/// shapes by ~2x.
+pub(super) fn run_case_warm(
+    ctx: &Arc<VulkanContext>,
+    exec: &Executor,
+    case: BenchCase,
+    iters: u32,
+    warmup: u32,
+    warm_for: Duration,
+) -> Result<BenchResult> {
     let bsz = case.b;
     let m = case.m;
     let n = case.n;
@@ -211,8 +229,11 @@ pub(super) fn run_case(
         }
     };
 
-    for _ in 0..warmup {
+    let warm_start = Instant::now();
+    let mut warmed = 0;
+    while warmed < warmup || warm_start.elapsed() < warm_for {
         run_once()?;
+        warmed += 1;
     }
 
     // Keep GPU and wall measurements paired so host overhead is derived from
