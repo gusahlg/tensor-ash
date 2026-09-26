@@ -402,10 +402,14 @@ impl MatmulPipeline {
                 | K::F16wCoopmatM128N64Bk64
                 | K::F16wCoopmatM128N64T256
                 | K::F16wCoopmatM64N128W64
-                | K::F16wCoopmatM64Bk64 => K::F16wCoopmat,
-                K::F16wA16CoopmatM64 | K::F16wA16CoopmatM64N128 | K::F16wA16CoopmatM128N64 => {
-                    K::F16wA16Coopmat
-                }
+                | K::F16wCoopmatM64Bk64
+                | K::F16wCoopmatM64Mfast
+                | K::F16wCoopmatM128N64Mfast
+                | K::F16wCoopmatM128N128Mfast => K::F16wCoopmat,
+                K::F16wA16CoopmatM64
+                | K::F16wA16CoopmatM64N128
+                | K::F16wA16CoopmatM128N64
+                | K::F16wA16CoopmatM64Mfast => K::F16wA16Coopmat,
                 // Packed B is a different layout; falling back to the
                 // unpacked row kernel would silently read garbage.
                 K::F16wRowBdaK16Packed | K::F16wRowBdaK16V2Packed => {
@@ -425,14 +429,20 @@ impl MatmulPipeline {
 
     /// Registry index of the f16-activations (a16) coopmat kernel for
     /// an aligned shape (M, N % 64 == 0, K % 32 == 0; resolution
-    /// enforces it).  An explicit coopmat1 selection — either A
-    /// storage, e.g. `ML_KERNEL=f16w_coopmat_m128n64` — pins the same
-    /// tile on this route, so tile A/Bs cover the f16-activation
+    /// enforces it).  An explicit a16 kernel runs as-is; an explicit
+    /// f16w coopmat1 tile — e.g. `ML_KERNEL=f16w_coopmat_m128n64` —
+    /// pins its a16 sibling on this route, so tile A/Bs cover the f16-activation
     /// prefill path too; every other selection takes the SM-aware
     /// heuristic.  The tile's own alignment is still checked at
     /// record time, so a pinned tile that does not divide the shape
     /// fails rather than reading out of bounds.
     pub(crate) fn a16_coopmat_index(&self, batch: u32, m: u32, n: u32, k: u32) -> usize {
+        // An explicit a16 kernel (e.g. a retune candidate) runs as-is.
+        if let Some(index) = self.selection.index()
+            && KERNEL_SPECS[index].a_f16()
+        {
+            return index;
+        }
         let tile = CoopmatTile::of_selection(self.selection)
             .or_else(|| routing::coopmat_tile(batch, m, n, k, self.ctx.sm_count()))
             .expect("a16 resolution already requires 64-aligned M/N");

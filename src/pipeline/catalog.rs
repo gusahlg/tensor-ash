@@ -376,6 +376,21 @@ kernel_catalog! {
     F16wCoopmatM64Bk64 => ("f16w_coopmat_m64n64_bk64", 64, 64, 64,
         "matmul_f16w_coopmat_m64n64_bk64.spv", false,
         ["f16w_coopmat_m64n64_bk64"]),
+    // Column-major (M-fastest) CTA order: consecutive CTAs share a B
+    // column block, so wide-N GEMMs stream B from DRAM ~once instead
+    // of once per row block.  Candidates, explicit selection only.
+    F16wCoopmatM64Mfast => ("f16w_coopmat_m64n64_mfast", 64, 64, 32,
+        "matmul_f16w_coopmat_m64n64_mfast.spv", false,
+        ["f16w_coopmat_m64n64_mfast"]),
+    F16wCoopmatM128N64Mfast => ("f16w_coopmat_m128n64_mfast", 128, 64, 32,
+        "matmul_f16w_coopmat_m128n64_mfast.spv", false,
+        ["f16w_coopmat_m128n64_mfast"]),
+    F16wCoopmatM128N128Mfast => ("f16w_coopmat_m128n128_mfast", 128, 128, 32,
+        "matmul_f16w_coopmat_m128n128_mfast.spv", false,
+        ["f16w_coopmat_m128n128_mfast"]),
+    F16wA16CoopmatM64Mfast => ("f16w_a16_coopmat_m64n64_mfast", 64, 64, 32,
+        "matmul_f16w_a16_coopmat_m64n64_mfast.spv", false,
+        ["f16w_a16_coopmat_m64n64_mfast"]),
     // Tensor-core GEMM via NV_cooperative_matrix2 (workgroup-scope
     // matrices + tensor addressing) with the fused store epilogue the
     // coopmat1 kernel cannot implement (`coopMatPerElementNV` at

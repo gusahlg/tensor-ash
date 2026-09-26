@@ -18,6 +18,7 @@
 //     C_F16 (optional): C is stored as IEEE half; the f32 accumulator
 //     fragments convert (RNE) at store time, and ACCUMULATE reloads
 //     prior C through the same half view.
+//     RASTER_M_FAST (optional): column-major tile order (see main()).
 //
 // Default layout: 256 threads = 8 subgroups of 32.  Workgroup tile
 // 128x128, BK = 32 (a wrapper may define BK 64; the host then checks
@@ -165,8 +166,20 @@ void load_b_tile(uint b_base, uint block_col, uint k_base, uint tid) {
 
 void main() {
     const uint batch = gl_WorkGroupID.z;
+#ifdef RASTER_M_FAST
+    // CTAs launch x-fastest; remap the linear launch index so that
+    // consecutive CTAs walk M (column-major tile order).  The CTAs in
+    // flight then share one B column block, so B streams from DRAM
+    // about once instead of once per row block — the wide-N / short-M
+    // case where x-fastest order re-reads B (M/BM) times.  Uniform per
+    // workgroup, so coopmat control flow stays uniform.
+    const uint tile_lin = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    const uint block_row = tile_lin % gl_NumWorkGroups.y;
+    const uint block_col = tile_lin / gl_NumWorkGroups.y;
+#else
     const uint block_row = gl_WorkGroupID.y;
     const uint block_col = gl_WorkGroupID.x;
+#endif
     const uint tid = gl_LocalInvocationIndex;
     const uint sg = gl_SubgroupID;
 

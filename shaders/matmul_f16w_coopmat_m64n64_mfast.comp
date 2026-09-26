@@ -1,0 +1,13 @@
+#version 460
+// Raster candidate: the 64x64 tile in column-major (M-fastest) CTA
+// order, so wide-N GEMMs stream B from DRAM ~once.
+
+#define RASTER_M_FAST 1
+#define BM 64u
+#define BN 64u
+#define THREADS 128u
+#define WM 32u
+#define WN 32u
+#define SG_N 2u
+
+#include "matmul_coopmat_kernel.glsl"
