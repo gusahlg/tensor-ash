@@ -4,13 +4,20 @@
 //! Subcommands:
 //!   bench    -m <gguf> [--pp 512] [--tg 128] [--ctx 2048]
 //!   generate -m <gguf> --ids "1,15043,3186" -n 24 [--ctx 2048]
+//!   numerics -m <gguf> [--ids "..."] [--pp 512] [--ctx 2048]
+//!
+//! `ML_COOPMAT_ACC=f16|promote` routes the prefill's coopmat GEMMs to
+//! the f16-accumulator kernels (default f32).  `generate` writes the
+//! prefill logits (raw f32 LE) to `LLAMA_ASH_LOGITS_OUT` when set.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use tensor_ash::{Executor, KernelSelection, MatmulPipeline, VulkanContext};
+use tensor_ash::{
+    CoopmatAcc, Executor, ExecutorConfig, KernelSelection, MatmulPipeline, VulkanContext,
+};
 
 use llama_ash::model::Model;
 
@@ -59,9 +66,18 @@ fn parse_args(mut args: std::env::Args) -> Result<(String, Args)> {
     Ok((cmd, parsed))
 }
 
-const USAGE: &str = "usage:\n  llama_ash bench -m <gguf> [--pp 512] [--tg 128] [--ctx 2048]\n  llama_ash generate -m <gguf> --ids \"1,15043,3186\" -n 24 [--ctx 2048]";
+const USAGE: &str = "usage:\n  llama_ash bench -m <gguf> [--pp 512] [--tg 128] [--ctx 2048]\n  llama_ash generate -m <gguf> --ids \"1,15043,3186\" -n 24 [--ctx 2048]\n  llama_ash numerics -m <gguf> [--ids \"...\"] [--pp 512] [--ctx 2048]";
 
 fn make_model(path: &Path, ctx_len: u32) -> Result<Model> {
+    Ok(make_model_parts(path, ctx_len)?.2)
+}
+
+/// The model plus the context and matmul pipeline it runs on (so side
+/// executors can share the compiled kernels).
+fn make_model_parts(
+    path: &Path,
+    ctx_len: u32,
+) -> Result<(Arc<VulkanContext>, Arc<MatmulPipeline>, Model)> {
     // Honors ML_DEVICE so multi-GPU hosts can pick the device.
     let ctx = VulkanContext::new(false)?;
     if !ctx.buffer_device_address_enabled || !ctx.f16_storage_enabled {
@@ -71,9 +87,15 @@ fn make_model(path: &Path, ctx_len: u32) -> Result<Model> {
         &ctx,
         KernelSelection::from_env()?,
     )?);
-    let exec = Arc::new(Executor::new(ctx.clone(), pipe, 2, 256)?);
-    log::info!("{}", ctx.diagnostics());
-    Model::load(&ctx, &exec, path, ctx_len)
+    // Executor::new reads ML_TUNE and ML_COOPMAT_ACC.
+    let exec = Arc::new(Executor::new(ctx.clone(), pipe.clone(), 2, 256)?);
+    log::info!(
+        "{} coopmat_acc={}",
+        ctx.diagnostics(),
+        exec.coopmat_acc().as_str()
+    );
+    let model = Model::load(&ctx, &exec, path, ctx_len)?;
+    Ok((ctx, pipe, model))
 }
 
 fn bench(args: &Args) -> Result<()> {
@@ -223,6 +245,11 @@ fn generate(args: &Args) -> Result<()> {
     if !logits.iter().all(|v| v.is_finite()) {
         bail!("prefill produced non-finite logits");
     }
+    if let Ok(path) = std::env::var("LLAMA_ASH_LOGITS_OUT") {
+        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&path, bytes).with_context(|| format!("write {path}"))?;
+        log::info!("prefill logits ({} f32) written to {path}", logits.len());
+    }
 
     let mut generated = vec![first];
     let t1 = Instant::now();
@@ -243,6 +270,74 @@ fn generate(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Real-activation GEMM numerics of the last layer's prefill GEMMs at
+/// every coopmat accumulator policy (see `Model::gemm_numerics`).
+fn numerics(args: &Args) -> Result<()> {
+    let (ctx, pipe, mut model) = make_model_parts(&args.model, args.ctx)?;
+    let ids: Vec<u32> = if args.ids.is_empty() {
+        std::iter::once(1)
+            .chain((1..args.pp).map(|i| 100 + (i % 1000)))
+            .collect()
+    } else {
+        args.ids.clone()
+    };
+    let rows = std::env::var("LLAMA_ASH_NUMERICS_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64usize);
+    let mut execs = Vec::new();
+    for acc in [CoopmatAcc::F32, CoopmatAcc::F16, CoopmatAcc::F16Promote] {
+        let exec = Executor::new_with_config(
+            ctx.clone(),
+            pipe.clone(),
+            ExecutorConfig {
+                n_slots: 1,
+                max_calls_per_submit: 8,
+                tune: false,
+                coopmat_acc: acc,
+            },
+        )?;
+        execs.push((format!("acc={}", acc.as_str()), exec));
+    }
+    let refs: Vec<(String, &Executor)> = execs.iter().map(|(l, e)| (l.clone(), e)).collect();
+    let reports = model.gemm_numerics(&ids, &refs, rows)?;
+    println!(
+        "last-layer prefill GEMMs, T={} (a16 route), {rows} sampled rows each, vs f64 reference",
+        ids.len()
+    );
+    println!(
+        "| gemm | MxNxK | max|A| | max|B| | max|ref| | rms(ref) | route | kernel | max abs err | max err / max|ref| | rms err | rel rms | mean err | nonfinite |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    for r in &reports {
+        let floor = std::iter::once((
+            "f16-store floor".to_string(),
+            "(ref rounded to f16)",
+            &r.f16_store_floor,
+        ));
+        for (label, kernel, e) in floor.chain(r.results.iter().map(|(l, k, e)| (l.clone(), *k, e))) {
+            println!(
+                "| {} | {}x{}x{} | {:.3} | {:.4} | {:.3} | {:.4} | {label} | {kernel} | {:.3e} | {:.3e} | {:.3e} | {:.3e} | {:+.2e} | {} |",
+                r.name,
+                r.m,
+                r.n,
+                r.k,
+                r.max_abs_a,
+                r.max_abs_b,
+                r.max_abs_ref,
+                r.rms_ref,
+                e.max_abs,
+                e.max_abs_over_max_ref,
+                e.rms,
+                e.rel_rms,
+                e.mean,
+                e.nonfinite,
+            );
+        }
+    }
+    Ok(())
+}
+
 fn join(ids: &[u32]) -> String {
     ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
 }
@@ -255,6 +350,7 @@ fn main() -> Result<()> {
     match cmd.as_str() {
         "bench" => bench(&parsed),
         "generate" => generate(&parsed),
+        "numerics" => numerics(&parsed),
         other => bail!("unknown subcommand {other}\n{USAGE}"),
     }
 }

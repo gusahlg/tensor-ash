@@ -343,6 +343,7 @@ fn transpose(src: &[f32], n_out: usize, n_in: usize) -> Vec<f32> {
 
 mod forward;
 mod load;
+pub mod numerics;
 
 impl Model {
     /// Re-zeroes the KV caches and rewinds to position 0.
