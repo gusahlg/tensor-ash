@@ -12,7 +12,8 @@
 //!   * `unif`: A, B ~ U[-1, 1)                    (the ml_bench fixture)
 //!   * `llm`:  A ~ N(0, 1) with 0.5% outlier channels x 20 (post-norm LLM
 //!     activations), B ~ N(0, 0.02^2) (projection weights)
-//! reporting max abs error, max err / max|ref|, relative RMS error and the
+//!
+//! It reports max abs error, max err / max|ref|, relative RMS error and the
 //! mean signed error (rounding bias) over 64 sampled rows x all columns.
 //!
 //! Run (4060 first):  cargo run --release --example coopmat_acc_numerics

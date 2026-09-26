@@ -496,6 +496,12 @@ impl MatmulPipeline {
         }
         let (tile, acc) = match routing::coopmat1_parts(self.selection) {
             Some((tile, _, pinned_acc)) => (tile, pinned_acc),
+            // The f16-accumulator classes have their own tile optimum.
+            None if acc != CoopmatAcc::F32 => (
+                routing::coopmat_tile_acc16(batch, m, n)
+                    .expect("a16 resolution already requires 64-aligned M/N"),
+                acc,
+            ),
             None => (
                 routing::coopmat_tile(batch, m, n, k, self.ctx.sm_count())
                     .expect("a16 resolution already requires 64-aligned M/N"),
@@ -508,11 +514,20 @@ impl MatmulPipeline {
     }
 
     /// Apply an accumulator policy to a routed kernel: an f32-accumulate
-    /// coopmat1 route maps to its `acc` twin when that slot is built;
-    /// every other kernel (and `acc == F32`) is returned unchanged.
-    /// Only auto routes remap — an explicit `ML_KERNEL` pin is honored
-    /// verbatim, like every other explicit selection.
-    pub(crate) fn with_coopmat_acc(&self, index: usize, acc: CoopmatAcc) -> usize {
+    /// coopmat1 route maps to the `acc` kernel of the accumulator-aware
+    /// tile rule (`routing::coopmat_tile_acc16`; the f16 classes favour
+    /// wider tiles) when that slot is built; every other kernel (and
+    /// `acc == F32`) is returned unchanged.  Only auto routes remap —
+    /// an explicit `ML_KERNEL` pin is honored verbatim, like every
+    /// other explicit selection.
+    pub(crate) fn with_coopmat_acc(
+        &self,
+        index: usize,
+        batch: u32,
+        m: u32,
+        n: u32,
+        acc: CoopmatAcc,
+    ) -> usize {
         if acc == CoopmatAcc::F32 || !self.is_auto() {
             return index;
         }
@@ -521,6 +536,7 @@ impl MatmulPipeline {
         };
         match routing::coopmat1_parts(selection) {
             Some((tile, a16, CoopmatAcc::F32)) => {
+                let tile = routing::coopmat_tile_acc16(batch, m, n).unwrap_or(tile);
                 let twin = tile
                     .selection_acc(a16, acc)
                     .index()

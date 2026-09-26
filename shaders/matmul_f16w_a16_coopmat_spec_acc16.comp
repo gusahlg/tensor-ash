@@ -1,0 +1,12 @@
+#version 460
+// Generator module (M1) x accumulator axis: the f16-activation coopmat1
+// GEMM with f16 accumulator fragments (HMMA.*.F16) and the tile set by
+// specialization constants 16-23 — `f16w_a16_coopmat_g_*_acc16` configs.
+// Opt-in numerics class, like every `_acc16` kernel.
+
+#define A_F16 1
+#define C_F16 1
+#define ACC_F16 1
+#define SPEC_TILE 1
+
+#include "matmul_coopmat_kernel.glsl"

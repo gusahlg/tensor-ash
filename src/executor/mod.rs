@@ -239,7 +239,9 @@ impl Executor {
         let (kernel, tuned) = self.pipeline.route(batch, m, n, k, b_f16);
         // f16w coopmat routes honor the accumulator policy (f32-B
         // routes never land on coopmat, so this is a no-op there).
-        let kernel = self.pipeline.with_coopmat_acc(kernel, self.coopmat_acc);
+        let kernel = self
+            .pipeline
+            .with_coopmat_acc(kernel, batch, m, n, self.coopmat_acc);
         // Split-K2's stage-1 kernels read f32 B only, so f16-weight
         // calls always take the data-parallel route.
         let splitk2 = (splitk2_eligible

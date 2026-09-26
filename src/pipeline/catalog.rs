@@ -581,6 +581,54 @@ kernel_catalog! {
     F16wA16CoopmatGN11 => ("f16w_a16_coopmat_g_n11", 32, 64, 32, "matmul_f16w_a16_coopmat_spec.spv", false,
         ["f16w_a16_coopmat_g_n11", "a16_coopmat_g_n11"],
         spec [(16, 32), (17, 64), (18, 32), (19, 32), (20, 32), (21, 64), (22, 1), (23, 1)]),
+    // Accumulator module axis: the same 15 configs on the f16-
+    // accumulator a16 module (`_acc16` suffix: F16 numerics class, so
+    // also gated on `coopmat_f16_acc_enabled`).
+    F16wA16CoopmatGT1Acc16 => ("f16w_a16_coopmat_g_t1_acc16", 128, 128, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_t1_acc16", "a16_coopmat_g_t1_acc16"],
+        spec [(16, 128), (17, 128), (18, 32), (19, 64), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT2Acc16 => ("f16w_a16_coopmat_g_t2_acc16", 64, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_t2_acc16", "a16_coopmat_g_t2_acc16"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT3Acc16 => ("f16w_a16_coopmat_g_t3_acc16", 64, 128, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_t3_acc16", "a16_coopmat_g_t3_acc16"],
+        spec [(16, 64), (17, 128), (18, 32), (19, 32), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT4Acc16 => ("f16w_a16_coopmat_g_t4_acc16", 128, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_t4_acc16", "a16_coopmat_g_t4_acc16"],
+        spec [(16, 128), (17, 64), (18, 32), (19, 64), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN1Acc16 => ("f16w_a16_coopmat_g_n1_acc16", 64, 64, 64, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n1_acc16", "a16_coopmat_g_n1_acc16"],
+        spec [(16, 64), (17, 64), (18, 64), (19, 32), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN2Acc16 => ("f16w_a16_coopmat_g_n2_acc16", 128, 64, 64, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n2_acc16", "a16_coopmat_g_n2_acc16"],
+        spec [(16, 128), (17, 64), (18, 64), (19, 64), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN3Acc16 => ("f16w_a16_coopmat_g_n3_acc16", 64, 128, 64, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n3_acc16", "a16_coopmat_g_n3_acc16"],
+        spec [(16, 64), (17, 128), (18, 64), (19, 32), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN4Acc16 => ("f16w_a16_coopmat_g_n4_acc16", 64, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n4_acc16", "a16_coopmat_g_n4_acc16"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 16), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN5Acc16 => ("f16w_a16_coopmat_g_n5_acc16", 128, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n5_acc16", "a16_coopmat_g_n5_acc16"],
+        spec [(16, 128), (17, 64), (18, 32), (19, 32), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN6Acc16 => ("f16w_a16_coopmat_g_n6_acc16", 64, 128, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n6_acc16", "a16_coopmat_g_n6_acc16"],
+        spec [(16, 64), (17, 128), (18, 32), (19, 32), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN7Acc16 => ("f16w_a16_coopmat_g_n7_acc16", 128, 128, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n7_acc16", "a16_coopmat_g_n7_acc16"],
+        spec [(16, 128), (17, 128), (18, 32), (19, 64), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN8Acc16 => ("f16w_a16_coopmat_g_n8_acc16", 128, 128, 64, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n8_acc16", "a16_coopmat_g_n8_acc16"],
+        spec [(16, 128), (17, 128), (18, 64), (19, 64), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN9Acc16 => ("f16w_a16_coopmat_g_n9_acc16", 64, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n9_acc16", "a16_coopmat_g_n9_acc16"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 0), (23, 0)]),
+    F16wA16CoopmatGN10Acc16 => ("f16w_a16_coopmat_g_n10_acc16", 64, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n10_acc16", "a16_coopmat_g_n10_acc16"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 2), (23, 2)]),
+    F16wA16CoopmatGN11Acc16 => ("f16w_a16_coopmat_g_n11_acc16", 32, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n11_acc16", "a16_coopmat_g_n11_acc16"],
+        spec [(16, 32), (17, 64), (18, 32), (19, 32), (20, 32), (21, 64), (22, 1), (23, 1)]),
     // Tensor-core GEMM via NV_cooperative_matrix2 (workgroup-scope
     // matrices + tensor addressing) with the fused store epilogue the
     // coopmat1 kernel cannot implement (`coopMatPerElementNV` at
@@ -727,7 +775,7 @@ mod tests {
     #[test]
     fn generated_configs_are_legal_and_consistent() {
         let generated: Vec<&KernelSpec> = KERNEL_SPECS.iter().filter(|s| s.is_generated()).collect();
-        assert_eq!(generated.len(), 30, "15 configs x {{a32, a16}}");
+        assert_eq!(generated.len(), 45, "15 configs x {{a32, a16, a16-acc16}}");
         for spec in generated {
             let [bm, bn, bk, wm, wn, threads, skew_a, skew_b] =
                 [16, 17, 18, 19, 20, 21, 22, 23].map(|id| spec_value(spec, id));

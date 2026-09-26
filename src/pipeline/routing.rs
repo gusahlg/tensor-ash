@@ -80,6 +80,44 @@ pub(crate) fn coopmat_tile(
     coopmat_tile_fallback(batch, m, n)
 }
 
+/// Tile pick for the f16-accumulator classes (`F16`, `F16Promote`).
+/// Halving the accumulator registers (f16 fragments: 4 regs instead of
+/// 8 per 16x16) moves the optimum to the WIDER tiles: RTX 4060 a16
+/// interleaved A/B (`ml_bench ab`, 7 rounds, GPU median ms,
+/// benchmarks/campaign/f16acc.md):
+///
+/// | shape (acc16) | 64x64 | 128x64 | 64x128 | 128x128 |
+/// |---|---|---|---|---|
+/// | 512x2048x2048 | 0.140 | 0.140 | 0.123 | **0.121** |
+/// | 512x2560x2048 | 0.160 | **0.144** | 0.148 | 0.164 |
+/// | 512x5632x2048 | 0.346 | 0.310 | **0.287** | 0.321 |
+/// | 512x2048x5632 | 0.362 | 0.364 | **0.316** | 0.318 |
+/// | 2048³ | 0.478 | 0.448 | **0.416** | 0.425 |
+/// | 4096³ | 4.664 | 3.459 | 3.568 | **3.320** |
+///
+/// Promote ranks the same way (within ~2%).  Rule: 128x128 on grids of
+/// more than 256 128-tiles, else 64x128 whenever N % 128 == 0 (never
+/// more than 2.8% off the per-shape best above), else 128x64 / 64x64.
+/// `None` when M or N is not 64-aligned.
+pub(crate) fn coopmat_tile_acc16(batch: u32, m: u32, n: u32) -> Option<CoopmatTile> {
+    if !m.is_multiple_of(64) || !n.is_multiple_of(64) {
+        return None;
+    }
+    let (m128, n128) = (m.is_multiple_of(128), n.is_multiple_of(128));
+    let tiles_128 = u64::from(batch)
+        .saturating_mul(u64::from(m / 128))
+        .saturating_mul(u64::from(n / 128));
+    Some(if m128 && n128 && tiles_128 > 256 {
+        CoopmatTile::T128
+    } else if n128 {
+        CoopmatTile::T64x128
+    } else if m128 {
+        CoopmatTile::T128x64
+    } else {
+        CoopmatTile::T64
+    })
+}
+
 /// The SM-agnostic rule (exp/grokmerge): calibrated on the 46-SM
 /// RTX 3070 for large squares and the 24-SM RTX 4060 for M=512
 /// prefill.  Used when the device reports no shader-core count.
@@ -283,6 +321,19 @@ mod bda_tests {
         // 64-aligned but not 128-aligned has no 128-tile route.
         assert_eq!(tile(1, 192, 320), Some(T64));
         assert_eq!(tile(1, 192, 300), None);
+    }
+
+    #[test]
+    fn acc16_tile_rule_tracks_the_4060_ab() {
+        use CoopmatTile::*;
+        assert_eq!(coopmat_tile_acc16(1, 512, 2048), Some(T64x128));
+        assert_eq!(coopmat_tile_acc16(1, 512, 2560), Some(T64x128));
+        assert_eq!(coopmat_tile_acc16(1, 512, 5632), Some(T64x128));
+        assert_eq!(coopmat_tile_acc16(1, 2048, 2048), Some(T64x128));
+        assert_eq!(coopmat_tile_acc16(1, 4096, 4096), Some(T128));
+        assert_eq!(coopmat_tile_acc16(1, 192, 320), Some(T64));
+        assert_eq!(coopmat_tile_acc16(1, 256, 320), Some(T128x64));
+        assert_eq!(coopmat_tile_acc16(1, 192, 300), None);
     }
 
     #[test]
