@@ -48,7 +48,7 @@ use tensor_ash::{
 
 use super::cases::BenchCase;
 use census::{Census, Mix};
-use nvcache::{NvucContainer, find_containers, parse_cache_blob, parse_container};
+use nvcache::{NvucContainer, parse_cache_blob, parse_container};
 use occupancy::{SmLimits, occupancy};
 
 /// `isa` subcommand.
@@ -147,6 +147,7 @@ pub(super) fn isa(
             vk::PipelineCreateFlags::empty(),
             spv_arg,
             None,
+            &out_dir.join(format!("{stem}.vkcache")),
         )?
         .0;
         let ucode = container.ucode().context("NVuc container without UCODE")?;
@@ -168,6 +169,7 @@ pub(super) fn isa(
                 flags,
                 spv_arg,
                 Some(props),
+                &out_dir.join(format!("{stem}.capture.vkcache")),
             )?;
             capture_same = if captured.ucode() == Some(ucode) {
                 "identical".into()
@@ -283,8 +285,12 @@ pub(super) fn isa_cache(mut args: impl Iterator<Item = String>) -> Result<()> {
     let entries = parse_cache_blob(&blob)?;
     let nvdisasm = nvdisasm_path();
     let mut rows = Vec::new();
+    let undecoded = entries.iter().filter(|e| e.payload.is_err()).count();
+    if undecoded > 0 {
+        println!("{undecoded} entries use a driver-internal zstd dictionary (skipped)");
+    }
     for (i, e) in entries.iter().enumerate() {
-        for (j, c) in find_containers(&e.payload)?.iter().enumerate() {
+        for (j, c) in e.containers()?.iter().enumerate() {
             let stem = format!("entry{i:03}.{j}");
             let (regs, _) = c.registers().unwrap_or((0, 0));
             let meta = format!(
@@ -622,6 +628,7 @@ fn compile_to_container(
     flags: vk::PipelineCreateFlags,
     spv: Option<&[u8]>,
     props: Option<&ash::khr::pipeline_executable_properties::Device>,
+    dump: &Path,
 ) -> Result<(NvucContainer, Option<ExecReport>)> {
     let device = &ctx.device;
     let cache =
@@ -636,17 +643,35 @@ fn compile_to_container(
     };
     let blob =
         unsafe { device.get_pipeline_cache_data(*cache) }.context("get_pipeline_cache_data")?;
+    // Keep the raw probe cache for offline study (tens of KB).
+    std::fs::write(dump, &blob).with_context(|| format!("write {}", dump.display()))?;
     let entries = parse_cache_blob(&blob)?;
     let mut containers = Vec::new();
-    for e in &entries {
-        containers.extend(find_containers(&e.payload)?);
+    let mut notes = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let found = e.containers()?;
+        notes.push(format!(
+            "entry {i}: {} B stored, {} B raw, {}",
+            e.stored_bytes,
+            e.raw_bytes,
+            match &e.payload {
+                Ok(_) => format!("{} NVuc container(s)", found.len()),
+                Err(why) => format!("not decoded ({why})"),
+            }
+        ));
+        containers.extend(found);
     }
     ensure!(
         containers.len() == 1,
-        "fresh probe cache holds {} NVuc containers in {} entries (expected exactly 1)",
+        "fresh probe cache holds {} NVuc containers (expected exactly 1): {}",
         containers.len(),
-        entries.len()
+        notes.join("; ")
     );
+    log::info!("probe cache: {}", notes.join("; "));
+    let mut report = report;
+    if let Some(r) = report.as_mut() {
+        let _ = writeln!(r.text, "probe cache entries: {}", notes.join("; "));
+    }
     Ok((containers.pop().expect("one container"), report))
 }
 
@@ -755,7 +780,7 @@ fn production_codes(ctx: &VulkanContext) -> HashSet<u64> {
     };
     entries
         .iter()
-        .filter_map(|e| find_containers(&e.payload).ok())
+        .filter_map(|e| e.containers().ok())
         .flatten()
         .filter_map(|c| c.ucode().map(hash))
         .collect()

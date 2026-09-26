@@ -39,9 +39,25 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 const NVDA_MAGIC: &[u8; 8] = b"NVDANVVM";
 const NVUC_MAGIC: &[u8; 4] = b"NVuc";
 
-/// One cache entry after decompression.
+/// One cache entry after decompression.  Some entries' zstd frames
+/// reference a dictionary the driver keeps internally (seen in fresh
+/// single-pipeline caches on AD107: a second, small entry next to the
+/// ISA entry); those cannot be decoded here and carry `Err(reason)`.
 pub(crate) struct CacheEntry {
-    pub(crate) payload: Vec<u8>,
+    pub(crate) payload: Result<Vec<u8>, String>,
+    /// Stored (possibly compressed) bytes and the declared raw size.
+    pub(crate) stored_bytes: usize,
+    pub(crate) raw_bytes: usize,
+}
+
+impl CacheEntry {
+    /// NVuc containers in a decodable payload (none otherwise).
+    pub(crate) fn containers(&self) -> Result<Vec<NvucContainer>> {
+        match &self.payload {
+            Ok(p) => find_containers(p),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
 }
 
 /// PCI device id from the Vulkan cache header.
@@ -85,20 +101,28 @@ pub(crate) fn parse_cache_blob(blob: &[u8]) -> Result<Vec<CacheEntry>> {
         let payload = if data.starts_with(&ZSTD_MAGIC) {
             let mut out = Vec::with_capacity(raw_size);
             let mut cursor = data;
-            ruzstd::decoding::StreamingDecoder::new(&mut cursor)
-                .map_err(|err| anyhow::anyhow!("cache entry {index}: zstd header: {err}"))?
-                .read_to_end(&mut out)
-                .with_context(|| format!("cache entry {index}: zstd decode"))?;
-            ensure!(
-                out.len() == raw_size,
-                "cache entry {index}: decompressed {} B, header says {raw_size}",
-                out.len()
-            );
-            out
+            match ruzstd::decoding::StreamingDecoder::new(&mut cursor) {
+                Ok(mut decoder) => {
+                    decoder
+                        .read_to_end(&mut out)
+                        .with_context(|| format!("cache entry {index}: zstd decode"))?;
+                    ensure!(
+                        out.len() == raw_size,
+                        "cache entry {index}: decompressed {} B, header says {raw_size}",
+                        out.len()
+                    );
+                    Ok(out)
+                }
+                Err(err) => Err(format!("zstd frame header: {err}")),
+            }
         } else {
-            data.to_vec()
+            Ok(data.to_vec())
         };
-        entries.push(CacheEntry { payload });
+        entries.push(CacheEntry {
+            payload,
+            stored_bytes: data.len(),
+            raw_bytes: raw_size,
+        });
         // key+len (20) + CPKV..len (36) + flags (4) + len.
         pos += 60 + len;
     }
@@ -333,6 +357,12 @@ mod tests {
         payload.extend(b"trailing records");
         let containers = find_containers(&payload).unwrap();
         assert_eq!(containers.len(), 1);
+        let entry = CacheEntry {
+            payload: Ok(payload.clone()),
+            stored_bytes: payload.len(),
+            raw_bytes: payload.len(),
+        };
+        assert_eq!(entry.containers().unwrap().len(), 1);
         let c = &containers[0];
         assert_eq!(c.registers(), Some((96, 255)));
         let code = c.ucode().unwrap();
