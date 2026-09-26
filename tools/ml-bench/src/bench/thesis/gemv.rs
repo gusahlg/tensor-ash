@@ -6,6 +6,15 @@
 //! the recorded device bandwidth.  Packed-B is used where llama-ash
 //! packs (k/v, gate/up, lm_head) so T2 sees the sequential K-walk
 //! that made lm_head hit 94% of device BW; q/o and down stay unpacked.
+//! The verdict is taken on a DRAM-cold measurement: every timed
+//! dispatch reads a different copy of B from a rotation set far larger
+//! than any L2, because decode streams ~2 GB of weights per token and
+//! never sees a weight L2-hot — while a repeated standalone dispatch
+//! of an 8 MB q/o weight is served from AD107's 24 MB L2 (and the
+//! 1 MB k/v weight even from GA104's 4 MB), which reported
+//! "efficiencies" above 100% of the DRAM floor.  The L2-hot
+//! `run_case` number is still reported alongside (it also validates
+//! numerics and names the routed kernel).
 //! T6 holds the f16w coopmat GEMM to a
 //! TFLOPS floor on REAL aligned prefill shapes (the 34.6 TF/s headline
 //! was 4096^3; what 512-row shapes sustain is the falsifiable claim),
@@ -19,11 +28,14 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tensor_ash::{Executor, VulkanContext};
+use tensor_ash::{
+    Executor, MatmulCall, MatmulOp, Tensor, VulkanContext, f16w_row_tile_n, pack_f16w_row_tiles,
+};
+use tensor_ash_test_support::fill_det;
 
 use super::expect::Section;
 use super::{Row, Verdict, check_min, key};
-use crate::bench::cases::BenchCase;
+use crate::bench::cases::{BenchCase, SampleSummary};
 use crate::bench::commands::run_case;
 use crate::bench::env::env_u32;
 
@@ -38,6 +50,72 @@ const GEMV_SHAPES: &[(&str, u32, u32, bool)] = &[
     ("down 5632x2048", 5632, 2048, false),
     ("lm_head 2048x32000", 2048, 32000, true),
 ];
+
+/// Bytes of distinct B copies the DRAM-cold T2 measurement rotates
+/// through: 8x AD107's 24 MB L2 (48x GA104's 4 MB), so each timed
+/// dispatch reads weights the previous dispatches evicted.
+const T2_ROTATION_BYTES: f64 = 192.0 * 1024.0 * 1024.0;
+const T2_MAX_COPIES: usize = 256;
+
+/// Median GPU time (us) of an M=1 f16w row GEMV whose B cycles through
+/// enough distinct copies that no dispatch finds its weights in L2 —
+/// the decode condition.  A and C stay resident (as in decode, where
+/// the activation row is L2-hot).  `None` without GPU timestamps.
+fn gemv_dram_cold_us(
+    ctx: &Arc<VulkanContext>,
+    exec: &Executor,
+    k: u32,
+    n: u32,
+    packed_b: bool,
+    iters: u32,
+    warmup: u32,
+) -> Result<Option<f64>> {
+    let b_bytes = 2.0 * k as f64 * n as f64;
+    let copies = ((T2_ROTATION_BYTES / b_bytes).ceil() as usize).clamp(2, T2_MAX_COPIES);
+    let a = Tensor::uninit_device(ctx, &[1, 1, k])?;
+    let c = Tensor::uninit_device(ctx, &[1, 1, n])?;
+    let mut h_a = vec![0.0f32; k as usize];
+    fill_det(&mut h_a, 7);
+    exec.upload(&h_a, &a)?;
+    let mut h_b = vec![0.0f32; k as usize * n as usize];
+    fill_det(&mut h_b, 11);
+    if packed_b {
+        let tile = f16w_row_tile_n(k, n) as usize;
+        h_b = pack_f16w_row_tiles(&h_b, k as usize, n as usize, tile);
+    }
+    let bs = (0..copies)
+        .map(|_| {
+            let b = Tensor::uninit_device_f16(ctx, &[1, k, n])?;
+            exec.upload(&h_b, &b)?;
+            Ok(b)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let run = |b: &Tensor| {
+        let call = MatmulCall {
+            a: &a,
+            b,
+            c: &c,
+            alpha: 1.0,
+            accumulate: false,
+        };
+        if packed_b {
+            exec.run_ops(&[MatmulOp::new(call).with_packed_b()])
+        } else {
+            exec.run_matmuls(std::slice::from_ref(&call))
+        }
+    };
+    for i in 0..warmup as usize {
+        run(&bs[i % copies])?;
+    }
+    let mut samples = Vec::with_capacity(iters as usize);
+    for i in 0..iters as usize {
+        match run(&bs[(warmup as usize + i) % copies])?.gpu_time_ns {
+            Some(ns) => samples.push(ns as f64 / 1e3),
+            None => return Ok(None),
+        }
+    }
+    Ok(SampleSummary::new(samples).map(|summary| summary.median))
+}
 
 pub(crate) fn t2_gemv_efficiency(
     ctx: &Arc<VulkanContext>,
@@ -75,7 +153,8 @@ pub(crate) fn t2_gemv_efficiency(
         } else {
             format!("GEMV {label} f16w")
         };
-        let Some(gpu) = result.gpu_ms else {
+        let cold_us = gemv_dram_cold_us(ctx, exec, k, n, packed_b, iters, warmup)?;
+        let (Some(gpu), Some(cold_us)) = (result.gpu_ms, cold_us) else {
             rows.push(Row {
                 thesis: "T2",
                 item,
@@ -87,7 +166,8 @@ pub(crate) fn t2_gemv_efficiency(
         };
         // f16 weights + f32 activation row in + f32 output row.
         let bytes = 2.0 * k as f64 * n as f64 + 4.0 * (k as f64 + n as f64);
-        let measured_gbps = bytes / (gpu.median * 1e6);
+        let measured_gbps = bytes / (cold_us * 1e3);
+        let hot_us = gpu.median * 1e3;
         let (prediction, measured, verdict) = match bw_gbps {
             Some(bw) => {
                 let frac = measured_gbps / bw;
@@ -98,8 +178,8 @@ pub(crate) fn t2_gemv_efficiency(
                         bytes / (bw * 1e3),
                     ),
                     format!(
-                        "{:.1} us = {measured_gbps:.0} GB/s = {:.0}% [{}]",
-                        gpu.median * 1e3,
+                        "{cold_us:.1} us = {measured_gbps:.0} GB/s = {:.0}% \
+                         (L2-hot {hot_us:.1} us) [{}]",
                         frac * 100.0,
                         result.dispatch.kernel,
                     ),
@@ -109,8 +189,7 @@ pub(crate) fn t2_gemv_efficiency(
             None => (
                 "unrecorded (needs mem_bw_gbps)".into(),
                 format!(
-                    "{:.1} us = {measured_gbps:.0} GB/s [{}]",
-                    gpu.median * 1e3,
+                    "{cold_us:.1} us = {measured_gbps:.0} GB/s (L2-hot {hot_us:.1} us) [{}]",
                     result.dispatch.kernel,
                 ),
                 Verdict::Info,
