@@ -34,8 +34,9 @@ Branch `campaign/sass`, 2026-09-26. Hosts: desktop RTX 3070 (GA104,
 4. **Coopmat kernels are tensor-pipe-bound by construction**: per loop
    iteration (8 K-tiles unrolled) a warp issues 737 instructions but
    needs 8192 tensor-pipe cycles (256 x HMMA.16816.F32 at 64 FMA/clk per
-   SM sub-partition). Measured 34.7 TF/s (3070) and 25.1-25.7 TF/s (4060) at
-   4096^3 are ~85% of the nominal f16-in/f32-acc peaks (40.6 / 30.2).
+   SM sub-partition). Measured 34.7 TF/s (3070) and 25.1-25.7 TF/s
+   (4060) at 4096^3 are ~85% of the nominal f16-in/f32-acc peaks
+   (40.6 / 30.2).
    Global loads are consumed 14-64 cycles after issue (no prefetch
    distance); the loop is strictly LDG -> F2FP -> STS -> BAR -> LDSM ->
    HMMA -> BAR per K-tile.
@@ -139,8 +140,8 @@ via `ML_PIPELINE_EXEC_INFO=1`): NVIDIA reports exactly five, for one
 executable `CS`: Register Count (always equals the NVuc REG section),
 Binary Size (= UCODE bytes), Stack Size (0), Local Memory Size
 (68719476736 = 2^36 for every probed kernel, all of them spill-free:
-not a usable spill signal; count LDL/STL instead), Shared Memory Size (declared
-bytes, sometimes rounded up: large_bda_v4 33,280 -> 33,792,
+not a usable spill signal; count LDL/STL instead), Shared Memory
+Size (declared bytes, sometimes rounded up: large_bda_v4 33,280 -> 33,792,
 coopmat_m128n64 14,848 -> 16,384, row GEMVs 4,096 -> 4,352; or
 driver-managed: f16w_cm2 declares none and gets 44,032). **No
 internal representations** are exposed.
@@ -224,7 +225,7 @@ Notes per family:
   bandwidth.
 - **Coopmat (KHR cooperative matrix, 16x8x16 HMMA).** The driver
   unrolls the K loop 8x (K=256 per loop iteration, 2 `BAR.SYNC` per
-  32-deep K-tile). Per K-tile per warp: 4-6 LDG.128 -> 8 `F2FP.PACK_AB`
+  32-deep K-tile). Per K-tile per warp: 6 LDG.128 -> 8 `F2FP.PACK_AB`
   (A f32 -> f16) -> 4 STS.128 -> BAR -> 12 LDSM.16.(M|MT)88.4 -> 32 HMMA
   (stall S08 between independent HMMAs) -> BAR -> exit test (numbers
   for the 128x128 tile; 64x64: 6 LDG / 8 LDSM / 16 HMMA, 128x64: 10
@@ -239,7 +240,7 @@ Notes per family:
   UCODE.
 - **SIMT SGEMM (BDA_V4).** 87-88% FFMA density with FFMA stall S01 and
   reuse flags on ~65% of instructions; A and B fragments come in as
-  LDS.128 (3 per k-step). 62 `MOV` per iteration in large_bda_v4 are
+  LDS.128 (4 per k-step for 128x128 TM=TN=8, 3 for 128x64 TM=8 TN=4). 62 `MOV` per iteration in large_bda_v4 are
   the register-double-buffer rotation. Occupancy is 16 warps/SM,
   register-limited at exactly 128 registers (the compiler's requested
   cap is 255: 128 is the 2-CTA/SM point for 256 threads) and, for
@@ -298,7 +299,7 @@ independent weight sets (what decode actually streams: every layer from
 DRAM) the same kernel runs at 264 GB/s = 97% of DRAM bandwidth, and at
 95% on the 3070. The 4060's 512-row prefill shapes moved 9% between
 runs (24.3 -> 22.2, 26.4 -> 24.1 TF/s) while every other case held
-within 1-4%: run-to-run clock state on that shape class; run 2 matches
+within ~5%: run-to-run clock state on that shape class; run 2 matches
 the numbers in `NEXT.md` (22.3 / 24.2).
 
 ## Q(a): does `glslc -O` vs `-Os` change the SASS?
@@ -413,8 +414,11 @@ per-thread load index math (needs registers: the kernel is at 128).
 
 - NVIDIA's `Registers requested` (NVuc REG word 2) is 255 for 128/256-
   thread CTAs and 128 for the 512-thread row GEMVs (the per-CTA
-  hardware limit); the SIMT and coopmat kernels allocate exactly 128 —
-  the 2-CTA/SM point — without spilling.
+  hardware limit). The routed 256-thread kernels land at or just below
+  128 (118-128: the 2-CTA/SM point) without spilling; the heavier
+  catalog tiles probed for Q(a) do not (large_bda 144, m256n64 165,
+  m128n64k64 tm16_tn4 196 / tm8_tn8 197, k64 tm8_tn8 236 registers:
+  1 CTA/SM for 256 threads).
 - None of the 11 kernels contains `LDGSTS`, `DEPBAR`, `LDL`/`STL` or
   `SHFL`. The only `CALL` in each GEMM loop is `@P CALL.REL.NOINC
   <after the loop>` right before the back-branch `BRA <loop start>`:
