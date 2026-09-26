@@ -37,6 +37,7 @@ pub mod dtype;
 pub mod executor;
 pub mod matmul;
 pub mod pipeline;
+pub mod ptx;
 pub mod tensor;
 
 pub use buffer::{Buffer, BufferLocation};

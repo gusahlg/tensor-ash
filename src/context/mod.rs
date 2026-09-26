@@ -74,6 +74,16 @@ pub struct VulkanContext {
     /// device-scope quorum atomics.  Default off (`ML_DEVICE_SCOPE=1`
     /// opts in): enabling it globally scrambled CM2 flash numerics.
     pub memory_model_device_scope_enabled: bool,
+    /// `VK_NV_cuda_kernel_launch` entry points when enabled (opt-in via
+    /// `ML_PTX=1`; `ML_NO_PTX=1` vetoes).  See [`crate::ptx`].
+    pub cuda_launch: Option<ash::nv::cuda_kernel_launch::Device>,
+    /// `VK_NVX_binary_import` entry points (cubin modules), enabled
+    /// alongside [`Self::cuda_launch`] when the driver exposes it.
+    pub nvx_binary_import: Option<ash::nvx::binary_import::Device>,
+    /// CUDA compute capability `(major, minor)` reported by
+    /// `VkPhysicalDeviceCudaKernelLaunchPropertiesNV`; `None` unless
+    /// [`Self::cuda_launch`] is enabled.
+    pub cuda_compute_capability: Option<(u32, u32)>,
     /// Pipeline cache, seeded from disk on init and flushed back on drop.
     /// Persisting it avoids the SPIR-V -> ISA recompile (50-200 ms on
     /// NVIDIA) on every cold start.

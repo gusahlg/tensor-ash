@@ -275,7 +275,20 @@ pub(super) fn create(
             );
         }
 
+        // VK_NV_cuda_kernel_launch (+ VK_NVX_binary_import for cubins):
+        // PTX kernels recorded into our own command buffers.  Strictly
+        // opt-in while experimental — `ML_PTX=1` requests it,
+        // `ML_NO_PTX=1` vetoes it — so device creation is unchanged
+        // unless asked for, and on drivers without the extension.
+        let ptx = probe_cuda_kernel_launch(&instance, physical_device, &device_extensions);
+
         let mut enabled_device_extensions = Vec::new();
+        if ptx.enable_cuda_launch {
+            enabled_device_extensions.push(ash::nv::cuda_kernel_launch::NAME.as_ptr());
+        }
+        if ptx.enable_nvx_binary_import {
+            enabled_device_extensions.push(ash::nvx::binary_import::NAME.as_ptr());
+        }
         if enable_coopmat {
             enabled_device_extensions.push(coopmat_name.as_ptr());
         }
@@ -326,6 +339,11 @@ pub(super) fn create(
         if enable_coopmat {
             device_ci = device_ci.push_next(&mut coopmat);
         }
+        let mut cuda_launch_features = vk::PhysicalDeviceCudaKernelLaunchFeaturesNV::default()
+            .cuda_kernel_launch_features(true);
+        if ptx.enable_cuda_launch {
+            device_ci = device_ci.push_next(&mut cuda_launch_features);
+        }
         // ash's typed `push_next` cannot chain a struct it does not
         // know, so the coopmat2 features link in by raw pointer (same
         // p_next contract, hand-managed).
@@ -348,6 +366,12 @@ pub(super) fn create(
             .context("create_device")?;
         let device = scopeguard::guard(device, |device| device.destroy_device(None));
         let queue = device.get_device_queue(compute_family, 0);
+        let cuda_launch = ptx
+            .enable_cuda_launch
+            .then(|| ash::nv::cuda_kernel_launch::Device::new(&instance, &device));
+        let nvx_binary_import = ptx
+            .enable_nvx_binary_import
+            .then(|| ash::nvx::binary_import::Device::new(&instance, &device));
 
         let pipeline_cache_path = pipeline_cache_path_for(&device_summary);
         let pipeline_cache = create_pipeline_cache(&device, pipeline_cache_path.as_deref());
@@ -389,11 +413,79 @@ pub(super) fn create(
             coopmat_enabled: enable_coopmat,
             coopmat2_enabled: enable_coopmat2,
             memory_model_device_scope_enabled: memory_model_device_scope,
+            cuda_launch,
+            nvx_binary_import,
+            cuda_compute_capability: ptx.compute_capability,
             pipeline_cache,
             pipeline_cache_path,
             debug_loader,
             debug_messenger,
         })
+    }
+}
+
+/// Outcome of the opt-in `VK_NV_cuda_kernel_launch` probe.
+struct PtxProbe {
+    enable_cuda_launch: bool,
+    enable_nvx_binary_import: bool,
+    compute_capability: Option<(u32, u32)>,
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Decide whether to enable `VK_NV_cuda_kernel_launch` (and
+/// `VK_NVX_binary_import`, the cubin loader DXVK-NVAPI uses).  Off
+/// unless `ML_PTX=1`; `ML_NO_PTX=1` always wins.  The extension is
+/// provisional (vulkan_beta.h) and NVIDIA-proprietary-only.
+unsafe fn probe_cuda_kernel_launch(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    device_extensions: &[vk::ExtensionProperties],
+) -> PtxProbe {
+    let off = PtxProbe {
+        enable_cuda_launch: false,
+        enable_nvx_binary_import: false,
+        compute_capability: None,
+    };
+    if !env_flag("ML_PTX") || env_flag("ML_NO_PTX") {
+        return off;
+    }
+    let has = |name: &CStr| {
+        device_extensions
+            .iter()
+            .any(|ext| unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) } == name)
+    };
+    let launch_present = has(ash::nv::cuda_kernel_launch::NAME);
+    let nvx_present = has(ash::nvx::binary_import::NAME);
+    if !launch_present {
+        log::warn!("tensor-ash: ML_PTX=1 but VK_NV_cuda_kernel_launch is not exposed; PTX off");
+        return off;
+    }
+    unsafe {
+        let mut features = vk::PhysicalDeviceCudaKernelLaunchFeaturesNV::default();
+        let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut features);
+        instance.get_physical_device_features2(physical_device, &mut features2);
+        let supported = features.cuda_kernel_launch_features == vk::TRUE;
+        let mut props = vk::PhysicalDeviceCudaKernelLaunchPropertiesNV::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut props);
+        instance.get_physical_device_properties2(physical_device, &mut props2);
+        let cc = (
+            props.compute_capability_major,
+            props.compute_capability_minor,
+        );
+        log::info!(
+            "tensor-ash: VK_NV_cuda_kernel_launch: feature={supported} sm_{}{} \
+             VK_NVX_binary_import={nvx_present}",
+            cc.0,
+            cc.1
+        );
+        PtxProbe {
+            enable_cuda_launch: supported,
+            enable_nvx_binary_import: supported && nvx_present,
+            compute_capability: supported.then_some(cc),
+        }
     }
 }
 
