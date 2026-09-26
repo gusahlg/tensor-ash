@@ -22,16 +22,17 @@ interleaved same-process A/Bs against tensor-ash's own route):
 
 | lever | 4060 | 3070 |
 |---|---|---|
-| **TinyLlama-1.1B f16 pp512, PTX f16-accumulate route** (`ML_PTX_GEMM=f16`) vs tensor-ash base | **1.39x** (12.9k -> 17.8-17.9k t/s) | **1.63x** (15.4k -> 24.3-25.4k t/s) |
-| same vs llama.cpp b9503 CUDA (same accumulate precision: cuBLAS `COMPUTE_16F`) | **1.39x** (same-day 12.9k) | ~1.5x vs the Sept scoreboard 16.7k (same-day re-measure blocked by the desktop embargo) |
-| pp512 with `ML_PTX_GEMM=f16p` (f16-rate mma, f32 promotion per k-tile; GEMM error ~3-7x *lower* than llama.cpp's cuBLAS path) | **1.28x** (16.5-16.7k t/s = 1.28x llama.cpp CUDA) | pending (embargo) |
-| f16 tensor-core GEMM, f16 accumulate, vs coopmat1 on the same f16 A/B/C (prefill shapes + squares) | 1.43-2.05x (40-53 TF/s) = 80-104% of cuBLAS 16F (4096^3 with grouped raster beats it) | 1.50-1.97x (48-68 TF/s) = 75-100% of cuBLAS 16F |
+| **TinyLlama-1.1B f16 pp512, PTX f16-accumulate route** (`ML_PTX_GEMM=f16`) vs tensor-ash base | **1.39x** (12.9k -> 17.8-17.9k t/s) | **1.58x** (16.1-16.2k -> 25.5-25.6k t/s) |
+| same vs llama.cpp b9503 CUDA pp512, same day (same accumulate precision: cuBLAS `COMPUTE_16F`) | **1.39x** (vs 12.9k) | **1.61x** (vs 15.8k) |
+| pp512 with `ML_PTX_GEMM=f16p` (f16-rate mma, f32 promotion per k-tile; GEMM error ~3-7x *lower* than llama.cpp's cuBLAS path) | **1.28x** base (16.5-16.7k t/s = 1.28x llama.cpp CUDA) | **1.35x** base (21.7-21.9k t/s = 1.38x llama.cpp CUDA) |
+| f16 tensor-core GEMM, f16 accumulate, vs coopmat1 on the same f16 A/B/C (prefill shapes + squares) | 1.43-2.05x (40-53 TF/s) = 80-104% of cuBLAS 16F (4096^3 with grouped raster beats it) | 1.50-2.00x (48-70 TF/s) = 75-104% of cuBLAS 16F (2048^3/4096^3 match or beat it) |
 | same, f32 accumulate (numerics identical to coopmat1) | 1.00-1.12x | 0.98-1.13x |
 | f32 SIMT SGEMM with a 3/4-stage `cp.async` pipeline vs tensor-ash's best GLSL route | 0.86-1.08x (ties on large) | 0.73-1.01x (ties at 2048/4096) |
 
 Token-exact: 32 greedy tokens after a 128-token (a16-path) prompt are
-identical for base, f32, f16p and f16 routes; the a16 correctness suite
-passes 13/13 through the f32-accumulate PTX route.
+identical for base, f32, f16p and f16 routes on the 4060 and for base,
+f16p and f16 on the 3070; the a16 correctness suite passes 13/13
+through the f32-accumulate PTX route.
 
 The central finding is not "PTX beats GLSL" in general - with f32
 accumulation both sit at the GeForce f32-accumulate tensor ceiling, and
@@ -333,11 +334,15 @@ the 4060's 24 MB L2, and grouping pays big:
 | 4096^3 | 42.7 -> **52.8** (2.05x TA) | 32.2 -> 39.8 | 29.2 -> 29.9 | 50.9 / 49.9 |
 
 With grouping the PTX f16-accumulate kernel **beats cuBLAS
-`COMPUTE_16F` at 4096^3 on the 4060** (52.8 vs 50.9 TF/s).  The route
+`COMPUTE_16F` at 4096^3 on the 4060** (52.8 vs 50.9 TF/s).  3070 (after
+the embargo lifted): f16 4096^3 68.4 -> **70.1** (cuBLAS 16F 67.5 / 66.7),
+2048^3 66.2 -> 67.0 (cuBLAS 66.6 / 66.8); f16p BK=64 plain 47.9-55.4,
+f16p `_g8` 53.2 at 4096^3; f32 g8 40.0 at 4096^3 (cuBLAS 32F 41.1).  The route
 now picks the `_g8` kernels when the grid has >= 16 x SM-count 128x128
 tiles (a CTA swizzle was a dead end for the f32 SIMT kernels on the 3070;
 it is not one for f16 tensor-core GEMM on a 24 MB-L2 part).  Not yet
-measured on the 3070 (embargo).
+the picked heuristic threshold (>= 16 tiles/SM) selects `_g8` only at
+4096^3 on both GPUs.
 
 Run-to-run note: the same kernel/shape moved by up to ~10% between
 processes (3070 512x2048x5632 128x128_s3: 48.6 in round 1, 53.4 in round
@@ -408,16 +413,22 @@ Token exactness: `llama_ash generate` with a 128-token prompt (which
 takes the a16 prefill path) and 32 greedy tokens produced identical ids
 for `ML_PTX_GEMM=off`, `f32`, `f16p` and `f16`.
 
-RTX 3070 (before the desktop embargo; first base run was a cold outlier):
+RTX 3070, final route picks, after the desktop embargo lifted (two
+alternating passes, same lock window as the llama.cpp re-measure; with
+the default `LD_LIBRARY_PATH` of `gpu3070` llama-bench loads the
+system `libggml-base` and aborts, so it ran with
+`LD_LIBRARY_PATH=/run/opengl-driver/lib`):
 
-| mode | prefill GPU ms | pp512 t/s |
+| run | prefill GPU ms | pp512 t/s |
 |---|---:|---:|
-| base | 70.43 (cold outlier), 33.24 | 7,140, 15,368 |
-| PTX f16 acc | 20.99, 20.06 | 24,332, 25,411 |
+| llama.cpp CUDA b9503, fa=1 (`llama-bench -p 512 -n 32 -fa 1 -r 5`) | - | 15,847 +- 1,869 |
+| tensor-ash base | 31.47 / 31.69 | 16,247 / 16,051 |
+| PTX f16p | 23.43 / 23.30 | 21,741 / 21,898 |
+| PTX f16 acc | 19.96 / 19.81 | 25,549 / 25,622 |
 
-= **1.63x** base (33.2 -> 20.5 ms) and ~1.5x the Sept-scoreboard
-llama.cpp CUDA pp512 (16.7k) - pending a same-day llama.cpp re-measure,
-which the embargo blocked.
+(An earlier pre-embargo pass: base 33.24 ms / 15,368 t/s after a cold
+70 ms outlier, f16 20.99 / 20.06 ms.)  So on the 3070 the f16 route is
+**1.58x base and 1.61x llama.cpp CUDA**, f16p 1.35x / 1.38x.
 
 ### Correctness gates (4060)
 
@@ -519,9 +530,10 @@ code; the rest is the proposal.
 
 ## Pending (blocked or not done)
 
-* 3070 (desktop embargo from 18:40, user gaming): same-day llama.cpp CUDA
-  pp512 re-measure, more base pp512 samples (one of two base runs was a
-  cold outlier), f16p route and grouped-raster kernels on the 3070.
+* 3070 was embargoed 18:40 to ~19:45 (user gaming); everything listed
+  as pending during that window was run afterwards (llama.cpp re-measure,
+  pp512 passes, token check, g8/f16p kernels).  Not run on the 3070:
+  split-K f16p, the new `ptx::` tests.
 * Measured-tuner integration of PTX candidates; fused epilogues in the
   PTX kernels; TN-weight layout variant; int8/int4 `mma` for the quant
   track; hand-scheduled SASS for f32 SGEMM.
