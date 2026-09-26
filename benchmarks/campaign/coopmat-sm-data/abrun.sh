@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage (inside the GPU lock, cwd = worktree root): abrun.sh <outdir> <batch> <case>...
-# Env passthrough: ML_AB_KERNELS ML_ROUNDS ML_ITERS ML_WARMUP ML_SM_COUNT BIN
+# Env passthrough: ML_AB_KERNELS ML_ROUNDS ML_ITERS ML_WARMUP ML_SM_COUNT ML_L2_MB ML_AB_COLD_MB BIN
 set -u
 out="$1"; batch="$2"; shift 2
 mkdir -p "$out"
@@ -12,7 +12,7 @@ nvidia-smi --query-gpu=timestamp,clocks.sm,clocks.mem,power.draw,temperature.gpu
 smi=$!
 {
   echo "# host=$(hostname) date=$(date -Is) bin=$bin git=$(cat GIT_HEAD 2>/dev/null)"
-  echo "# ML_AB_KERNELS=$ML_AB_KERNELS ML_ROUNDS=$ML_ROUNDS ML_ITERS=${ML_ITERS:-20} ML_WARMUP=${ML_WARMUP:-5} ML_SM_COUNT=${ML_SM_COUNT:-}"
+  echo "# ML_AB_KERNELS=$ML_AB_KERNELS ML_ROUNDS=$ML_ROUNDS ML_ITERS=${ML_ITERS:-20} ML_WARMUP=${ML_WARMUP:-5} ML_SM_COUNT=${ML_SM_COUNT:-} ML_L2_MB=${ML_L2_MB:-} ML_AB_COLD_MB=${ML_AB_COLD_MB:-0}"
   echo "# cmd: $bin ab $*"
 } > "$out/$batch.csv"
 start=$(date +%s.%N)
