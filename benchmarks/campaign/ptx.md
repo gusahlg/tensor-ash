@@ -17,27 +17,33 @@ them, launch parameters are captured at record time, the bound Vulkan
 compute state survives a launch, and dynamic shared memory up to 99 KiB
 works with no attribute call.  Nothing crashed or hung on either GPU.
 
-What it buys, measured:
+What it buys, measured (4060 = louise-pc, 3070 = desktop; ratios are
+interleaved same-process A/Bs against tensor-ash's own route):
 
 | lever | 4060 | 3070 |
 |---|---|---|
-| f16 tensor-core GEMM, **f16 accumulate** (`mma ...f16.f16.f16.f16`, what llama.cpp gets from cuBLAS `COMPUTE_16F`) vs tensor-ash coopmat1 on the same f16 A/B/C | **1.46-1.68x** (40.9-45.6 TF/s) | **1.50-1.88x** (48.6-64.2 TF/s) |
+| **TinyLlama-1.1B f16 pp512, PTX f16-accumulate route** (`ML_PTX_GEMM=f16`) vs tensor-ash base | **1.36-1.38x** (12.9k -> 17.5-17.9k t/s) | **1.63x** (15.4k -> 24.3-25.4k t/s) |
+| same vs llama.cpp b9503 CUDA (same accumulate precision: cuBLAS `COMPUTE_16F`) | **1.36x** (same-day 12.9k) | ~1.5x vs the Sept scoreboard 16.7k (same-day re-measure blocked by the desktop embargo) |
+| pp512 with `ML_PTX_GEMM=f16p` (f16-rate mma, f32 promotion per k-tile; 5-8x lower error than f16 acc) | 1.16x (BK=32 kernel; BK=64 pick pending) | - |
+| f16 tensor-core GEMM, f16 accumulate, vs coopmat1 on the same f16 A/B/C (prefill shapes + squares) | 1.43-1.79x (40-48 TF/s) = 80-94% of cuBLAS 16F | 1.50-1.97x (48-68 TF/s) = 75-100% of cuBLAS 16F |
 | same, f32 accumulate (numerics identical to coopmat1) | 1.00-1.12x | 0.98-1.13x |
-| f32 SIMT SGEMM with a 3/4-stage `cp.async` pipeline vs tensor-ash's best GLSL route | 0.94-1.08x (ties) | 0.84-1.01x (ties at 2048/4096) |
+| f32 SIMT SGEMM with a 3/4-stage `cp.async` pipeline vs tensor-ash's best GLSL route | 0.86-1.08x (ties on large) | 0.73-1.01x (ties at 2048/4096) |
 
-(round-1 kernels; see the tables below for per-shape numbers, round 2,
-and the end-to-end llama prefill measurement.)
+Token-exact: 32 greedy tokens after a 128-token (a16-path) prompt are
+identical for base, f32, f16p and f16 routes; the a16 correctness suite
+passes 13/13 through the f32-accumulate PTX route.
 
-The big finding is not "PTX beats GLSL" in general - with f32
-accumulation both are at the GeForce f32-accumulate tensor ceiling and
+The central finding is not "PTX beats GLSL" in general - with f32
+accumulation both sit at the GeForce f32-accumulate tensor ceiling, and
 f32 SIMT is not limited by the missing `cp.async` - it is that **the
-entire llama.cpp prefill gap is f16 accumulation**: on the 4060
-tensor-ash coopmat1 (27-29 TF/s) already equals cuBLAS `COMPUTE_32F`
-(27.6-30.8 TF/s), while cuBLAS `COMPUTE_16F` - the path llama.cpp b9503
-takes for f16 weights - runs at 42-55 TF/s.  The PTX `mma.sync` f16-acc
-kernel reaches 78-91% of that on the 4060 and 68-95% on the 3070
-(weakest: 512x2048x5632, small MN / long K, where cuBLAS presumably
-splits K).
+whole llama.cpp prefill gap was f16 accumulation**: tensor-ash coopmat1
+(27-29 TF/s on the 4060) already equals cuBLAS `COMPUTE_32F` (27.6-30.8),
+and today's campaign base already matches llama.cpp CUDA pp512 on the
+4060 (12.87k vs 12.89k), while cuBLAS `COMPUTE_16F` - the path llama.cpp
+b9503 takes for f16 weights - runs at 42-55 TF/s.  Vulkan's coopmat
+could express f16 accumulation too, but PTX gives the `mma.sync` +
+`ldmatrix` + `cp.async` pipeline that reaches 80-100% of cuBLAS with it,
+plus a promoted variant (f16p) that cuBLAS does not have.
 
 ## Setup
 
@@ -426,7 +432,10 @@ code; the rest is the proposal.
    (`VK_NV_shader_sm_builtins`); the proposal is to make PTX entries
    ordinary candidates of the existing measured tuner (`ML_TUNE`), keyed
    by the same `TuneKey`, so the per-device winner (the 4060 and 3070
-   disagree - 24 MB vs 4 MB L2) is measured, not guessed.
+   disagree - 24 MB vs 4 MB L2) is measured, not guessed.  Caveat today:
+   with the route on, `ML_TUNE=1` measurements of a16 coopmat candidates
+   actually time the PTX kernel (the recorder substitutes it), so tune
+   with the route off until PTX entries are first-class candidates.
 4. **Graphs / PreparedOps (done by construction).** Because (a) compute
    barriers order CUDA launches both ways, (b) params are captured at
    record time, and (c) bound Vulkan state survives a launch, a PTX
@@ -450,6 +459,34 @@ code; the rest is the proposal.
    returns its own cubin for `nvdisasm`, so a hand-scheduled SASS kernel
    can ship as a cubin blob with the PTX as fallback when the device's
    cc differs.  That is the lever left for f32 SIMT SGEMM.
+
+## Negative results and dead ends (this track)
+
+* **cp.async alone does not fix f32 SGEMM.**  A real 3/4-stage cp.async
+  pipeline (BK 8/16, 128x128, 8x8 thread tiles, conflict-free LDS.128)
+  ties tensor-ash's GLSL BDA_V4 kernels on large squares and loses on
+  small/odd shapes on both GPUs; the 3070 cuBLAS gap (13.7 vs 12.1 TF/s at
+  4096^3) is below PTX (SASS scheduling).  Driver-JIT SASS equals nvcc
+  12.9 SASS, so there is no JIT tax to win back either.
+* **f32-accumulate tensor-core GEMM has no headroom on GeForce.**  PTX
+  mma.sync f32-acc is +0-13% over coopmat1; both sit at the half-rate
+  f32-accumulate ceiling (4060 ~30 TF/s, 3070 ~41 TF/s; cuBLAS 32F is in
+  the same place).  As an end-to-end route it is a wash (4060 pp512 0.98x).
+* **Split-K** (two-stage, deterministic) did not speed up any of the
+  512-row prefill shapes on either GPU; it only reduces f16-acc error.
+* **8-warp 128x128, BK=64, 256x128 f16 tiles**: no general win over the
+  4-warp 128x128 3-stage kernel (BK=64 helps 512x2048x2048 slightly).
+* **4-stage / 64 KiB+ shared memory** hurts: one CTA per SM (s4 variants
+  -10 to -25% vs s3).
+
+## Pending (blocked or not done)
+
+* 3070 (desktop embargo from 18:40, user gaming): same-day llama.cpp CUDA
+  pp512 re-measure, more base pp512 samples (one of two base runs was a
+  cold outlier), f16p route and grouped-raster kernels on the 3070.
+* Measured-tuner integration of PTX candidates; fused epilogues in the
+  PTX kernels; TN-weight layout variant; int8/int4 `mma` for the quant
+  track; hand-scheduled SASS for f32 SGEMM.
 
 ## Reproduction
 
