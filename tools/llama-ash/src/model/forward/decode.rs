@@ -88,7 +88,12 @@ impl Model {
                 // visible to the device at submit; run()'s fence wait
                 // orders the token-cell read after the GPU argmax.
                 self.pos_buf.set(start_pos + i)?;
-                self.decode_prepared.as_mut().unwrap().run_silent()?;
+                if self.time_decode_steps {
+                    let stats = self.decode_prepared.as_mut().unwrap().run()?;
+                    self.note("prepared_total", &stats);
+                } else {
+                    self.decode_prepared.as_mut().unwrap().run_silent()?;
+                }
                 token = self.token_buf.read()?;
                 generated.push(token);
             }

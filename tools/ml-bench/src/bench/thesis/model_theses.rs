@@ -93,9 +93,13 @@ pub(crate) fn t1_decode_bandwidth(
         "context too small for pp512+tg128"
     );
     let prompt = synth_prompt(PP, cfg.vocab)?;
+    // Per-token prepared replay only reads its GPU timestamps on
+    // request (decode_many otherwise uses the silent fence-only path).
+    model.time_decode_steps = true;
 
     // Warmup prefill + decode burn-in, then the measured run — the
-    // same discipline as `llama_ash bench`.
+    // same discipline `llama_ash bench` used before its tg path moved
+    // to the one-submit unroll (T1 keeps per-token submissions).
     let (warm, _) = model.prefill(&prompt)?;
     model.decode_many(warm, 16)?;
     model.reset()?;
@@ -112,6 +116,7 @@ pub(crate) fn t1_decode_bandwidth(
         .filter(|(class, _)| matches!(*class, "graph_total" | "prepared_total"))
         .map(|(_, ns)| ns)
         .sum();
+    model.time_decode_steps = false;
     model.reset()?;
     if gpu_ns == 0 {
         return Ok(skip(

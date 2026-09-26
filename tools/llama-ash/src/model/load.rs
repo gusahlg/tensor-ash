@@ -295,6 +295,7 @@ impl Model {
             token_buf,
             token_ids,
             breakdown: std::cell::RefCell::new(Vec::new()),
+            time_decode_steps: false,
             decode_mode: match overrides.decode_mode {
                 Some(mode) => mode,
                 None => match std::env::var("LLAMA_ASH_DECODE").as_deref() {

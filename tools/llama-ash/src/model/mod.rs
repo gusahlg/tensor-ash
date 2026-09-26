@@ -237,6 +237,12 @@ pub struct Model {
     /// Per-op-class GPU nanoseconds for the current perop decode step
     /// (diagnostics; filled when `LLAMA_ASH_BREAKDOWN=1`).
     pub breakdown: std::cell::RefCell<Vec<(&'static str, u64)>>,
+    /// Read each prepared decode step's GPU timestamps in
+    /// [`decode_many`](Self::decode_many) and note them as
+    /// `prepared_total` (default off: the per-token query read is
+    /// host time the generate path does not need).  The thesis
+    /// harness's T1 turns it on to price decode GPU time per token.
+    pub time_decode_steps: bool,
     /// Record-once prefill graph for the last `t` at `pos_base == 0`.
     /// Dropped before scratch/weights (see [`Drop`]).
     prefill_prepared: Option<PrefillPrepared>,
