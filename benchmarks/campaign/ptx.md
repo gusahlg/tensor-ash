@@ -320,15 +320,16 @@ ratios, not absolute TF/s, across tables.
 `ACC=2` kernels run `mma ...f16.f16.f16.f16` inside one k-tile (BK=32:
 two m16n8k16 steps; BK=64: four), then add the f16 partials into f32
 registers and zero them.  4060, round 3 (`ml_bench ptx hgemm`, TF/s and
-rel-RMS vs f64; TA = coopmat1 in the same process):
+rel-RMS vs f64; ratios vs coopmat1 measured interleaved in the same
+process, TA itself at 26-29 TF/s):
 
-| shape | TA | f16p 128x64 BK=32 | f16p 128x64 BK=64 | f16 acc 128x128 | rel-RMS: f32 acc / f16p BK32 / f16p BK64 / f16 acc / cuBLAS 16F |
-|---|---:|---:|---:|---:|---|
-| 512x2048x2048 | 28.0 | 33.4 (1.19x) | 38.3 (1.37x) | 40.2 (1.43x) | 2.05e-4 / 3.81e-4 / 4.98e-4 / 2.41e-3 / 1.65e-3 |
-| 512x5632x2048 | 28.1 | 35.6 (1.27x) | 42.1 (1.50x) | 46.4 (1.62x) | 2.14e-4 / 3.85e-4 / 4.62e-4 / 2.39e-3 / 1.61e-3 |
-| 512x2048x5632 | 26.0 | 34.5 (1.19x) | 36.2 (1.40x) | 43.2 (1.48x) | 2.15e-4 / 3.87e-4 / 4.72e-4 / 3.81e-3 / 2.83e-3 |
-| 2048^3 | 26.5 | 36.8 (1.38x) | 43.0 (1.62x) | 46.6 (1.74x) | 2.16e-4 / 3.88e-4 / 4.88e-4 / 2.27e-3 / 1.62e-3 |
-| 4096^3 | 26.3 | 33.0 (1.28x) | 34.0 (1.29x) | 44.0 (1.69x) | 1.99e-4 / 3.80e-4 / 4.70e-4 / 3.19e-3 / 1.94e-3 |
+| shape | f16p 128x64 BK=32 | f16p 128x64 BK=64 | f16 acc 128x128 | rel-RMS: f32 acc / f16p BK32 / f16p BK64 / f16 acc / cuBLAS 16F |
+|---|---:|---:|---:|---|
+| 512x2048x2048 | 33.4 (1.19x) | 38.3 (1.37x) | 40.2 (1.43x) | 2.05e-4 / 3.81e-4 / 4.98e-4 / 2.41e-3 / 1.65e-3 |
+| 512x5632x2048 | 35.6 (1.27x) | 42.1 (1.50x) | 46.4 (1.62x) | 2.14e-4 / 3.85e-4 / 4.62e-4 / 2.39e-3 / 1.61e-3 |
+| 512x2048x5632 | 34.5 (1.19x) | 36.2 (1.40x) | 43.2 (1.48x) | 2.15e-4 / 3.87e-4 / 4.72e-4 / 3.81e-3 / 2.83e-3 |
+| 2048^3 | 36.8 (1.38x) | 43.0 (1.62x) | 46.6 (1.74x) | 2.16e-4 / 3.88e-4 / 4.88e-4 / 2.27e-3 / 1.62e-3 |
+| 4096^3 | 33.0 (1.28x) | 34.0 (1.29x) | 44.0 (1.69x) | 1.99e-4 / 3.80e-4 / 4.70e-4 / 3.19e-3 / 1.94e-3 |
 
 f16p with BK=64 keeps ~90% of the f16-accumulate speed (1.29-1.62x
 coopmat1) at **5-8x lower error than f16 accumulate and 3.4-6x lower
