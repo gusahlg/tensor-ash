@@ -429,7 +429,7 @@ system `libggml-base` and aborts, so it ran with
 70 ms outlier, f16 20.99 / 20.06 ms.)  So on the 3070 the f16 route is
 **1.58x base and 1.61x llama.cpp CUDA**, f16p 1.35x / 1.38x.
 
-### Correctness gates (4060)
+### Correctness gates (4060; the 3070 re-ran `ptx::` 2/2 and `f16::` through the f32 route 13/13)
 
 `cargo test --release --test correctness -- --ignored --test-threads=1 <filter>`:
 
@@ -531,8 +531,8 @@ code; the rest is the proposal.
 
 * 3070 was embargoed 18:40 to ~19:45 (user gaming); everything listed
   as pending during that window was run afterwards (llama.cpp re-measure,
-  pp512 passes, token check, g8/f16p kernels).  Not run on the 3070:
-  split-K f16p, the new `ptx::` tests.
+  pp512 passes, token check, g8/f16p kernels, `ptx::` and `f16::`
+  tests).  Not run on the 3070: split-K f16p/f32 entries.
 * Measured-tuner integration of PTX candidates; fused epilogues in the
   PTX kernels; TN-weight layout variant; int8/int4 `mma` for the quant
   track; hand-scheduled SASS for f32 SGEMM.
