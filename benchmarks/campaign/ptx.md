@@ -448,7 +448,11 @@ code; the rest is the proposal.
    `CudaModule::from_ptx_cached` persists the driver-compiled cubin
    (`vkGetCudaModuleCacheNV`) under
    `~/.cache/tensor-ash/ptx_<label>_v<vendor>_<device>_d<driver>_<hash>.cubin`;
-   a cold JIT of the GEMM module costs 0.4-0.7 s, a cached load ~0.1 ms.
+   a cold JIT of the GEMM module costs 0.4-0.7 s (1.5-1.7 s for the
+   current 33-entry experiment module - `ptx/hgemm.ptx` is 1.9 MB; a
+   shipping build should prune it to the ~8 routed kernels), a cached
+   load ~0.1 ms (measured: 3-5 ms for the whole route incl. function
+   lookups).
    Any load/JIT failure logs and leaves the Vulkan kernels in charge
    (GLSL fallback is the default path, not an error path).  Lowering
    the emitted `.version` (nvcc 12.9 writes 8.8) to the lowest ISA the
@@ -458,8 +462,9 @@ code; the rest is the proposal.
    `route.select(m, n, k)` for a16 matmuls (f16 A/B/C, batch 1, plain
    `alpha*A*B`, no fused epilogue/normed-A/store) and records
    `vkCmdCudaLaunchKernelNV` instead of bind + push + dispatch.  The
-   current tile pick is a two-line SM-count heuristic
-   (`VK_NV_shader_sm_builtins`); the proposal is to make PTX entries
+   current tile pick is a small SM-count heuristic
+   (`VK_NV_shader_sm_builtins`: 64x64 / 128x64 below ~2-4 tiles per SM,
+   128x128 above, grouped-raster `_g8` above 16 tiles per SM); the proposal is to make PTX entries
    ordinary candidates of the existing measured tuner (`ML_TUNE`), keyed
    by the same `TuneKey`, so the per-device winner (the 4060 and 3070
    disagree - 24 MB vs 4 MB L2) is measured, not guessed.  Caveat today:
@@ -477,12 +482,15 @@ code; the rest is the proposal.
    ggml's `GGML_PREC_DEFAULT/F32` - llama prefill projections may opt
    into `f16`/`f16p`, attention scores and anything reduction-sensitive
    stay f32.  `f16p` (f16-rate mma, per-k-tile f32 promotion) is the
-   candidate default if its error stays near f32's (round 2).
+   natural default for projections: measured 2.2-2.4x the f32-accumulate
+   error (5-8x below f16 accumulate, ~3-7x below llama.cpp's cuBLAS path)
+   at 1.28x base pp512 on the 4060, token-exact on the gate prompt.
 6. **Epilogues / fusion next.** The Vulkan route fuses bias, activation,
    residual and RoPE stores; the PTX kernels should grow the same
    template epilogues (cheap: registers are already in hand) before they
-   replace fused paths.  Split-K for small-MN/large-K shapes (512x2048x5632
-   is our weakest shape vs cuBLAS) and a TN-weight variant are the next
+   replace fused paths.  The weakest shape vs cuBLAS (512x2048x5632 on
+   the 3070, 75%) did not respond to two-stage split-K; a TN-weight
+   variant and a BK=64 f16p kernel with grouped raster are the next
    kernel items; int8 `mma.m16n8k32` / int4 `m16n8k64` for the
    quantization track reuse exactly this scaffolding.
 7. **SASS.** The driver accepts cubins through both extensions and
