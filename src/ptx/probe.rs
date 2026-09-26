@@ -84,6 +84,19 @@ impl ProbeAffine {
     }
 }
 
+impl ProbeAffine {
+    /// Dispatch again WITHOUT re-binding the pipeline or re-pushing
+    /// constants — probes whether a CUDA launch recorded in between
+    /// disturbs Vulkan's bound compute state (the executor elides
+    /// redundant binds).
+    ///
+    /// # Safety
+    /// A previous [`Self::cmd_dispatch`] in `cb` must have bound state.
+    pub unsafe fn cmd_dispatch_reuse_state(&self, cb: vk::CommandBuffer, groups: u32) {
+        unsafe { self.ctx.device.cmd_dispatch(cb, groups, 1, 1) };
+    }
+}
+
 impl Drop for ProbeAffine {
     fn drop(&mut self) {
         unsafe {

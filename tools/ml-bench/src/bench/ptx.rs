@@ -9,6 +9,7 @@
 //!   through both VK_NV_cuda_kernel_launch and VK_NVX_binary_import.
 //! * `smem`     — dynamic shared memory above 48 KiB.
 //! * `sync`     — Vulkan<->CUDA ordering under several barrier kinds.
+//! * `state`    — does a CUDA launch clobber bound Vulkan compute state?
 //! * `overhead` — launch cost vs a Vulkan dispatch; launch overlap.
 //! * `sgemm [MxNxK ...]` — PTX f32 SGEMM vs tensor-ash's f32 route.
 //! * `hgemm [MxNxK ...]` — PTX mma.sync GEMM vs tensor-ash a16 coopmat.
@@ -41,10 +42,11 @@ pub(super) fn run(
         "probe" => probe(ctx, exec),
         "smem" => smem(ctx, exec),
         "sync" => sync(ctx, exec),
+        "state" => state(ctx, exec),
         "overhead" => overhead(ctx, exec),
         "sgemm" => sgemm(ctx, exec, &rest),
         "hgemm" => hgemm(ctx, exec, &rest),
-        _ => bail!("ptx: unknown mode '{mode}' (probe|smem|sync|overhead|sgemm|hgemm)"),
+        _ => bail!("ptx: unknown mode '{mode}' (probe|smem|sync|state|overhead|sgemm|hgemm)"),
     }
 }
 
@@ -588,6 +590,62 @@ fn sync(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// state: Vulkan dispatch, CUDA launch, then a Vulkan dispatch that
+// relies on the previously bound pipeline + push constants.
+
+fn state(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
+    let n = 1u32 << 20;
+    let rec = Rec::new(ctx, 4)?;
+    let module = CudaModule::from_ptx(ctx, kernels::PROBE_PTX)?;
+    let cu = module.function("probe_affine")?;
+    let vk_affine = ProbeAffine::new(ctx)?;
+    let dev = &ctx.device;
+    let seed: Vec<u32> = (0..n).map(|i| i.wrapping_mul(2654435761)).collect();
+    let x = u32_tensor(ctx, exec, &seed)?;
+    let y = u32_tensor(ctx, exec, &vec![0u32; n as usize])?;
+    let (xa, ya) = (addr(ctx, &x), addr(ctx, &y));
+    let groups = n.div_ceil(256);
+    let (m1, a1, m2, a2) = (3u32, 7u32, 5u32, 11u32);
+    rec.run(|cb| unsafe {
+        vk_affine.cmd_dispatch(cb, xa, ya, n, m1, a1, groups); // y = x*m1+a1
+        compute_barrier(dev, cb);
+        cu.cmd_launch(
+            cb,
+            [groups, 1, 1],
+            [256, 1, 1],
+            0,
+            &[
+                KernelArg::U64(ya),
+                KernelArg::U64(xa),
+                KernelArg::U32(n),
+                KernelArg::U32(m2),
+                KernelArg::U32(a2),
+            ],
+        ); // x = y*m2+a2
+        compute_barrier(dev, cb);
+        vk_affine.cmd_dispatch_reuse_state(cb, groups); // y = x*m1+a1 (state reused)
+    })?;
+    let got = download_u32(exec, &y, n as usize)?;
+    let bad = got
+        .iter()
+        .zip(&seed)
+        .filter(|(g, s)| {
+            **g != s
+                .wrapping_mul(m1)
+                .wrapping_add(a1)
+                .wrapping_mul(m2)
+                .wrapping_add(a2)
+                .wrapping_mul(m1)
+                .wrapping_add(a1)
+        })
+        .count();
+    println!(
+        "bound-state reuse across a CUDA launch (pipeline + push constants not re-recorded): mismatches={bad}/{n}"
+    );
     Ok(())
 }
 
