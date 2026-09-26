@@ -193,14 +193,14 @@ LDS.128 of A hits 4 distinct bank groups.  128 registers, 2 CTAs/SM,
 
 3070:
 
-| shape | TA TF/s | best PTX | PTX TF/s | PTX/TA | cuBLAS TF/s (Sept re-baseline) |
+| shape | TA TF/s | best PTX | PTX TF/s | PTX/TA | cuBLAS TF/s, same day (best of 30 / mean) |
 |---|---:|---|---:|---:|---:|
-| 4096^3 | 11.99 | 128x128x8_s3_v4 | 12.06 | 1.006 | 13.50 |
-| 2048^3 | 11.72 | 128x128x8_s3_v4 | 11.79 | 1.005 | - |
-| 1024^3 | 11.06 | 128x128x8_s3_v4 | 9.25 | 0.837 | - |
-| 1024x3072x512 | 11.20 | 128x128x8_s3_v4 | 10.79 | 0.963 | - |
-| 768^3 | 9.14 | 128x128x16_s2_v4 | 9.08 | 0.994 | - |
-| 1023x1025x1027 | 9.55 | 128x128x8_s4_s1 | 6.97 | 0.730 | 11.16 |
+| 4096^3 | 11.99 | 128x128x8_s3_v4 | 12.06 | 1.006 | 13.68 / 13.36 |
+| 2048^3 | 11.72 | 128x128x8_s3_v4 | 11.79 | 1.005 | 13.05 / 12.91 |
+| 1024^3 | 11.06 | 128x128x8_s3_v4 | 9.25 | 0.837 | 11.92 / 11.80 |
+| 1024x3072x512 | 11.20 | 128x128x8_s3_v4 | 10.79 | 0.963 | 12.43 / 12.38 |
+| 768^3 | 9.14 | 128x128x16_s2_v4 | 9.08 | 0.994 | 10.92 / 10.77 |
+| 1023x1025x1027 | 9.55 | 128x128x8_s4_s1 | 6.97 | 0.730 | 11.25 / 11.10 |
 
 **Finding (negative):** a real multi-stage `cp.async` pipeline - the
 primitive every GLSL smem-pipeline experiment lacked - does *not* by
@@ -209,8 +209,10 @@ BDA_V4 kernels on large squares on both GPUs and loses on small shapes
 (one 128x128 tile shape vs tensor-ash's tile family).  On the 4060
 everyone (tensor-ash, PTX, cuBLAS) sits at ~8.4-8.7 TF/s at 4096^3 - the
 board is power-limited there (tensor-ash min 14.25 ms vs median 16.2
-ms).  The remaining 3070 gap to cuBLAS (12.1 vs 13.5 TF/s) is below
-PTX: register-bank/reuse scheduling in SASS.  The path to that level now
+ms).  The remaining 3070 gap to cuBLAS (12.1 vs 13.4-13.7 TF/s) is below
+PTX: register-bank/reuse scheduling in SASS.  (Odd shapes are worse
+still: the fully general `s1` variant uses 4-byte cp.async and scalar
+stores.)  The path to that level now
 exists (the driver accepts cubins, so hand-scheduled SASS can be
 assembled offline and shipped), but it is a different project.
 Driver-JIT SASS == nvcc 12.9 SASS here, so no JIT penalty either way.
@@ -227,8 +229,8 @@ one llama prefill uses): f16 A (activations), f16 B `[K][N]`, f16 C;
 
 * `f32` - `mma ...f32.f16.f16.f32` (numerics class of coopmat1).
 * `f16` - `mma ...f16.f16.f16.f16`, 2x tensor throughput on GeForce.
-* `f16p` (round 2) - f16-rate mma within one BK=32 k-tile, promoted into
-  f32 registers after every k-tile.
+* `f16p` (round 2) - f16-rate mma within one BK (32 or 64) k-tile,
+  promoted into f32 registers after every k-tile.
 
 ### What llama.cpp actually does (b9503)
 
