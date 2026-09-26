@@ -315,6 +315,19 @@ demotes to an in-budget sibling; the NVIDIA proprietary driver keeps the
 49,664 B BK=64 tiles under a bounded, measured allowance (see
 `VulkanContext::workgroup_shared_budget`).
 
+### Experimental: PTX kernels inside the Vulkan command buffers
+
+On the NVIDIA proprietary driver, `ML_PTX=1` enables
+`VK_NV_cuda_kernel_launch` (`ML_NO_PTX=1` vetoes; device creation is
+unchanged otherwise).  `src/ptx` then JIT-compiles the checked-in PTX
+(`ptx/*.cu` -> `ptx/*.ptx`, no CUDA toolkit needed to build) and records
+CUDA kernel launches next to the Vulkan dispatches.  `ML_PTX_GEMM=f32|f16|f16p`
+routes a16 matmuls (f16 A/B/C, the llama prefill contract) through
+`mma.sync` kernels; `f16` is f16 accumulation (what llama.cpp's cuBLAS
+path does, ~10x noisier than f32), `f16p` promotes to f32 every k-tile.
+`ml_bench ptx <probe|smem|sync|state|overhead|dump|sgemm|hgemm>` is the
+harness; findings and numbers are in `benchmarks/campaign/ptx.md`.
+
 ## Tests
 
 ```bash

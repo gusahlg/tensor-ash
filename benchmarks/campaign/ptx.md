@@ -280,10 +280,91 @@ Relative RMS error vs an f64 reference (512 sampled outputs):
   ours exactly; on K=2048 shapes cuBLAS's k-ordering is ~1.45x better).
   That is the precision llama.cpp's CUDA prefill already runs at.
 
-## 6. Round 2 and end-to-end prefill
+## 6. Round 2 kernels, split-K, f16p, and end-to-end prefill
 
-(pending: 8-warp / BK=64 / 256x128 variants, `f16p` promoted
-accumulation, and TinyLlama pp512 through the integrated route)
+### Tile variants (round 2)
+
+Added 8-warp 128x128 (warp tiles 64x32 / 32x64), BK=64 two-stage
+variants, 256x128, and a deterministic two-stage split-K (f32 partial
+planes + an f16 reduce kernel).  Best f16-accumulate kernel per shape
+(TF/s; ratio vs tensor-ash coopmat1 in the same process; share of the
+best cuBLAS `COMPUTE_16F` layout):
+
+| shape | 4060 best (kernel) | vs TA | vs cuBLAS 16F | 3070 best (kernel) | vs TA | vs cuBLAS 16F |
+|---|---|---:|---:|---|---:|---:|
+| 512x2048x2048 | 41.0 (128x64_k64_s2) | 1.47x | 89% | 54.0 (128x64_k64_s2) | 1.62x | 86% |
+| 512x5632x2048 | 46.0 (128x128_s3) | 1.61x | 93% | 65.2 (128x128_s3) | 1.82x | 97% |
+| 512x2048x5632 | 43.2 (128x128_s3) | 1.48x | 88% | 53.4 (128x128_s3) | 1.58x | 75% |
+| 2048^3 | 48.1 (128x128_s3) | 1.79x | 94% | 66.3 (128x64_k64_s2) | 1.96x | 99% |
+| 4096^3 | 44.4 (128x128_w32x64_s3) | 1.79x | 80% | 67.6 (128x128_s3) | 1.92x | 100% |
+
+* The plain 4-warp 128x128 / 3-stage kernel stays the best general pick;
+  8-warp CTAs and BK=64 help only on the 512x2048 shapes (and not
+  reliably), 256x128 loses everywhere (one CTA/SM).  On the 3070 the PTX
+  f16-acc kernel matches cuBLAS `COMPUTE_16F` at 2048^3 and 4096^3.
+* **Split-K did not pay** on either GPU for these shapes (best split
+  results: 4060 512x2048x5632 41.0 vs 43.2 unsplit; 3070 53.1 vs 53.4);
+  it does lower f16-accumulate error (fewer terms per f16 chain:
+  2.41e-3 -> 1.66e-3 / 1.36e-3 / 1.13e-3 rel-RMS for 2/3/4 splits at
+  K=2048).  The weak 512x2048x5632 shape vs cuBLAS on the 3070 stays open.
+* f32 accumulate: the 8-warp 128x128 f32 kernel is +6-7% over coopmat1
+  at 2048^3/4096^3 on the 4060, below 64x64_s4 / 128x128_s3 elsewhere.
+
+Run-to-run note: the same kernel/shape moved by up to ~10% between
+processes (3070 512x2048x5632 128x128_s3: 48.6 in round 1, 53.4 in round
+2), always with TA measured interleaved in the same process; compare
+ratios, not absolute TF/s, across tables.
+
+### f16p: f16-rate mma with f32 promotion
+
+`ACC=2` kernels run `mma ...f16.f16.f16.f16` inside one BK=32 k-tile
+(two m16n8k16 steps), then add the f16 partials into f32 registers and
+zero them.  Error (rel-RMS vs f64, 4060, split-K harness numbers where
+the non-split run is pending):
+
+| shape | f32 acc | f16p | f16 acc | cuBLAS 16F |
+|---|---:|---:|---:|---:|
+| 512x2048x2048 | 2.05e-4 | 3.81e-4 | 2.41e-3 | 1.65e-3 |
+| 512x5632x2048 | 2.14e-4 | 3.85e-4 | 2.39e-3 | 1.61e-3 |
+| 512x2048x5632 | 2.15e-4 | 3.87e-4 | 3.81e-3 | 2.83e-3 |
+| 2048^3 | 2.16e-4 | 3.88e-4 | 2.27e-3 | 1.62e-3 |
+
+f16p is 6-10x more accurate than f16 accumulate (and 4-7x more accurate
+than what llama.cpp's cuBLAS path delivers), 1.8x the f32-accumulate
+error (which is itself dominated by the final f16 rounding of C).  Its
+cost is the promotion adds: in the kernel sweep it runs ~15% behind the
+f16 kernels (e.g. 4060 512x2048x2048 split/2: 33.7 vs 38.7 TF/s), still
+1.2x coopmat1.
+
+### End-to-end: TinyLlama-1.1B f16 prefill (pp512) through the integrated route
+
+`ML_PTX=1 ML_PTX_GEMM=<mode> llama_ash bench -m tinyllama-1.1b-chat-v1.0.f16.gguf --pp 512 --tg 32`
+(one process per run, modes alternated; "GPU" = timestamped prefill graph):
+
+RTX 4060 (two alternating passes):
+
+| mode | prefill GPU ms | pp512 t/s | vs base |
+|---|---:|---:|---:|
+| base (Vulkan coopmat1) | 39.26 / 39.28 | 12,951 / 12,940 | 1.00 |
+| PTX f32 acc | 39.82 / 40.47 | 12,770 / 12,629 | 0.98 |
+| PTX f16p | 33.94 / 33.85 | 14,953 / 14,993 | **1.16** |
+| PTX f16 acc | 28.48 / 28.75 | 17,929 / 17,618 | **1.37** |
+
+llama.cpp b9503 on the same 4060 (scoreboard 2026-08-15): CUDA fa=1
+13,042 t/s, Vulkan CM2 fa=1 14,003 t/s.  With the f16-accumulate route
+tensor-ash prefill is **~1.36x llama.cpp CUDA** on this card (same-day
+llama.cpp re-measure: see below).
+
+RTX 3070 (before the desktop embargo; first base run was a cold outlier):
+
+| mode | prefill GPU ms | pp512 t/s |
+|---|---:|---:|
+| base | 70.43 (cold outlier), 33.24 | 7,140, 15,368 |
+| PTX f16 acc | 20.99, 20.06 | 24,332, 25,411 |
+
+= **1.63x** base (33.2 -> 20.5 ms) and ~1.5x the Sept-scoreboard
+llama.cpp CUDA pp512 (16.7k) - pending a same-day llama.cpp re-measure,
+which the embargo blocked.
 
 ## 7. Design proposal: a PTX accelerator backend
 
