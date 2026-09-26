@@ -30,6 +30,13 @@ impl KernelSpec {
         self.name.contains("_a16_")
     }
 
+    /// Accumulator class: `F16` / `F16Promote` for the `*_acc16` /
+    /// `*_acc16p` coopmat twins, `F32` for everything else.
+    #[inline]
+    pub fn accumulator(&self) -> super::CoopmatAcc {
+        super::CoopmatAcc::of_kernel_name(self.name)
+    }
+
     /// Total workgroup (shared) memory the shader declares, in bytes —
     /// the number drivers check against `maxComputeSharedMemorySize`
     /// (VUID-RuntimeSpirv-Workgroup-06530).  Read from the embedded
@@ -136,7 +143,7 @@ macro_rules! kernel_catalog {
             )
         ),+ $(,)?
     ) => {
-        #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+        #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
         pub enum KernelSelection {
             Auto,
             $($variant),+
@@ -171,6 +178,13 @@ macro_rules! kernel_catalog {
                 Self::parse(&value)
             }
 
+            /// The concrete selection at registry `index` (inverse of
+            /// [`Self::index`]).
+            #[inline]
+            pub(crate) fn from_index(index: usize) -> Option<Self> {
+                CONCRETE_SELECTIONS.get(index).copied()
+            }
+
             /// Index into `KERNEL_SPECS` / `MatmulPipeline::kernels`.
             /// `Auto` has no fixed kernel and returns `None`.
             #[inline]
@@ -182,8 +196,9 @@ macro_rules! kernel_catalog {
             }
         }
 
-        #[cfg(test)]
-        const CONCRETE_SELECTIONS: &[KernelSelection] = &[
+        /// Every concrete selection in registry order
+        /// (`CONCRETE_SELECTIONS[i].index() == Some(i)`).
+        pub(crate) const CONCRETE_SELECTIONS: &[KernelSelection] = &[
             $(KernelSelection::$variant),+
         ];
 
@@ -359,6 +374,46 @@ kernel_catalog! {
     F16wA16CoopmatM128N64 => ("f16w_a16_coopmat_m128n64", 128, 64, 32,
         "matmul_f16w_a16_coopmat_m128n64.spv", false,
         ["f16w_a16_coopmat_m128n64", "a16_coopmat_m128n64"]),
+    // f16-ACCUMULATOR twins of the eight coopmat1 kernels above
+    // (`_acc16`: HMMA.*.F16 end to end; `_acc16p`: f16 partials over
+    // 128 K promoted into f32 accumulators).  A different numerics
+    // class: never picked by the heuristic or the tuner, only through
+    // the executor's `coopmat_acc` policy (ExecutorConfig /
+    // ML_COOPMAT_ACC) or an explicit ML_KERNEL pin.  Slots are empty
+    // unless `VulkanContext::coopmat_f16_acc_enabled`; their pipelines
+    // are built on first use (no eager fallbacks).
+    F16wCoopmatAcc16 => ("f16w_coopmat_acc16", 128, 128, 32,
+        "matmul_f16w_coopmat_acc16.spv", false, ["f16w_coopmat_acc16", "coopmat_acc16"]),
+    F16wCoopmatAcc16p => ("f16w_coopmat_acc16p", 128, 128, 32,
+        "matmul_f16w_coopmat_acc16p.spv", false, ["f16w_coopmat_acc16p", "coopmat_acc16p"]),
+    F16wCoopmatM64Acc16 => ("f16w_coopmat_m64n64_acc16", 64, 64, 32,
+        "matmul_f16w_coopmat_m64n64_acc16.spv", false, ["f16w_coopmat_m64n64_acc16", "coopmat_m64_acc16"]),
+    F16wCoopmatM64Acc16p => ("f16w_coopmat_m64n64_acc16p", 64, 64, 32,
+        "matmul_f16w_coopmat_m64n64_acc16p.spv", false, ["f16w_coopmat_m64n64_acc16p", "coopmat_m64_acc16p"]),
+    F16wCoopmatM64N128Acc16 => ("f16w_coopmat_m64n128_acc16", 64, 128, 32,
+        "matmul_f16w_coopmat_m64n128_acc16.spv", false, ["f16w_coopmat_m64n128_acc16", "coopmat_m64n128_acc16"]),
+    F16wCoopmatM64N128Acc16p => ("f16w_coopmat_m64n128_acc16p", 64, 128, 32,
+        "matmul_f16w_coopmat_m64n128_acc16p.spv", false, ["f16w_coopmat_m64n128_acc16p", "coopmat_m64n128_acc16p"]),
+    F16wCoopmatM128N64Acc16 => ("f16w_coopmat_m128n64_acc16", 128, 64, 32,
+        "matmul_f16w_coopmat_m128n64_acc16.spv", false, ["f16w_coopmat_m128n64_acc16", "coopmat_m128n64_acc16"]),
+    F16wCoopmatM128N64Acc16p => ("f16w_coopmat_m128n64_acc16p", 128, 64, 32,
+        "matmul_f16w_coopmat_m128n64_acc16p.spv", false, ["f16w_coopmat_m128n64_acc16p", "coopmat_m128n64_acc16p"]),
+    F16wA16CoopmatAcc16 => ("f16w_a16_coopmat_acc16", 128, 128, 32,
+        "matmul_f16w_a16_coopmat_acc16.spv", false, ["f16w_a16_coopmat_acc16", "a16_coopmat_acc16"]),
+    F16wA16CoopmatAcc16p => ("f16w_a16_coopmat_acc16p", 128, 128, 32,
+        "matmul_f16w_a16_coopmat_acc16p.spv", false, ["f16w_a16_coopmat_acc16p", "a16_coopmat_acc16p"]),
+    F16wA16CoopmatM64Acc16 => ("f16w_a16_coopmat_m64n64_acc16", 64, 64, 32,
+        "matmul_f16w_a16_coopmat_m64n64_acc16.spv", false, ["f16w_a16_coopmat_m64n64_acc16", "a16_coopmat_m64_acc16"]),
+    F16wA16CoopmatM64Acc16p => ("f16w_a16_coopmat_m64n64_acc16p", 64, 64, 32,
+        "matmul_f16w_a16_coopmat_m64n64_acc16p.spv", false, ["f16w_a16_coopmat_m64n64_acc16p", "a16_coopmat_m64_acc16p"]),
+    F16wA16CoopmatM64N128Acc16 => ("f16w_a16_coopmat_m64n128_acc16", 64, 128, 32,
+        "matmul_f16w_a16_coopmat_m64n128_acc16.spv", false, ["f16w_a16_coopmat_m64n128_acc16", "a16_coopmat_m64n128_acc16"]),
+    F16wA16CoopmatM64N128Acc16p => ("f16w_a16_coopmat_m64n128_acc16p", 64, 128, 32,
+        "matmul_f16w_a16_coopmat_m64n128_acc16p.spv", false, ["f16w_a16_coopmat_m64n128_acc16p", "a16_coopmat_m64n128_acc16p"]),
+    F16wA16CoopmatM128N64Acc16 => ("f16w_a16_coopmat_m128n64_acc16", 128, 64, 32,
+        "matmul_f16w_a16_coopmat_m128n64_acc16.spv", false, ["f16w_a16_coopmat_m128n64_acc16", "a16_coopmat_m128n64_acc16"]),
+    F16wA16CoopmatM128N64Acc16p => ("f16w_a16_coopmat_m128n64_acc16p", 128, 64, 32,
+        "matmul_f16w_a16_coopmat_m128n64_acc16p.spv", false, ["f16w_a16_coopmat_m128n64_acc16p", "a16_coopmat_m128n64_acc16p"]),
     // Tensor-core GEMM via NV_cooperative_matrix2 (workgroup-scope
     // matrices + tensor addressing) with the fused store epilogue the
     // coopmat1 kernel cannot implement (`coopMatPerElementNV` at
@@ -437,6 +492,19 @@ mod tests {
         assert_eq!(by_name("f16w_coopmat_m64n64"), 9_728); // 64*5*16 + 32*9*16
         assert_eq!(by_name("f16w_coopmat_m64n128"), 13_824); // 64*5*16 + 32*17*16
         assert_eq!(by_name("f16w_coopmat_m128n64"), 14_848); // 128*5*16 + 32*9*16
+        // The f16-accumulator twins declare the same staging tiles.
+        for (base, bytes) in [
+            ("coopmat", 18_944),
+            ("coopmat_m64n64", 9_728),
+            ("coopmat_m64n128", 13_824),
+            ("coopmat_m128n64", 14_848),
+        ] {
+            for fam in ["f16w_", "f16w_a16_"] {
+                for acc in ["_acc16", "_acc16p"] {
+                    assert_eq!(by_name(&format!("{fam}{base}{acc}")), bytes, "{fam}{base}{acc}");
+                }
+            }
+        }
         assert_eq!(by_name("outer_bda"), 0); // register-only
     }
 
@@ -478,6 +546,15 @@ mod tests {
             max,
             crate::context::VulkanContext::MAX_SHIPPED_WORKGROUP_BYTES
         );
+    }
+
+    #[test]
+    fn from_index_inverts_index() {
+        for (i, spec) in KERNEL_SPECS.iter().enumerate() {
+            let selection = KernelSelection::from_index(i).expect("in range");
+            assert_eq!(selection.index(), Some(i), "{}", spec.name);
+        }
+        assert_eq!(KernelSelection::from_index(KERNEL_SPECS.len()), None);
     }
 
     #[test]

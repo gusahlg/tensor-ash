@@ -25,6 +25,7 @@ fn executor_config(n_slots: usize, max_calls: u32) -> ExecutorConfig {
         n_slots,
         max_calls_per_submit: max_calls,
         tune: false,
+        ..ExecutorConfig::default()
     }
 }
 

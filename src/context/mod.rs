@@ -67,6 +67,11 @@ pub struct VulkanContext {
     /// Vulkan memory model).  Required for the tensor-core `coopmat`
     /// kernels; `ML_NO_COOPMAT=1` forces it off.
     pub coopmat_enabled: bool,
+    /// Whether the device reports a 16x16x16 subgroup coopmat
+    /// configuration with f16 A/B/C/Result — the f16-accumulator
+    /// (`*_acc16*`) tensor-core kernels.  Requires
+    /// [`Self::coopmat_enabled`].
+    pub coopmat_f16_acc_enabled: bool,
     /// Whether `VK_NV_cooperative_matrix2` was enabled with every
     /// feature bit the cm2 flash kernels need (workgroup scope,
     /// flexible dimensions, reductions, conversions, per-element ops,

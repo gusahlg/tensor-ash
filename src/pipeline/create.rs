@@ -212,6 +212,29 @@ pub(super) unsafe fn destroy_kernel(ctx: &Arc<VulkanContext>, kernel: MatmulKern
     }
 }
 
+/// A kernel whose pipelines are ALL built on first use: only the
+/// shader module is created here and every eager variant slot stays
+/// null (`MatmulPipeline::pipeline_for_epilogue` then takes the lazy
+/// path for every variant).  For opt-in families whose eager fallbacks
+/// would only add cold-start compile time.
+pub(super) fn create_kernel_lazy(
+    ctx: &Arc<VulkanContext>,
+    pipeline_layout: vk::PipelineLayout,
+    spec: &KernelSpec,
+) -> Result<MatmulKernel> {
+    let shader_module = create_shader_module(ctx, spec.spv, spec.name)?;
+    Ok(MatmulKernel {
+        name: spec.name,
+        tile_m: spec.tile_m,
+        tile_n: spec.tile_n,
+        tile_k: spec.tile_k,
+        shader_module,
+        variants: [vk::Pipeline::null(); KernelVariant::COUNT],
+        pipeline_layout,
+        uses_descriptors: spec.uses_descriptors,
+    })
+}
+
 pub(super) fn create_kernel(
     ctx: &Arc<VulkanContext>,
     pipeline_layout: vk::PipelineLayout,

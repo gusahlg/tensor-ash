@@ -2,6 +2,7 @@
 //! and BDA / f16w family promotion.
 
 use super::catalog::KernelSelection;
+use super::precision::CoopmatAcc;
 
 /// Decode f16w row-GEMV tile: sixteen K-slices at tile_n=32 on deep-K
 /// / narrow-N / square-ish shapes; VCOLS=2 (tile_n=64) on wide-N
@@ -118,33 +119,64 @@ pub(crate) fn coopmat_tile_fallback(batch: u32, m: u32, n: u32) -> Option<Coopma
     })
 }
 
+/// Every coopmat1 kernel as (selection, tile, a16, accumulator): the
+/// single table the tile/acc mappings below read.
+const COOPMAT1: &[(KernelSelection, CoopmatTile, bool, CoopmatAcc)] = {
+    use CoopmatAcc::{F16, F16Promote, F32};
+    use CoopmatTile::*;
+    use KernelSelection as K;
+    &[
+        (K::F16wCoopmat, T128, false, F32),
+        (K::F16wA16Coopmat, T128, true, F32),
+        (K::F16wCoopmatM64, T64, false, F32),
+        (K::F16wA16CoopmatM64, T64, true, F32),
+        (K::F16wCoopmatM64N128, T64x128, false, F32),
+        (K::F16wA16CoopmatM64N128, T64x128, true, F32),
+        (K::F16wCoopmatM128N64, T128x64, false, F32),
+        (K::F16wA16CoopmatM128N64, T128x64, true, F32),
+        (K::F16wCoopmatAcc16, T128, false, F16),
+        (K::F16wA16CoopmatAcc16, T128, true, F16),
+        (K::F16wCoopmatM64Acc16, T64, false, F16),
+        (K::F16wA16CoopmatM64Acc16, T64, true, F16),
+        (K::F16wCoopmatM64N128Acc16, T64x128, false, F16),
+        (K::F16wA16CoopmatM64N128Acc16, T64x128, true, F16),
+        (K::F16wCoopmatM128N64Acc16, T128x64, false, F16),
+        (K::F16wA16CoopmatM128N64Acc16, T128x64, true, F16),
+        (K::F16wCoopmatAcc16p, T128, false, F16Promote),
+        (K::F16wA16CoopmatAcc16p, T128, true, F16Promote),
+        (K::F16wCoopmatM64Acc16p, T64, false, F16Promote),
+        (K::F16wA16CoopmatM64Acc16p, T64, true, F16Promote),
+        (K::F16wCoopmatM64N128Acc16p, T64x128, false, F16Promote),
+        (K::F16wA16CoopmatM64N128Acc16p, T64x128, true, F16Promote),
+        (K::F16wCoopmatM128N64Acc16p, T128x64, false, F16Promote),
+        (K::F16wA16CoopmatM128N64Acc16p, T128x64, true, F16Promote),
+    ]
+};
+
 impl CoopmatTile {
-    /// The f16w (f32-A) or a16 (f16-A/C) kernel for this tile.
+    /// The f16w (f32-A) or a16 (f16-A/C) f32-accumulate kernel for
+    /// this tile.
     pub(crate) fn selection(self, a16: bool) -> KernelSelection {
-        use KernelSelection as K;
-        match (self, a16) {
-            (Self::T128, false) => K::F16wCoopmat,
-            (Self::T128, true) => K::F16wA16Coopmat,
-            (Self::T64, false) => K::F16wCoopmatM64,
-            (Self::T64, true) => K::F16wA16CoopmatM64,
-            (Self::T64x128, false) => K::F16wCoopmatM64N128,
-            (Self::T64x128, true) => K::F16wA16CoopmatM64N128,
-            (Self::T128x64, false) => K::F16wCoopmatM128N64,
-            (Self::T128x64, true) => K::F16wA16CoopmatM128N64,
-        }
+        self.selection_acc(a16, CoopmatAcc::F32)
     }
 
-    /// The tile of a coopmat1 kernel selection (either A storage).
-    pub(crate) fn of_selection(selection: KernelSelection) -> Option<Self> {
-        use KernelSelection as K;
-        Some(match selection {
-            K::F16wCoopmat | K::F16wA16Coopmat => Self::T128,
-            K::F16wCoopmatM64 | K::F16wA16CoopmatM64 => Self::T64,
-            K::F16wCoopmatM64N128 | K::F16wA16CoopmatM64N128 => Self::T64x128,
-            K::F16wCoopmatM128N64 | K::F16wA16CoopmatM128N64 => Self::T128x64,
-            _ => return None,
-        })
+    /// The kernel for this tile, A storage, and accumulator class.
+    pub(crate) fn selection_acc(self, a16: bool, acc: CoopmatAcc) -> KernelSelection {
+        COOPMAT1
+            .iter()
+            .find(|&&(_, tile, is_a16, class)| tile == self && is_a16 == a16 && class == acc)
+            .map(|&(selection, ..)| selection)
+            .expect("COOPMAT1 covers every (tile, a16, acc)")
     }
+}
+
+/// (tile, a16, accumulator) of a coopmat1 kernel selection, `None` for
+/// every other kernel.
+pub(crate) fn coopmat1_parts(selection: KernelSelection) -> Option<(CoopmatTile, bool, CoopmatAcc)> {
+    COOPMAT1
+        .iter()
+        .find(|&&(s, ..)| s == selection)
+        .map(|&(_, tile, a16, acc)| (tile, a16, acc))
 }
 
 pub(crate) fn coopmat_selection(
@@ -251,6 +283,27 @@ mod bda_tests {
         // 64-aligned but not 128-aligned has no 128-tile route.
         assert_eq!(tile(1, 192, 320), Some(T64));
         assert_eq!(tile(1, 192, 300), None);
+    }
+
+    #[test]
+    fn coopmat1_table_is_a_bijection_over_tile_a16_acc() {
+        use CoopmatTile::*;
+        let mut seen = std::collections::HashSet::new();
+        for tile in [T128, T64, T64x128, T128x64] {
+            for a16 in [false, true] {
+                for acc in [CoopmatAcc::F32, CoopmatAcc::F16, CoopmatAcc::F16Promote] {
+                    let selection = tile.selection_acc(a16, acc);
+                    assert!(seen.insert(selection), "{selection:?} listed twice");
+                    assert_eq!(coopmat1_parts(selection), Some((tile, a16, acc)));
+                    let spec = &super::super::KERNEL_SPECS[selection.index().unwrap()];
+                    assert_eq!(spec.accumulator(), acc, "{}", spec.name);
+                    assert_eq!(spec.a_f16(), a16, "{}", spec.name);
+                    assert!(spec.name.contains("coopmat"), "{}", spec.name);
+                }
+            }
+        }
+        assert_eq!(seen.len(), COOPMAT1.len());
+        assert_eq!(coopmat1_parts(KernelSelection::LargeBdaV4), None);
     }
 
     #[test]

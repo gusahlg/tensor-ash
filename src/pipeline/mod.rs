@@ -6,6 +6,7 @@
 mod abi;
 mod catalog;
 mod create;
+mod precision;
 mod routing;
 mod runtime;
 mod selection;
@@ -22,21 +23,21 @@ use scopeguard::ScopeGuard;
 use crate::context::VulkanContext;
 
 use create::{
-    create_epilogue_pipeline, create_kernel, create_shader_module, create_specialized_pipeline_in,
-    destroy_kernel, spec_data_for,
+    create_epilogue_pipeline, create_kernel, create_kernel_lazy, create_shader_module,
+    create_specialized_pipeline_in, destroy_kernel, spec_data_for,
 };
 use selection::{auto_min_large_tiles_for, auto_select_kernel};
 use tuning::{load_tuned, save_tuned, shader_registry_hash};
 
 pub use abi::{EpilogueKey, KernelVariant, MATMUL_FLAG_NORM_A, MatmulPushConstants};
 pub use catalog::{KERNEL_SPECS, KernelSelection, KernelSpec};
+pub use precision::CoopmatAcc;
 pub(crate) use create::{build_compute_pipeline, create_pc_only_layout};
 pub use runtime::MatmulKernel;
 pub(crate) use tuning::{SPLITK2_SPIRV, TuneEntry, TuneKey};
 
 pub(crate) use routing::{
-    CoopmatTile, coopmat_selection, f16w_row_packed_selection, f16w_row_selection, maybe_to_bda,
-    to_f16w,
+    coopmat_selection, f16w_row_packed_selection, f16w_row_selection, maybe_to_bda, to_f16w,
 };
 pub use routing::{f16w_row_tile_n, f16w_row_uses_k16};
 
@@ -166,6 +167,10 @@ impl MatmulPipeline {
                 // instead of failing the whole pipeline. Routing and
                 // validation never select an empty slot.
                 let coopmat_gated = spec.name.contains("coopmat") && !ctx.coopmat_enabled;
+                // f16-accumulator coopmat twins additionally need an
+                // f16 C/Result coopmat configuration.
+                let f16_acc = spec.accumulator() != CoopmatAcc::F32;
+                let acc_gated = f16_acc && !ctx.coopmat_f16_acc_enabled;
                 // The NV_cooperative_matrix2 GEMM ships SPIR-V 1.6 and
                 // workgroup-scope matrices; its slot stays empty
                 // without the full coopmat2 feature gate.
@@ -178,6 +183,7 @@ impl MatmulPipeline {
                 let shared_gated = spec.shared_memory_bytes() > shared_budget;
                 if (spec.weights_f16() && !ctx.f16_storage_enabled)
                     || coopmat_gated
+                    || acc_gated
                     || cm2_gated
                     || shared_gated
                 {
@@ -197,8 +203,15 @@ impl MatmulPipeline {
                 } else {
                     pipeline_layout_bda
                 };
-                let kernel = create_kernel(ctx, layout, spec)
-                    .with_context(|| format!("create {} matmul kernel", spec.name))?;
+                // Opt-in f16-accumulator twins build no eager fallbacks
+                // (aligned coopmat dispatches never bind them anyway):
+                // their first dispatch compiles the exact variant.
+                let kernel = if f16_acc {
+                    create_kernel_lazy(ctx, layout, spec)
+                } else {
+                    create_kernel(ctx, layout, spec)
+                }
+                .with_context(|| format!("create {} matmul kernel", spec.name))?;
                 kernels_guard.push(Some(kernel));
             }
             if let Some(index) = selection.index()
@@ -209,6 +222,10 @@ impl MatmulPipeline {
                     "requires NV cooperative matrix 2 support this device lacks".to_string()
                 } else if spec.name.contains("coopmat") && !ctx.coopmat_enabled {
                     "requires cooperative-matrix support this device lacks".to_string()
+                } else if spec.accumulator() != CoopmatAcc::F32 && !ctx.coopmat_f16_acc_enabled {
+                    "requires a 16x16x16 f16-accumulator cooperative-matrix configuration \
+                     this device does not report"
+                        .to_string()
                 } else if spec.weights_f16() && !ctx.f16_storage_enabled {
                     "requires f16 storage support (shaderFloat16 + \
                      storageBuffer16BitAccess) this device lacks"
@@ -423,19 +440,60 @@ impl MatmulPipeline {
     /// Registry index of the f16-activations (a16) coopmat kernel for
     /// an aligned shape (M, N % 64 == 0, K % 32 == 0; resolution
     /// enforces it).  An explicit coopmat1 selection — either A
-    /// storage, e.g. `ML_KERNEL=f16w_coopmat_m128n64` — pins the same
-    /// tile on this route, so tile A/Bs cover the f16-activation
-    /// prefill path too; every other selection takes the SM-aware
-    /// heuristic.  The tile's own alignment is still checked at
-    /// record time, so a pinned tile that does not divide the shape
-    /// fails rather than reading out of bounds.
-    pub(crate) fn a16_coopmat_index(&self, batch: u32, m: u32, n: u32, k: u32) -> usize {
-        let tile = CoopmatTile::of_selection(self.selection)
-            .or_else(|| routing::coopmat_tile(batch, m, n, k, self.ctx.sm_count()))
-            .expect("a16 resolution already requires 64-aligned M/N");
-        tile.selection(true)
+    /// storage, any accumulator, e.g. `ML_KERNEL=f16w_coopmat_m128n64`
+    /// — pins the same tile AND accumulator class on this route, so
+    /// tile A/Bs cover the f16-activation prefill path too; every other
+    /// selection takes the SM-aware heuristic tile with the caller's
+    /// accumulator policy `acc`.  The tile's own alignment is still
+    /// checked at record time, so a pinned tile that does not divide
+    /// the shape fails rather than reading out of bounds.
+    pub(crate) fn a16_coopmat_index(
+        &self,
+        batch: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+        acc: CoopmatAcc,
+    ) -> usize {
+        let (tile, acc) = match routing::coopmat1_parts(self.selection) {
+            Some((tile, _, pinned_acc)) => (tile, pinned_acc),
+            None => (
+                routing::coopmat_tile(batch, m, n, k, self.ctx.sm_count())
+                    .expect("a16 resolution already requires 64-aligned M/N"),
+                acc,
+            ),
+        };
+        tile.selection_acc(true, acc)
             .index()
             .expect("a16 coopmat selection is concrete")
+    }
+
+    /// Apply an accumulator policy to a routed kernel: an f32-accumulate
+    /// coopmat1 route maps to its `acc` twin when that slot is built;
+    /// every other kernel (and `acc == F32`) is returned unchanged.
+    /// Only auto routes remap — an explicit `ML_KERNEL` pin is honored
+    /// verbatim, like every other explicit selection.
+    pub(crate) fn with_coopmat_acc(&self, index: usize, acc: CoopmatAcc) -> usize {
+        if acc == CoopmatAcc::F32 || !self.is_auto() {
+            return index;
+        }
+        let Some(selection) = KernelSelection::from_index(index) else {
+            return index;
+        };
+        match routing::coopmat1_parts(selection) {
+            Some((tile, a16, CoopmatAcc::F32)) => {
+                let twin = tile
+                    .selection_acc(a16, acc)
+                    .index()
+                    .expect("coopmat1 selection is concrete");
+                if self.kernels[twin].is_some() {
+                    twin
+                } else {
+                    index
+                }
+            }
+            _ => index,
+        }
     }
 
     /// Epilogue-capable kernel for this shape: the normal heuristic
@@ -536,6 +594,11 @@ impl MatmulPipeline {
                 if (kernel.name.contains("coopmat") && !kernel.name.ends_with("_aligned"))
                     || kernel.name.contains("packed")
                 {
+                    return false;
+                }
+                // A different numerics class is never a tuning
+                // candidate: the policy, not a stopwatch, admits it.
+                if CoopmatAcc::of_kernel_name(kernel.name) != CoopmatAcc::F32 {
                     return false;
                 }
                 let coopmat_fits = tensor_core
@@ -663,7 +726,12 @@ impl MatmulPipeline {
         epilogue: EpilogueKey,
     ) -> Result<vk::Pipeline> {
         if epilogue.is_none() && variant == variant.fallback() {
-            return Ok(kernel.pipeline_for(variant));
+            let eager = kernel.pipeline_for(variant);
+            // Lazily-built kernels (`create_kernel_lazy`) hold no
+            // eager fallbacks; they take the cache path below.
+            if eager != vk::Pipeline::null() {
+                return Ok(eager);
+            }
         }
         let key = (kernel.name, variant.index(), epilogue);
         let mut cache = self.epilogue_pipelines.lock();

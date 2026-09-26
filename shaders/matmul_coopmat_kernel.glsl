@@ -18,6 +18,18 @@
 //     C_F16 (optional): C is stored as IEEE half; the f32 accumulator
 //     fragments convert (RNE) at store time, and ACCUMULATE reloads
 //     prior C through the same half view.
+//     ACC_F16 (optional): the accumulator fragments are float16_t
+//     (HMMA.*.F16: twice the f32-accumulate tensor rate on GeForce
+//     Ampere/Ada, half the accumulator registers).  Every MMA rounds
+//     the running sum to f16 — the numerics of cuBLAS
+//     CUBLAS_COMPUTE_16F, which llama.cpp's CUDA backend uses for f16
+//     weight GEMMs.  Converted to f32 at store time.
+//     ACC_F16_PROMOTE (optional, exclusive with ACC_F16): f16 partial
+//     fragments accumulate PROMOTE_KT K-tiles (PROMOTE_KT * BK K
+//     elements) at the f16 rate, then are added into f32 accumulator
+//     fragments and reset.  Error is bounded by the f16 rounding of a
+//     chunk partial instead of the full running sum, at the cost of
+//     half again the f32 accumulator registers.
 //
 // Default layout: 256 threads = 8 subgroups of 32.  Workgroup tile
 // 128x128, BK = 32.  Subgroups tile the output (BM/WM) x SG_N, each
@@ -52,6 +64,20 @@
 #endif
 #ifndef SG_N
 #define SG_N 4u
+#endif
+
+#if defined(ACC_F16) && defined(ACC_F16_PROMOTE)
+#error "ACC_F16 and ACC_F16_PROMOTE are exclusive"
+#endif
+#ifdef ACC_F16
+#define ACC_T float16_t
+#else
+#define ACC_T float
+#endif
+#ifdef ACC_F16_PROMOTE
+#ifndef PROMOTE_KT
+#define PROMOTE_KT 4u
+#endif
 #endif
 
 layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
@@ -175,13 +201,31 @@ void main() {
     const uint warp_row0 = (sg / SG_N) * WM;
     const uint warp_col0 = (sg % SG_N) * WN;
 
-    coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator> acc[FRAG_M][FRAG_N];
+    coopmat<ACC_T, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator> acc[FRAG_M][FRAG_N];
     [[unroll]] for (uint i = 0u; i < FRAG_M; ++i)
         [[unroll]] for (uint j = 0u; j < FRAG_N; ++j)
-            acc[i][j] = coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator>(0.0);
+            acc[i][j] = coopmat<ACC_T, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator>(0.0);
+#ifdef ACC_F16_PROMOTE
+    // f16 chunk partials, promoted into `acc` every PROMOTE_KT K-tiles.
+    coopmat<float16_t, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator> part[FRAG_M][FRAG_N];
+    [[unroll]] for (uint i = 0u; i < FRAG_M; ++i)
+        [[unroll]] for (uint j = 0u; j < FRAG_N; ++j)
+            part[i][j] = coopmat<float16_t, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator>(0.0);
+#define MMA_DST part
+#else
+#define MMA_DST acc
+#endif
 
     const uint num_k = pc.K / BK;
+#ifdef ACC_F16_PROMOTE
+    // Chunk loop: uniform bounds keep the promotion in subgroup-uniform
+    // control flow (a coopmat requirement).
+    for (uint kc = 0u; kc < num_k; kc += PROMOTE_KT) {
+    const uint kt_end = min(kc + PROMOTE_KT, num_k);
+    for (uint kt = kc; kt < kt_end; ++kt) {
+#else
     for (uint kt = 0u; kt < num_k; ++kt) {
+#endif
         const uint k_base = kt * BK;
         load_a_tile(a_base, block_row, k_base, tid);
         load_b_tile(b_base, block_col, k_base, tid);
@@ -206,11 +250,20 @@ void main() {
                     B_ROW_V4,
                     gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (uint i = 0u; i < FRAG_M; ++i)
-                    acc[i][j] = coopMatMulAdd(a_frag[i], b_frag, acc[i][j]);
+                    MMA_DST[i][j] = coopMatMulAdd(a_frag[i], b_frag, MMA_DST[i][j]);
             }
         }
         barrier();
     }
+#ifdef ACC_F16_PROMOTE
+    [[unroll]] for (uint i = 0u; i < FRAG_M; ++i) {
+        [[unroll]] for (uint j = 0u; j < FRAG_N; ++j) {
+            acc[i][j] += coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator>(part[i][j]);
+            part[i][j] = coopmat<float16_t, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+    }
+#endif
 
     // Store: fragment rows are 16 floats = 4 vec4 (or 16 halves),
     // N % BN == 0 keeps every row start 16-byte aligned.  Alpha and
@@ -225,27 +278,43 @@ void main() {
     const uint col0 = block_col * BN + warp_col0;
     [[unroll]] for (uint i = 0u; i < FRAG_M; ++i) {
         [[unroll]] for (uint j = 0u; j < FRAG_N; ++j) {
+#ifdef ACC_F16
+#ifdef C_F16
+            if (ALPHA_IS_ONE && !ACCUMULATE) {
+                // Plain C = A@B with f16 C: the f16 accumulator IS the
+                // stored value (f16 -> f32 -> f16 would be exact).
+                coopMatStore(acc[i][j], c_h.v,
+                             c_base + (row0 + i * LM) * pc.N + col0 + j * LN,
+                             pc.N, gl_CooperativeMatrixLayoutRowMajor);
+                continue;
+            }
+#endif
+            coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator> r =
+                coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator>(acc[i][j]);
+#else
+            coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator> r = acc[i][j];
+#endif
             if (!ALPHA_IS_ONE) {
-                for (uint e = 0u; e < acc[i][j].length(); ++e) acc[i][j][e] *= pc.alpha;
+                for (uint e = 0u; e < r.length(); ++e) r[e] *= pc.alpha;
             }
 #ifdef C_F16
             const uint element = c_base + (row0 + i * LM) * pc.N + col0 + j * LN;
             if (ACCUMULATE) {
                 coopmat<float16_t, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator> prior16;
                 coopMatLoad(prior16, c_h.v, element, pc.N, gl_CooperativeMatrixLayoutRowMajor);
-                acc[i][j] += coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator>(prior16);
+                r += coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator>(prior16);
             }
             coopmat<float16_t, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator> out16 =
-                coopmat<float16_t, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator>(acc[i][j]);
+                coopmat<float16_t, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator>(r);
             coopMatStore(out16, c_h.v, element, pc.N, gl_CooperativeMatrixLayoutRowMajor);
 #else
             const uint element = (c_base + (row0 + i * LM) * pc.N + col0 + j * LN) / 4u;
             if (ACCUMULATE) {
                 coopmat<float, gl_ScopeSubgroup, LM, LN, gl_MatrixUseAccumulator> prior;
                 coopMatLoad(prior, c_v4.v, element, pc.N / 4u, gl_CooperativeMatrixLayoutRowMajor);
-                acc[i][j] += prior;
+                r += prior;
             }
-            coopMatStore(acc[i][j], c_v4.v, element, pc.N / 4u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatStore(r, c_v4.v, element, pc.N / 4u, gl_CooperativeMatrixLayoutRowMajor);
 #endif
         }
     }
