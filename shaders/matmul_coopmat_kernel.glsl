@@ -20,7 +20,8 @@
 //     prior C through the same half view.
 //
 // Default layout: 256 threads = 8 subgroups of 32.  Workgroup tile
-// 128x128, BK = 32.  Subgroups tile the output (BM/WM) x SG_N, each
+// 128x128, BK = 32 (a wrapper may define BK 64; the host then checks
+// K % 64 through the catalog's tile_k).  Subgroups tile the output (BM/WM) x SG_N, each
 // owning a WM x WN slice of 16x16 fragments.  The 64x64 wrapper uses
 // 128 threads / 4 subgroups / 32x32 slices.  Shared tiles are staged
 // as uvec4 (8 halves) with a 16-byte row skew, per NVIDIA's
@@ -63,7 +64,9 @@ layout(constant_id = 1) const bool ALPHA_IS_ONE = true;
 layout(constant_id = 2) const bool INTERIOR_ONLY = false;
 layout(constant_id = 3) const bool K_MULTIPLE = false;
 
-const uint BK = 32u;
+#ifndef BK
+#define BK 32u
+#endif
 const uint LM = 16u;
 const uint LN = 16u;
 const uint LK = 16u;
@@ -72,7 +75,7 @@ const uint FRAG_N = WN / LN;
 
 // Shared rows carry a 16-byte (one uvec4 / 8 halves) skew to dodge
 // bank conflicts on the fragment loads.
-const uint A_ROW_V4 = BK / 8u + 1u; // 5 uvec4 per A row
+const uint A_ROW_V4 = BK / 8u + 1u; // 5 (BK=32) or 9 (BK=64) uvec4 per A row
 const uint B_ROW_V4 = BN / 8u + 1u; // 17 (BN=128) or 9 (BN=64) uvec4 per B row
 
 layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer F32V4ReadOnly {

@@ -359,6 +359,23 @@ kernel_catalog! {
     F16wA16CoopmatM128N64 => ("f16w_a16_coopmat_m128n64", 128, 64, 32,
         "matmul_f16w_a16_coopmat_m128n64.spv", false,
         ["f16w_a16_coopmat_m128n64", "a16_coopmat_m128n64"]),
+    // Retune candidates (benchmarks/campaign/coopmat-sm.md): explicit
+    // selection only; auto never routes here.  BK=64 halves the
+    // barriers per K step (host-checked K % 64 via tile_k); t256 runs
+    // the 128x64 tile on 8 subgroups of 32x32; w64 gives 64x128 the
+    // 64x32 subgroup slice that compiles to 128 registers on 128x64.
+    F16wCoopmatM128N64Bk64 => ("f16w_coopmat_m128n64_bk64", 128, 64, 64,
+        "matmul_f16w_coopmat_m128n64_bk64.spv", false,
+        ["f16w_coopmat_m128n64_bk64"]),
+    F16wCoopmatM128N64T256 => ("f16w_coopmat_m128n64_t256", 128, 64, 32,
+        "matmul_f16w_coopmat_m128n64_t256.spv", false,
+        ["f16w_coopmat_m128n64_t256"]),
+    F16wCoopmatM64N128W64 => ("f16w_coopmat_m64n128_w64", 64, 128, 32,
+        "matmul_f16w_coopmat_m64n128_w64.spv", false,
+        ["f16w_coopmat_m64n128_w64"]),
+    F16wCoopmatM64Bk64 => ("f16w_coopmat_m64n64_bk64", 64, 64, 64,
+        "matmul_f16w_coopmat_m64n64_bk64.spv", false,
+        ["f16w_coopmat_m64n64_bk64"]),
     // Tensor-core GEMM via NV_cooperative_matrix2 (workgroup-scope
     // matrices + tensor addressing) with the fused store epilogue the
     // coopmat1 kernel cannot implement (`coopMatPerElementNV` at

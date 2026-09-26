@@ -396,7 +396,13 @@ impl MatmulPipeline {
                 // Wave-fill tiles are ~9.7 KiB; if a future budget
                 // gate empties them, fall back to the 128x128 sibling
                 // (same family, same alignment).
-                K::F16wCoopmatM64 | K::F16wCoopmatM64N128 | K::F16wCoopmatM128N64 => K::F16wCoopmat,
+                K::F16wCoopmatM64
+                | K::F16wCoopmatM64N128
+                | K::F16wCoopmatM128N64
+                | K::F16wCoopmatM128N64Bk64
+                | K::F16wCoopmatM128N64T256
+                | K::F16wCoopmatM64N128W64
+                | K::F16wCoopmatM64Bk64 => K::F16wCoopmat,
                 K::F16wA16CoopmatM64 | K::F16wA16CoopmatM64N128 | K::F16wA16CoopmatM128N64 => {
                     K::F16wA16Coopmat
                 }

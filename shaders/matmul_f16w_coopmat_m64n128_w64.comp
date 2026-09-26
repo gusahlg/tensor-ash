@@ -1,0 +1,14 @@
+#version 460
+// Retune candidate: 64x128 tile with 128x64's 64x32 subgroup slice
+// (1 x 4 subgroups).  The shipped 64x128 (32x64 slices) compiles to
+// 168 registers -> 3 CTAs/SM; this slice shape is 128 registers on
+// 128x64.
+
+#define BM 64u
+#define BN 128u
+#define THREADS 128u
+#define WM 64u
+#define WN 32u
+#define SG_N 4u
+
+#include "matmul_coopmat_kernel.glsl"
