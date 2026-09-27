@@ -282,7 +282,12 @@ ML_OUTPUT=csv cargo run --release -p ml-bench -- cases \
   square,1,512,512,512 edge,1,511,513,515
 ML_OUTPUT=csv cargo run --release -p ml-bench -- cases \
   lm_unpacked,1,1,32000,2048,f16w lm_packed,1,1,32000,2048,packed
+# GPU assembly of the routed kernel (NVIDIA): SASS + census, see benchmarks/SASS.md
+ML_ISA_OUT=isa-out cargo run --release -p ml-bench -- isa odd,1,1023,1025,1027
 ```
+
+`ml_bench isa` sets `ML_PIPELINE_EXEC_INFO=1`, which makes the library enable
+`VK_KHR_pipeline_executable_properties` for that process (off by default).
 
 Timed runs validate sampled outputs outside the measurement window and report
 paired wall/GPU minimum, median, and p95 values. TFLOPS uses the median; CSV

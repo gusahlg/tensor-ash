@@ -54,3 +54,52 @@ ML_OUTPUT=csv target/release/ml_bench cases \
 ML_OUTPUT=csv target/release/ml_bench cases \
   lm_head,1,1,32000,2048,packed kv,1,1,256,2048,f16w,packed
 ```
+
+## GPU assembly: `isa`, `isa-analyze`, `isa-cache`
+
+`ml_bench isa` shows the SASS the NVIDIA driver actually generates for a
+routed kernel. Each argument is a `cases` spec
+(`label,b,m,n,k[,f16w][,packed]`); the shape is routed exactly like a
+dispatch (tuned winners and `ML_KERNEL=` included), the bound
+specialization is derived (`KernelVariant::for_dispatch`, zero epilogue),
+and that pipeline is compiled through the library's own creation path
+(`MatmulPipeline::create_probe_pipeline`) into a fresh, empty
+`VkPipelineCache`. Pipeline creation dispatches no GPU work.
+
+```console
+ML_ISA_OUT=isa-out target/release/ml_bench isa \
+  gateup,1,1,5632,2048,f16w lm_head,1,1,32000,2048,packed \
+  odd,1,1023,1025,1027 sq4096,1,4096,4096,4096
+```
+
+Per case it writes `<label>.<kernel>.v<variant>.<arch>.*` into `ML_ISA_OUT`:
+
+| file | content |
+|---|---|
+| `.meta` | route, variant, spec constants, workgroup size, declared shared bytes, registers (NVuc `REG` section), code hash, driver statistics (`stat.*`), `capture_flags_code` (capture flags must not change code), `in_production_cache` (the same UCODE exists in the persisted cache) |
+| `.nvuc` | the driver's ISA container, decoded from the cache blob (`nvcache.rs` documents the layout) |
+| `.ucode.bin` | the exact raw SASS (the container's UCODE section) |
+| `.stats.txt` | section table + every `VK_KHR_pipeline_executable_properties` statistic / internal representation |
+| `.sass`, `.census.txt` | only when `nvdisasm` is available: the disassembly, and the census (opcode classes, LDG/STG/LDS/STS/LDSM widths, bytes/thread, loops with math density and decoded control bits — summed stall cycles per iteration, scoreboard waits, reuse — occupancy for sm_86/sm_89, and a decode sanity check) |
+
+A markdown summary row per case is printed at the end.
+
+`isa` sets `ML_PIPELINE_EXEC_INFO=1`, which makes the library enable
+`VK_KHR_pipeline_executable_properties` for that process only. Knobs:
+`ML_ISA_ARCH` (nvdisasm `-b` value; default from the device name, RTX
+30xx -> `SM86`, RTX 40xx -> `SM89`), `ML_ISA_NVDISASM` (path or `off`),
+`ML_ISA_SPV` (compile this SPIR-V file instead of the embedded module;
+same interface required, e.g. a `glslc -Os` build of the same shader),
+`ML_ISA_TAG` (suffix for the output stem).
+
+On a host without the CUDA toolkit (louise-pc), copy the output directory
+to one that has `nvdisasm` and run the census offline (no GPU, no Vulkan):
+
+```console
+ml_bench isa-analyze isa-out/            # every .meta in the directory
+ml_bench isa-cache ~/.cache/tensor-ash/pipeline_cache_v10de_2488.bin out/
+```
+
+`isa-cache` splits a persisted pipeline cache into one container per
+entry and censuses each (the cache stores no kernel names, so those rows
+have no occupancy).

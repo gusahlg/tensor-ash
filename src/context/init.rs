@@ -275,7 +275,33 @@ pub(super) fn create(
             );
         }
 
+        // VK_KHR_pipeline_executable_properties: opt-in only
+        // (`ML_PIPELINE_EXEC_INFO=1`), for ISA introspection tools.
+        let want_exec_info = std::env::var("ML_PIPELINE_EXEC_INFO")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let exec_info_name = ash::khr::pipeline_executable_properties::NAME;
+        let enable_exec_info = want_exec_info
+            && device_extensions
+                .iter()
+                .any(|ext| CStr::from_ptr(ext.extension_name.as_ptr()) == exec_info_name)
+            && {
+                let mut query =
+                    vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
+                let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut query);
+                instance.get_physical_device_features2(physical_device, &mut features2);
+                query.pipeline_executable_info == vk::TRUE
+            };
+        if want_exec_info && !enable_exec_info {
+            log::warn!(
+                "tensor-ash: ML_PIPELINE_EXEC_INFO=1 but the device lacks \
+                 VK_KHR_pipeline_executable_properties / pipelineExecutableInfo"
+            );
+        }
+
         let mut enabled_device_extensions = Vec::new();
+        if enable_exec_info {
+            enabled_device_extensions.push(exec_info_name.as_ptr());
+        }
         if enable_coopmat {
             enabled_device_extensions.push(coopmat_name.as_ptr());
         }
@@ -325,6 +351,11 @@ pub(super) fn create(
         }
         if enable_coopmat {
             device_ci = device_ci.push_next(&mut coopmat);
+        }
+        let mut exec_info = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
+            .pipeline_executable_info(true);
+        if enable_exec_info {
+            device_ci = device_ci.push_next(&mut exec_info);
         }
         // ash's typed `push_next` cannot chain a struct it does not
         // know, so the coopmat2 features link in by raw pointer (same
@@ -389,6 +420,7 @@ pub(super) fn create(
             coopmat_enabled: enable_coopmat,
             coopmat2_enabled: enable_coopmat2,
             memory_model_device_scope_enabled: memory_model_device_scope,
+            pipeline_executable_info_enabled: enable_exec_info,
             pipeline_cache,
             pipeline_cache_path,
             debug_loader,

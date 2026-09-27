@@ -1,0 +1,31 @@
+label = sq1024
+shape = b=1 m=1024 n=1024 k=1024
+b_f16 = false
+packed_b = false
+device = NVIDIA GeForce RTX 4060
+driver = 0x94d40000
+arch = SM89
+kernel = m128n64k64_bda_v4
+tile = [128, 64, 64]
+variant = KernelVariant { accumulate: false, alpha_is_one: true, interior_only: true, k_multiple: true }
+variant_index = 14
+spec_constants = [0, 1, 1, 1, 0, 0, 0]
+spirv = spv/matmul_f32_m128n64k64_bda_v4.Os.spv (glslc --target-env=vulkan1.2, shaderc v2026.1)
+spirv_bytes = 312452
+spirv_hash = f21691cfa12e3dd3
+local_size = [16, 16, 1]
+threads = 256
+shared_bytes = 49664
+registers = 118
+registers_cap = 255
+barriers = 2
+symbol = __id4_4
+ucode_bytes = 40064
+ucode_hash = 37be2ed94fd5cc14
+capture_flags_code = identical
+in_production_cache = yes
+stat.register_count = 118
+stat.binary_size = 40064
+stat.stack_size = 0
+stat.local_memory_size = 68719476736
+stat.shared_memory_size = 49664

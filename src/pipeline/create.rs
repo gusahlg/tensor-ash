@@ -50,6 +50,30 @@ pub(crate) fn create_specialized_pipeline(
     spec_data: &[u32],
     label: &str,
 ) -> Result<vk::Pipeline> {
+    create_specialized_pipeline_in(
+        ctx,
+        ctx.pipeline_cache,
+        vk::PipelineCreateFlags::empty(),
+        module,
+        layout,
+        spec_data,
+        label,
+    )
+}
+
+/// [`create_specialized_pipeline`] with an explicit pipeline cache and
+/// create flags: the one creation path shared by the dispatcher and
+/// ISA probes (`MatmulPipeline::create_probe_pipeline`), so a probe
+/// compiles exactly what a dispatch would.
+pub(crate) fn create_specialized_pipeline_in(
+    ctx: &VulkanContext,
+    cache: vk::PipelineCache,
+    flags: vk::PipelineCreateFlags,
+    module: vk::ShaderModule,
+    layout: vk::PipelineLayout,
+    spec_data: &[u32],
+    label: &str,
+) -> Result<vk::Pipeline> {
     unsafe {
         let entry = std::ffi::CString::new("main").unwrap();
         let spec_entries = spec_map_entries(spec_data.len() as u32);
@@ -62,14 +86,14 @@ pub(crate) fn create_specialized_pipeline(
             .name(&entry)
             .specialization_info(&spec_info);
         let create_info = vk::ComputePipelineCreateInfo::default()
+            .flags(flags)
             .stage(stage)
             .layout(layout);
 
-        match ctx.device.create_compute_pipelines(
-            ctx.pipeline_cache,
-            std::slice::from_ref(&create_info),
-            None,
-        ) {
+        match ctx
+            .device
+            .create_compute_pipelines(cache, std::slice::from_ref(&create_info), None)
+        {
             Ok(pipelines) => Ok(pipelines[0]),
             Err((partial, err)) => {
                 for p in partial {
@@ -121,17 +145,20 @@ pub(crate) fn build_compute_pipeline(
     Ok((ScopeGuard::into_inner(guard), pipeline))
 }
 
-/// Build one pipeline for a (kernel, base-variant, epilogue) triple.
-/// Used by the lazy epilogue-pipeline cache in `MatmulPipeline` — the
-/// eager `create_kernel` path only builds bounds-checked, zero-epilogue
-/// fallbacks.
-pub(super) fn create_epilogue_pipeline(
-    ctx: &Arc<VulkanContext>,
+/// Specialization constants (ids `0..len`) of the pipeline the
+/// dispatcher uses for a (kernel, variant, epilogue) triple.  The eager
+/// bounds-checked zero-epilogue fallbacks (`create_kernel`) set only
+/// ids 0..3; every lazily-built pipeline (`create_epilogue_pipeline`)
+/// also sets the epilogue ids its body declares (4..6, plus 7..8 for
+/// the fused-store row GEMVs).
+pub(super) fn spec_data_for(
     kernel: &MatmulKernel,
     variant: KernelVariant,
     epilogue: EpilogueKey,
-) -> Result<vk::Pipeline> {
-    let spec_count = if kernel.supports_store() {
+) -> Vec<u32> {
+    let spec_count = if epilogue.is_none() && variant == variant.fallback() {
+        4
+    } else if kernel.supports_store() {
         9
     } else if kernel.supports_epilogue() {
         7
@@ -149,11 +176,24 @@ pub(super) fn create_epilogue_pipeline(
         epilogue.store_mode,
         epilogue.store_f16 as u32,
     ];
+    spec_data[..spec_count].to_vec()
+}
+
+/// Build one pipeline for a (kernel, base-variant, epilogue) triple.
+/// Used by the lazy epilogue-pipeline cache in `MatmulPipeline` — the
+/// eager `create_kernel` path only builds bounds-checked, zero-epilogue
+/// fallbacks.
+pub(super) fn create_epilogue_pipeline(
+    ctx: &Arc<VulkanContext>,
+    kernel: &MatmulKernel,
+    variant: KernelVariant,
+    epilogue: EpilogueKey,
+) -> Result<vk::Pipeline> {
     create_specialized_pipeline(
         ctx,
         kernel.shader_module,
         kernel.pipeline_layout,
-        &spec_data[..spec_count],
+        &spec_data_for(kernel, variant, epilogue),
         &format!("epilogue {epilogue:?} on {}", kernel.name),
     )
 }
