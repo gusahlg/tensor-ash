@@ -35,3 +35,18 @@ Louise trees: `~/ta-wt/cm-base` (7cfca58 grokmerge build), `cm-sm`
   then a 3070 cold subset (a16 + m512 + t128) -> `cold-3070`.
 - Desktop grokmerge build for the 3070 pp512 A/B: `git archive 7cfca58`
   into `target/cm-base-src/` (ignored), `tabuild build --release -p llama-ash`.
+
+## 2026-09-27 (successor #5, from 07:05)
+
+- Overnight: the 4060 cold sweep (louise `~/ta-wt/cm-results/4060cold`)
+  finished sq/m256/m384/m512/m768 before the desktop reboot cut the ssh;
+  the 3070 warm verify got sq/m256/m384 (copied to
+  `$SP/work/coopmat/results/verify-3070`); the 3070 pp512 variant A/B
+  got 2 rows only (unusable).
+- 07:08 relaunched on louise (detached, `cm-results/cold4060_rest.sh`):
+  m1024 m2048 t128 t1920 done, a16_* queued.  Data -> `coopmat-sm-data/cold-4060/`.
+- 3070 queue (`$SP/work/coopmat/run3070.sh`, binary
+  `$SP/work/coopmat/bin/ml_bench-34ad9f1`): cold a16_512 m512, warm
+  verify remainder, cold a16_* t128 m256 m384.
+- Desktop note: user app `project_watt_cubed` runs on the 3070 (~30% util
+  at idle clocks); no embargo file.  Check the `.smi.csv` logs.
