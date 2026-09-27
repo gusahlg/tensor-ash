@@ -372,6 +372,9 @@ impl Executor {
         // `ML_COOPMAT_ACC=f16|f16p` opts env-configured executors
         // into the f16-accumulator coopmat twins (default f32).
         let coopmat_acc = CoopmatAcc::from_env()?;
+        // Deprecated `ML_PTX_GEMM=f32|f16|f16p` (one release): the class
+        // when `ML_COOPMAT_ACC` is unset, with a warning.
+        let coopmat_acc = crate::ptx::legacy_env_acc(coopmat_acc);
         Self::new_with_config(
             ctx,
             pipeline,

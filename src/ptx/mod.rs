@@ -28,7 +28,7 @@ mod probe;
 mod route;
 
 pub use probe::ProbeAffine;
-pub use route::{PtxGemmMode, PtxRoute, route_kernel_name};
+pub use route::{PtxGemmMode, PtxRoute, legacy_env_acc, route_kernel_name};
 
 use std::ffi::{CString, c_void};
 use std::sync::Arc;

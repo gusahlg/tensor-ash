@@ -16,7 +16,11 @@
 //!   `ML_PTX=1` where `VK_NV_cuda_kernel_launch` is usable (see
 //!   `ptx_gate` in `context/init.rs`; `ML_NO_PTX=1` vetoes), and
 //!   `ML_PTX_GEMM` says which precision classes it serves
-//!   ([`PtxGemmMode`], default `auto`).
+//!   ([`PtxGemmMode`]: `on`/`auto` (default), `all`, `off`).  The
+//!   experiment branch's `ML_PTX_GEMM=f32|f16|f16p` still works for one
+//!   release: backend on, and — for env-configured executors when
+//!   `ML_COOPMAT_ACC` is unset — that policy, with a deprecation
+//!   warning ([`legacy_env_acc`]).
 //!
 //! The executor's matmul recorder asks [`PtxRoute::select`] before
 //! binding a Vulkan `*_a16_*` coopmat pipeline; when a PTX kernel is
@@ -67,17 +71,16 @@ pub enum PtxGemmMode {
 }
 
 impl PtxGemmMode {
+    /// `auto` (= `on`, `1`), `all`, `off` (= `0`).  The deprecated
+    /// precision spellings of the experiment branch map to the mode
+    /// that serves that class (`f16`/`f16p` -> `auto`, `f32` -> `all`);
+    /// the class itself is set by [`legacy_env_acc`].
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "" | "auto" | "1" | "on" => Ok(Self::Auto),
+            "" | "auto" | "1" | "on" | "f16" | "f16p" => Ok(Self::Auto),
             "0" | "off" => Ok(Self::Off),
-            "all" => Ok(Self::All),
-            precision @ ("f32" | "f16" | "f16p") => bail!(
-                "ML_PTX_GEMM={precision} no longer selects a precision: set the accumulator \
-                 policy with ML_COOPMAT_ACC=f32|f16|promote (ExecutorConfig::coopmat_acc) and \
-                 ML_PTX_GEMM=auto|all|off for the PTX backend"
-            ),
-            other => bail!("invalid ML_PTX_GEMM '{other}', expected auto, all or off"),
+            "all" | "f32" => Ok(Self::All),
+            other => bail!("invalid ML_PTX_GEMM '{other}', expected on (auto), all or off"),
         }
     }
 
@@ -116,6 +119,52 @@ impl PtxGemmMode {
             _ => Self::All,
         }
     }
+}
+
+/// The accumulator class of a deprecated `ML_PTX_GEMM=f32|f16|f16p`
+/// (the experiment branch's one knob for backend *and* precision).
+fn legacy_class(value: &str) -> Option<CoopmatAcc> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "f32" => Some(CoopmatAcc::F32),
+        "f16" => Some(CoopmatAcc::F16),
+        "f16p" => Some(CoopmatAcc::F16Promote),
+        _ => None,
+    }
+}
+
+/// Compatibility shim for env-configured executors (`Executor::new`),
+/// for one release: when `ML_COOPMAT_ACC` is unset, a deprecated
+/// precision value of `ML_PTX_GEMM` sets the policy, with a warning.
+/// `ML_COOPMAT_ACC` always wins; a disagreement is reported too.
+pub fn legacy_env_acc(policy: CoopmatAcc) -> CoopmatAcc {
+    let Some(legacy) = std::env::var("ML_PTX_GEMM")
+        .ok()
+        .and_then(|v| legacy_class(&v))
+    else {
+        return policy;
+    };
+    if std::env::var_os("ML_COOPMAT_ACC").is_some() {
+        if legacy != policy {
+            log::warn!(
+                "tensor-ash: ML_PTX_GEMM={} (deprecated precision spelling) ignored: \
+                 ML_COOPMAT_ACC={} sets the accumulator policy",
+                legacy.as_str(),
+                policy.as_str()
+            );
+        }
+        return policy;
+    }
+    log::warn!(
+        "tensor-ash: ML_PTX_GEMM={0} is deprecated: it now means ML_PTX_GEMM={1} + \
+         ML_COOPMAT_ACC={0}; set those instead",
+        legacy.as_str(),
+        if legacy == CoopmatAcc::F32 {
+            "all"
+        } else {
+            "on"
+        }
+    );
+    legacy
 }
 
 /// SM count assumed when `VK_NV_shader_sm_builtins` is absent (never
@@ -401,11 +450,19 @@ mod tests {
         assert_eq!(PtxGemmMode::parse("off").unwrap(), PtxGemmMode::Off);
         assert_eq!(PtxGemmMode::parse("0").unwrap(), PtxGemmMode::Off);
         assert_eq!(PtxGemmMode::parse("all").unwrap(), PtxGemmMode::All);
-        // The old precision spellings are refused with a pointer to
-        // the policy, never reinterpreted.
-        for old in ["f32", "f16", "f16p"] {
-            let err = PtxGemmMode::parse(old).unwrap_err().to_string();
-            assert!(err.contains("ML_COOPMAT_ACC"), "{err}");
+        assert_eq!(PtxGemmMode::parse("on").unwrap(), PtxGemmMode::Auto);
+        // Deprecated precision spellings: the mode that serves the
+        // class (the class itself comes from `legacy_env_acc`).
+        assert_eq!(PtxGemmMode::parse("f16").unwrap(), PtxGemmMode::Auto);
+        assert_eq!(PtxGemmMode::parse("f16p").unwrap(), PtxGemmMode::Auto);
+        assert_eq!(PtxGemmMode::parse("f32").unwrap(), PtxGemmMode::All);
+        assert_eq!(legacy_class("f16p"), Some(CoopmatAcc::F16Promote));
+        assert_eq!(legacy_class(" F16 "), Some(CoopmatAcc::F16));
+        assert_eq!(legacy_class("f32"), Some(CoopmatAcc::F32));
+        assert_eq!(legacy_class("on"), None);
+        for class in CLASSES {
+            // Every legacy class is served by the mode it maps to.
+            assert!(PtxGemmMode::parse(class.as_str()).unwrap().serves(class));
         }
         assert!(PtxGemmMode::parse("fast").is_err());
         assert!(!PtxGemmMode::Auto.serves(CoopmatAcc::F32));
