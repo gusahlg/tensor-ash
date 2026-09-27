@@ -1,0 +1,19 @@
+# louise 2026-09-27T08:09:21+02:00 model=/home/gusahlg/models/tinyllama-1.1b-chat-v1.0.f16.gguf pp=512 variants: base=ML_X=0:/home/gusahlg/ta-wt/cm-results/bin/llama_ash-7cfca58 old=ML_X=0:/home/gusahlg/ta-wt/cm-results/bin/llama_ash-100df0d new=ML_X=0:/home/gusahlg/ta-wt/cm-results/bin/llama_ash-0fc29f9
+round=1 variant=old prefill_gpu_ms=40.019 prefill_wall_ms=40.294 pp_tps=12706.55 argmax 29872 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=1 variant=new prefill_gpu_ms=38.716 prefill_wall_ms=38.884 pp_tps=13167.35 argmax 29872 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=1 variant=base prefill_gpu_ms=39.471 prefill_wall_ms=39.758 pp_tps=12877.92 argmax 29872 
+round=2 variant=new prefill_gpu_ms=38.529 prefill_wall_ms=38.777 pp_tps=13203.57 argmax 29872 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=2 variant=base prefill_gpu_ms=39.262 prefill_wall_ms=39.539 pp_tps=12949.26 argmax 29872 
+round=2 variant=old prefill_gpu_ms=39.667 prefill_wall_ms=39.936 pp_tps=12820.45 argmax 29872 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=3 variant=base prefill_gpu_ms=39.307 prefill_wall_ms=39.582 pp_tps=12935.22 argmax 29872 
+round=3 variant=old prefill_gpu_ms=39.670 prefill_wall_ms=39.940 pp_tps=12819.22 argmax 29872 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=3 variant=new prefill_gpu_ms=38.307 prefill_wall_ms=38.455 pp_tps=13314.21 argmax 29872 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=4 variant=old prefill_gpu_ms=39.727 prefill_wall_ms=39.998 pp_tps=12800.76 argmax 29872 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=4 variant=new prefill_gpu_ms=38.348 prefill_wall_ms=38.427 pp_tps=13323.89 argmax 29872 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=4 variant=base prefill_gpu_ms=39.980 prefill_wall_ms=40.260 pp_tps=12717.20 argmax 29872 
+round=5 variant=new prefill_gpu_ms=38.440 prefill_wall_ms=38.749 pp_tps=13213.32 argmax 29872 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=5 variant=base prefill_gpu_ms=39.668 prefill_wall_ms=39.940 pp_tps=12819.21 argmax 29872 
+round=5 variant=old prefill_gpu_ms=40.163 prefill_wall_ms=40.574 pp_tps=12618.94 argmax 29872 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=6 variant=base prefill_gpu_ms=39.494 prefill_wall_ms=39.776 pp_tps=12872.05 argmax 29872 
+round=6 variant=old prefill_gpu_ms=40.117 prefill_wall_ms=40.592 pp_tps=12613.33 argmax 29872 shader_cores=24 (VK_NV_shader_sm_builtins)
+round=6 variant=new prefill_gpu_ms=38.470 prefill_wall_ms=38.723 pp_tps=13222.21 argmax 29872 shader_cores=24 (VK_NV_shader_sm_builtins)

@@ -44,7 +44,9 @@ clock logs are in [`coopmat-sm-data/`](coopmat-sm-data/).
    77 shapes slower than exp/grokmerge by >1%, geomean ×1.081; clean
    cold M=512 set 11/11 at the measured best (×1.056).  4060 — cold
    sweep geomean ×1.083, 1 shape slower by >1% (384x2560x2048, +2.4%),
-   mean regret vs the best of five tiles 0.71%.  TinyLlama pp512: §9.
+   mean regret vs the best of five tiles 0.71%.  TinyLlama pp512 on the
+   4060: 0fc29f9 38.46 ms vs grokmerge 39.48 ms GPU prefill (−2.6%,
+   6 rotated rounds, faster in every round; 100df0d was +1.0%), §9.
    **3070 embargo from 07:44 (2026-09-27)**: the 3070 pp512 A/B and the
    dedicated 128x64-vs-128x128 A/B are PENDING (§12.5).
 
@@ -524,13 +526,47 @@ grokmerge (7cfca58) and branch builds with the same fast profile,
 alternating A,B,A,B... (`coopmat-sm-data/llama_ab.sh`), prefill GPU time
 from the `prefill timing` log line (graph GPU timestamps).
 
-PP4060
+**RTX 4060, 2026-09-26 (100df0d)**: `pp512_ab_4060.log` — grokmerge
+39.42 vs 100df0d 40.00 ms GPU prefill (medians, 5 alternating pairs):
+100df0d **1.5% slower**.  `pp512_variants_4060.log` (4 rotated rounds):
+base 39.71, `ML_SM_COUNT=0` 39.65, 100df0d 40.08, 100df0d with
+`ML_L2_MB=1` (small-L2 branch = 64x64 M-fast on all four GEMMs) 38.36 ms.
+This is what triggered the cold-L2 refit (§12).
 
-**RTX 3070: PENDING** (embargo).  Build `llama_ash` for 7cfca58 and the
-branch head, then `$SP/bin/gpu3070 coopmat-sm-data/llama_ab.sh <base>
-<branch> 5 pp512_ab_3070.log 512`.  Expected from §7's per-GEMM picks:
-QKV 30.2 → 35.4 TF/s and gate/up 35.8 → ~37 (M-fast), q/o and down
-unchanged.
+**RTX 4060, 2026-09-27 (0fc29f9)**: three binaries rotated per round,
+6 rounds (`coopmat-sm-data/llama_env_ab.sh`, louise
+`~/ta-wt/cm-results/pp4060.sh`; raw `coopmat-sm-data/pp512_final_4060.log`):
+
+```
+llama_env_ab.sh 6 pp512_final_4060.log base=ML_X=0:llama_ash-7cfca58 old=ML_X=0:llama_ash-100df0d new=ML_X=0:llama_ash-0fc29f9
+```
+
+| build | prefill GPU ms, median (min-max) | vs grokmerge |
+|---|---:|---:|
+| grokmerge 7cfca58 | 39.48 (39.26-39.98) | — |
+| 100df0d | 39.87 (39.67-40.16) | +1.0% |
+| **0fc29f9** | **38.46 (38.31-38.72)** | **−2.6%** (every round: −1.9 to −4.1%) |
+
+pp512 throughput 13.2-13.3k vs 12.7-12.9k tokens/s; argmax 29872 in
+every run.  Consistent with the rule's per-GEMM cold gains over
+grokmerge's picks (`cold-4060-0fc29f9/`, `auto` cells: q/o +1.9%, QKV
++2.0%, gate/up +10.2%, down +0.5%).
+
+**RTX 3070: PENDING** (embargo from 2026-09-27 07:44; an attempt on
+2026-09-26 21:01 got 2 rows before the reboot: new 30.27 ms vs
+`ML_SM_COUNT=0` 31.52 ms, one round, not a result).  Validated binaries
+are ready: `$SP/work/coopmat/bin/llama_ash-{7cfca58,0fc29f9}` (desktop
+builds; 0fc29f9 kernels are byte-identical to 34ad9f1, GPU tests pass
+on the 4060).  Run when the embargo file is gone:
+
+```
+cd $SP/work/coopmat && GPU_WAIT=3600 $SP/bin/gpu3070 timeout 580 \
+  <worktree>/benchmarks/campaign/coopmat-sm-data/llama_env_ab.sh 5 results/pp512_final_3070.log \
+  base=ML_X=0:$PWD/bin/llama_ash-7cfca58 new=ML_X=0:$PWD/bin/llama_ash-0fc29f9
+```
+
+Expected from the clean per-GEMM 3070 data (§12.3/§5): q/o +3%, QKV
++19%, gate/up +6%, down +5% vs grokmerge's picks.
 
 ## 10. Negative results (do not retry without a new mechanism)
 
@@ -546,13 +582,19 @@ unchanged.
 
 ## 11. Follow-ups
 
-- 3070 verification sweep + pp512 A/B (PENDING, embargo): commands in
-  §8/§9, binaries `ml_bench`/`llama_ash` at the branch head.
-- 128x128 on the largest 4060 grids (4096³ +3.6%, N=32000 +1-2%): a
-  "many waves and B >> L2" exception needs more than two shapes.
-- a16 64x64 x-fast on large operands wins on the 4060 by 2-9% where
-  the rule (large L2) already picks it; on unknown-L2 parts it falls to
-  128x64 — a real L2 query (or a one-shot probe) would remove the table.
+- **3070, PENDING (embargo)**: pp512 A/B (§9 command); the 15-round
+  128x128-vs-128x64 A/B (`$SP/work/coopmat/large3070.sh` (copy in `coopmat-sm-data/jobs/`), §12.5); the
+  remaining cold batches (`ML_AB_COLD_MB=64 $SP/work/coopmat/run3070.sh
+  cold-3070 a16_128 a16_256 a16_1024 a16_1920 t128 m256 m384 sq m768
+  m1024`) and a clean re-run of the quarantined warm batches
+  (`run3070.sh verify-3070 m512 a16_512 m768 m1024 m2048 t128 t1920
+  a16_128 a16_256 a16_1024 a16_1920`).  Then `python3 coldfit.py`.
+- 4060 a16 128x5632x2048 cold (128x64 +17% over the pick): M=128 is a
+  single 128-row block; needs more M=128 data before a special case.
+- 3070 single-pass M-fast at M=256/384 (rows 4-6) wins warm on 5 of 8
+  shapes (+1-6%) but loses 7% at 256x2048x2048; the rule requires 8
+  row blocks.  Cold 3070 m256/m384 would settle it.
+- A real L2 query (or one-shot probe) instead of the device-ID table.
 - 64x128's 168 registers: find what the compiler keeps live (SASS agent).
 
 ## 12. Cold-L2 refit (2026-09-27, commit 0fc29f9)
@@ -825,7 +867,7 @@ the 4060, cold, 128x64 leads at 4096³ (26.23 vs 25.49) and 3072³
 (27.41 vs 26.17).  Strictly, the 4096³ and 3072³ verify cells are the
 only clean 3070 measurements where the new pick trails grokmerge's by
 more than 1% (1.3%, 1.6%).  A dedicated 15-round, two-kernel warm +
-cold A/B on eight large shapes (`$SP/work/coopmat/large3070.sh`,
+cold A/B on eight large shapes (`$SP/work/coopmat/large3070.sh` (copy in `coopmat-sm-data/jobs/`),
 `large.txt`) was queued but refused by the embargo: **PENDING**.  If it
 confirms 128x128 ahead by >1% at 4096³, the fix is a "128-tile grid
 >= 8 waves on a small L2" branch; nothing in the data supports it yet

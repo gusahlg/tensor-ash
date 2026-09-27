@@ -68,3 +68,11 @@ Louise trees: `~/ta-wt/cm-base` (7cfca58 grokmerge build), `cm-sm`
   with `$SP/work/coopmat/bin/llama_ash-{7cfca58,0fc29f9}`.
 - louise: unit tests 14/14 ok at 0fc29f9; GPU tests + pp512 A/B queued
   (`cm-results/pp4060.sh`).
+- 08:00-08:20 louise: GPU tests `f16_routes_pick_f16w_kernels_and_skip_splitk2`
+  + `coopmat_asymmetric_tiles_match_dual_rounded_reference` pass at 0fc29f9;
+  clippy -D warnings clean (tensor-ash, ml-bench, all targets); `auto`
+  routes of the 0fc29f9 ml_bench match `coldfit.new_rule` 19/19
+  (`cold-4060-0fc29f9/`); pp512 A/B: 0fc29f9 38.46 ms vs grokmerge 39.48
+  (−2.6%, 6/6 rounds), 100df0d 39.87 (`pp512_final_4060.log`).
+- Report §9, §11, §12 written.  Remaining = 3070 items only (embargo);
+  commands in §9 / §11, scripts in `coopmat-sm-data/jobs/`.
