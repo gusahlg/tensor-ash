@@ -322,3 +322,47 @@ fn v4_kernels_handle_n_not_multiple_of_4() {
         }
     }
 }
+
+/// Odd-K tails used to run a full BK-step inner loop on a zero-padded
+/// last tile.  Truncating to ceil(k_rem/8)*8 steps must stay equal to
+/// the CPU reference (pad is +0.0, so skipped FMAs are exact no-ops).
+/// The 128x128 tiles keep the full tail (`ODDK_FULL_TAIL`); they stay
+/// here as the control, with the transposed-A large route.
+#[test]
+#[ignore]
+fn odd_k_tails_match_reference() {
+    let kernels = [
+        ("k64_bda_v4_tm8_tn4", KernelSelection::K64BdaV4Tm8Tn4),
+        ("m128n64k64_bda_v4", KernelSelection::M128N64K64BdaV4),
+        ("large_bda_v4", KernelSelection::LargeBdaV4),
+        ("small_bda_v4", KernelSelection::SmallBdaV4),
+        ("m64n32_bda", KernelSelection::M64N32Bda),
+        ("large_bda", KernelSelection::LargeBda),
+        ("large_bda_v4t", KernelSelection::LargeBdaV4t),
+    ];
+    const M: u32 = 200;
+    const N: u32 = 200;
+    const KS: &[u32] = &[
+        1, 2, 3, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 127, 129, 263,
+    ];
+    for (name, sel) in kernels {
+        let Some((ctx, exec)) = make_setup_with_kernel_if_fits(1, 4, sel) else {
+            continue;
+        };
+        for (i, &k) in KS.iter().enumerate() {
+            let (gpu, cpu) = run_one(
+                &ctx,
+                &exec,
+                &[M, k],
+                &[k, N],
+                &[M, N],
+                1.0,
+                false,
+                163u64 + i as u64,
+                167u64 + i as u64,
+                None,
+            );
+            assert_close(&gpu, &cpu, k, &format!("{name} M={M} N={N} K={k}"));
+        }
+    }
+}

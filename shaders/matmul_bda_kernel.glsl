@@ -235,6 +235,11 @@ void main() {
 
         barrier();
 
+#ifdef ODDK_FULL_TAIL
+        // 128x128 wrappers keep the full-BK tail: the truncated tail
+        // measured -2.4% on the RTX 3070 (2048x2048x2049) and -1.75% on
+        // the RTX 4060 (1024x1024x4097) with large_bda_v4
+        // (benchmarks/campaign/merge-1.md).
         [[unroll]] for (uint k = 0u; k < BK; ++k) {
             float a_reg[TM];
             float b_reg[TN];
@@ -247,6 +252,42 @@ void main() {
                     acc[i][j] = fma(a_reg[i], b_reg[j], acc[i][j]);
         }
 
+#else
+        // Truncate the inner-K loop to ceil(k_rem/8)*8 steps.  Scalar
+        // loaders write +0.0 for g_col >= K (A) / g_row >= K (B), so
+        // skipping pad-only BK steps is bit-identical: fma(0, x, acc)
+        // == acc for finite x.  Folded away when K_MULTIPLE is true.
+        const uint k_rem = pc.K - num_full_k * BK;
+        const uint n_chunks = (k_rem + 7u) / 8u;
+
+        float a_reg[2][TM];
+        float b_reg[2][TN];
+        [[unroll]] for (uint i = 0u; i < TM; ++i)
+            a_reg[0][i] = As[a_row0 + i][0];
+        [[unroll]] for (uint j = 0u; j < TN; ++j)
+            b_reg[0][j] = Bs[0][b_col0 + j];
+
+        for (uint c = 0u; c < n_chunks; ++c) {
+            [[unroll]] for (uint kk = 0u; kk < 8u; ++kk) {
+                const uint k = c * 8u + kk;
+                const uint cur = k & 1u;
+                const uint nxt = (k + 1u) & 1u;
+                // Prefetch k+1 into the alternate bank.  Reading the
+                // +0.0 pad past k_rem is harmless; clamp so the last
+                // step of a nearly-full tile does not index As[][BK]
+                // / Bs[BK] (the last FMA of the last chunk ignores nxt).
+                const uint k_next = min(k + 1u, BK - 1u);
+                [[unroll]] for (uint i = 0u; i < TM; ++i)
+                    a_reg[nxt][i] = As[a_row0 + i][k_next];
+                [[unroll]] for (uint j = 0u; j < TN; ++j)
+                    b_reg[nxt][j] = Bs[k_next][b_col0 + j];
+                [[unroll]] for (uint i = 0u; i < TM; ++i)
+                    [[unroll]] for (uint j = 0u; j < TN; ++j)
+                        acc[i][j] = fma(a_reg[cur][i], b_reg[cur][j], acc[i][j]);
+            }
+        }
+
+#endif
         barrier();
     }
 

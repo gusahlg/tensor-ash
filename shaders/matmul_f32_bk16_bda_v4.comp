@@ -12,4 +12,7 @@
 #define TN   8u
 #define TN_RAW 8
 
+// 128x128: keep the full-BK odd-K tail (see the body).
+#define ODDK_FULL_TAIL 1
+
 #include "matmul_bda_v4_kernel.glsl"
