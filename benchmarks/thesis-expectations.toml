@@ -24,7 +24,14 @@ t1_min_bw_frac = 0.78
 # T2: every decode GEMV class >= this fraction of its bandwidth floor
 # (leg 13/15: row GEMVs measured 81-89% of floor; the tiny k/v
 # 2048x256 class is the one to watch — launch overhead bites first).
+# Since campaign/integrate T2 times DRAM-cold (read-mostly GEMV L2
+# scrub before every dispatch) — the 3070 has not been re-measured
+# under it yet (desktop GPU embargo 2026-09-26); re-record on the next
+# 3070 run.
 t2_min_bw_frac = 0.80
+# k/v moves 1.06 MB (floor 2.4 us) and is launch-bound: the 2026-08-15
+# baseline measured it at ~30% of floor (see the T1 note above).
+t2_kv_min_bw_frac = 0.25
 
 # T3: full compute-barrier drain on a trivial kernel, in microseconds.
 # FALSIFIED 2026-08-15: the leg-5-era ~7.7 us figure did not survive
@@ -67,3 +74,47 @@ t6_ref_rel_tol = 0.15
 
 # T7 (token exactness) is a correctness invariant: it needs no
 # recorded numbers and FAILs unconditionally on any divergence.
+
+["NVIDIA GeForce RTX 4060"]
+# AD107, 24 SM, 24 MB L2, driver 595.80, host louise-pc (Ryzen 5 5500).
+# Recorded 2026-09-26 on campaign/integrate from two full
+# `ml_bench thesis --all` runs plus a T2/T6 re-run, then confirmed
+# PASS by three gated runs (2026-09-26 x2, 2026-09-27 on the all -Os
+# build; raw tables and commands: benchmarks/campaign/integrate.md).  Every floor is a
+# measured-reality guard just under the worse run; the AD107 is
+# thermally noisy (2460-2745 MHz SM between runs, ~5-7% on GEMM rates).
+mem_bw_gbps = 272.0
+
+# T1: 227 / 221 GB/s = 83.5% / 81.3% of 272 (9.10 / 9.35 ms GPU per
+# token, 201 dispatches, 156 barriers/token, host +0.30 ms).
+t1_min_bw_frac = 0.78
+
+# T2 (DRAM-cold): q 88.6%, o 87.1%, gate/up 92.3%, down 90.8%, packed
+# lm_head 94.5% (510.7 us) — within ~3% of the same GEMVs inside a
+# real perop decode step.  k/v: 11.9-12.5 us = 31-33% of its 3.9 us
+# floor (launch-bound, hidden behind q in decode).
+t2_min_bw_frac = 0.82
+t2_kv_min_bw_frac = 0.25
+
+# T3: 0.78-0.81 us/barrier in every run (serial 30->227..31->235 us,
+# overlapped 6->27..28 us over 32->256 dispatches).
+t3_barrier_us = 0.81
+t3_rel_tol = 1.00
+
+# T4: louise-pc's round-trip is 14.3-14.7 us in every run (64 submits
+# 0.96 ms vs 1 submit 0.06 ms) — half the desktop's; a host property.
+t4_submit_us_lo = 10.0
+t4_submit_us_hi = 20.0
+t4_edge_tol = 0.20
+
+# T5: +11.4% / +17.3% (sum vs whole 39.2-39.6 ms; GEMM 100-107% of
+# the whole because the f32-A f16w GEMM pieces run slower than the
+# a16 twins prefill uses; flash 4%, elementwise 7%, barriers 1%).
+t5_rel_gap = 0.25
+
+# T6 (200 ms warm-up per shape): qkv 22.8-24.8, o 23.1-24.2, gate/up
+# 23.4-26.4, down 22.3-24.9 TF/s; 4096^3 24.7-25.3 TF/s.  Aspirational
+# target stays >= 30 TF/s (THESES.md).
+t6_min_tflops = 20.0
+t6_ref_tflops = 25.0
+t6_ref_rel_tol = 0.15
