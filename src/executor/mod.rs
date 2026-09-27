@@ -369,7 +369,7 @@ impl Executor {
         let tune = std::env::var("ML_TUNE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        // `ML_COOPMAT_ACC=f16|promote` opts env-configured executors
+        // `ML_COOPMAT_ACC=f16|f16p` opts env-configured executors
         // into the f16-accumulator coopmat twins (default f32).
         let coopmat_acc = CoopmatAcc::from_env()?;
         Self::new_with_config(
