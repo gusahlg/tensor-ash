@@ -863,8 +863,10 @@ fn nvdisasm_path() -> Option<String> {
 /// the first entry point.
 fn spirv_local_size(spv: &[u8]) -> Option<[u32; 3]> {
     let words: Vec<u32> = spv
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
     if words.first() != Some(&0x0723_0203) {
         return None;

@@ -39,8 +39,10 @@ fn local_size(spv: &[u8]) -> Option<[u32; 3]> {
     const OP_EXECUTION_MODE: u32 = 16;
     const MODE_LOCAL_SIZE: u32 = 17;
     let words: Vec<u32> = spv
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
     let mut pc = 5;
     while pc < words.len() {
@@ -197,8 +199,10 @@ fn main() -> Result<()> {
             }
             let words: Vec<u32> = spec
                 .spv
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect();
             let module = device
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)?;
