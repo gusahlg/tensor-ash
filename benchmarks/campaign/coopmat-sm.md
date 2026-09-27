@@ -864,7 +864,17 @@ clean 3070 interleaved runs at the large end (TF/s, 128x128 / 128x64):
 the 1-4% same-kernel noise of multi-millisecond shapes (§3) — while
 128x64 leads by 6-12% at 2048³ and by up to 56% on mid-size grids.  On
 the 4060, cold, 128x64 leads at 4096³ (26.23 vs 25.49) and 3072³
-(27.41 vs 26.17).  Strictly, the 4096³ and 3072³ verify cells are the
+(27.41 vs 26.17).  On the 4060 a dedicated 15-round two-kernel A/B (0fc29f9 binary,
+`jobs/large4060.sh`, raw `large-4060/`, 2026-09-27 08:25) gives
+128x64 / 128x128 (TF/s, warm | cold): 3072³ 26.70/24.93 | 27.72/26.16;
+4096³ 24.63/24.19 | 25.81/25.77; 2048x5632x5632 25.59/23.86 |
+25.11/24.63; 2048x2560x5632 26.60/23.47 | 27.90/24.59; 2048x32000x2048
+23.82/23.88 | 24.51/23.90; 1920x32000x2048 23.97/23.87 | 24.35/23.92;
+1024x32000x2048 23.00/23.81 | 24.08/23.93; a16 1920x5632x2048
+28.50/24.87 | 28.97/26.19.  128x64 wins 15 of 16 cells; the only loss
+is warm 1024x32000x2048 (−3.4%; cold it wins by 0.6%), so the earlier
+"4096³ −3.6%, reproduced" 4060 cell (§4) is not confirmed with 15
+rounds.  Strictly, the 4096³ and 3072³ verify cells are the
 only clean 3070 measurements where the new pick trails grokmerge's by
 more than 1% (1.3%, 1.6%).  A dedicated 15-round, two-kernel warm +
 cold A/B on eight large shapes (`$SP/work/coopmat/large3070.sh` (copy in `coopmat-sm-data/jobs/`),
