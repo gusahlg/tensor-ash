@@ -104,7 +104,8 @@ const DESCRIPTIONS: &[(&str, &str)] = &[
     ),
     (
         "t2",
-        "GEMV efficiency: each decode GEMV class runs >= 80% of its bandwidth floor",
+        "GEMV efficiency: each >= 8 MB decode GEMV class runs >= 80% of its DRAM-cold \
+         bandwidth floor (launch-bound k/v has its own floor)",
     ),
     (
         "t3",
@@ -112,15 +113,17 @@ const DESCRIPTIONS: &[(&str, &str)] = &[
     ),
     (
         "t4",
-        "submission cost: one vkQueueSubmit + fence round-trip costs ~30-60 us",
+        "submission cost: one vkQueueSubmit + fence round-trip costs tens of us \
+         (a host property: each GPU section records its own band)",
     ),
     (
         "t5",
-        "prefill accounting: piecewise op-class sum within 10% of the whole pp512 graph",
+        "prefill accounting: piecewise op-class sum within t5_rel_gap of the whole pp512 graph",
     ),
     (
         "t6",
-        "coopmat ceiling: f16w coopmat GEMM sustains >= 30 TF/s on real prefill shapes",
+        "coopmat ceiling: f16w coopmat GEMM on real prefill shapes (gate: regression floor; \
+         >= 30 TF/s is the aspirational target)",
     ),
     (
         "t7",
