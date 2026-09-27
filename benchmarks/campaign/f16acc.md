@@ -429,3 +429,173 @@ of 4 prefill shapes, reproduced in a fresh process):**
 Observations: skew 0 (n9) is 1.7-1.8x slower (bank conflicts — the skew is
 essential); BK=64 at 128x128 (n8) and the 4-warp 128x128 (n7) lose with f32
 accumulators; 32x64 (n11) never wins.
+
+### 7a. S2 fresh-process reproduction
+
+Second process, same binary, same protocol (9 interleaved rounds;
+`results/gen-{a16,f16w,acc16-a16}-4060-rep.txt`, `job5.sh` / `job7.sh`).
+"vs route" = routed tile / best new config - 1; "vs best literal" = the best
+hand-written tile of the same run / best new config - 1:
+
+| module | shape | run 1: best new, vs route, vs best literal | run 2 (fresh process) |
+|---|---|---|---|
+| a32, f32 acc | qkv | n6 (64x128, 8 warps) +3.4%, +5.3% | n6 +3.8%, +4.8% |
+| a32, f32 acc | dn | n10 (skew 2) +5.8%, +0.8% | n10 +6.5%, +0.2% |
+| a32, f32 acc | gu | n10 +2.6%, +3.2% | n10 +3.0%, +4.3% |
+| a16, f32 acc | gu | n10 +4.5%, -2.8% | n10 +5.0%, -2.4% |
+| a16, f32 acc | dn | n1 (BK 64) +4.1%, +1.0% | n1 +4.3%, -1.0% |
+| a16, f16 acc | qo | n2 +2.7%, +4.4% | n7 +3.6%, +2.7% |
+| a16, f16 acc | dn | n3 +4.2%, +4.2% | n3 +1.0%, +3.4% |
+
+* **a32 (f32 acc): S2 passes formally (qkv and dn reproduce >= 3%), but only
+  qkv/n6 is a new-config win** (+5% over every hand-written tile, both
+  runs).  On dn the "win" is noise in the route's median: the route *is*
+  the 64x64 tile, and the pinned 64x64 of the same run is within 1% of n10.
+* **a16 (f32 acc): no new-config signal.**  gu/dn beat the route by 4-5% in
+  both runs, but the hand-written 64x64 matches or beats every new config:
+  it is the f32 tile rule sending gu to 128x64 (a routing fix, 7% on gu on
+  the 4060, not a generator result).
+* **a16 f16-acc axis: S2 fails** (no shape >= 3% in both runs): the
+  accumulator-aware tile rule (64x128) is within +-3% of all 15 configs.
+* Median noise: the same kernel measured as `auto` and pinned in one run
+  differs by up to 5% at the median on gu/dn/2048^3 (minima agree within
+  0.5%), so single-run S2 margins of 3-5% on those shapes are at the noise
+  floor; see the auto-vs-pinned control in §8b.
+
+### 7b. The K_UNROLL rescue and the Tier verdict
+
+Diagnosis from §7: the driver unrolls the literal wrappers' runtime K loop 8x
+but leaves the spec module's rolled.  Rescue: a `K_UNROLL` body axis
+(`matmul_f16w_a16_coopmat_spec_ku8`, commit 2c3220c): the K loop becomes
+`for (kt0 < num_k; kt0 += 8) [[unroll]] for (ku < 8) { if (kt >= num_k)
+break; ... }`, the literal-bounded structure R1 prescribes.  All `_ku8`
+configs pass the f64 gate (`results/numerics-gate3-4060.md`).
+
+Twin parity with and without the rescue (4060, a16, 16 kernels in one
+process, 9 interleaved rounds, `job6.sh`, `results/gen-ku8-a16-4060.txt`;
+gen time / literal time - 1, %):
+
+| twin | qo | qkv | gu | dn | 1024³ | 2048³ |
+|---|---|---|---|---|---|---|
+| t1 = 128x128 | +9.2 | +14.5 | +10.9 | +3.9 | +4.6 | +6.2 |
+| t1 ku8 | +1.0 | -0.8 | -4.7 | -3.2 | +0.9 | -7.7 |
+| t2 = 64x64 | +0.6 | +0.0 | +0.5 | +1.7 | +0.0 | +2.6 |
+| t2 ku8 | +0.6 | -1.5 | +0.0 | **+5.4** | +3.6 | +3.7 |
+| t3 = 64x128 | +1.6 | +1.8 | -0.2 | -2.1 | +3.0 | -3.8 |
+| t3 ku8 | **-7.4** | **-7.6** | **-9.9** | **-8.8** | -5.0 | -12.2 |
+| t4 = 128x64 | +5.7 | +2.4 | +4.8 | +3.0 | +6.2 | +6.0 |
+| t4 ku8 | +5.2 | +1.9 | +5.7 | +3.4 | +2.1 | +5.3 |
+
+SM89 driver statistics of the same kernels (`VK_KHR_pipeline_executable_properties`,
+`ML_STATS_FILTER=coopmat examples/coopmat_occupancy`, `results/occupancy-4060.txt`):
+
+| kernel | literal: regs / binary B / driver shared B | spec (rolled K) | spec ku8 |
+|---|---|---|---|
+| 128x128 | 128 / 15,616 / 18,944 | 128 / 10,112 / **44,544** | 128 / 19,072 / **44,544** |
+| 64x64 | 72 / 12,032 / 9,728 | 72 / 5,760 / 9,728 | **80** / 12,928 / **14,336** |
+| 64x128 | 155 / 21,248 / 13,824 | 156 / 8,960 / 13,824 | **128** / 22,144 / **25,600** |
+| 128x64 | 128 / 18,688 / 16,384 | 126 / 6,912 / 14,848 | 127 / 17,920 / 14,848 |
+
+(driver shared above the declared size = accumulator registers the compiler
+parked in shared memory; declared: 18,944 / 9,728 / 13,824 / 14,848.)
+
+* The rescue does what it was built for: the ku8 binaries are the size of
+  the literal ones (the K loop is now unrolled; the rolled spec kernels are
+  2-3x smaller).
+* It does not buy parity: with the per-K-tile code identical, the driver's
+  register allocator still lands elsewhere — 64x128 drops from 155 to 128
+  registers by parking 11,776 B of accumulators in shared memory (4 instead
+  of 3 CTAs/SM: 7-12% *faster* than the hand-written tile), 64x64 goes from
+  72 to 80 registers + 4,608 B parked (6 instead of 7 CTAs/SM: up to 5%
+  slower), 128x128 keeps parking 25,600 B in both spec forms, 128x64 stays
+  3-6% slower at the same register count.  S1's criteria (+-2% time,
+  registers within +-4) fail for 3 of 4 twins with or without the rescue.
+* The allocation is a property of the driver's heuristics on the whole
+  module (spec-bounded loop nests, loop structure), not of anything the
+  spec module controls; no further GLSL-level rescue is indicated.
+
+**Tier verdict: Tier C** (design §4 readout, S1 fail): shipped coopmat
+kernels are generated *literal* wrappers (per-config `#define`s compiled at
+build time, like today's hand-written tiles; the spec module's value
+table becomes the generator's config list).  The spec-constant module stays
+useful as a fast exploratory compile (0.09 s / module, G0 infrastructure,
+spec-aware `workgroup_shared_bytes`), but a spec config is a *different
+kernel* from its literal twin (+-10%): any config that wins in the spec
+module must be re-measured as its literal wrapper before it is routed.
+The one real search signal (a32 qkv, n6 = 64x128 with 8 warps, +5%) is the
+first candidate for a literal wrapper.
+
+## 9. Precision policy (merge-ready) and one policy for both backends
+
+### 9a. What lands on this branch
+
+* `tensor_ash::CoopmatAcc { F32 (default), F16, F16Promote }`
+  (`src/pipeline/precision.rs`): strings `f32` / `f16` / `f16p` (`as_str`;
+  `parse` also takes `promote`, `fast16`, `acc16`, `acc16p`).  `F16Promote`
+  is specified as a class — f16 partials of **at most 128 K** added into f32
+  — so any backend with chunks <= 128 K serves it.
+* `ExecutorConfig::coopmat_acc` (per executor, default `F32`);
+  `Executor::new` reads `ML_COOPMAT_ACC=f32|f16|f16p` (invalid value = error,
+  unset = f32).  Unsupported device (no 16x16x16 f16/f16/f16/f16 coopmat
+  configuration) -> `F32` + warning.
+* Never default, never a tuner candidate (`tune_candidates` drops every
+  kernel whose class is not F32), never picked by the heuristic: the only
+  ways in are the policy and an explicit `ML_KERNEL` pin (which keeps the
+  pinned kernel's own class).  The acc twins build lazily (no cold-start
+  cost when the policy is F32).
+* Scope: f16-weight coopmat1 GEMMs only (a16 route and f16w route).  f32-B
+  routes, GEMVs (decode), attention and the LM head do not change.
+* Tests: `tests/correctness/coopmat_acc.rs` (4 GPU tests, `--ignored`):
+  the policy reaches the `_acc16`/`_acc16p` twins with the acc-aware tile;
+  every class stays within its per-element f64 budget on 6 shapes
+  (incl. batched, K not a chunk multiple, K = 5632), on the f32-activation
+  route, with alpha + accumulate and through the graph path; and the f16
+  classes are measurably *less* exact than f32 (a silent fallback to f32
+  would fail).  Unit tests: parse/as_str, name -> class, `promote_chunk_k`.
+
+### 9b. The PTX track's knob (campaign/ptx @ 10ab22a, read-only)
+
+`ML_PTX_GEMM=f32|f16|f16p` (`src/ptx/route.rs`, `enum PtxAccum { F32, F16,
+F16Promoted }`) turns the PTX a16 route on *and* picks its accumulator in
+one process-wide variable, read once in `MatmulPipeline::new`; the recorder
+(`record_one_matmul`) swaps a Vulkan `*_a16_*` coopmat dispatch for
+`vkCmdCudaLaunchKernelNV` when `route.select(m, n, k)` returns a kernel.
+Its `f16p` promotes every BK = 64 k-tile (64 K), i.e. inside the
+`F16Promote` class above; its `f16` is the same class as `F16`.
+
+Two knobs for one numerics decision would let the backends disagree (e.g.
+`ML_COOPMAT_ACC=f32` + `ML_PTX_GEMM=f16` silently runs f16 accumulation).
+
+### 9c. Proposed unified API (for the merge of f16acc + ptx)
+
+1. **One class type.**  Delete `PtxAccum`; the PTX route uses
+   `CoopmatAcc` (strings already agree: `f32|f16|f16p`).  (A later rename
+   to a backend-neutral `GemmAcc` is cosmetic; keep `CoopmatAcc` for now.)
+2. **Policy per executor, class carried by the resolved kernel.**  The
+   executor already maps its `coopmat_acc` onto the kernel it resolves
+   (`a16_coopmat_index(.., acc)` / `with_coopmat_acc`), so
+   `record_one_matmul` receives an `_acc16` / `_acc16p` kernel under
+   F16 / F16Promote.  The PTX route reads the class from there:
+   `route.select(CoopmatAcc::of_kernel_name(kernel.name), m, n, k)` (was `select(m, n, k)`
+   with the route-global `accum`).  No new plumbing; a per-op override
+   (ggml's `GGML_PREC_F32` analogue for attention-like ops) would later
+   be one `Option<CoopmatAcc>` on `MatmulOp`, resolved in the same place.
+3. **Backend knob = backend only.**  `ML_PTX_GEMM=on|off` (plus
+   `ML_PTX=1` for the device extension, `ML_PTX_GEMM_KERNEL` for pins).
+   For one release, the legacy values `f32|f16|f16p` mean `on` and, when
+   `ML_COOPMAT_ACC` is unset, also set that class for env-built executors,
+   with a deprecation warning.
+4. **Class contracts** (what a backend must honour to serve a class):
+   `F32` = f32 accumulation end to end; `F16` = f16 accumulation (cuBLAS
+   `COMPUTE_16F` numerics); `F16Promote` = f16 partials over <= 128 K added
+   in f32.  Both backends' kernels already qualify; the f64 budgets in
+   `tests/correctness/coopmat_acc.rs` (and `ml_bench`'s `acc16_budget`,
+   which scales with the chunk depth) are the shared acceptance test.
+5. **Unchanged guarantees**: default F32; no tuner or heuristic ever
+   crosses a class; an unsupported class degrades to F32 with a warning
+   (PTX: no `VK_NV_cuda_kernel_launch` -> Vulkan kernel of the same class).
+
+Code the PTX branch would change: `src/ptx/route.rs` (drop `PtxAccum`,
+`from_env` parses on/off, `select` takes `CoopmatAcc`),
+`src/executor/recording.rs` (pass `CoopmatAcc::of_kernel_name(kernel.name)`),
+`tests/correctness/ptx.rs` (set the class through `ExecutorConfig`).
