@@ -28,13 +28,15 @@ pub(crate) fn create_shader_module(
     }
 }
 
-/// `n` u32 specialization constants: id `i` at offset `i*4`, 4 bytes each.
-fn spec_map_entries(n: u32) -> Vec<vk::SpecializationMapEntry> {
-    (0..n)
-        .map(|i| {
+/// Map entries for sparse `(constant_id, value)` pairs: pair `i` at
+/// data offset `i*4`, 4 bytes each.
+fn spec_map_entries_for(spec: &[(u32, u32)]) -> Vec<vk::SpecializationMapEntry> {
+    spec.iter()
+        .enumerate()
+        .map(|(i, &(id, _))| {
             vk::SpecializationMapEntry::default()
-                .constant_id(i)
-                .offset(i * 4)
+                .constant_id(id)
+                .offset(i as u32 * 4)
                 .size(4)
         })
         .collect()
@@ -50,36 +52,43 @@ pub(crate) fn create_specialized_pipeline(
     spec_data: &[u32],
     label: &str,
 ) -> Result<vk::Pipeline> {
+    let spec: Vec<(u32, u32)> = spec_data
+        .iter()
+        .enumerate()
+        .map(|(id, &value)| (id as u32, value))
+        .collect();
     create_specialized_pipeline_in(
         ctx,
         ctx.pipeline_cache,
         vk::PipelineCreateFlags::empty(),
         module,
         layout,
-        spec_data,
+        &spec,
         label,
     )
 }
 
-/// [`create_specialized_pipeline`] with an explicit pipeline cache and
-/// create flags: the one creation path shared by the dispatcher and
-/// ISA probes (`MatmulPipeline::create_probe_pipeline`), so a probe
-/// compiles exactly what a dispatch would.
+/// Build one pipeline with an explicit pipeline cache, create flags,
+/// and sparse `(constant_id, value)` specialization: the one creation
+/// path shared by the dispatcher and ISA probes
+/// (`MatmulPipeline::create_probe_pipeline`), so a probe compiles
+/// exactly what a dispatch would.
 pub(crate) fn create_specialized_pipeline_in(
     ctx: &VulkanContext,
     cache: vk::PipelineCache,
     flags: vk::PipelineCreateFlags,
     module: vk::ShaderModule,
     layout: vk::PipelineLayout,
-    spec_data: &[u32],
+    spec: &[(u32, u32)],
     label: &str,
 ) -> Result<vk::Pipeline> {
     unsafe {
         let entry = std::ffi::CString::new("main").unwrap();
-        let spec_entries = spec_map_entries(spec_data.len() as u32);
+        let spec_entries = spec_map_entries_for(spec);
+        let spec_data: Vec<u32> = spec.iter().map(|&(_, value)| value).collect();
         let spec_info = vk::SpecializationInfo::default()
             .map_entries(&spec_entries)
-            .data(bytemuck::cast_slice(spec_data));
+            .data(bytemuck::cast_slice(&spec_data));
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
@@ -145,17 +154,18 @@ pub(crate) fn build_compute_pipeline(
     Ok((ScopeGuard::into_inner(guard), pipeline))
 }
 
-/// Specialization constants (ids `0..len`) of the pipeline the
+/// Specialization constants `(id, value)` of the pipeline the
 /// dispatcher uses for a (kernel, variant, epilogue) triple.  The eager
 /// bounds-checked zero-epilogue fallbacks (`create_kernel`) set only
 /// ids 0..3; every lazily-built pipeline (`create_epilogue_pipeline`)
 /// also sets the epilogue ids its body declares (4..6, plus 7..8 for
-/// the fused-store row GEMVs).
+/// the fused-store row GEMVs).  Generated kernels append their tile
+/// specialization (`KernelSpec::spec`, ids 16+) in every case.
 pub(super) fn spec_data_for(
     kernel: &MatmulKernel,
     variant: KernelVariant,
     epilogue: EpilogueKey,
-) -> Vec<u32> {
+) -> Vec<(u32, u32)> {
     let spec_count = if epilogue.is_none() && variant == variant.fallback() {
         4
     } else if kernel.supports_store() {
@@ -176,7 +186,12 @@ pub(super) fn spec_data_for(
         epilogue.store_mode,
         epilogue.store_f16 as u32,
     ];
-    spec_data[..spec_count].to_vec()
+    spec_data[..spec_count]
+        .iter()
+        .enumerate()
+        .map(|(id, &value)| (id as u32, value))
+        .chain(kernel.spec_tail.iter().copied())
+        .collect()
 }
 
 /// Build one pipeline for a (kernel, base-variant, epilogue) triple.
@@ -189,8 +204,10 @@ pub(super) fn create_epilogue_pipeline(
     variant: KernelVariant,
     epilogue: EpilogueKey,
 ) -> Result<vk::Pipeline> {
-    create_specialized_pipeline(
+    create_specialized_pipeline_in(
         ctx,
+        ctx.pipeline_cache,
+        vk::PipelineCreateFlags::empty(),
         kernel.shader_module,
         kernel.pipeline_layout,
         &spec_data_for(kernel, variant, epilogue),
@@ -214,6 +231,30 @@ pub(super) unsafe fn destroy_kernel(ctx: &Arc<VulkanContext>, kernel: MatmulKern
     }
 }
 
+/// A kernel whose pipelines are ALL built on first use: only the
+/// shader module is created here and every eager variant slot stays
+/// null (`MatmulPipeline::pipeline_for_epilogue` then takes the lazy
+/// path for every variant).  For opt-in families whose eager fallbacks
+/// would only add cold-start compile time.
+pub(super) fn create_kernel_lazy(
+    ctx: &Arc<VulkanContext>,
+    pipeline_layout: vk::PipelineLayout,
+    spec: &KernelSpec,
+) -> Result<MatmulKernel> {
+    let shader_module = create_shader_module(ctx, spec.spv, spec.name)?;
+    Ok(MatmulKernel {
+        name: spec.name,
+        tile_m: spec.tile_m,
+        tile_n: spec.tile_n,
+        tile_k: spec.tile_k,
+        shader_module,
+        variants: [vk::Pipeline::null(); KernelVariant::COUNT],
+        pipeline_layout,
+        uses_descriptors: spec.uses_descriptors,
+        spec_tail: spec.spec,
+    })
+}
+
 pub(super) fn create_kernel(
     ctx: &Arc<VulkanContext>,
     pipeline_layout: vk::PipelineLayout,
@@ -228,9 +269,14 @@ pub(super) fn create_kernel(
         // Only accumulate/alpha affect semantics.  Build the four fully
         // bounds-checked variants eagerly; aligned M/N/K specializations
         // are compiled on first use through `pipeline_for_epilogue`.
-        let spec_entries = spec_map_entries(4);
+        // Ids 0..3, then the kernel's own tile specialization (if any).
+        let ids: Vec<(u32, u32)> = (0..4u32)
+            .map(|id| (id, 0))
+            .chain(spec.spec.iter().copied())
+            .collect();
+        let spec_entries = spec_map_entries_for(&ids);
 
-        let spec_data: Vec<[u32; 4]> = (0..KernelVariant::FALLBACK_COUNT)
+        let spec_data: Vec<Vec<u32>> = (0..KernelVariant::FALLBACK_COUNT)
             .map(|i| {
                 let v = KernelVariant::from_index(i);
                 [
@@ -239,6 +285,9 @@ pub(super) fn create_kernel(
                     v.interior_only as u32,
                     v.k_multiple as u32,
                 ]
+                .into_iter()
+                .chain(spec.spec.iter().map(|&(_, value)| value))
+                .collect()
             })
             .collect();
 
@@ -298,6 +347,7 @@ pub(super) fn create_kernel(
             variants,
             pipeline_layout,
             uses_descriptors: spec.uses_descriptors,
+            spec_tail: spec.spec,
         })
     }
 }

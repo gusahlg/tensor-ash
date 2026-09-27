@@ -2,6 +2,7 @@
 //! and BDA / f16w family promotion.
 
 use super::catalog::KernelSelection;
+use super::precision::CoopmatAcc;
 
 /// Decode f16w row-GEMV tile: sixteen K-slices at tile_n=32 on deep-K
 /// / narrow-N / square-ish shapes; VCOLS=2 (tile_n=64) on wide-N
@@ -291,36 +292,146 @@ pub(crate) fn coopmat_tile_fallback(batch: u32, m: u32, n: u32) -> Option<Coopma
     })
 }
 
+/// Tile pick for the f16-accumulator classes (`F16`, `F16Promote`).
+/// Halving the accumulator registers (f16 fragments: 4 regs instead of
+/// 8 per 16x16) moves the optimum to the WIDER tiles: RTX 4060 a16
+/// interleaved A/B (`ml_bench ab`, 7 rounds, GPU median ms,
+/// benchmarks/campaign/f16acc.md):
+///
+/// | shape (acc16) | 64x64 | 128x64 | 64x128 | 128x128 |
+/// |---|---|---|---|---|
+/// | 512x2048x2048 | 0.140 | 0.140 | 0.123 | **0.121** |
+/// | 512x2560x2048 | 0.160 | **0.144** | 0.148 | 0.164 |
+/// | 512x5632x2048 | 0.346 | 0.310 | **0.287** | 0.321 |
+/// | 512x2048x5632 | 0.362 | 0.364 | **0.316** | 0.318 |
+/// | 2048³ | 0.478 | 0.448 | **0.416** | 0.425 |
+/// | 4096³ | 4.664 | 3.459 | 3.568 | **3.320** |
+///
+/// Promote ranks the same way (within ~2%).  Rule: 128x128 on grids of
+/// more than 256 128-tiles, else 64x128 whenever N % 128 == 0 (never
+/// more than 2.8% off the per-shape best above), else 128x64 / 64x64.
+/// `None` when M or N is not 64-aligned.
+///
+/// This rule is SM-count-agnostic: it was measured on the 4060 and
+/// confirmed end to end on the 3070 (pp512 1.28x), but no acc16
+/// candidate has been scored with [`CoopmatGrid::balance`] yet, and
+/// the acc16 tiles have no M-fast sibling, so [`coopmat_tile_acc`]
+/// does not call [`CoopmatGrid::m_fast_64`] for these classes.
+pub(crate) fn coopmat_tile_acc16(batch: u32, m: u32, n: u32) -> Option<CoopmatTile> {
+    if !m.is_multiple_of(64) || !n.is_multiple_of(64) {
+        return None;
+    }
+    let (m128, n128) = (m.is_multiple_of(128), n.is_multiple_of(128));
+    let tiles_128 = u64::from(batch)
+        .saturating_mul(u64::from(m / 128))
+        .saturating_mul(u64::from(n / 128));
+    Some(if m128 && n128 && tiles_128 > 256 {
+        CoopmatTile::T128
+    } else if n128 {
+        CoopmatTile::T64x128
+    } else if m128 {
+        CoopmatTile::T128x64
+    } else {
+        CoopmatTile::T64
+    })
+}
+
+/// Accumulator-aware tile dispatcher: `F32` takes the SM-aware
+/// [`coopmat_tile`] (grid + its rho table), the f16-accumulator classes
+/// take [`coopmat_tile_acc16`].  The class never changes here: the
+/// caller's policy picks the rule, the rule picks the tile.
+pub(crate) fn coopmat_tile_acc(
+    acc: CoopmatAcc,
+    batch: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    a16: bool,
+    device: CoopmatDevice,
+) -> Option<CoopmatTile> {
+    match acc {
+        CoopmatAcc::F32 => coopmat_tile(batch, m, n, k, a16, device),
+        CoopmatAcc::F16 | CoopmatAcc::F16Promote => coopmat_tile_acc16(batch, m, n),
+    }
+}
+
+/// Every coopmat1 kernel as (selection, tile, a16, accumulator): the
+/// single table the tile/acc mappings below read.  The 64x64 M-fast
+/// raster exists for the f32 accumulator only.
+const COOPMAT1: &[(KernelSelection, CoopmatTile, bool, CoopmatAcc)] = {
+    use CoopmatAcc::{F16, F16Promote, F32};
+    use CoopmatTile::*;
+    use KernelSelection as K;
+    &[
+        (K::F16wCoopmat, T128, false, F32),
+        (K::F16wA16Coopmat, T128, true, F32),
+        (K::F16wCoopmatM64, T64, false, F32),
+        (K::F16wA16CoopmatM64, T64, true, F32),
+        (K::F16wCoopmatM64Mfast, T64Mfast, false, F32),
+        (K::F16wA16CoopmatM64Mfast, T64Mfast, true, F32),
+        (K::F16wCoopmatM64N128, T64x128, false, F32),
+        (K::F16wA16CoopmatM64N128, T64x128, true, F32),
+        (K::F16wCoopmatM128N64, T128x64, false, F32),
+        (K::F16wA16CoopmatM128N64, T128x64, true, F32),
+        (K::F16wCoopmatAcc16, T128, false, F16),
+        (K::F16wA16CoopmatAcc16, T128, true, F16),
+        (K::F16wCoopmatM64Acc16, T64, false, F16),
+        (K::F16wA16CoopmatM64Acc16, T64, true, F16),
+        (K::F16wCoopmatM64N128Acc16, T64x128, false, F16),
+        (K::F16wA16CoopmatM64N128Acc16, T64x128, true, F16),
+        (K::F16wCoopmatM128N64Acc16, T128x64, false, F16),
+        (K::F16wA16CoopmatM128N64Acc16, T128x64, true, F16),
+        (K::F16wCoopmatAcc16p, T128, false, F16Promote),
+        (K::F16wA16CoopmatAcc16p, T128, true, F16Promote),
+        (K::F16wCoopmatM64Acc16p, T64, false, F16Promote),
+        (K::F16wA16CoopmatM64Acc16p, T64, true, F16Promote),
+        (K::F16wCoopmatM64N128Acc16p, T64x128, false, F16Promote),
+        (K::F16wA16CoopmatM64N128Acc16p, T64x128, true, F16Promote),
+        (K::F16wCoopmatM128N64Acc16p, T128x64, false, F16Promote),
+        (K::F16wA16CoopmatM128N64Acc16p, T128x64, true, F16Promote),
+    ]
+};
+
 impl CoopmatTile {
-    /// The f16w (f32-A) or a16 (f16-A/C) kernel for this tile.
+    /// The f16w (f32-A) or a16 (f16-A/C) f32-accumulate kernel for
+    /// this tile.
     pub(crate) fn selection(self, a16: bool) -> KernelSelection {
-        use KernelSelection as K;
-        match (self, a16) {
-            (Self::T128, false) => K::F16wCoopmat,
-            (Self::T128, true) => K::F16wA16Coopmat,
-            (Self::T64, false) => K::F16wCoopmatM64,
-            (Self::T64, true) => K::F16wA16CoopmatM64,
-            (Self::T64Mfast, false) => K::F16wCoopmatM64Mfast,
-            (Self::T64Mfast, true) => K::F16wA16CoopmatM64Mfast,
-            (Self::T64x128, false) => K::F16wCoopmatM64N128,
-            (Self::T64x128, true) => K::F16wA16CoopmatM64N128,
-            (Self::T128x64, false) => K::F16wCoopmatM128N64,
-            (Self::T128x64, true) => K::F16wA16CoopmatM128N64,
-        }
+        self.selection_acc(a16, CoopmatAcc::F32)
     }
 
-    /// The tile of a coopmat1 kernel selection (either A storage).
-    pub(crate) fn of_selection(selection: KernelSelection) -> Option<Self> {
-        use KernelSelection as K;
-        Some(match selection {
-            K::F16wCoopmat | K::F16wA16Coopmat => Self::T128,
-            K::F16wCoopmatM64 | K::F16wA16CoopmatM64 => Self::T64,
-            K::F16wCoopmatM64Mfast | K::F16wA16CoopmatM64Mfast => Self::T64Mfast,
-            K::F16wCoopmatM64N128 | K::F16wA16CoopmatM64N128 => Self::T64x128,
-            K::F16wCoopmatM128N64 | K::F16wA16CoopmatM128N64 => Self::T128x64,
-            _ => return None,
-        })
+    /// The kernel for this tile, A storage, and accumulator class.  The
+    /// f16-accumulator classes have no M-fast twin: `T64Mfast` maps to
+    /// the x-fast 64x64 kernel of that class (same tile, same numerics;
+    /// only the CTA raster differs).
+    pub(crate) fn selection_acc(self, a16: bool, acc: CoopmatAcc) -> KernelSelection {
+        let tile = if self == Self::T64Mfast && acc != CoopmatAcc::F32 {
+            Self::T64
+        } else {
+            self
+        };
+        COOPMAT1
+            .iter()
+            .find(|&&(_, t, is_a16, class)| t == tile && is_a16 == a16 && class == acc)
+            .map(|&(selection, ..)| selection)
+            .expect("COOPMAT1 covers every (tile, a16, acc)")
     }
+
+    /// The tile of a coopmat1 kernel selection (either A storage, any
+    /// accumulator).
+    pub(crate) fn of_selection(selection: KernelSelection) -> Option<Self> {
+        coopmat1_parts(selection).map(|(tile, ..)| tile)
+    }
+}
+
+/// (tile, a16, accumulator) of a coopmat1 kernel selection, `None` for
+/// every other kernel.
+pub(crate) fn coopmat1_parts(
+    selection: KernelSelection,
+) -> Option<(CoopmatTile, bool, CoopmatAcc)> {
+    COOPMAT1
+        .iter()
+        .find(|&&(s, ..)| s == selection)
+        .map(|&(_, tile, a16, acc)| (tile, a16, acc))
 }
 
 pub(crate) fn coopmat_selection(
@@ -573,6 +684,65 @@ mod bda_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn acc16_tile_rule_tracks_the_4060_ab() {
+        use CoopmatTile::*;
+        assert_eq!(coopmat_tile_acc16(1, 512, 2048), Some(T64x128));
+        assert_eq!(coopmat_tile_acc16(1, 512, 2560), Some(T64x128));
+        assert_eq!(coopmat_tile_acc16(1, 512, 5632), Some(T64x128));
+        assert_eq!(coopmat_tile_acc16(1, 2048, 2048), Some(T64x128));
+        assert_eq!(coopmat_tile_acc16(1, 4096, 4096), Some(T128));
+        assert_eq!(coopmat_tile_acc16(1, 192, 320), Some(T64));
+        assert_eq!(coopmat_tile_acc16(1, 256, 320), Some(T128x64));
+        assert_eq!(coopmat_tile_acc16(1, 192, 300), None);
+    }
+
+    #[test]
+    fn coopmat_tile_acc_dispatches_on_the_class() {
+        for device in [RTX4060, RTX3070, CoopmatDevice::default()] {
+            for (m, n, k) in [(512, 2048, 2048), (512, 5632, 2048), (4096, 4096, 4096)] {
+                for a16 in [false, true] {
+                    assert_eq!(
+                        coopmat_tile_acc(CoopmatAcc::F32, 1, m, n, k, a16, device),
+                        coopmat_tile(1, m, n, k, a16, device)
+                    );
+                    for acc in [CoopmatAcc::F16, CoopmatAcc::F16Promote] {
+                        assert_eq!(
+                            coopmat_tile_acc(acc, 1, m, n, k, a16, device),
+                            coopmat_tile_acc16(1, m, n)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coopmat1_table_is_a_bijection_over_tile_a16_acc() {
+        use CoopmatTile::*;
+        let mut seen = std::collections::HashSet::new();
+        for tile in [T128, T64, T64Mfast, T64x128, T128x64] {
+            for a16 in [false, true] {
+                for acc in [CoopmatAcc::F32, CoopmatAcc::F16, CoopmatAcc::F16Promote] {
+                    let selection = tile.selection_acc(a16, acc);
+                    let spec = &super::super::KERNEL_SPECS[selection.index().unwrap()];
+                    assert_eq!(spec.accumulator(), acc, "{}", spec.name);
+                    assert_eq!(spec.a_f16(), a16, "{}", spec.name);
+                    assert!(spec.name.contains("coopmat"), "{}", spec.name);
+                    if tile == T64Mfast && acc != CoopmatAcc::F32 {
+                        // No f16-accumulator M-fast twin: the x-fast 64x64.
+                        assert_eq!(selection, T64.selection_acc(a16, acc));
+                        continue;
+                    }
+                    assert!(seen.insert(selection), "{selection:?} listed twice");
+                    assert_eq!(coopmat1_parts(selection), Some((tile, a16, acc)));
+                }
+            }
+        }
+        assert_eq!(seen.len(), COOPMAT1.len());
+        assert_eq!(coopmat1_parts(KernelSelection::LargeBdaV4), None);
     }
 
     #[test]

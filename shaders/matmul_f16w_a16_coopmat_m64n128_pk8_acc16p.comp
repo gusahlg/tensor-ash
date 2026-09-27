@@ -1,0 +1,18 @@
+#version 460
+// Promote chunk-length sweep (E1): the a16 64x128x32 promote kernel
+// with PROMOTE_KT = 8 (f16 partials over 256 K, then added into the f32
+// accumulators) instead of the default 4 (128 K).  Pin-only
+// (ML_KERNEL / ml_bench ab); never routed.
+
+#define A_F16 1
+#define C_F16 1
+#define ACC_F16_PROMOTE 1
+#define PROMOTE_KT 8u
+#define BM 64u
+#define BN 128u
+#define THREADS 128u
+#define WM 32u
+#define WN 64u
+#define SG_N 2u
+
+#include "matmul_coopmat_kernel.glsl"

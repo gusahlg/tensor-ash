@@ -1,0 +1,5 @@
+test coopmat_acc::coopmat_acc_a16_gemms_stay_within_the_class_budget ... ok
+test coopmat_acc::coopmat_acc_alpha_accumulate_and_graph_path_stay_within_budget ... ok
+test coopmat_acc::coopmat_acc_f32_activation_route_stays_within_the_class_budget ... ok
+test coopmat_acc::coopmat_acc_policy_routes_to_the_f16_accumulator_twins ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 138 filtered out; finished in 3.20s

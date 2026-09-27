@@ -44,7 +44,7 @@ use ash::vk;
 use parking_lot::{Condvar, Mutex};
 
 use crate::context::{DeviceKind, VulkanContext};
-use crate::pipeline::MatmulPipeline;
+use crate::pipeline::{CoopmatAcc, MatmulPipeline};
 
 use slot::Slot;
 use splitk2::SplitK2Pipeline;
@@ -87,6 +87,13 @@ pub struct ExecutorConfig {
     pub n_slots: usize,
     pub max_calls_per_submit: u32,
     pub tune: bool,
+    /// Accumulator precision of auto-routed coopmat1 (tensor-core)
+    /// GEMMs.  `F32` (default) keeps today's exact-f32 accumulation;
+    /// `F16` / `F16Promote` opt into the f16-accumulator twins (see
+    /// [`CoopmatAcc`]).  Explicit `ML_KERNEL` pins are unaffected.  On
+    /// devices without an f16-accumulator coopmat configuration the
+    /// policy degrades to `F32` with a warning.
+    pub coopmat_acc: CoopmatAcc,
 }
 
 impl Default for ExecutorConfig {
@@ -95,6 +102,7 @@ impl Default for ExecutorConfig {
             n_slots: 2,
             max_calls_per_submit: 64,
             tune: false,
+            coopmat_acc: CoopmatAcc::F32,
         }
     }
 }
@@ -120,6 +128,9 @@ pub struct Executor {
     /// default — persisted winners from previous tuned runs still
     /// apply either way.
     tune_enabled: bool,
+    /// Effective coopmat1 accumulator policy (`ExecutorConfig::
+    /// coopmat_acc`, degraded to `F32` where unsupported).
+    coopmat_acc: CoopmatAcc,
 }
 
 /// Complete validated route for one op shape, resolved once per
@@ -139,6 +150,11 @@ pub(crate) struct OpPlan {
 }
 
 impl Executor {
+    /// The effective coopmat1 accumulator policy of this executor.
+    pub fn coopmat_acc(&self) -> CoopmatAcc {
+        self.coopmat_acc
+    }
+
     /// Report the kernel and optional tuned split-K2 route a plain,
     /// non-accumulating matmul (f32 B) would use. Useful for benchmark
     /// diagnostics.
@@ -175,9 +191,13 @@ impl Executor {
     /// == 0, K % 32 == 0): always an a16 coopmat tile, chosen by the
     /// SM-aware heuristic unless the pipeline pins a coopmat tile.
     pub fn dispatch_info_a16(&self, batch: u32, m: u32, n: u32, k: u32) -> DispatchInfo {
-        let kernel = self
-            .pipeline
-            .kernel_at(self.pipeline.a16_coopmat_index(batch, m, n, k));
+        let kernel = self.pipeline.kernel_at(self.pipeline.a16_coopmat_index(
+            batch,
+            m,
+            n,
+            k,
+            self.coopmat_acc,
+        ));
         DispatchInfo {
             kernel: kernel.name,
             tile: [kernel.tile_m, kernel.tile_n, kernel.tile_k],
@@ -218,6 +238,11 @@ impl Executor {
         splitk2_eligible: bool,
     ) -> OpPlan {
         let (kernel, tuned) = self.pipeline.route(batch, m, n, k, b_f16);
+        // f16w coopmat routes honor the accumulator policy (f32-B
+        // routes never land on coopmat, so this is a no-op there).
+        let kernel = self
+            .pipeline
+            .with_coopmat_acc(kernel, batch, m, n, self.coopmat_acc);
         // Split-K2's stage-1 kernels read f32 B only, so f16-weight
         // calls always take the data-parallel route.
         let splitk2 = (splitk2_eligible
@@ -271,9 +296,13 @@ impl Executor {
                 );
             }
             return Ok(OpPlan {
-                kernel: self
-                    .pipeline
-                    .a16_coopmat_index(dims.batch, dims.m, dims.n, dims.k),
+                kernel: self.pipeline.a16_coopmat_index(
+                    dims.batch,
+                    dims.m,
+                    dims.n,
+                    dims.k,
+                    self.coopmat_acc,
+                ),
                 splitk2: None,
             });
         }
@@ -358,6 +387,9 @@ impl Executor {
         let tune = std::env::var("ML_TUNE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        // `ML_COOPMAT_ACC=f16|f16p` opts env-configured executors
+        // into the f16-accumulator coopmat twins (default f32).
+        let coopmat_acc = CoopmatAcc::from_env()?;
         Self::new_with_config(
             ctx,
             pipeline,
@@ -365,6 +397,7 @@ impl Executor {
                 n_slots,
                 max_calls_per_submit,
                 tune,
+                coopmat_acc,
             },
         )
     }
@@ -379,6 +412,25 @@ impl Executor {
         }
         let n_slots = config.n_slots.max(1);
         let max_calls_per_submit = config.max_calls_per_submit.max(1);
+        let coopmat_acc = if config.coopmat_acc != CoopmatAcc::F32
+            && ctx.coopmat_enabled
+            && !ctx.coopmat_f16_acc_enabled
+        {
+            log::warn!(
+                "tensor-ash: coopmat accumulator policy {} unsupported on this device \
+                 (no 16x16x16 f16-accumulator configuration); using f32",
+                config.coopmat_acc.as_str()
+            );
+            CoopmatAcc::F32
+        } else {
+            config.coopmat_acc
+        };
+        if coopmat_acc != CoopmatAcc::F32 {
+            log::info!(
+                "tensor-ash: coopmat accumulator policy: {}",
+                coopmat_acc.as_str()
+            );
+        }
         let mut slots = VecDeque::with_capacity(n_slots);
         for _ in 0..n_slots {
             slots.push_back(Slot::create(
@@ -396,6 +448,7 @@ impl Executor {
             split_k2: OnceLock::new(),
             elementwise: OnceLock::new(),
             tune_enabled: config.tune,
+            coopmat_acc,
         })
     }
 }

@@ -116,6 +116,7 @@ pub unsafe extern "C" fn ta_executor_create_v2(
                 n_slots,
                 max_calls_per_submit,
                 tune: tune != 0,
+                ..ExecutorConfig::default()
             },
         )?;
         Ok(Box::into_raw(Box::new(ta_executor {

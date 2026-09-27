@@ -1,0 +1,9 @@
+round 1 mode f32 prefill timing: 31.949 ms GPU vs 31.994 ms wall (0.045 ms host) | pp512       |    512 |    0.032 | 16002.89 | 
+round 1 mode f16 prefill timing: 24.541 ms GPU vs 24.598 ms wall (0.057 ms host) | pp512       |    512 |    0.025 | 20815.07 | 
+round 1 mode promote prefill timing: 56.193 ms GPU vs 57.606 ms wall (1.413 ms host) | pp512       |    512 |    0.058 |  8888.01 | 
+round 2 mode promote prefill timing: 53.123 ms GPU vs 54.519 ms wall (1.397 ms host) | pp512       |    512 |    0.055 |  9391.20 | 
+round 2 mode f16 prefill timing: 54.811 ms GPU vs 55.193 ms wall (0.381 ms host) | pp512       |    512 |    0.055 |  9276.62 | 
+round 2 mode f32 prefill timing: 73.500 ms GPU vs 74.863 ms wall (1.363 ms host) | pp512       |    512 |    0.075 |  6839.17 | 
+round 3 mode f32 prefill timing: 72.351 ms GPU vs 73.612 ms wall (1.262 ms host) | pp512       |    512 |    0.074 |  6955.37 | 
+round 3 mode f16 prefill timing: 25.097 ms GPU vs 25.157 ms wall (0.059 ms host) | pp512       |    512 |    0.025 | 20352.55 | 
+round 3 mode promote prefill timing: 25.826 ms GPU vs 25.867 ms wall (0.041 ms host) | pp512       |    512 |    0.026 | 19793.34 | 

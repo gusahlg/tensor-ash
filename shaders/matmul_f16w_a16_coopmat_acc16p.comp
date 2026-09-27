@@ -1,0 +1,12 @@
+#version 460
+// f16-activation (A/B/C f16) coopmat tile 128x128x32 on 256 threads;
+// f16 partial fragments over PROMOTE_KT*32 K, promoted into f32
+// accumulators.  Opt-in numerics class: routed only when the
+// executor's coopmat_acc policy (ExecutorConfig / ML_COOPMAT_ACC) or
+// ML_KERNEL asks for it.
+
+#define A_F16 1
+#define C_F16 1
+#define ACC_F16_PROMOTE 1
+
+#include "matmul_coopmat_kernel.glsl"

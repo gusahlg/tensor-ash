@@ -54,7 +54,7 @@ pub use matmul::{
     MatrixShape, RunStats, pack_f16w_row_tiles,
 };
 pub use pipeline::{
-    EpilogueKey, KERNEL_SPECS, KernelSelection, KernelSpec, KernelVariant, MATMUL_FLAG_NORM_A,
-    MatmulKernel, MatmulPipeline, MatmulPushConstants, f16w_row_tile_n,
+    CoopmatAcc, EpilogueKey, KERNEL_SPECS, KernelSelection, KernelSpec, KernelVariant,
+    MATMUL_FLAG_NORM_A, MatmulKernel, MatmulPipeline, MatmulPushConstants, f16w_row_tile_n,
 };
 pub use tensor::Tensor;

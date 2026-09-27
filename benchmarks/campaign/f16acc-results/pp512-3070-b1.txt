@@ -1,0 +1,9 @@
+round 1 mode f32 [2026-09-26T16:26:33Z INFO  llama_ash] prefill timing: 31.474 ms GPU vs 31.605 ms wall (0.131 ms host) | pp512       |    512 |    0.032 | 16199.79 | 
+round 1 mode f16 [2026-09-26T16:26:51Z INFO  llama_ash] prefill timing: 24.522 ms GPU vs 24.622 ms wall (0.100 ms host) | pp512       |    512 |    0.025 | 20794.13 | 
+round 1 mode promote [2026-09-26T16:27:08Z INFO  llama_ash] prefill timing: 24.536 ms GPU vs 24.674 ms wall (0.138 ms host) | pp512       |    512 |    0.025 | 20750.36 | 
+round 2 mode promote [2026-09-26T16:27:25Z INFO  llama_ash] prefill timing: 24.548 ms GPU vs 24.701 ms wall (0.153 ms host) | pp512       |    512 |    0.025 | 20728.32 | 
+round 2 mode f16 [2026-09-26T16:27:42Z INFO  llama_ash] prefill timing: 24.795 ms GPU vs 24.924 ms wall (0.129 ms host) | pp512       |    512 |    0.025 | 20542.63 | 
+round 2 mode f32 [2026-09-26T16:27:59Z INFO  llama_ash] prefill timing: 32.105 ms GPU vs 32.245 ms wall (0.139 ms host) | pp512       |    512 |    0.032 | 15878.58 | 
+round 3 mode f32 [2026-09-26T16:28:17Z INFO  llama_ash] prefill timing: 32.080 ms GPU vs 32.208 ms wall (0.128 ms host) | pp512       |    512 |    0.032 | 15896.72 | 
+round 3 mode f16 [2026-09-26T16:28:35Z INFO  llama_ash] prefill timing: 24.798 ms GPU vs 24.927 ms wall (0.130 ms host) | pp512       |    512 |    0.025 | 20539.85 | 
+round 3 mode promote [2026-09-26T16:28:52Z INFO  llama_ash] prefill timing: 24.572 ms GPU vs 24.710 ms wall (0.138 ms host) | pp512       |    512 |    0.025 | 20720.31 | 

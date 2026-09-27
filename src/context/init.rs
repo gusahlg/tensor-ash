@@ -248,6 +248,30 @@ pub(super) fn create(
             && coopmat_present
             && coopmat_query.cooperative_matrix == vk::TRUE
             && vulkan12_query.vulkan_memory_model == vk::TRUE;
+        // f16-accumulator coopmat kernels (`*_acc16*`) need a 16x16x16
+        // subgroup-scope configuration with an f16 C/Result (HMMA.F16 on
+        // NVIDIA).  Queried rather than assumed: the extension only
+        // guarantees that *some* configuration exists.
+        let coopmat_f16_acc = enable_coopmat && {
+            let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
+            cm.get_physical_device_cooperative_matrix_properties(physical_device)
+                .map(|props| {
+                    props.iter().any(|p| {
+                        p.m_size == 16
+                            && p.n_size == 16
+                            && p.k_size == 16
+                            && p.a_type == vk::ComponentTypeKHR::FLOAT16
+                            && p.b_type == vk::ComponentTypeKHR::FLOAT16
+                            && p.c_type == vk::ComponentTypeKHR::FLOAT16
+                            && p.result_type == vk::ComponentTypeKHR::FLOAT16
+                            && p.scope == vk::ScopeKHR::SUBGROUP
+                    })
+                })
+                .unwrap_or(false)
+        };
+        if enable_coopmat {
+            log::info!("tensor-ash: coopmat f16-accumulate 16x16x16: {coopmat_f16_acc}");
+        }
         // VK_NV_cooperative_matrix2 (workgroup-scope matrices, tensor
         // addressing, reductions, per-element ops) for the cm2 flash
         // kernels.  Unknown to ash 0.38, so the feature/property
@@ -460,6 +484,7 @@ pub(super) fn create(
             buffer_device_address_enabled: buffer_device_address_supported,
             f16_storage_enabled: f16_storage_supported,
             coopmat_enabled: enable_coopmat,
+            coopmat_f16_acc_enabled: coopmat_f16_acc,
             coopmat2_enabled: enable_coopmat2,
             memory_model_device_scope_enabled: memory_model_device_scope,
             pipeline_executable_info_enabled: enable_exec_info,

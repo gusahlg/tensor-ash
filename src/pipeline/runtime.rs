@@ -24,6 +24,10 @@ pub struct MatmulKernel {
     /// `false` if it dereferences them through `buffer_reference`
     /// pointers in the push constants. Mirrors `KernelSpec::uses_descriptors`.
     pub uses_descriptors: bool,
+    /// Tile specialization `(constant_id, value)` pairs appended to
+    /// every pipeline of a generated (spec-constant module) kernel;
+    /// empty for literal kernels.  Mirrors `KernelSpec::spec`.
+    pub spec_tail: &'static [(u32, u32)],
 }
 
 impl MatmulKernel {

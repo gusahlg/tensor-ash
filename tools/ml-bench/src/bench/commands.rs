@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tensor_ash::{
-    DeviceKind, Executor, MatmulCall, MatmulOp, Tensor, VulkanContext, f16w_row_tile_n,
-    pack_f16w_row_tiles,
+    CoopmatAcc, DeviceKind, Executor, KERNEL_SPECS, MatmulCall, MatmulOp, Tensor, VulkanContext,
+    f16w_row_tile_n, pack_f16w_row_tiles,
 };
 use tensor_ash_test_support::{cpu_bmm, fill_det, max_abs_err, tolerance};
 
@@ -319,7 +319,14 @@ pub(super) fn run_case_warm(
             stats.gpu_time_ns.map(|ns| ns as f64 / 1e6),
         ));
     }
-    validate_samples(exec, &c, &h_a, &h_b, bsz, m, n, k, case.a16)?;
+    let routed = if case.packed_b {
+        exec.dispatch_info_packed(n, k).kernel
+    } else if case.a16 {
+        exec.dispatch_info_a16(bsz, m, n, k).kernel
+    } else {
+        exec.dispatch_info_for(bsz, m, n, k, case.b_f16).kernel
+    };
+    validate_samples(exec, &c, &h_a, &h_b, bsz, m, n, k, case.a16, routed)?;
     let wall_ms = SampleSummary::new(samples.iter().map(|(wall, _)| *wall))
         .context("benchmark produced no wall-time samples")?;
     let gpu_ms = SampleSummary::new(samples.iter().filter_map(|(_, gpu)| *gpu));
@@ -363,6 +370,40 @@ pub(super) fn run_case_warm(
 /// `c_f16` widens the budget by the f16 store's rounding (2^-11 relative,
 /// doubled like the accumulation term).
 #[allow(clippy::too_many_arguments)]
+/// Extra per-sample error budget of an f16-accumulator coopmat route:
+/// one f16 rounding (2^-11 relative) of a running sum of typical size
+/// `l2 = sqrt(sum_i (a_i b_i)^2)` per 16-deep MMA, grown linearly in
+/// the MMA count so even round-toward-zero accumulation (a biased
+/// walk) stays inside it — a smoke gate against wrong-tile / garbage
+/// output (errors of order `l2` itself), not a precision spec; the
+/// measured error lives in `benchmarks/campaign/f16acc.md`.
+pub(super) fn acc16_budget(acc: CoopmatAcc, promote_k: u32, k: u32, l2: f32) -> f32 {
+    match acc {
+        CoopmatAcc::F32 => 0.0,
+        // Pure f16: K/16 roundings of the full running sum.
+        CoopmatAcc::F16 => (k as f32 / 16.0) * 2.0f32.powi(-11) * l2,
+        // Promote with C-deep chunks: C/16 roundings per chunk partial
+        // (|chunk| ~ l2*sqrt(C/K)), K/C chunks added in f32:
+        // sqrt(K*C)/16 roundings of l2 (= 8 sqrt(K/128) at C = 128).
+        CoopmatAcc::F16Promote => {
+            let c = promote_k.min(k) as f32;
+            (k as f32 * c).sqrt() / 16.0 * 2.0f32.powi(-11) * l2
+        }
+    }
+}
+
+/// Accumulator class and promote chunk depth (K per f16 partial) of a
+/// routed kernel, for [`acc16_budget`].
+pub(super) fn kernel_acc(kernel: &str) -> (CoopmatAcc, u32) {
+    let chunk = KERNEL_SPECS
+        .iter()
+        .find(|spec| spec.name == kernel)
+        .and_then(|spec| spec.promote_chunk_k())
+        .unwrap_or(128);
+    (CoopmatAcc::of_kernel_name(kernel), chunk)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn validate_samples(
     exec: &Executor,
     c: &Tensor,
@@ -373,8 +414,10 @@ pub(super) fn validate_samples(
     n: u32,
     k: u32,
     c_f16: bool,
+    kernel: &str,
 ) -> Result<()> {
     const CHECKS: usize = 8;
+    let (acc, promote_k) = kernel_acc(kernel);
     let mut output = vec![0.0; host_len(&[batch, m, n])?];
     exec.download(c, &mut output)?;
     let checks = output.len().min(CHECKS);
@@ -392,19 +435,20 @@ pub(super) fn validate_samples(
         let within_plane = index % plane;
         let row = within_plane / n as usize;
         let col = within_plane % n as usize;
-        let expected = (0..k as usize)
-            .map(|inner| {
-                a[(batch_index * m as usize + row) * k as usize + inner]
-                    * b[(batch_index * k as usize + inner) * n as usize + col]
-            })
-            .sum::<f32>();
+        let products = (0..k as usize).map(|inner| {
+            a[(batch_index * m as usize + row) * k as usize + inner]
+                * b[(batch_index * k as usize + inner) * n as usize + col]
+        });
+        let expected = products.clone().sum::<f32>();
+        let l2 = products.map(|p| p * p).sum::<f32>().sqrt();
         // Excess error over this sample's budget; the worst one fails.
         let budget = 2.0 * tolerance(k)
             + if c_f16 {
                 expected.abs() * 2.0f32.powi(-10)
             } else {
                 0.0
-            };
+            }
+            + acc16_budget(acc, promote_k, k, l2);
         let error = (output[index] - expected).abs();
         if !error.is_finite() || error - budget > max_error - max_budget {
             max_error = error;

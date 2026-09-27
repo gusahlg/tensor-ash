@@ -14,6 +14,10 @@ pub struct KernelSpec {
     pub tile_k: u32,
     pub spv: &'static [u8],
     pub uses_descriptors: bool,
+    /// Tile specialization `(constant_id, value)` pairs for kernels
+    /// built from a spec-constant module (the `*_coopmat_g_*` generator
+    /// configs, ids 16-23); empty for literal wrappers.
+    pub spec: &'static [(u32, u32)],
 }
 
 impl KernelSpec {
@@ -30,13 +34,43 @@ impl KernelSpec {
         self.name.contains("_a16_")
     }
 
+    /// Accumulator class: `F16` / `F16Promote` for the `*_acc16` /
+    /// `*_acc16p` coopmat twins, `F32` for everything else.
+    #[inline]
+    pub fn accumulator(&self) -> super::CoopmatAcc {
+        super::CoopmatAcc::of_kernel_name(self.name)
+    }
+
+    /// K elements per f16 partial of an `_acc16p` (promote) kernel:
+    /// `PROMOTE_KT * tile_k`, read from a `_pk<KT>_` name tag
+    /// (default PROMOTE_KT = 4, i.e. 128 K on the BK = 32 tiles).
+    /// `None` for every other accumulator class.
+    pub fn promote_chunk_k(&self) -> Option<u32> {
+        if self.accumulator() != super::CoopmatAcc::F16Promote {
+            return None;
+        }
+        let kt = self
+            .name
+            .split('_')
+            .find_map(|part| part.strip_prefix("pk").and_then(|v| v.parse::<u32>().ok()))
+            .unwrap_or(4);
+        Some(kt * self.tile_k)
+    }
+
     /// Total workgroup (shared) memory the shader declares, in bytes —
     /// the number drivers check against `maxComputeSharedMemorySize`
     /// (VUID-RuntimeSpirv-Workgroup-06530).  Read from the embedded
     /// SPIR-V so the budget gate stays exact for every kernel without
     /// maintaining a per-family size formula next to the GLSL.
     pub fn shared_memory_bytes(&self) -> u32 {
-        workgroup_shared_bytes(self.spv)
+        workgroup_shared_bytes(self.spv, self.spec)
+    }
+
+    /// Whether this is a generator config (a spec-constant module plus
+    /// a tile specialization) rather than a literal wrapper.
+    #[inline]
+    pub fn is_generated(&self) -> bool {
+        !self.spec.is_empty()
     }
 }
 
@@ -44,7 +78,17 @@ impl KernelSpec {
 /// SPIR-V module.  Sizes use natural (scalar/vector/array) layout,
 /// which matches how glslang emits shared declarations; no kernel puts
 /// structs in shared memory, so struct padding is not modeled.
-fn workgroup_shared_bytes(spv: &[u8]) -> u32 {
+///
+/// Spec-constant modules size their shared arrays with
+/// `OpSpecConstantOp` expressions: `overrides` gives the specialization
+/// `(constant_id, value)` pairs, every other spec constant takes its
+/// default, and the integer ops glslang emits for array extents (IAdd,
+/// ISub, IMul, UDiv, UMod, shifts) are folded.  A Workgroup variable
+/// whose size cannot be evaluated panics with its id rather than being
+/// silently under-counted (the budget gate depends on this number).
+fn workgroup_shared_bytes(spv: &[u8], overrides: &[(u32, u32)]) -> u32 {
+    const OP_DECORATE: u32 = 71;
+    const DECORATION_SPEC_ID: u32 = 1;
     const OP_TYPE_INT: u32 = 21;
     const OP_TYPE_FLOAT: u32 = 22;
     const OP_TYPE_VECTOR: u32 = 23;
@@ -53,8 +97,17 @@ fn workgroup_shared_bytes(spv: &[u8]) -> u32 {
     const OP_TYPE_POINTER: u32 = 32;
     const OP_CONSTANT: u32 = 43;
     const OP_SPEC_CONSTANT: u32 = 50;
+    const OP_SPEC_CONSTANT_OP: u32 = 52;
     const OP_VARIABLE: u32 = 59;
     const STORAGE_CLASS_WORKGROUP: u32 = 4;
+    // OpSpecConstantOp operations over 32-bit integers.
+    const OP_IADD: u32 = 128;
+    const OP_ISUB: u32 = 130;
+    const OP_IMUL: u32 = 132;
+    const OP_UDIV: u32 = 134;
+    const OP_UMOD: u32 = 137;
+    const OP_SHIFT_RIGHT_LOGICAL: u32 = 194;
+    const OP_SHIFT_LEFT_LOGICAL: u32 = 196;
 
     let words: Vec<u32> = spv
         .as_chunks::<4>()
@@ -65,6 +118,7 @@ fn workgroup_shared_bytes(spv: &[u8]) -> u32 {
     // build.rs embeds glslc output, which is always little-endian.
     assert_eq!(words[0], 0x0723_0203, "embedded SPIR-V has bad magic");
 
+    let mut spec_ids: HashMap<u32, u32> = HashMap::new(); // result id -> SpecId
     let mut type_sizes: HashMap<u32, u32> = HashMap::new(); // type id -> bytes
     let mut constants: HashMap<u32, u32> = HashMap::new(); // constant id -> value
     let mut workgroup_pointees: HashMap<u32, u32> = HashMap::new(); // pointer type id -> pointee
@@ -79,6 +133,10 @@ fn workgroup_shared_bytes(spv: &[u8]) -> u32 {
         assert!(word_count > 0, "malformed SPIR-V instruction");
         let operands = &words[pc + 1..pc + word_count];
         match opcode {
+            // [target, decoration, literal...]
+            OP_DECORATE if operands[1] == DECORATION_SPEC_ID => {
+                spec_ids.insert(operands[0], operands[2]);
+            }
             // [result, width-in-bits, ...]
             OP_TYPE_INT | OP_TYPE_FLOAT => {
                 type_sizes.insert(operands[0], operands[1] / 8);
@@ -90,8 +148,6 @@ fn workgroup_shared_bytes(spv: &[u8]) -> u32 {
             }
             // [result, element type, length constant id]
             OP_TYPE_ARRAY => {
-                // Shared arrays are sized by compile-time macros, so the
-                // length is a plain (or spec-default) constant.
                 if let (Some(&element), Some(&length)) =
                     (type_sizes.get(&operands[1]), constants.get(&operands[2]))
                 {
@@ -111,13 +167,48 @@ fn workgroup_shared_bytes(spv: &[u8]) -> u32 {
                 workgroup_pointees.insert(operands[0], operands[2]);
             }
             // [result type, result, literal value...]
-            OP_CONSTANT | OP_SPEC_CONSTANT => {
+            OP_CONSTANT => {
                 constants.insert(operands[1], operands[2]);
+            }
+            // [result type, result, default literal...]: the override
+            // for its SpecId wins.
+            OP_SPEC_CONSTANT => {
+                let value = spec_ids
+                    .get(&operands[1])
+                    .and_then(|sid| overrides.iter().find(|&&(id, _)| id == *sid))
+                    .map_or(operands[2], |&(_, value)| value);
+                constants.insert(operands[1], value);
+            }
+            // [result type, result, opcode, operand ids...]
+            OP_SPEC_CONSTANT_OP if word_count == 6 => {
+                let (op, lhs, rhs) = (operands[2], operands[3], operands[4]);
+                if let (Some(&x), Some(&y)) = (constants.get(&lhs), constants.get(&rhs)) {
+                    let value = match op {
+                        OP_IADD => Some(x.wrapping_add(y)),
+                        OP_ISUB => Some(x.wrapping_sub(y)),
+                        OP_IMUL => Some(x.wrapping_mul(y)),
+                        OP_UDIV if y != 0 => Some(x / y),
+                        OP_UMOD if y != 0 => Some(x % y),
+                        OP_SHIFT_RIGHT_LOGICAL => Some(x.checked_shr(y).unwrap_or(0)),
+                        OP_SHIFT_LEFT_LOGICAL => Some(x.checked_shl(y).unwrap_or(0)),
+                        _ => None,
+                    };
+                    if let Some(value) = value {
+                        constants.insert(operands[1], value);
+                    }
+                }
             }
             // [result (pointer) type, result, storage class, ...]
             OP_VARIABLE if operands[2] == STORAGE_CLASS_WORKGROUP => {
                 let pointee = workgroup_pointees[&operands[0]];
-                total += type_sizes[&pointee];
+                let size = type_sizes.get(&pointee).unwrap_or_else(|| {
+                    panic!(
+                        "workgroup variable %{} has a size the evaluator cannot fold \
+                         (unsupported OpSpecConstantOp in its array extent)",
+                        operands[1]
+                    )
+                });
+                total += size;
             }
             _ => {}
         }
@@ -135,10 +226,11 @@ macro_rules! kernel_catalog {
                 $name:literal, $tile_m:literal, $tile_n:literal, $tile_k:literal,
                 $shader:literal, $uses_descriptors:literal,
                 [$($alias:literal),+ $(,)?]
+                $(, spec [$(($sid:literal, $sval:literal)),* $(,)?])?
             )
         ),+ $(,)?
     ) => {
-        #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+        #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
         pub enum KernelSelection {
             Auto,
             $($variant),+
@@ -154,6 +246,7 @@ macro_rules! kernel_catalog {
                 tile_k: $tile_k,
                 spv: include_bytes!(concat!(env!("OUT_DIR"), "/", $shader)),
                 uses_descriptors: $uses_descriptors,
+                spec: &[$($(($sid, $sval)),*)?],
             }),+
         ];
 
@@ -173,6 +266,13 @@ macro_rules! kernel_catalog {
                 Self::parse(&value)
             }
 
+            /// The concrete selection at registry `index` (inverse of
+            /// [`Self::index`]).
+            #[inline]
+            pub(crate) fn from_index(index: usize) -> Option<Self> {
+                CONCRETE_SELECTIONS.get(index).copied()
+            }
+
             /// Index into `KERNEL_SPECS` / `MatmulPipeline::kernels`.
             /// `Auto` has no fixed kernel and returns `None`.
             #[inline]
@@ -184,8 +284,9 @@ macro_rules! kernel_catalog {
             }
         }
 
-        #[cfg(test)]
-        const CONCRETE_SELECTIONS: &[KernelSelection] = &[
+        /// Every concrete selection in registry order
+        /// (`CONCRETE_SELECTIONS[i].index() == Some(i)`).
+        pub(crate) const CONCRETE_SELECTIONS: &[KernelSelection] = &[
             $(KernelSelection::$variant),+
         ];
 
@@ -377,6 +478,220 @@ kernel_catalog! {
     F16wA16CoopmatM64Mfast => ("f16w_a16_coopmat_m64n64_mfast", 64, 64, 32,
         "matmul_f16w_a16_coopmat_m64n64_mfast.spv", false,
         ["f16w_a16_coopmat_m64n64_mfast", "a16_coopmat_m64_mfast"]),
+    // f16-ACCUMULATOR twins of the eight coopmat1 kernels above
+    // (`_acc16`: HMMA.*.F16 end to end; `_acc16p`: f16 partials over
+    // 128 K promoted into f32 accumulators).  A different numerics
+    // class: never picked by the heuristic or the tuner, only through
+    // the executor's `coopmat_acc` policy (ExecutorConfig /
+    // ML_COOPMAT_ACC) or an explicit ML_KERNEL pin.  Slots are empty
+    // unless `VulkanContext::coopmat_f16_acc_enabled`; their pipelines
+    // are built on first use (no eager fallbacks).
+    F16wCoopmatAcc16 => ("f16w_coopmat_acc16", 128, 128, 32,
+        "matmul_f16w_coopmat_acc16.spv", false, ["f16w_coopmat_acc16", "coopmat_acc16"]),
+    F16wCoopmatAcc16p => ("f16w_coopmat_acc16p", 128, 128, 32,
+        "matmul_f16w_coopmat_acc16p.spv", false, ["f16w_coopmat_acc16p", "coopmat_acc16p"]),
+    F16wCoopmatM64Acc16 => ("f16w_coopmat_m64n64_acc16", 64, 64, 32,
+        "matmul_f16w_coopmat_m64n64_acc16.spv", false, ["f16w_coopmat_m64n64_acc16", "coopmat_m64_acc16"]),
+    F16wCoopmatM64Acc16p => ("f16w_coopmat_m64n64_acc16p", 64, 64, 32,
+        "matmul_f16w_coopmat_m64n64_acc16p.spv", false, ["f16w_coopmat_m64n64_acc16p", "coopmat_m64_acc16p"]),
+    F16wCoopmatM64N128Acc16 => ("f16w_coopmat_m64n128_acc16", 64, 128, 32,
+        "matmul_f16w_coopmat_m64n128_acc16.spv", false, ["f16w_coopmat_m64n128_acc16", "coopmat_m64n128_acc16"]),
+    F16wCoopmatM64N128Acc16p => ("f16w_coopmat_m64n128_acc16p", 64, 128, 32,
+        "matmul_f16w_coopmat_m64n128_acc16p.spv", false, ["f16w_coopmat_m64n128_acc16p", "coopmat_m64n128_acc16p"]),
+    F16wCoopmatM128N64Acc16 => ("f16w_coopmat_m128n64_acc16", 128, 64, 32,
+        "matmul_f16w_coopmat_m128n64_acc16.spv", false, ["f16w_coopmat_m128n64_acc16", "coopmat_m128n64_acc16"]),
+    F16wCoopmatM128N64Acc16p => ("f16w_coopmat_m128n64_acc16p", 128, 64, 32,
+        "matmul_f16w_coopmat_m128n64_acc16p.spv", false, ["f16w_coopmat_m128n64_acc16p", "coopmat_m128n64_acc16p"]),
+    F16wA16CoopmatAcc16 => ("f16w_a16_coopmat_acc16", 128, 128, 32,
+        "matmul_f16w_a16_coopmat_acc16.spv", false, ["f16w_a16_coopmat_acc16", "a16_coopmat_acc16"]),
+    F16wA16CoopmatAcc16p => ("f16w_a16_coopmat_acc16p", 128, 128, 32,
+        "matmul_f16w_a16_coopmat_acc16p.spv", false, ["f16w_a16_coopmat_acc16p", "a16_coopmat_acc16p"]),
+    F16wA16CoopmatM64Acc16 => ("f16w_a16_coopmat_m64n64_acc16", 64, 64, 32,
+        "matmul_f16w_a16_coopmat_m64n64_acc16.spv", false, ["f16w_a16_coopmat_m64n64_acc16", "a16_coopmat_m64_acc16"]),
+    F16wA16CoopmatM64Acc16p => ("f16w_a16_coopmat_m64n64_acc16p", 64, 64, 32,
+        "matmul_f16w_a16_coopmat_m64n64_acc16p.spv", false, ["f16w_a16_coopmat_m64n64_acc16p", "a16_coopmat_m64_acc16p"]),
+    F16wA16CoopmatM64N128Acc16 => ("f16w_a16_coopmat_m64n128_acc16", 64, 128, 32,
+        "matmul_f16w_a16_coopmat_m64n128_acc16.spv", false, ["f16w_a16_coopmat_m64n128_acc16", "a16_coopmat_m64n128_acc16"]),
+    F16wA16CoopmatM64N128Acc16p => ("f16w_a16_coopmat_m64n128_acc16p", 64, 128, 32,
+        "matmul_f16w_a16_coopmat_m64n128_acc16p.spv", false, ["f16w_a16_coopmat_m64n128_acc16p", "a16_coopmat_m64n128_acc16p"]),
+    F16wA16CoopmatM128N64Acc16 => ("f16w_a16_coopmat_m128n64_acc16", 128, 64, 32,
+        "matmul_f16w_a16_coopmat_m128n64_acc16.spv", false, ["f16w_a16_coopmat_m128n64_acc16", "a16_coopmat_m128n64_acc16"]),
+    F16wA16CoopmatM128N64Acc16p => ("f16w_a16_coopmat_m128n64_acc16p", 128, 64, 32,
+        "matmul_f16w_a16_coopmat_m128n64_acc16p.spv", false, ["f16w_a16_coopmat_m128n64_acc16p", "a16_coopmat_m128n64_acc16p"]),
+    // Promote chunk-length sweep on the routed a16 prefill tile
+    // (64x128): PROMOTE_KT = 2 (64 K) and 8 (256 K) beside the default
+    // 4 (128 K) of `f16w_a16_coopmat_m64n128_acc16p`.  Pin-only.
+    F16wA16CoopmatM64N128Pk2Acc16p => ("f16w_a16_coopmat_m64n128_pk2_acc16p", 64, 128, 32,
+        "matmul_f16w_a16_coopmat_m64n128_pk2_acc16p.spv", false,
+        ["f16w_a16_coopmat_m64n128_pk2_acc16p", "a16_coopmat_m64n128_pk2_acc16p"]),
+    F16wA16CoopmatM64N128Pk8Acc16p => ("f16w_a16_coopmat_m64n128_pk8_acc16p", 64, 128, 32,
+        "matmul_f16w_a16_coopmat_m64n128_pk8_acc16p.spv", false,
+        ["f16w_a16_coopmat_m64n128_pk8_acc16p", "a16_coopmat_m64n128_pk8_acc16p"]),
+    // Generator milestone M1: coopmat1 configs from ONE spec-constant
+    // module per A storage (`matmul_f16w{,_a16}_coopmat_spec`, tile
+    // params = spec ids 16-23: BM, BN, BK, WM, WN, THREADS, A_SKEW,
+    // B_SKEW).  t1-t4 are twins of the four literal tiles (parity gate);
+    // n1-n11 are new points (BK=64, 8-warp, skews, 32x64, ...).  Slots
+    // stay empty unless ML_GEN=1 or ML_KERNEL pins one; pipelines are
+    // built on first use.
+    F16wCoopmatGT1 => ("f16w_coopmat_g_t1", 128, 128, 32, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_t1", "coopmat_g_t1"],
+        spec [(16, 128), (17, 128), (18, 32), (19, 64), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wCoopmatGT2 => ("f16w_coopmat_g_t2", 64, 64, 32, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_t2", "coopmat_g_t2"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wCoopmatGT3 => ("f16w_coopmat_g_t3", 64, 128, 32, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_t3", "coopmat_g_t3"],
+        spec [(16, 64), (17, 128), (18, 32), (19, 32), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wCoopmatGT4 => ("f16w_coopmat_g_t4", 128, 64, 32, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_t4", "coopmat_g_t4"],
+        spec [(16, 128), (17, 64), (18, 32), (19, 64), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wCoopmatGN1 => ("f16w_coopmat_g_n1", 64, 64, 64, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_n1", "coopmat_g_n1"],
+        spec [(16, 64), (17, 64), (18, 64), (19, 32), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wCoopmatGN2 => ("f16w_coopmat_g_n2", 128, 64, 64, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_n2", "coopmat_g_n2"],
+        spec [(16, 128), (17, 64), (18, 64), (19, 64), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wCoopmatGN3 => ("f16w_coopmat_g_n3", 64, 128, 64, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_n3", "coopmat_g_n3"],
+        spec [(16, 64), (17, 128), (18, 64), (19, 32), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wCoopmatGN4 => ("f16w_coopmat_g_n4", 64, 64, 32, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_n4", "coopmat_g_n4"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 16), (21, 256), (22, 1), (23, 1)]),
+    F16wCoopmatGN5 => ("f16w_coopmat_g_n5", 128, 64, 32, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_n5", "coopmat_g_n5"],
+        spec [(16, 128), (17, 64), (18, 32), (19, 32), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wCoopmatGN6 => ("f16w_coopmat_g_n6", 64, 128, 32, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_n6", "coopmat_g_n6"],
+        spec [(16, 64), (17, 128), (18, 32), (19, 32), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wCoopmatGN7 => ("f16w_coopmat_g_n7", 128, 128, 32, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_n7", "coopmat_g_n7"],
+        spec [(16, 128), (17, 128), (18, 32), (19, 64), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wCoopmatGN8 => ("f16w_coopmat_g_n8", 128, 128, 64, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_n8", "coopmat_g_n8"],
+        spec [(16, 128), (17, 128), (18, 64), (19, 64), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wCoopmatGN9 => ("f16w_coopmat_g_n9", 64, 64, 32, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_n9", "coopmat_g_n9"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 0), (23, 0)]),
+    F16wCoopmatGN10 => ("f16w_coopmat_g_n10", 64, 64, 32, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_n10", "coopmat_g_n10"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 2), (23, 2)]),
+    F16wCoopmatGN11 => ("f16w_coopmat_g_n11", 32, 64, 32, "matmul_f16w_coopmat_spec.spv", false,
+        ["f16w_coopmat_g_n11", "coopmat_g_n11"],
+        spec [(16, 32), (17, 64), (18, 32), (19, 32), (20, 32), (21, 64), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT1 => ("f16w_a16_coopmat_g_t1", 128, 128, 32, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_t1", "a16_coopmat_g_t1"],
+        spec [(16, 128), (17, 128), (18, 32), (19, 64), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT2 => ("f16w_a16_coopmat_g_t2", 64, 64, 32, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_t2", "a16_coopmat_g_t2"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT3 => ("f16w_a16_coopmat_g_t3", 64, 128, 32, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_t3", "a16_coopmat_g_t3"],
+        spec [(16, 64), (17, 128), (18, 32), (19, 32), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT4 => ("f16w_a16_coopmat_g_t4", 128, 64, 32, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_t4", "a16_coopmat_g_t4"],
+        spec [(16, 128), (17, 64), (18, 32), (19, 64), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN1 => ("f16w_a16_coopmat_g_n1", 64, 64, 64, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_n1", "a16_coopmat_g_n1"],
+        spec [(16, 64), (17, 64), (18, 64), (19, 32), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN2 => ("f16w_a16_coopmat_g_n2", 128, 64, 64, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_n2", "a16_coopmat_g_n2"],
+        spec [(16, 128), (17, 64), (18, 64), (19, 64), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN3 => ("f16w_a16_coopmat_g_n3", 64, 128, 64, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_n3", "a16_coopmat_g_n3"],
+        spec [(16, 64), (17, 128), (18, 64), (19, 32), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN4 => ("f16w_a16_coopmat_g_n4", 64, 64, 32, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_n4", "a16_coopmat_g_n4"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 16), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN5 => ("f16w_a16_coopmat_g_n5", 128, 64, 32, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_n5", "a16_coopmat_g_n5"],
+        spec [(16, 128), (17, 64), (18, 32), (19, 32), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN6 => ("f16w_a16_coopmat_g_n6", 64, 128, 32, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_n6", "a16_coopmat_g_n6"],
+        spec [(16, 64), (17, 128), (18, 32), (19, 32), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN7 => ("f16w_a16_coopmat_g_n7", 128, 128, 32, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_n7", "a16_coopmat_g_n7"],
+        spec [(16, 128), (17, 128), (18, 32), (19, 64), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN8 => ("f16w_a16_coopmat_g_n8", 128, 128, 64, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_n8", "a16_coopmat_g_n8"],
+        spec [(16, 128), (17, 128), (18, 64), (19, 64), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN9 => ("f16w_a16_coopmat_g_n9", 64, 64, 32, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_n9", "a16_coopmat_g_n9"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 0), (23, 0)]),
+    F16wA16CoopmatGN10 => ("f16w_a16_coopmat_g_n10", 64, 64, 32, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_n10", "a16_coopmat_g_n10"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 2), (23, 2)]),
+    F16wA16CoopmatGN11 => ("f16w_a16_coopmat_g_n11", 32, 64, 32, "matmul_f16w_a16_coopmat_spec.spv", false,
+        ["f16w_a16_coopmat_g_n11", "a16_coopmat_g_n11"],
+        spec [(16, 32), (17, 64), (18, 32), (19, 32), (20, 32), (21, 64), (22, 1), (23, 1)]),
+    // Accumulator module axis: the same 15 configs on the f16-
+    // accumulator a16 module (`_acc16` suffix: F16 numerics class, so
+    // also gated on `coopmat_f16_acc_enabled`).
+    F16wA16CoopmatGT1Acc16 => ("f16w_a16_coopmat_g_t1_acc16", 128, 128, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_t1_acc16", "a16_coopmat_g_t1_acc16"],
+        spec [(16, 128), (17, 128), (18, 32), (19, 64), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT2Acc16 => ("f16w_a16_coopmat_g_t2_acc16", 64, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_t2_acc16", "a16_coopmat_g_t2_acc16"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT3Acc16 => ("f16w_a16_coopmat_g_t3_acc16", 64, 128, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_t3_acc16", "a16_coopmat_g_t3_acc16"],
+        spec [(16, 64), (17, 128), (18, 32), (19, 32), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT4Acc16 => ("f16w_a16_coopmat_g_t4_acc16", 128, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_t4_acc16", "a16_coopmat_g_t4_acc16"],
+        spec [(16, 128), (17, 64), (18, 32), (19, 64), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN1Acc16 => ("f16w_a16_coopmat_g_n1_acc16", 64, 64, 64, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n1_acc16", "a16_coopmat_g_n1_acc16"],
+        spec [(16, 64), (17, 64), (18, 64), (19, 32), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN2Acc16 => ("f16w_a16_coopmat_g_n2_acc16", 128, 64, 64, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n2_acc16", "a16_coopmat_g_n2_acc16"],
+        spec [(16, 128), (17, 64), (18, 64), (19, 64), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN3Acc16 => ("f16w_a16_coopmat_g_n3_acc16", 64, 128, 64, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n3_acc16", "a16_coopmat_g_n3_acc16"],
+        spec [(16, 64), (17, 128), (18, 64), (19, 32), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN4Acc16 => ("f16w_a16_coopmat_g_n4_acc16", 64, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n4_acc16", "a16_coopmat_g_n4_acc16"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 16), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN5Acc16 => ("f16w_a16_coopmat_g_n5_acc16", 128, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n5_acc16", "a16_coopmat_g_n5_acc16"],
+        spec [(16, 128), (17, 64), (18, 32), (19, 32), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN6Acc16 => ("f16w_a16_coopmat_g_n6_acc16", 64, 128, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n6_acc16", "a16_coopmat_g_n6_acc16"],
+        spec [(16, 64), (17, 128), (18, 32), (19, 32), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN7Acc16 => ("f16w_a16_coopmat_g_n7_acc16", 128, 128, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n7_acc16", "a16_coopmat_g_n7_acc16"],
+        spec [(16, 128), (17, 128), (18, 32), (19, 64), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN8Acc16 => ("f16w_a16_coopmat_g_n8_acc16", 128, 128, 64, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n8_acc16", "a16_coopmat_g_n8_acc16"],
+        spec [(16, 128), (17, 128), (18, 64), (19, 64), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN9Acc16 => ("f16w_a16_coopmat_g_n9_acc16", 64, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n9_acc16", "a16_coopmat_g_n9_acc16"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 0), (23, 0)]),
+    F16wA16CoopmatGN10Acc16 => ("f16w_a16_coopmat_g_n10_acc16", 64, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n10_acc16", "a16_coopmat_g_n10_acc16"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 2), (23, 2)]),
+    F16wA16CoopmatGN11Acc16 => ("f16w_a16_coopmat_g_n11_acc16", 32, 64, 32, "matmul_f16w_a16_coopmat_spec_acc16.spv", false,
+        ["f16w_a16_coopmat_g_n11_acc16", "a16_coopmat_g_n11_acc16"],
+        spec [(16, 32), (17, 64), (18, 32), (19, 32), (20, 32), (21, 64), (22, 1), (23, 1)]),
+    // K_UNROLL=8 body axis on the a16 module (`_ku8`): the S1 parity
+    // rescue experiment for the twins plus the two best S2 configs.
+    F16wA16CoopmatGT1Ku8 => ("f16w_a16_coopmat_g_t1_ku8", 128, 128, 32, "matmul_f16w_a16_coopmat_spec_ku8.spv", false,
+        ["f16w_a16_coopmat_g_t1_ku8", "a16_coopmat_g_t1_ku8"],
+        spec [(16, 128), (17, 128), (18, 32), (19, 64), (20, 32), (21, 256), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT2Ku8 => ("f16w_a16_coopmat_g_t2_ku8", 64, 64, 32, "matmul_f16w_a16_coopmat_spec_ku8.spv", false,
+        ["f16w_a16_coopmat_g_t2_ku8", "a16_coopmat_g_t2_ku8"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT3Ku8 => ("f16w_a16_coopmat_g_t3_ku8", 64, 128, 32, "matmul_f16w_a16_coopmat_spec_ku8.spv", false,
+        ["f16w_a16_coopmat_g_t3_ku8", "a16_coopmat_g_t3_ku8"],
+        spec [(16, 64), (17, 128), (18, 32), (19, 32), (20, 64), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGT4Ku8 => ("f16w_a16_coopmat_g_t4_ku8", 128, 64, 32, "matmul_f16w_a16_coopmat_spec_ku8.spv", false,
+        ["f16w_a16_coopmat_g_t4_ku8", "a16_coopmat_g_t4_ku8"],
+        spec [(16, 128), (17, 64), (18, 32), (19, 64), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN1Ku8 => ("f16w_a16_coopmat_g_n1_ku8", 64, 64, 64, "matmul_f16w_a16_coopmat_spec_ku8.spv", false,
+        ["f16w_a16_coopmat_g_n1_ku8", "a16_coopmat_g_n1_ku8"],
+        spec [(16, 64), (17, 64), (18, 64), (19, 32), (20, 32), (21, 128), (22, 1), (23, 1)]),
+    F16wA16CoopmatGN10Ku8 => ("f16w_a16_coopmat_g_n10_ku8", 64, 64, 32, "matmul_f16w_a16_coopmat_spec_ku8.spv", false,
+        ["f16w_a16_coopmat_g_n10_ku8", "a16_coopmat_g_n10_ku8"],
+        spec [(16, 64), (17, 64), (18, 32), (19, 32), (20, 32), (21, 128), (22, 2), (23, 2)]),
     // Tensor-core GEMM via NV_cooperative_matrix2 (workgroup-scope
     // matrices + tensor addressing) with the fused store epilogue the
     // coopmat1 kernel cannot implement (`coopMatPerElementNV` at
@@ -455,6 +770,23 @@ mod tests {
         assert_eq!(by_name("f16w_coopmat_m64n64"), 9_728); // 64*5*16 + 32*9*16
         assert_eq!(by_name("f16w_coopmat_m64n128"), 13_824); // 64*5*16 + 32*17*16
         assert_eq!(by_name("f16w_coopmat_m128n64"), 14_848); // 128*5*16 + 32*9*16
+        // The f16-accumulator twins declare the same staging tiles.
+        for (base, bytes) in [
+            ("coopmat", 18_944),
+            ("coopmat_m64n64", 9_728),
+            ("coopmat_m64n128", 13_824),
+            ("coopmat_m128n64", 14_848),
+        ] {
+            for fam in ["f16w_", "f16w_a16_"] {
+                for acc in ["_acc16", "_acc16p"] {
+                    assert_eq!(
+                        by_name(&format!("{fam}{base}{acc}")),
+                        bytes,
+                        "{fam}{base}{acc}"
+                    );
+                }
+            }
+        }
         assert_eq!(by_name("outer_bda"), 0); // register-only
     }
 
@@ -496,6 +828,125 @@ mod tests {
             max,
             crate::context::VulkanContext::MAX_SHIPPED_WORKGROUP_BYTES
         );
+    }
+
+    /// Tile parameter of a generated config by spec id.
+    fn spec_value(spec: &KernelSpec, id: u32) -> u32 {
+        spec.spec
+            .iter()
+            .find(|&&(sid, _)| sid == id)
+            .map(|&(_, v)| v)
+            .unwrap_or_else(|| panic!("{} lacks spec id {id}", spec.name))
+    }
+
+    #[test]
+    fn generated_configs_are_legal_and_consistent() {
+        let generated: Vec<&KernelSpec> =
+            KERNEL_SPECS.iter().filter(|s| s.is_generated()).collect();
+        assert_eq!(
+            generated.len(),
+            51,
+            "15 configs x {{a32, a16, a16-acc16}} + 6 ku8"
+        );
+        for spec in generated {
+            let [bm, bn, bk, wm, wn, threads, skew_a, skew_b] =
+                [16, 17, 18, 19, 20, 21, 22, 23].map(|id| spec_value(spec, id));
+            assert!(spec.name.contains("_coopmat_g_"), "{}", spec.name);
+            assert_eq!(
+                [spec.tile_m, spec.tile_n, spec.tile_k],
+                [bm, bn, bk],
+                "{}",
+                spec.name
+            );
+            assert!(
+                wm % 16 == 0 && wn % 16 == 0 && bk % 16 == 0,
+                "{}",
+                spec.name
+            );
+            assert!(bm % wm == 0 && bn % wn == 0, "{}", spec.name);
+            assert_eq!(threads, (bm / wm) * (bn / wn) * 32, "{}", spec.name);
+            assert_eq!((bm * bk / 8) % threads, 0, "{} A staging", spec.name);
+            assert_eq!((bk * bn / 8) % threads, 0, "{} B staging", spec.name);
+            // The SPIR-V evaluation of the spec-sized shared arrays equals
+            // the analytic size (R5).
+            let analytic = bm * (bk / 8 + skew_a) * 16 + bk * (bn / 8 + skew_b) * 16;
+            assert_eq!(spec.shared_memory_bytes(), analytic, "{}", spec.name);
+        }
+    }
+
+    #[test]
+    fn promote_chunk_k_reads_the_pk_tag() {
+        let by = |name: &str| {
+            KERNEL_SPECS
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+        assert_eq!(
+            by("f16w_a16_coopmat_m64n128_acc16p").promote_chunk_k(),
+            Some(128)
+        );
+        assert_eq!(by("f16w_coopmat_acc16p").promote_chunk_k(), Some(128));
+        assert_eq!(
+            by("f16w_a16_coopmat_m64n128_pk2_acc16p").promote_chunk_k(),
+            Some(64)
+        );
+        assert_eq!(
+            by("f16w_a16_coopmat_m64n128_pk8_acc16p").promote_chunk_k(),
+            Some(256)
+        );
+        assert_eq!(by("f16w_a16_coopmat_m64n128_acc16").promote_chunk_k(), None);
+        assert_eq!(by("f16w_coopmat_aligned").promote_chunk_k(), None);
+        // The chunk variants stage the same tiles as their base kernel.
+        for name in [
+            "f16w_a16_coopmat_m64n128_pk2_acc16p",
+            "f16w_a16_coopmat_m64n128_pk8_acc16p",
+        ] {
+            assert_eq!(by(name).shared_memory_bytes(), 13_824, "{name}");
+            assert!(by(name).a_f16(), "{name}");
+        }
+    }
+
+    #[test]
+    fn generated_twins_match_the_literal_tiles_shared_bytes() {
+        let bytes = |name: &str| {
+            KERNEL_SPECS
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no kernel named {name}"))
+                .shared_memory_bytes()
+        };
+        for fam in ["f16w_", "f16w_a16_"] {
+            for (twin, literal, expect) in [
+                ("t1", "coopmat_aligned", 18_944),
+                ("t2", "coopmat_m64n64", 9_728),
+                ("t3", "coopmat_m64n128", 13_824),
+                ("t4", "coopmat_m128n64", 14_848),
+            ] {
+                assert_eq!(
+                    bytes(&format!("{fam}coopmat_g_{twin}")),
+                    expect,
+                    "{fam}{twin}"
+                );
+                assert_eq!(bytes(&format!("{fam}{literal}")), expect, "{fam}{literal}");
+            }
+        }
+        // Spec defaults (no overrides) evaluate to the 128x128 tile.
+        let module = KERNEL_SPECS
+            .iter()
+            .find(|s| s.name == "f16w_a16_coopmat_g_t1")
+            .unwrap()
+            .spv;
+        assert_eq!(workgroup_shared_bytes(module, &[]), 18_944);
+    }
+
+    #[test]
+    fn from_index_inverts_index() {
+        for (i, spec) in KERNEL_SPECS.iter().enumerate() {
+            let selection = KernelSelection::from_index(i).expect("in range");
+            assert_eq!(selection.index(), Some(i), "{}", spec.name);
+        }
+        assert_eq!(KernelSelection::from_index(KERNEL_SPECS.len()), None);
     }
 
     #[test]

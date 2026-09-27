@@ -1,0 +1,21 @@
+ab protocol: burn-in ~300ms 4096^3 on first kernel; rounds=7 iters=20 warmup=5; kernels=auto,auto@f16,auto@promote; per-round kernel start rotated by round index; gpu_ms = median of per-round GPU medians
+case                     kernel                           gpu_ms gpu_ms_min     TF/s    ratio  route
+------------------------------------------------------------------------------------------------------------------------
+qo                       auto                              0.161      0.153    26.63    1.000  f16w_a16_coopmat_m64n64
+qo                       auto@f16                          0.115      0.112    37.27    1.400  f16w_a16_coopmat_m64n128_acc16
+qo                       auto@promote                      0.120      0.116    35.75    1.343  f16w_a16_coopmat_m64n128_acc16p
+qkv                      auto                              0.212      0.202    25.34    1.000  f16w_a16_coopmat_m128n64
+qkv                      auto@f16                          0.150      0.145    35.80    1.413  f16w_a16_coopmat_m64n128_acc16
+qkv                      auto@promote                      0.163      0.158    32.97    1.301  f16w_a16_coopmat_m64n128_acc16p
+gu                       auto                              0.434      0.413    27.22    1.000  f16w_a16_coopmat_m128n64
+gu                       auto@f16                          0.294      0.284    40.12    1.474  f16w_a16_coopmat_m64n128_acc16
+gu                       auto@promote                      0.325      0.317    36.33    1.334  f16w_a16_coopmat_m64n128_acc16p
+dn                       auto                              0.437      0.405    27.01    1.000  f16w_a16_coopmat_m64n64
+dn                       auto@f16                          0.304      0.291    38.83    1.438  f16w_a16_coopmat_m64n128_acc16
+dn                       auto@promote                      0.327      0.315    36.12    1.337  f16w_a16_coopmat_m64n128_acc16p
+s2k                      auto                              0.733      0.665    23.43    1.000  f16w_a16_coopmat_aligned
+s2k                      auto@f16                          0.434      0.395    39.62    1.691  f16w_a16_coopmat_m64n128_acc16
+s2k                      auto@promote                      0.471      0.436    36.47    1.556  f16w_a16_coopmat_m64n128_acc16p
+s4k                      auto                              5.127      4.985    26.81    1.000  f16w_a16_coopmat_aligned
+s4k                      auto@f16                          3.218      3.080    42.71    1.593  f16w_a16_coopmat_acc16
+s4k                      auto@promote                      4.101      3.961    33.51    1.250  f16w_a16_coopmat_acc16p

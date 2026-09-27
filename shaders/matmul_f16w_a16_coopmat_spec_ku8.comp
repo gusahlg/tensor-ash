@@ -1,0 +1,12 @@
+#version 460
+// Generator module (M1) body axis: the f16-activation spec-constant
+// coopmat1 GEMM with a literal 8x K-tile unroll (K_UNROLL = 8), the
+// structure the driver gives the literal wrappers — the S1 parity
+// rescue experiment (`f16w_a16_coopmat_gk8_*` configs).
+
+#define A_F16 1
+#define C_F16 1
+#define SPEC_TILE 1
+#define K_UNROLL 8u
+
+#include "matmul_coopmat_kernel.glsl"

@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Added
+
+- **f16-accumulator tensor-core GEMMs (opt-in numerics class)**:
+  `_acc16` (HMMA.*.F16 end to end — the numerics of cuBLAS
+  `CUBLAS_COMPUTE_16F`, which llama.cpp CUDA uses for every f16 weight
+  GEMM with more than 16 rows) and `_acc16p` (f16 partials over 128 K
+  promoted into f32 accumulators) twins of the 4 coopmat1 tiles x
+  {f32 A, f16 A}.  Policy: `ExecutorConfig::coopmat_acc`
+  (`CoopmatAcc::{F32, F16, F16Promote}`, default F32) or
+  `ML_COOPMAT_ACC=f16|f16p` (`promote` is an alias) for env-built executors; never tuned,
+  never default; gated on `VulkanContext::coopmat_f16_acc_enabled`
+  (queried 16x16x16 f16/f16/f16/f16 configuration).  The f16 classes
+  route through their own tile rule (`coopmat_tile_acc16`: 64x128 /
+  128x128).  RTX 4060 a16 prefill GEMMs 1.40-1.48x, TinyLlama pp512
+  12.9k -> 16.1k t/s (f16) / 14.8k (promote), greedy tokens identical;
+  RTX 3070 pp512 15.9k -> 20.5k.  `benchmarks/campaign/f16acc.md`.
+- **Generator M1**: one spec-constant coopmat1 module per A storage
+  (`SPEC_TILE`, spec ids 16-23) with 15 configs each (`*_coopmat_g_*`,
+  `ML_GEN=1` or an `ML_KERNEL` pin), an f16-accumulator module axis and
+  a `K_UNROLL` body axis; `workgroup_shared_bytes` folds
+  `OpSpecConstantOp` (the C8 panic is gone).
+- `ml_bench ab` entries take `@f32|@f16|@f16p`; `llama_ash numerics`
+  (real-activation GEMM error vs f64); `LLAMA_ASH_LOGITS_OUT`;
+  `examples/coopmat_acc_numerics.rs`.
+
 ### Changed
 
 - **SM-count-aware coopmat tile routing** (`pipeline/routing.rs`,

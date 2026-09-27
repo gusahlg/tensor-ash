@@ -1,0 +1,10 @@
+#version 460
+// Generator module (M1): f16-activation (A/B/C f16) coopmat1 GEMM whose
+// tile is set by specialization constants 16-23 — one module, many
+// `f16w_a16_coopmat_g_*` catalog configs.
+
+#define A_F16 1
+#define C_F16 1
+#define SPEC_TILE 1
+
+#include "matmul_coopmat_kernel.glsl"
