@@ -415,12 +415,6 @@ impl CoopmatTile {
             .map(|&(selection, ..)| selection)
             .expect("COOPMAT1 covers every (tile, a16, acc)")
     }
-
-    /// The tile of a coopmat1 kernel selection (either A storage, any
-    /// accumulator).
-    pub(crate) fn of_selection(selection: KernelSelection) -> Option<Self> {
-        coopmat1_parts(selection).map(|(tile, ..)| tile)
-    }
 }
 
 /// (tile, a16, accumulator) of a coopmat1 kernel selection, `None` for
@@ -677,7 +671,10 @@ mod bda_tests {
         for tile in [T128, T64, T64Mfast, T64x128, T128x64] {
             for a16 in [false, true] {
                 let selection = tile.selection(a16);
-                assert_eq!(CoopmatTile::of_selection(selection), Some(tile));
+                assert_eq!(
+                    coopmat1_parts(selection),
+                    Some((tile, a16, CoopmatAcc::F32))
+                );
                 assert_eq!(
                     super::super::KERNEL_SPECS[selection.index().unwrap()].a_f16(),
                     a16
