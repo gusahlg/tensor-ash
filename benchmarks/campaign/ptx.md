@@ -532,7 +532,49 @@ pipelines (f16acc's proposal reads the class from the kernel name; on
 this branch alone the a16 kernels carry no class, so the policy is
 passed explicitly).
 
-### 7e. Still a proposal
+### 7e. Gates for the merge-ready branch (2026-09-27, RTX 4060)
+
+Scripts `ptx-logs/scripts/run_v2_{tests,numerics,llama}.sh` (under
+`lgpu c-ptx`), logs `ptx-logs/4060_v2_tests.log`, `4060_v2_llama.log`;
+correctness binary `correctness-b859650e2dc3747a` built from `a532a0a`
+(later commits touch only docs/scripts).
+
+| gate | result |
+|---|---|
+| `cargo test --release -p tensor-ash --lib` (desktop): `ptx_gate` (vendor, extension, feature, cc, veto, never queried unless requested), route class mapping over 480 shape x SM x class combinations, `ML_PTX_GEMM` parsing incl. deprecated spellings, `CoopmatAcc` | 60 / 60 pass |
+| `ML_PTX=1 ... ptx::` | **5 / 5 pass** |
+| `ptx_f32_route_is_bitwise_coopmat1`: 8 shapes (128x256x128 ... 4096x4096x256, 64-aligned-only 192x320x64, alpha 0.75), single op, `ExecOp` graph, 2 prepared replays | **bit-identical** to coopmat1 (every f16 output bit) |
+| `ptx_route_in_mixed_graphs_and_prepared_replay`: 512x2048, 9-op graph, PTX GEMMs <-> Vulkan `Binary` with RAW both ways, WAR, WAW and two independent launches | f32 policy: bit-identical to the all-Vulkan graph, immediate and prepared (x2 replays); f16p and f16: prepared == immediate == rerun bitwise; worst rel-RMS vs the f32 graph **1.06e-3 (f16p)**, **4.46e-3 (f16)** (gates 5e-3 / 3e-2; f16 > f16p > 0 asserted, so neither silently ran f32) |
+| `ptx_policy_is_explicit_and_degrades_to_f32` | pass: `F16` with the route off -> executor reports `F32`; `on` serves f16/f16p with a kernel of that class, never f32; `all` serves f32 |
+| `ptx::` without `ML_PTX`, with `ML_PTX=1 ML_NO_PTX=1`, with `ML_PTX_GEMM=off` | 5 / 5 each (PTX tests skip; the policy test takes its degrade branch) |
+| `ML_PTX=1 ML_PTX_GEMM=all ... f16:: graph:: prepared:: replay::` (every a16 op through PTX at f32) | **25 / 25** (control without PTX: 25 / 25) |
+| `ML_PTX_GEMM=bogus`, `ML_COOPMAT_ACC=bf16` | configuration errors, as intended |
+| deprecated `ML_PTX_GEMM=f16p` | warning, policy f16p, pp512 16,640 t/s |
+
+TinyLlama pp512 through the new API (`llama_ash bench --pp 512 --tg 32`,
+one process per run, alternated, two passes):
+
+| run | prefill GPU ms | pp512 t/s | vs base |
+|---|---:|---:|---:|
+| base (`ML_PTX=0`) | 39.81 / 39.68 | 12,772 / 12,813 | 1.00 |
+| `ML_PTX=1` (policy f32: route idle) | 39.90 / 39.99 | 12,741 / 12,710 | 1.00 |
+| `ML_PTX=1 ML_COOPMAT_ACC=f16p` | 30.75 / 30.74 | 16,500 / 16,502 | **1.29** |
+| `ML_PTX=1 ML_COOPMAT_ACC=f16` | 28.80 / 28.73 | 17,598 / 17,648 | **1.38** |
+
+Same kernels, same ratios as the 2026-09-26 runs (1.28x / 1.39x).  The
+cubin cache makes the route cost 3.7 ms at startup.  `llama_ash
+generate` with the 128-token prompt: 32 greedy tokens identical for
+`ML_PTX=0`, `ML_PTX=1`, `ML_PTX=1 ML_PTX_GEMM=all`, `f16p` and `f16`.
+
+**RTX 3070: pending.**  The desktop was under the gaming embargo
+(`GPU3070_EMBARGO`, set 07:44) for the whole continuation; the 3070 batch
+(`run_v2_3070.sh`: `ptx::` + the four suites with `ML_PTX_GEMM=all`, then
+`run_v2_3070.sh llama`) is ready and uses the already-built desktop
+binaries.  The kernels themselves were validated on the 3070 on
+2026-09-26 (`3070_tests.log`, `3070_llama_pp512_final.log`); what is new
+since is host-side plumbing.
+
+### 7f. Still a proposal
 
 1. PTX entries as first-class candidates of the measured tuner, keyed
    by `TuneKey` + class (the 4060 and 3070 disagree on tiles: 24 MB vs
