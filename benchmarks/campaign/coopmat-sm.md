@@ -28,20 +28,25 @@ clock logs are in [`coopmat-sm-data/`](coopmat-sm-data/).
    M-fastest (new `f16w[_a16]_coopmat_m64n64_mfast`) lifts a16 gate/up
    512x5632x2048 on the 3070 from 29.1 (64x64) / 33.8 (128x64) to
    **35.2 TF/s**.
-4. **L2 capacity matters as much as SM count** for the 64x64-vs-128x64
-   call, and Vulkan cannot report it.  The SM-count-only model transfers
-   the 128-row tiles' per-clock efficiency between GA104 and AD107
-   within 3%, but 64x64 runs 16-17% less efficiently per clock on the
-   4 MiB-L2 GA104.  The rule therefore takes an L2 lower bound from an
-   NVIDIA device-ID family table (`ML_L2_MB` overrides; unknown = small,
-   the conservative side).
-5. Result on the measured matrices (in-sample for the rule's six fitted
-   ratios): 3070 — 0 shapes slower than exp/grokmerge by >1%, 45 of 77
-   faster, geomean ×1.079; 4060 — 47 faster, 4 slower by 1.2-3.6%
-   (the 128x128-favoured large grids above), geomean ×1.073.  Fresh
-   4060 verification and TinyLlama pp512: see §8-§9.  **Every 3070
-   step after 18:40 is PENDING** — the desktop was embargoed (user
-   gaming) before the 3070 verification sweep and pp512 A/B could run.
+4. **L2 capacity matters, but not the way the warm sweep said** (§12).
+   The SM-count-only model transfers the 128-row tiles' per-clock
+   efficiency between GA104 and AD107 within 3%, but 64x64 runs 16-17%
+   less efficiently per clock on the 4 MiB-L2 GA104, so the rule keeps an
+   L2 lower bound from an NVIDIA device-ID family table (`ML_L2_MB`
+   overrides; unknown = small).  The 100df0d rule also used it to keep
+   x-fast order whenever B fits a large L2; that was a **warm-L2
+   artifact** of `ml_bench ab` (B stays resident between repeats) and
+   made 4060 pp512 1.5% slower than exp/grokmerge.  With weights evicted
+   before every GEMM (`ML_AB_COLD_MB=64`) 64x64 M-fast wins all four
+   pp512 GEMMs on both GPUs, so 0fc29f9 drops that exception; on a large
+   L2 the L2 now only makes M-fast's *A* re-reads cheap.
+5. Result (0fc29f9, §12): 3070 — replayed on the clean §4 sweep, 0 of
+   77 shapes slower than exp/grokmerge by >1%, geomean ×1.081; clean
+   cold M=512 set 11/11 at the measured best (×1.056).  4060 — cold
+   sweep geomean ×1.083, 1 shape slower by >1% (384x2560x2048, +2.4%),
+   mean regret vs the best of five tiles 0.71%.  TinyLlama pp512: §9.
+   **3070 embargo from 07:44 (2026-09-27)**: the 3070 pp512 A/B and the
+   dedicated 128x64-vs-128x128 A/B are PENDING (§12.5).
 
 ## 1. SM count (and L2) on the host
 
@@ -432,7 +437,7 @@ operands (e.g. a16 1920x5632x2048: 4060 64x64 29.5 vs 128x64 27.0;
 3070 64x64 26.9 vs 128x64 35.6) — the two GPUs genuinely disagree there
 and no SM-count-only rule can serve both.
 
-## 7. Shipped rule (`src/pipeline/routing.rs::coopmat_tile`)
+## 7. The 100df0d rule (superseded in part by §12)
 
 No SM count → the exp/grokmerge rule, unchanged (`coopmat_tile_fallback`).
 With `S` SMs, compare 128x64 and 64x64 (128x128 / 64x128 stay
@@ -463,14 +468,15 @@ alignment, selection round trips; `context::device::tests` cover the
 2048³ when the SM count is known; `coopmat_asymmetric_tiles_match_dual_rounded_reference`
 covers both M-fast kernels including a batched ragged grid.
 
-Picks for TinyLlama pp512 (a16, M=512):
+Picks for TinyLlama pp512 (a16, M=512); superseded by the cold refit
+(§12), which picks 64x64 M-fast for all four on both GPUs:
 
-| GEMM | 4060 old → new | 3070 old → new |
+| GEMM | 4060 grokmerge → 100df0d → 0fc29f9 | 3070 grokmerge → 100df0d → 0fc29f9 |
 |---|---|---|
-| q/o 512x2048x2048 | 64x64 → 64x64 | 64x64 → 64x64 |
-| concat QKV 512x2560x2048 | 128x64 → 64x64 | 128x64 → 64x64 |
-| gate, up 512x5632x2048 | 128x64 → 64x64 | 128x64 → 64x64 M-fast |
-| down 512x2048x5632 | 64x64 → 64x64 | 64x64 → 64x64 |
+| q/o 512x2048x2048 | 64x64 → 64x64 → 64x64 M-fast | 64x64 → 64x64 → 64x64 M-fast |
+| concat QKV 512x2560x2048 | 128x64 → 64x64 → 64x64 M-fast | 128x64 → 64x64 → 64x64 M-fast |
+| gate, up 512x5632x2048 | 128x64 → 64x64 → 64x64 M-fast | 128x64 → 64x64 M-fast → 64x64 M-fast |
+| down 512x2048x5632 | 64x64 → 64x64 → 64x64 M-fast | 64x64 → 64x64 → 64x64 M-fast |
 
 ## 8. Verification
 
@@ -487,11 +493,17 @@ ML_ROUNDS=7 ML_OUTPUT=csv target/release/ml_bench ab <batch cases from batches.t
 python3 analysis.py verify verify-4060 4060 --md
 ```
 
-VERIFY4060
+4060 (verify-4060/, warm, 100df0d binary): 77 shapes, 47 faster than
+grokmerge, 1 slower by >1% (384x2560x2048, +2.3%), geomean ×1.083,
+mean regret 0.42% (`python3 analysis.py verify verify-4060 4060`).
+The cold re-run and the 0fc29f9 replay are in §12.
 
-**RTX 3070: PENDING.**  The desktop was embargoed at 18:40 (user
-gaming) before this sweep could run; the attempt made no GPU work.
-Rerun, one batch per `gpu3070` hold:
+RTX 3070: sq/m256/m384 ran clean on 2026-09-26 21:00 (`verify-3070/`);
+the rest ran on 2026-09-27 07:25-07:45 next to a foreign 3-5 GB GPU
+allocation (the user's game starting; embargo at 07:44) and is
+quarantined in `verify-3070-contended/` (absolute TF/s −4%, tile-ratio
+disagreement with the clean §4 sweep p90 14% vs 5% for the clean
+batches).  Command used, one batch per `gpu3070` hold:
 
 ```
 for b in sq m256 m384 m512 m768 m1024 m2048 t128 t1920 a16_128 a16_256 a16_512 a16_1024 a16_1920; do
@@ -542,3 +554,309 @@ unchanged.
   the rule (large L2) already picks it; on unknown-L2 parts it falls to
   128x64 — a real L2 query (or a one-shot probe) would remove the table.
 - 64x128's 168 registers: find what the compiler keeps live (SASS agent).
+
+## 12. Cold-L2 refit (2026-09-27, commit 0fc29f9)
+
+### 12.1 Why
+
+4060 pp512 (§9): the 100df0d rule was 1.5% *slower* than exp/grokmerge,
+and forcing the small-L2 branch (`ML_L2_MB=1`, i.e. 64x64 M-fast on all
+four GEMMs) was 3.4% *faster* than grokmerge.  The large-L2 branch had
+been fitted on warm `ml_bench ab` runs, where B stays in the 24 MiB L2
+between the 20 back-to-back repeats, so x-fast order never paid for its
+B re-streams.  In a forward pass every weight matrix is cold.
+
+### 12.2 Protocol
+
+`ML_AB_COLD_MB=64` (34ad9f1): before every timed GEMM a 64 MiB buffer
+is written (evicting L2) and A is re-read (activations are warm in a
+real forward: the previous op produced them).  Same interleaved `ab`
+protocol otherwise (7 rounds, rotation, GPU medians), kernels
+`f16w_coopmat_{m128n64,m64n64,m64n64_mfast,aligned,m64n128},auto`:
+
+```
+ML_AB_COLD_MB=64 BIN=<ml_bench 34ad9f1> coopmat-sm-data/verify.sh <outdir> <batch>...   # one GPU-lock hold per chunk
+```
+
+4060: louise `~/ta-wt/cm-var` build (100df0d + cold mode), all 77 shapes
+(`cold-4060/`; 2026-09-26 21:02 and 2026-09-27 07:08-07:20, launcher
+`louise:~/ta-wt/cm-results/cold4060_rest.sh`).  3070: desktop binary
+`$SP/work/coopmat/bin/ml_bench-34ad9f1`, M=512 f16w + a16 (`cold-3070/`,
+07:15 / 07:19, launcher `$SP/work/coopmat/run3070.sh`); the other 3070
+cold batches were blocked by the embargo.
+
+### 12.3 What the cold data say
+
+64x64 M-fast gain over 64x64 x-fast (cold, same run): on the 4060 it is
+**+6% to +68% wherever M-fast moves fewer bytes** (traffic ratio
+< 0.75), whether or not B fits the L2 — e.g. a16 512x5632x2048 +10.5%
+cold vs +0.9% warm, 256x5632x5632 +13.8%; +0-8% at ratio 0.75-1.0; and
+−17% to −32% only once A is large *and* re-streamed (M >= 1920 with
+K = 5632, 3072³, 4096³).  On the 3070, single-pass (x-fast `xp` = 1)
+M=512 grids gain +2.7% to +14% although the traffic model calls the two
+orders equal.  a16 pp512 GEMMs, cold (TF/s):
+
+| GEMM | 4060 64x64 | 4060 M-fast | 4060 128x64 | 3070 64x64 | 3070 M-fast | 3070 128x64 |
+|---|---:|---:|---:|---:|---:|---:|
+| q/o 512x2048x2048 | 27.14 | **27.27** | 24.54 | 32.24 | **33.34** | 31.33 |
+| QKV 512x2560x2048 | 26.22 | **26.61** | 26.08 | 34.41 | **35.34** | 29.64 |
+| gate/up 512x5632x2048 | 26.07 | **28.81** | 26.36 | 29.93 | **36.72** | 34.69 |
+| down 512x2048x5632 | 28.65 | **28.71** | 25.57 | 32.86 | **34.43** | 33.19 |
+
+The 3070 M-fast wins also hold warm (§5 raster candidates: 31.18 /
+33.54 / 35.21 / 33.55 vs 64x64 30.50 / 33.05 / 29.05 / 32.06), so they
+are not a cold-only effect.
+
+### 12.4 The refitted rule (`routing.rs`, `CoopmatGrid::m_fast_64`)
+
+64x64 is launched M-fastest iff
+
+* M-fast moves clearly fewer bytes (`|A| mp + |B| < 0.75 (|B| xp + |A|)`,
+  unchanged) **or** the x-fast grid is a single pass at least 8 row
+  blocks tall and 32 column blocks wide (M >= 512, N >= 2048; new);
+* **and** its A re-reads are cheap: `|A| (mp - 1) <= 8 MiB` (unchanged)
+  **or** A fits half of a large L2 (new; replaces "never if B fits a
+  large L2").
+
+rho is unchanged except that the small-L2 f16w value is keyed on
+`xp > 1` only (identical to 100df0d wherever 100df0d could pick M-fast;
+a single-pass M-fast grid keeps the single-pass rho).  A grid search of
+rho on the cold 4060 set (6x6x5x6 values) improves mean regret only
+0.71% -> 0.65%, so rho stays.
+
+**Composition with the f16-accumulate rule** (branch `campaign/f16acc`,
+`coopmat_tile_acc16`): the accumulator-independent pieces are now
+`CoopmatGrid` — `new` (SM count, L2, operand bytes), `m_fast_64`
+(raster) and `balance` (wave balance x occupancy floor).
+`coopmat_tile` is the f32-accumulate rule = grid + its rho table.  An
+accumulator-aware dispatcher matches on `CoopmatAcc`: `F32` ->
+`coopmat_tile`; `F16`/`F16Promote` -> an acc16 rule that builds the same
+grid and scores its own candidates (64x128 / 128x128) with `balance`.
+f16acc's tiles have no M-fast sibling yet, so that rule would not call
+`m_fast_64` until one exists (f16acc's `COOPMAT1` table would also need
+a `T64Mfast` row per accumulator, or `selection_acc` must map
+`T64Mfast` to the x-fast kernel for the f16 classes).
+
+Candidate rules replayed on every clean same-run set
+(`python3 coldfit.py`; "slower" = vs the grokmerge pick's cell in the
+same run; verify-3070 = the clean sq/m256/m384 batches only):
+
+```
+--- shipped (100df0d)
+  cold-4060    n=77 regret mean  1.24% max  17.2%  vs grokmerge x1.077  slower>1%: 2  a512x5632x2048 64x64<-128x64 +1.1%, g384x2560x2048 128x64<-64x64 +2.4%
+  cold-3070    n=11 regret mean  1.67% max   4.8%  vs grokmerge x1.039  slower>1%: 0  
+  verify-4060  n=77 regret mean  0.42% max   7.6%  vs grokmerge x1.083  slower>1%: 1  g384x2560x2048 128x64<-64x64 +2.3%
+  verify-3070  n=19 regret mean  1.34% max   6.5%  vs grokmerge x1.099  slower>1%: 2  sq3072 128x64<-128x128 +1.6%, sq4096 128x64<-128x128 +1.3%
+--- drop large-L2 fit exemption
+  cold-4060    n=77 regret mean  0.87% max  17.5%  vs grokmerge x1.081  slower>1%: 1  g384x2560x2048 128x64<-64x64 +2.4%
+  cold-3070    n=11 regret mean  1.67% max   4.8%  vs grokmerge x1.039  slower>1%: 0  
+  verify-4060  n=77 regret mean  0.54% max   7.6%  vs grokmerge x1.081  slower>1%: 5
+  verify-3070  n=19 regret mean  1.34% max   6.5%  vs grokmerge x1.099  slower>1%: 2  sq3072 128x64<-128x128 +1.6%, sq4096 128x64<-128x128 +1.3%
+--- small-L2 rule everywhere
+  cold-4060    n=77 regret mean  1.29% max  17.5%  vs grokmerge x1.077  slower>1%: 5
+  cold-3070    n=11 regret mean  1.67% max   4.8%  vs grokmerge x1.039  slower>1%: 0  
+  verify-4060  n=77 regret mean  1.09% max  10.2%  vs grokmerge x1.076  slower>1%: 9
+  verify-3070  n=19 regret mean  1.34% max   6.5%  vs grokmerge x1.099  slower>1%: 2  sq3072 128x64<-128x128 +1.6%, sq4096 128x64<-128x128 +1.3%
+--- NEW: cold-fitted raster (routing.rs)
+  cold-4060    n=77 regret mean  0.71% max  17.5%  vs grokmerge x1.083  slower>1%: 1  g384x2560x2048 128x64<-64x64 +2.4%
+  cold-3070    n=11 regret mean  0.00% max   0.0%  vs grokmerge x1.056  slower>1%: 0  
+  verify-4060  n=77 regret mean  0.66% max   7.6%  vs grokmerge x1.080  slower>1%: 5  a128x5632x2048 64x64m<-64x64 +1.9%, a256x5632x2048 64x64m<-64x64 +1.7%, a512x2048x2048 64x64m<-64x64 +2.5%, a512x2048x5632 64x64m<-64x64 +3.8%, g384x2560x2048 128x64<-64x64 +2.3%
+  verify-3070  n=19 regret mean  1.34% max   6.5%  vs grokmerge x1.099  slower>1%: 2  sq3072 128x64<-128x128 +1.6%, sq4096 128x64<-128x128 +1.3%
+```
+
+`verify-4060` (warm) is the only set where 0fc29f9 loses to 100df0d:
+the four a16 cells where warm x-fast beats M-fast by 1.7-3.8% are the
+warm-L2 artifact itself (cold, M-fast wins or ties them).
+
+Every changed 3070 pick has clean evidence (new/grokmerge, same run):
+512x2048x2048 cold 1.037; 512x2560x2048 candidates 1.123 / cold 1.117;
+a16 256x5632x2048 candidates 1.153; a16 512x2048x2048 candidates 1.023 /
+cold 1.034; a16 512x2048x5632 candidates 1.046 / cold 1.048; a16
+512x2560x2048 candidates 1.197 / cold 1.192; a16 512x5632x2048
+candidates 1.043 / cold 1.058.  Every other §4 shape keeps the 100df0d
+pick; replaying 0fc29f9 on the clean §4 sweep gives **0 of 77 3070
+shapes slower than grokmerge by >1%, geomean ×1.081** (M-fast cells
+scaled by their in-run ratio to 64x64 from the candidate / cold runs).
+The one caveat is 3072³ / 4096³ (§12.5).
+
+Known residuals: 4060 a16 128x5632x2048 cold — 128x64 20.53 vs the
+pick (64x64 M-fast) 17.47 TF/s (−15%; warm, 64x64 wins, and grokmerge
+picks 64x64 too); 4060 384x2560x2048 — 128x64 picked, 64x64 x-fast
++2.4% (both regimes).
+
+#### 4060 — cold sweep (`cold-4060/`, `python3 coldfit.py table cold-4060 4060`; TF/s)
+
+| shape | 128x64 | 64x64 | 64x64 M-fast | 128x128 | 64x128 | grokmerge | 100df0d | new | new/grokmerge |
+|---|---:|---:|---:|---:|---:|---|---|---|---:|
+| 128x2048x2048 | 12.91 | **15.87** | 15.30 | 10.99 | 14.19 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 128x2048x5632 | 13.70 | **17.27** | 16.33 | 11.59 | 15.47 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 128x2560x2048 | 14.82 | **15.89** | 15.70 | 12.88 | 15.44 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 128x5632x2048 | **19.95** | 16.74 | 16.22 | 18.77 | 15.26 | 64x64 | 128x64 | 128x64 | 1.192 |
+| 128x32000x2048 | **23.98** | 14.27 | 23.28 | 22.05 | 14.21 | 64x64 | 128x64 | 128x64 | 1.680 |
+| 256x2048x2048 | 21.29 | 21.39 | **21.94** | 17.03 | 20.64 | 64x64 | 128x64 | 128x64 | 0.996 |
+| 256x2048x5632 | 23.11 | 22.58 | **23.40** | 17.99 | 22.10 | 64x64 | 128x64 | 128x64 | 1.024 |
+| 256x2560x2048 | 21.33 | 21.96 | **22.57** | 20.25 | 18.10 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 256x2560x5632 | 22.71 | 23.33 | **24.13** | 21.44 | 18.89 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 256x5632x2048 | 22.29 | 20.64 | **23.30** | 20.90 | 18.88 | 64x64 | 128x64 | 128x64 | 1.080 |
+| 256x5632x5632 | 24.19 | 21.30 | **24.23** | 22.68 | 19.31 | 64x64 | 128x64 | 128x64 | 1.136 |
+| 256x32000x2048 | **25.25** | 14.93 | 25.16 | 23.60 | 15.05 | 64x64 | 128x64 | 128x64 | 1.691 |
+| 384x2048x2048 | **25.21** | 22.06 | 21.47 | 23.67 | 19.56 | 64x64 | 128x64 | 128x64 | 1.143 |
+| 384x2048x5632 | **27.13** | 22.26 | 22.32 | 25.78 | 20.85 | 64x64 | 128x64 | 128x64 | 1.219 |
+| 384x2560x2048 | 21.78 | 22.30 | **23.91** | 18.56 | 23.11 | 64x64 | 128x64 | 128x64 | 0.977 |
+| 384x2560x5632 | 23.93 | 23.00 | **24.97** | 19.01 | 24.63 | 64x64 | 128x64 | 128x64 | 1.040 |
+| 384x5632x2048 | 24.25 | 22.31 | **24.57** | 21.58 | 21.67 | 64x64 | 128x64 | 128x64 | 1.087 |
+| 384x5632x5632 | **25.98** | 20.78 | 25.24 | 22.99 | 21.42 | 64x64 | 128x64 | 128x64 | 1.250 |
+| 384x32000x2048 | **24.97** | 15.05 | 24.84 | 23.59 | 15.19 | 64x64 | 128x64 | 128x64 | 1.659 |
+| 512x2048x2048 | 22.60 | 23.91 | **23.99** | 19.79 | 21.72 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 512x2048x5632 | 23.36 | 24.71 | **24.95** | 20.01 | 22.72 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 512x2560x2048 | **24.72** | 23.08 | 23.66 | 20.98 | 22.70 | 128x64 | 128x64 | 128x64 | 1.000 |
+| 512x2560x5632 | **26.10** | 23.58 | 24.40 | 21.68 | 21.80 | 128x64 | 128x64 | 128x64 | 1.000 |
+| 512x5632x2048 | 24.62 | 22.99 | **24.98** | 21.90 | 22.29 | 128x64 | 128x64 | 128x64 | 1.000 |
+| 512x5632x5632 | **25.90** | 19.62 | 25.33 | 23.10 | 23.11 | 128x64 | 128x64 | 128x64 | 1.000 |
+| 512x32000x2048 | 24.60 | 15.16 | **25.05** | 23.91 | 15.26 | 128x64 | 128x64 | 128x64 | 1.000 |
+| 768x2048x2048 | **26.18** | 24.48 | 24.08 | 24.51 | 24.53 | 128x128 | 128x64 | 128x64 | 1.068 |
+| 768x2048x5632 | **27.55** | 24.90 | 25.01 | 25.82 | 26.05 | 128x128 | 128x64 | 128x64 | 1.067 |
+| 768x2560x2048 | **25.92** | 24.12 | 24.70 | 23.54 | 24.70 | 128x128 | 128x64 | 128x64 | 1.101 |
+| 768x2560x5632 | **27.01** | 24.06 | 25.35 | 23.97 | 23.64 | 128x128 | 128x64 | 128x64 | 1.127 |
+| 768x5632x2048 | **25.72** | 23.79 | 25.36 | 23.79 | 23.59 | 128x128 | 128x64 | 128x64 | 1.081 |
+| 768x5632x5632 | **26.10** | 18.05 | 25.22 | 24.57 | 22.94 | 128x128 | 128x64 | 128x64 | 1.062 |
+| 768x32000x2048 | **24.66** | 15.25 | 24.02 | 23.84 | 15.35 | 128x128 | 128x64 | 128x64 | 1.034 |
+| 1024x1024x1024 | 21.06 | **22.95** | 22.25 | 17.86 | 20.29 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 1024x2048x2048 | **25.94** | 24.21 | 24.37 | 22.47 | 24.43 | 128x128 | 128x64 | 128x64 | 1.154 |
+| 1024x2048x5632 | **27.21** | 24.58 | 24.57 | 23.27 | 25.64 | 128x128 | 128x64 | 128x64 | 1.169 |
+| 1024x2560x2048 | **25.52** | 24.09 | 24.74 | 23.19 | 24.19 | 128x128 | 128x64 | 128x64 | 1.100 |
+| 1024x2560x5632 | **26.55** | 23.50 | 25.17 | 23.64 | 24.43 | 128x128 | 128x64 | 128x64 | 1.123 |
+| 1024x5632x2048 | **25.65** | 24.01 | 25.44 | 23.66 | 23.86 | 128x128 | 128x64 | 128x64 | 1.084 |
+| 1024x5632x5632 | **25.24** | 17.22 | 24.77 | 24.26 | 23.08 | 128x128 | 128x64 | 128x64 | 1.041 |
+| 1024x32000x2048 | **24.65** | 14.70 | 23.44 | 23.84 | 14.94 | 128x128 | 128x64 | 128x64 | 1.034 |
+| 1536x1536x1536 | **25.73** | 23.65 | 24.28 | 23.88 | 24.54 | 128x128 | 128x64 | 128x64 | 1.077 |
+| 1920x2048x2048 | **27.09** | 24.91 | 25.08 | 25.10 | 25.75 | 128x128 | 128x64 | 128x64 | 1.079 |
+| 1920x2048x5632 | **28.09** | 24.92 | 18.87 | 26.28 | 26.69 | 128x128 | 128x64 | 128x64 | 1.069 |
+| 1920x2560x2048 | **26.87** | 24.50 | 25.05 | 24.44 | 25.73 | 128x128 | 128x64 | 128x64 | 1.099 |
+| 1920x5632x2048 | **26.16** | 24.22 | 25.22 | 24.39 | 25.15 | 128x128 | 128x64 | 128x64 | 1.072 |
+| 1920x32000x2048 | **24.18** | 14.77 | 23.37 | 23.92 | 14.99 | 128x128 | 128x64 | 128x64 | 1.011 |
+| 2048x2048x2048 | **26.63** | 24.92 | 25.02 | 24.30 | 25.35 | 128x128 | 128x64 | 128x64 | 1.096 |
+| 2048x2048x2048 | **26.64** | 24.98 | 25.19 | 24.38 | 25.39 | 128x128 | 128x64 | 128x64 | 1.093 |
+| 2048x2048x5632 | **27.52** | 24.89 | 18.76 | 25.08 | 26.20 | 128x128 | 128x64 | 128x64 | 1.098 |
+| 2048x2560x2048 | **26.85** | 24.52 | 25.11 | 24.53 | 25.73 | 128x128 | 128x64 | 128x64 | 1.095 |
+| 2048x2560x5632 | **26.99** | 22.97 | 18.51 | 25.18 | 25.16 | 128x128 | 128x64 | 128x64 | 1.072 |
+| 2048x5632x2048 | **25.75** | 23.82 | 24.98 | 24.25 | 25.06 | 128x128 | 128x64 | 128x64 | 1.062 |
+| 2048x5632x5632 | **25.63** | 16.23 | 18.57 | 24.67 | 23.28 | 128x128 | 128x64 | 128x64 | 1.039 |
+| 2048x32000x2048 | **24.11** | 14.81 | 23.54 | 23.95 | 14.99 | 128x128 | 128x64 | 128x64 | 1.007 |
+| 3072x3072x3072 | **27.41** | 24.18 | 16.38 | 26.17 | 26.96 | 128x128 | 128x64 | 128x64 | 1.047 |
+| 4096x4096x4096 | **26.23** | 21.58 | 17.80 | 25.49 | 23.58 | 128x128 | 128x64 | 128x64 | 1.029 |
+| a16 128x2048x2048 | 13.96 | **15.83** | 15.58 | 11.11 | 13.75 | 64x64 | 64x64 | 64x64 | 1.000 |
+| a16 128x2048x5632 | 14.95 | **17.93** | 17.28 | 12.01 | 15.03 | 64x64 | 64x64 | 64x64 | 1.000 |
+| a16 128x2560x2048 | 15.23 | **15.76** | 15.68 | 12.90 | 15.36 | 64x64 | 64x64 | 64x64 | 1.000 |
+| a16 128x5632x2048 | **20.53** | 17.51 | 17.47 | 18.87 | 15.58 | 64x64 | 64x64 | 64x64 M-fast | 0.998 |
+| a16 256x2048x2048 | 23.05 | **23.51** | 23.09 | 17.85 | 21.19 | 64x64 | 64x64 | 64x64 | 1.000 |
+| a16 256x2048x5632 | 24.86 | **25.27** | 24.58 | 19.05 | 22.65 | 64x64 | 64x64 | 64x64 | 1.000 |
+| a16 256x2560x2048 | 22.17 | **24.83** | 24.60 | 20.98 | 18.49 | 64x64 | 64x64 | 64x64 | 1.000 |
+| a16 256x5632x2048 | 22.92 | 22.73 | **26.40** | 21.60 | 19.51 | 64x64 | 64x64 | 64x64 M-fast | 1.161 |
+| a16 512x2048x2048 | 24.54 | 27.14 | **27.27** | 21.45 | 22.39 | 64x64 | 64x64 | 64x64 M-fast | 1.005 |
+| a16 512x2048x5632 | 25.57 | 28.65 | **28.71** | 21.67 | 23.53 | 64x64 | 64x64 | 64x64 M-fast | 1.002 |
+| a16 512x2560x2048 | 26.08 | 26.22 | **26.61** | 21.66 | 23.01 | 128x64 | 64x64 | 64x64 M-fast | 1.020 |
+| a16 512x5632x2048 | 26.36 | 26.07 | **28.81** | 23.30 | 23.49 | 128x64 | 64x64 | 64x64 M-fast | 1.093 |
+| a16 1024x2048x2048 | 28.11 | 28.61 | **28.74** | 24.00 | 25.33 | 128x128 | 64x64 | 64x64 M-fast | 1.197 |
+| a16 1024x2048x5632 | 29.36 | 29.38 | **29.91** | 25.28 | 26.39 | 128x128 | 64x64 | 64x64 M-fast | 1.183 |
+| a16 1024x2560x2048 | 27.37 | 28.39 | **28.66** | 24.78 | 24.87 | 128x128 | 64x64 | 64x64 M-fast | 1.157 |
+| a16 1024x5632x2048 | 27.97 | 28.18 | **29.94** | 25.68 | 25.38 | 128x128 | 64x64 | 64x64 M-fast | 1.166 |
+| a16 1920x2048x2048 | 29.68 | 29.85 | **30.00** | 27.09 | 26.72 | 128x128 | 64x64 | 64x64 | 1.102 |
+| a16 1920x2048x5632 | 30.07 | **30.52** | 29.93 | 28.02 | 27.77 | 128x128 | 64x64 | 64x64 | 1.089 |
+| a16 1920x2560x2048 | 29.18 | 29.13 | **29.50** | 25.83 | 26.54 | 128x128 | 64x64 | 64x64 | 1.128 |
+| a16 1920x5632x2048 | 28.77 | 29.02 | **29.86** | 26.40 | 26.83 | 128x128 | 64x64 | 64x64 M-fast | 1.131 |
+#### 3070 — cold, M=512 (`cold-3070/`)
+
+| shape | 128x64 | 64x64 | 64x64 M-fast | 128x128 | 64x128 | grokmerge | 100df0d | new | new/grokmerge |
+|---|---:|---:|---:|---:|---:|---|---|---|---:|
+| 512x2048x2048 | 30.75 | 30.78 | **31.93** | 24.03 | 29.53 | 64x64 | 64x64 | 64x64 M-fast | 1.037 |
+| 512x2048x5632 | **32.58** | 28.37 | 32.33 | 24.65 | 31.18 | 64x64 | 128x64 | 128x64 | 1.148 |
+| 512x2560x2048 | 29.98 | 32.27 | **33.47** | 28.90 | 26.73 | 128x64 | 64x64 | 64x64 M-fast | 1.117 |
+| 512x2560x5632 | **31.91** | 30.44 | 31.68 | 30.85 | 28.06 | 128x64 | 128x64 | 128x64 | 1.000 |
+| 512x5632x2048 | **34.07** | 26.45 | 34.07 | 32.11 | 28.48 | 128x64 | 128x64 | 128x64 | 1.000 |
+| 512x5632x5632 | **34.86** | 23.89 | 31.08 | 33.20 | 28.24 | 128x64 | 128x64 | 128x64 | 1.000 |
+| 512x32000x2048 | **34.73** | 24.51 | 32.63 | 32.67 | 24.56 | 128x64 | 128x64 | 128x64 | 1.000 |
+| a16 512x2048x2048 | 31.33 | 32.24 | **33.34** | 24.03 | 29.01 | 64x64 | 64x64 | 64x64 M-fast | 1.034 |
+| a16 512x2048x5632 | 33.19 | 32.86 | **34.43** | 24.85 | 31.06 | 64x64 | 64x64 | 64x64 M-fast | 1.048 |
+| a16 512x2560x2048 | 29.64 | 34.41 | **35.34** | 29.01 | 26.10 | 128x64 | 64x64 | 64x64 M-fast | 1.192 |
+| a16 512x5632x2048 | 34.69 | 29.93 | **36.72** | 32.67 | 28.31 | 128x64 | 64x64 M-fast | 64x64 M-fast | 1.058 |
+#### 3070 — warm verify, clean batches (`verify-3070/`, 2026-09-26 21:00, 34ad9f1)
+
+| shape | 128x64 | 64x64 | 64x64 M-fast | 128x128 | 64x128 | grokmerge | 100df0d | new | new/grokmerge |
+|---|---:|---:|---:|---:|---:|---|---|---|---:|
+| 256x2048x2048 | 18.34 | **27.83** | 25.78 | 14.29 | 18.57 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 256x2048x5632 | 20.91 | **29.94** | 27.81 | 15.93 | 20.98 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 256x2560x2048 | 24.22 | 26.73 | **28.46** | 19.37 | 24.79 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 256x2560x5632 | 26.11 | 28.29 | **29.38** | 20.15 | 25.62 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 256x5632x2048 | **31.77** | 26.42 | 29.61 | 30.25 | 27.27 | 64x64 | 128x64 | 128x64 | 1.202 |
+| 256x5632x5632 | **33.02** | 23.62 | 26.16 | 30.84 | 28.46 | 64x64 | 128x64 | 128x64 | 1.398 |
+| 256x32000x2048 | **32.67** | 24.70 | 32.50 | 29.87 | 24.47 | 64x64 | 128x64 | 128x64 | 1.323 |
+| 384x2048x2048 | 22.51 | 26.21 | **26.81** | 17.49 | 21.91 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 384x2048x5632 | 24.72 | 27.92 | **28.80** | 18.24 | 23.21 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 384x2560x2048 | 28.53 | 28.38 | **29.18** | 22.25 | 27.15 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 384x2560x5632 | **30.13** | 27.33 | 28.62 | 22.07 | 28.32 | 64x64 | 128x64 | 128x64 | 1.102 |
+| 384x5632x2048 | 31.44 | 27.12 | **32.53** | 27.58 | 27.44 | 64x64 | 128x64 | 128x64 | 1.159 |
+| 384x5632x5632 | **32.20** | 25.31 | 30.51 | 27.59 | 27.86 | 64x64 | 128x64 | 128x64 | 1.272 |
+| 384x32000x2048 | **33.05** | 24.67 | 32.36 | 29.93 | 24.58 | 64x64 | 128x64 | 128x64 | 1.340 |
+| 1024x1024x1024 | 27.97 | **29.00** | 28.17 | 21.95 | 26.72 | 64x64 | 64x64 | 64x64 | 1.000 |
+| 1536x1536x1536 | 30.45 | **30.63** | 28.26 | 26.59 | 28.73 | 128x128 | 128x64 | 128x64 | 1.145 |
+| 2048x2048x2048 | **33.09** | 30.63 | 22.76 | 29.57 | 31.00 | 128x128 | 128x64 | 128x64 | 1.119 |
+| 3072x3072x3072 | 33.12 | 23.33 | 14.41 | **33.64** | 30.91 | 128x128 | 128x64 | 128x64 | 0.985 |
+| 4096x4096x4096 | 33.69 | 23.61 | 13.77 | **34.12** | 26.65 | 128x128 | 128x64 | 128x64 | 0.987 |
+### 12.5 128x64 vs 128x128 on large 3070 shapes (NEXT.md question 1)
+
+Answer: **no measurable reason to keep 128x128; 128x64 stays.**  All
+clean 3070 interleaved runs at the large end (TF/s, 128x128 / 128x64):
+
+| shape | §4 sweep (e1670b8) | §5 raster run | verify (34ad9f1) |
+|---|---|---|---|
+| 4096³ | 34.38 / 34.38 | 33.83 / 33.38 | 34.12 / 33.69 |
+| 3072³ | 33.42 / 34.29 | — | 33.64 / 33.12 |
+| 2048³ | 29.80 / 31.76 and 30.40 / 32.39 | — | 29.57 / 33.09 |
+| 2048x5632x5632 | 33.10 / 32.90 | — | — |
+| 2048x32000x2048 | 33.05 / 32.98 | — | — |
+| 1920x32000x2048 | 33.27 / 33.23 | — | — |
+
+128x128 leads by at most 1.6% (3072³ verify, while the §4 run has
+128x64 ahead by 2.6% on the same shape) and by 0.0-1.3% at 4096³ — inside
+the 1-4% same-kernel noise of multi-millisecond shapes (§3) — while
+128x64 leads by 6-12% at 2048³ and by up to 56% on mid-size grids.  On
+the 4060, cold, 128x64 leads at 4096³ (26.23 vs 25.49) and 3072³
+(27.41 vs 26.17).  Strictly, the 4096³ and 3072³ verify cells are the
+only clean 3070 measurements where the new pick trails grokmerge's by
+more than 1% (1.3%, 1.6%).  A dedicated 15-round, two-kernel warm +
+cold A/B on eight large shapes (`$SP/work/coopmat/large3070.sh`,
+`large.txt`) was queued but refused by the embargo: **PENDING**.  If it
+confirms 128x128 ahead by >1% at 4096³, the fix is a "128-tile grid
+>= 8 waves on a small L2" branch; nothing in the data supports it yet
+(an SM-count-only version would lose 8.5% at 2048³ on the 4060, cold).
+
+### 12.6 Model prediction error across GPUs and regimes
+
+The §6 model (fit per tile and A dtype on one set, predict every cell of
+another; regret = the model's choice among the four x-fast tiles vs the
+measured best; `python3 coldfit.py model`):
+
+| fit on | predict | shapes | median abs err | p90 abs err | regret mean / max |
+|---|---|---:|---:|---:|---:|
+| 4060 warm | 4060 warm | 77 | 3.2% | 10.4% | 0.38% / 8.7% |
+| 4060 warm | 3070 warm | 77 | 4.6% | 21.8% | 2.47% / 38.6% |
+| 4060 warm | 4060 cold | 77 | 5.2% | 18.5% | 0.56% / 17.2% |
+| 4060 warm | 3070 cold | 11 | 4.8% | 13.9% | 1.55% / 15.9% |
+| 3070 warm | 4060 warm | 77 | 7.3% | 18.8% | 2.12% / 12.8% |
+| 3070 warm | 3070 warm | 77 | 5.0% | 14.1% | 1.53% / 15.3% |
+| 3070 warm | 4060 cold | 77 | 5.7% | 16.8% | 1.25% / 10.6% |
+| 3070 warm | 3070 cold | 11 | 4.7% | 11.7% | 1.73% / 7.6% |
+| 4060 cold | 4060 warm | 77 | 9.1% | 18.0% | 0.95% / 12.8% |
+| 4060 cold | 3070 warm | 77 | 6.9% | 15.8% | 3.18% / 46.8% |
+| 4060 cold | 4060 cold | 77 | 4.4% | 14.1% | 0.35% / 8.9% |
+| 4060 cold | 3070 cold | 11 | 4.9% | 10.5% | 0.10% / 1.0% |
+
+Reading: across GPUs the model predicts time with a 4.6-7.3% median
+error (p90 11-22%); switching regime (warm <-> cold) costs about as much
+as switching GPU.  Its tile choice is good in-regime (<= 0.4% mean
+regret on the 4060) but not across GPUs (2-3% mean, 38-47% max),
+because of the L2-dependent 64x64 efficiency (§6) — which is why the
+shipped rule is a fitted rule with an L2 class, not the model itself.
+The refitted raster constants are in-sample (fitted on both GPUs' cold
+data); there is no held-out GPU.

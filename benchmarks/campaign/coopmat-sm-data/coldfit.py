@@ -3,6 +3,7 @@
 
     python3 coldfit.py                 # regret of candidate rules on cold-4060 / cold-3070 (+ warm checks)
     python3 coldfit.py table DIR GPU   # markdown table of one sweep with old/new picks
+    python3 coldfit.py model           # §6 model fitted per GPU/regime, cross-predicted
 """
 import itertools, math, sys
 import statistics as st
@@ -127,3 +128,30 @@ def md_table(d, gpu, l2):
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "table":
     md_table(sys.argv[2], sys.argv[3], (24 if sys.argv[3] == "4060" else 1) * MIB)
+
+
+def model_errors():
+    """§6 model: fit per GPU/regime, predict the others (median/p90 |err|, tile regret)."""
+    import numpy as np
+    sets = {"4060 warm": ("sweep-4060", "4060"), "3070 warm": ("sweep-3070", "3070"),
+            "4060 cold": ("cold-4060", "4060"), "3070 cold": ("cold-3070", "3070")}
+    data = {k: A.load_dir(d) for k, (d, g) in sets.items()}
+    clk = {k: A.median_clock(d) for k, (d, g) in sets.items()}
+    fits = {k: A.fit(data[k], A.GPUS[sets[k][1]], clk[k]) for k in ("4060 warm", "3070 warm", "4060 cold")}
+    for fk in fits:
+        for pk in sets:
+            g = sets[pk][1]
+            errs, regrets = [], []
+            for d in data[pk].values():
+                pred = {t: A.predict_ms(t, d, A.GPUS[g], clk[pk], fits[fk][(t, d["a16"])][0]) for t in A.ORDER if t in d["cells"]}
+                pred = {t: v for t, v in pred.items() if v}
+                meas = {t: d["cells"][t]["ms"] for t in pred}
+                errs += [abs(pred[t] / meas[t] - 1) for t in pred]
+                regrets.append(meas[min(pred, key=pred.get)] / min(meas.values()) - 1)
+            e, r = np.array(errs), np.array(regrets)
+            print(f"| {fk} | {pk} | {len(regrets)} | {np.median(e)*100:.1f}% | {np.percentile(e, 90)*100:.1f}% | "
+                  f"{r.mean()*100:.2f}% / {r.max()*100:.1f}% |")
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "model":
+    model_errors()
