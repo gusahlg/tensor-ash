@@ -549,6 +549,27 @@ passed explicitly).
 6. int8 `mma.m16n8k32` / int4 `m16n8k64` for the quantization track and
    hand-scheduled SASS (the driver accepts cubins) for f32 SGEMM.
 
+## 8. Parked: round-5 kernel (`hgemm2`)
+
+A predecessor's last uncommitted work (2026-09-26 21:01) was
+`ptx/hgemm2.cu`: the same operand contract and accumulation modes as
+`hgemm.cu` with loop-invariant per-thread copy descriptors, rolling stage
+indices, CUTLASS-style fragment double-buffering, and an in-kernel
+(last-arrival, deterministic) split-K fixup.  Its sm_89 `ptxas` /
+`cuobjdump` pass showed the 128x128_s3 f16 main loop at 168 SASS
+instructions (64 HMMA, 30 IMAD) against 308 (64 HMMA, 130 IMAD) in
+`hgemm.cu`, no spills except two dropped entries.  The checked-in PTX was
+never generated (the nvcc run was killed at the cutoff) and nothing was
+validated or timed.  Decision (2026-09-27): **parked, not merged** - the
+continuation's scope was merge readiness, and an unvalidated 20-entry
+module does not belong on the merge branch.  It is preserved as commit
+`c9bcf15` on branch `campaign/ptx-hgemm2-wip` (does not build: no
+`hgemm2.ptx`).  Next step there: generate the PTX, run
+`ptx_hgemm_kernels_match_reference`-style validation on the 4060, then
+an interleaved A/B against `ta_hgemm_f16_128x128_s3`; the halved
+integer overhead is the one untested lever left for the f16-accumulate
+kernels' remaining 0-20% gap to cuBLAS `COMPUTE_16F`.
+
 ## Negative results and dead ends (this track)
 
 * **cp.async alone does not fix f32 SGEMM.**  A real 3/4-stage cp.async
@@ -568,15 +589,16 @@ passed explicitly).
 * **128x128 with 4 stages (64 KiB shared)** hurts: one CTA per SM (s4
   -10 to -25% vs s3).
 
-## Pending (blocked or not done)
+## Pending (not done)
 
-* 3070 was embargoed 18:40 to ~19:45 (user gaming); everything listed
-  as pending during that window was run afterwards (llama.cpp re-measure,
-  pp512 passes, token check, g8/f16p kernels, `ptx::` and `f16::`
-  tests).  Not run on the 3070: split-K f16p/f32 entries.
-* Measured-tuner integration of PTX candidates; fused epilogues in the
-  PTX kernels; TN-weight layout variant; int8/int4 `mma` for the quant
-  track; hand-scheduled SASS for f32 SGEMM.
+* hgemm2 (above); measured-tuner integration of PTX candidates; fused
+  epilogues in the PTX kernels; TN-weight layout variant; pruned route
+  module; int8/int4 `mma` for the quant track; hand-scheduled SASS for
+  f32 SGEMM.
+* Real-activation numerics of the PTX classes through f16acc's
+  `llama_ash numerics` (exists only on `campaign/f16acc`; one run after
+  the merge).
+* Not run on the 3070: split-K f16p/f32 entries (bench-only).
 
 ## Reproduction
 
