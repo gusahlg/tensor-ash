@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Refit the coopmat tile rule on the cold-L2 sweeps (coopmat-sm.md §11).
 
-    python3 coldfit.py            # per-tile regret of candidate rules on cold-4060 / cold-3070 (+ warm checks)
+    python3 coldfit.py                 # regret of candidate rules on cold-4060 / cold-3070 (+ warm checks)
+    python3 coldfit.py table DIR GPU   # markdown table of one sweep with old/new picks
 """
 import itertools, math, sys
 import statistics as st
@@ -95,10 +96,34 @@ def evaluate(name, rule, sets, verbose=False):
     return out
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and len(sys.argv) == 1:
     SETS = [("cold-4060", "4060", 24 * MIB), ("cold-3070", "3070", MIB),
             ("verify-4060", "4060", 24 * MIB), ("verify-3070", "3070", MIB)]
     evaluate("shipped (100df0d)", make_rule(), SETS)
     evaluate("drop large-L2 fit exemption", make_rule(exempt_fit=False), SETS)
     evaluate("small-L2 rule everywhere", make_rule(), [(d, g, MIB) for d, g, _ in SETS])
     evaluate("NEW: cold-fitted raster (routing.rs)", new_rule, SETS, verbose=True)
+
+
+def md_table(d, gpu, l2):
+    """Markdown table of one same-run sweep: TF/s per tile, picks, new/old."""
+    S = A.load_dir(d)
+    sms = A.GPUS[gpu]["sms"]
+    old_rule = make_rule()
+    nm = lambda t: t.replace("64x64m", "64x64 M-fast")
+    print("| shape | 128x64 | 64x64 | 64x64 M-fast | 128x128 | 64x128 | grokmerge | 100df0d | new | new/grokmerge |")
+    print("|---|---:|---:|---:|---:|---:|---|---|---|---:|")
+    for case, s in sorted(S.items(), key=lambda kv: (kv[1]["a16"], kv[1]["m"], kv[1]["n"], kv[1]["k"])):
+        c = s["cells"]
+        ms = {t: c[t]["ms"] for t in TILES if t in c}
+        best = min(ms, key=ms.get)
+        fl = 2.0 * s["b"] * s["m"] * s["n"] * s["k"]
+        cell = lambda t: (("**%.2f**" if t == best else "%.2f") % (fl / ms[t] * 1e-9)) if t in ms else "n/a"
+        g, o, n = A.grokmerge(s), old_rule(s, sms, l2), new_rule(s, sms, l2)
+        tag = "a16 " if s["a16"] else ""
+        print(f"| {tag}{s['m']}x{s['n']}x{s['k']} | " + " | ".join(cell(t) for t in TILES)
+              + f" | {nm(g)} | {nm(o)} | {nm(n)} | {ms[g] / ms[n]:.3f} |")
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "table":
+    md_table(sys.argv[2], sys.argv[3], (24 if sys.argv[3] == "4060" else 1) * MIB)

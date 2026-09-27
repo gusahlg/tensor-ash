@@ -50,3 +50,21 @@ Louise trees: `~/ta-wt/cm-base` (7cfca58 grokmerge build), `cm-sm`
   verify remainder, cold a16_* t128 m256 m384.
 - Desktop note: user app `project_watt_cubed` runs on the 3070 (~30% util
   at idle clocks); no embargo file.  Check the `.smi.csv` logs.
+- 07:20-07:45: 4060 cold sweep complete (77 shapes, `cold-4060/`); 3070
+  cold a16_512 + m512 (`cold-3070/`), warm verify remainder.
+- **Refit (0fc29f9)**: cold data kill the large-L2 "B fits L2 -> x-fast"
+  exception (M-fast wins every a16 pp512 GEMM cold on both GPUs).  New
+  raster: fewer bytes (0.75) or tall single pass (M>=512, N>=2048), and
+  cheap A re-reads (<=8 MiB or A <= L2/2 on a large L2).  rho unchanged
+  except f16w small-L2 keyed on xp.  `coldfit.py` evaluates it.
+  CoopmatGrid factors out raster + balance for an acc16 rule.
+- 3070 EMBARGO from 07:44 (TABG).  A foreign 3-5 GB GPU allocation was
+  present from ~07:25, so the 3070 batches from 07:25 on are quarantined
+  in `verify-3070-contended/` (abs TF/s -4%, tile-ratio p90 disagreement
+  14% vs 5% clean).  Clean 3070 data: §4 sweep, §5 candidates, verify
+  sq/m256/m384, cold m512 (07:19) and a16_512 (07:15, a light GUI app ran).
+- 3070 PENDING (embargo): large 128x128-vs-128x64 15-round A/B
+  (`$SP/work/coopmat/large3070.sh`), remaining cold batches, pp512 A/B
+  with `$SP/work/coopmat/bin/llama_ash-{7cfca58,0fc29f9}`.
+- louise: unit tests 14/14 ok at 0fc29f9; GPU tests + pp512 A/B queued
+  (`cm-results/pp4060.sh`).
