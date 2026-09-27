@@ -1,2 +1,9 @@
-gpu3070: EMBARGO — the user is gaming on this desktop; the RTX 3070 is OFF LIMITS until the embargo file is removed. Do ALL GPU work on louise-pc (lgpu). Record any 3070-only step as PENDING in your report (do not retry in a loop). Reason: user gaming (auto-detected TotallyAccurateBattlegrounds on the 3070, 2026-09-27 07:44); 3070 off limits
-user gaming on the 3070 (TotallyAccurateBattlegrounds detected 07:44); set by tensor-ash session
+## ptx:: ML_PTX=1
+test ptx::ptx_f32_route_is_bitwise_coopmat1 ... ok
+test ptx::ptx_hgemm_kernels_match_reference ... ok
+test ptx::ptx_launches_order_with_vulkan_dispatches ... ok
+test ptx::ptx_policy_is_explicit_and_degrades_to_f32 ... ok
+test ptx::ptx_route_in_mixed_graphs_and_prepared_replay ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 138 filtered out; finished in 3.20s
+## f16:: graph:: prepared:: replay:: with ML_PTX_GEMM=all
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 118 filtered out; finished in 11.70s

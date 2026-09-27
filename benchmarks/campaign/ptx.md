@@ -13,8 +13,7 @@ otherwise), precision is the executor policy shared with
 `campaign/f16acc` (`CoopmatAcc`, default `F32`; `f16p` = recommended fast
 mode; `f16` = opt-in llama.cpp-parity mode), the f32 PTX route is
 bit-identical to coopmat1 through single ops, graphs and prepared replay,
-and all GPU gates pass on the 4060 (§7e).  The 3070 re-confirmation of
-this continuation is pending (gaming embargo).
+and all GPU gates pass on the 4060 and the 3070 (§7e).
 
 **Feasible, stable, and worth a backend.**  The NVIDIA proprietary
 driver's `VK_NV_cuda_kernel_launch` (rev 2) JIT-compiles PTX (and
@@ -575,13 +574,14 @@ cubin cache makes the route cost 3.7 ms at startup.  `llama_ash
 generate` with the 128-token prompt: 32 greedy tokens identical for
 `ML_PTX=0`, `ML_PTX=1`, `ML_PTX=1 ML_PTX_GEMM=all`, `f16p` and `f16`.
 
-**RTX 3070: pending.**  The desktop was under the gaming embargo
-(`GPU3070_EMBARGO`, set 07:44) for the whole continuation; the 3070 batch
-(`run_v2_3070.sh`: `ptx::` + the four suites with `ML_PTX_GEMM=all`, then
-`run_v2_3070.sh llama`) is ready and uses the already-built desktop
-binaries.  The kernels themselves were validated on the 3070 on
-2026-09-26 (`3070_tests.log`, `3070_llama_pp512_final.log`); what is new
-since is host-side plumbing.
+**RTX 3070** (desktop, `gpu3070`, after the gaming embargo lifted at
+~10:10; validated binaries built from `a532a0a`; logs
+`ptx-logs/3070_v2_tests.log`, `3070_v2_llama.log`, script
+`run_v2_3070.sh`): `ML_PTX=1 ... ptx::` **5 / 5** (incl. the bitwise and
+mixed-graph tests), `ML_PTX=1 ML_PTX_GEMM=all ... f16:: graph:: prepared::
+replay::` **25 / 25**; pp512 (two alternating passes) base 16,090 / 16,079,
+`f16p` 21,754 / 21,770 (**1.35x**), `f16` 25,550 / 24,453 (**1.59x /
+1.52x**); 32 greedy tokens identical for base, `f16p`, `f16`.
 
 ### 7f. Still a proposal
 
