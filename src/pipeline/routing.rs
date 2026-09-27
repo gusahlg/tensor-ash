@@ -86,41 +86,127 @@ pub(crate) struct CoopmatDevice {
 }
 
 const MIB: u64 = 1 << 20;
-/// An L2 this large keeps a TinyLlama-class prefill operand resident
-/// (AD107: 24 MiB); GA104's 4 MiB does not.
+/// An L2 this large keeps a TinyLlama-class prefill activation
+/// resident (AD107: 24 MiB); GA104's 4 MiB does not.
 const LARGE_L2_BYTES: u64 = 16 * MIB;
 /// CTAs per SM from the driver register counts (identical on sm_86
 /// and sm_89; `examples/coopmat_occupancy.rs`): 64x64 is 72 regs x 4
 /// warps -> 7; 128x64 is 128 regs x 4 warps -> 4.
 const CTAS_PER_SM_64: u64 = 7;
 
-/// SM-count-aware coopmat tile pick for an f16w (`a16 = false`) or
-/// f16-activation (`a16 = true`) shape; `k % 32 == 0` is the caller's
-/// precondition.  With no SM count this is exactly the exp/grokmerge
-/// rule ([`coopmat_tile_fallback`]).
+/// The accumulator-independent part of the coopmat tile rules: one
+/// GEMM grid on one device, as SM load balance and DRAM traffic see
+/// it.  [`coopmat_tile`] (f32 accumulate) is this plus a per-tile
+/// efficiency table; a rule for another accumulator class (the
+/// f16-accumulate tiles prefer wider tiles) composes the same way:
+/// build the grid, score its own candidate tiles with
+/// [`CoopmatGrid::balance`], and reuse [`CoopmatGrid::m_fast_64`] for
+/// the raster of a 64x64 grid (raster is about operand bytes, not the
+/// accumulator).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CoopmatGrid {
+    batch: u64,
+    m: u64,
+    n: u64,
+    sms: u64,
+    a_bytes: u64,
+    b_bytes: u64,
+    l2_bytes: u64,
+}
+
+impl CoopmatGrid {
+    /// `None` when the device reports no SM count (callers then use
+    /// the SM-agnostic [`coopmat_tile_fallback`]).
+    pub(crate) fn new(
+        batch: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+        a16: bool,
+        device: CoopmatDevice,
+    ) -> Option<Self> {
+        let sms = device.sm_count.filter(|&count| count > 0)?;
+        let (m, n, k) = (u64::from(m), u64::from(n), u64::from(k));
+        Some(Self {
+            batch: u64::from(batch),
+            m,
+            n,
+            sms: u64::from(sms),
+            a_bytes: m * k * if a16 { 2 } else { 4 },
+            b_bytes: k * n * 2,
+            l2_bytes: device.l2_bytes.unwrap_or(0),
+        })
+    }
+
+    /// The L2 is large enough to keep a prefill activation resident.
+    pub(crate) fn large_l2(&self) -> bool {
+        self.l2_bytes >= LARGE_L2_BYTES
+    }
+
+    /// How many times a 64x64 grid streams B in x-fastest order
+    /// (`xp`) and A in M-fastest order (`mp`), with an in-flight
+    /// window of `7 S` CTAs.
+    fn passes_64(&self) -> (u64, u64) {
+        let (rows, cols) = (self.m / 64, self.n / 64);
+        let window = (self.sms * CTAS_PER_SM_64) as f64;
+        let passes = |blocks: u64, other: u64| -> u64 {
+            (blocks as f64 / (window / other as f64).max(1.0)).ceil() as u64
+        };
+        (passes(rows, cols), passes(cols, rows))
+    }
+
+    /// Launch the 64x64 grid M-fastest ([`CoopmatTile::T64Mfast`])?
+    /// Fitted on cold-L2 sweeps (`ML_AB_COLD_MB=64`: weights evicted
+    /// before every GEMM, as in a model forward):
+    ///
+    /// * M-fast must move clearly fewer bytes
+    ///   (`|A| mp + |B| < 0.75 (|B| xp + |A|)`), or the grid is a
+    ///   single x-fast pass at least 8 row blocks tall and 32 column
+    ///   blocks wide (M >= 512, N >= 2048: +3-14% on the 3070 at
+    ///   M=512, where traffic is equal; 1024³ lost 3% warm);
+    /// * and its A re-reads must be cheap: `|A| (mp - 1) <= 8 MiB`, or
+    ///   A fits half of a large L2 (re-reads then hit in L2).
+    ///
+    /// The earlier "B fits a large L2 -> x-fast" exception was a
+    /// warm-L2 artifact: with cold weights M-fast wins every a16 pp512
+    /// GEMM on the 4060 too.
+    pub(crate) fn m_fast_64(&self) -> bool {
+        let (xp, mp) = self.passes_64();
+        let (a, b) = (self.a_bytes, self.b_bytes);
+        let cheap_a = a * (mp - 1) <= 8 * MIB || (self.large_l2() && 2 * a <= self.l2_bytes);
+        let fewer_bytes = ((a * mp + b) as f64) < 0.75 * (b * xp + a) as f64;
+        let tall_single_pass = xp == 1 && self.m / 64 >= 8 && self.n / 64 >= 32;
+        cheap_a && (fewer_bytes || tall_single_pass)
+    }
+
+    /// SM load balance times an occupancy floor for a grid of `tiles`
+    /// CTAs: `n = ceil(tiles / S)` land on the busiest SM, and fewer
+    /// than 3 per SM cannot hide the load/MMA latency of any tile.
+    pub(crate) fn balance(&self, tiles: u64) -> f64 {
+        let per_sm = tiles.div_ceil(self.sms);
+        tiles as f64 / (self.sms * per_sm) as f64 * (per_sm as f64 / 3.0).min(1.0)
+    }
+}
+
+/// SM-count-aware coopmat tile pick for the f32-accumulate kernels,
+/// f16w (`a16 = false`) or f16-activation (`a16 = true`); `k % 32 == 0`
+/// is the caller's precondition.  With no SM count this is exactly
+/// the exp/grokmerge rule ([`coopmat_tile_fallback`]).
 ///
 /// With `S` SMs the rule compares the two tiles that won the two-GPU
 /// sweep, 128x64 and 64x64:
 ///
-/// 1. **Raster of the 64x64 grid.**  In-flight window `W = 7 S` CTAs.
-///    x-fastest order re-streams B `xp = ceil(rows / max(1, W/cols))`
-///    times; M-fastest re-streams A `mp = ceil(cols / max(1, W/rows))`
-///    times.  M-fast when it moves clearly fewer bytes
-///    (`|A| mp + |B| < 0.75 (|B| xp + |A|)`), its A re-reads stay
-///    small (`|A| (mp - 1) <= 8 MiB`), and B does not already fit a
-///    large L2 (then re-streams hit in L2 and x-fast is as good).
-/// 2. **Wave balance.**  Per tile, `n = ceil(tiles / S)` CTAs land on
-///    the busiest SM; `score = tiles/(S n) * min(1, n/3) * rho`, i.e.
-///    SM load balance times an occupancy term (fewer than 3 CTAs per SM
-///    cannot hide the load/MMA latency of either tile).
+/// 1. **Raster of the 64x64 grid**: [`CoopmatGrid::m_fast_64`].
+/// 2. **Wave balance** per tile: [`CoopmatGrid::balance`].
 /// 3. **Tile efficiency rho** of 64x64 relative to 128x64 (fit to the
-///    sweep): large L2 — 1.02 a16 (f16 A), 0.92 f16w (f32 A); small or
-///    unknown L2 — a16 1.02, but 0.8 when an x-fast grid re-streams B;
-///    f16w 0.9, except 1.0 (single-pass x-fast, `|A| <= 4 MiB`) / 0.85
-///    (single-pass, larger A).
+///    sweeps; unchanged by the cold-L2 refit): large L2 — 1.02 a16
+///    (f16 A), 0.92 f16w (f32 A); small or unknown L2 — a16 1.02, but
+///    0.8 when an x-fast grid re-streams B; f16w 0.9 on a multi-pass
+///    grid (`xp > 1`), else 1.0 (`|A| <= 4 MiB`) / 0.85 (larger A).
 ///
-/// Ties go to 64x64 (finer balance, more resident warps).  M or N not
-/// 128-/64-aligned: 64x64 only (`None` below 64-alignment).
+/// `score = balance * rho`; ties go to 64x64 (finer balance, more
+/// resident warps).  M or N not 128-/64-aligned: 64x64 only (`None`
+/// below 64-alignment).
 pub(crate) fn coopmat_tile(
     batch: u32,
     m: u32,
@@ -129,29 +215,13 @@ pub(crate) fn coopmat_tile(
     a16: bool,
     device: CoopmatDevice,
 ) -> Option<CoopmatTile> {
-    let Some(sms) = device.sm_count.filter(|&count| count > 0) else {
+    let Some(grid) = CoopmatGrid::new(batch, m, n, k, a16, device) else {
         return coopmat_tile_fallback(batch, m, n);
     };
     if !m.is_multiple_of(64) || !n.is_multiple_of(64) {
         return None;
     }
-    let sms = u64::from(sms);
-    let (batch, m, n, k) = (u64::from(batch), u64::from(m), u64::from(n), u64::from(k));
-    let (rows, cols) = (m / 64, n / 64);
-    let window = (sms * CTAS_PER_SM_64) as f64;
-    let passes = |blocks: u64, other: u64| -> u64 {
-        (blocks as f64 / (window / other as f64).max(1.0)).ceil() as u64
-    };
-    let a_bytes = m * k * if a16 { 2 } else { 4 };
-    let b_bytes = k * n * 2;
-    let xp = passes(rows, cols);
-    let mp = passes(cols, rows);
-    let l2 = device.l2_bytes.unwrap_or(0);
-    let large_l2 = l2 >= LARGE_L2_BYTES;
-    // An L2 that holds all of B makes x-fast re-streams free.
-    let m_fast = !(large_l2 && b_bytes <= l2)
-        && a_bytes * (mp - 1) <= 8 * MIB
-        && ((a_bytes * mp + b_bytes) as f64) < 0.75 * (b_bytes * xp + a_bytes) as f64;
+    let m_fast = grid.m_fast_64();
     let t64 = if m_fast {
         CoopmatTile::T64Mfast
     } else {
@@ -160,21 +230,19 @@ pub(crate) fn coopmat_tile(
     if !m.is_multiple_of(128) {
         return Some(t64);
     }
-    let rho = match (large_l2, a16) {
+    let (xp, _) = grid.passes_64();
+    let rho = match (grid.large_l2(), a16) {
         (true, true) => 1.02,
         (true, false) => 0.92,
         (false, true) if !m_fast && xp > 1 => 0.8,
         (false, true) => 1.02,
-        (false, false) if m_fast || xp > 1 => 0.9,
-        (false, false) if a_bytes <= 4 * MIB => 1.0,
+        (false, false) if xp > 1 => 0.9,
+        (false, false) if grid.a_bytes <= 4 * MIB => 1.0,
         (false, false) => 0.85,
     };
-    let score = |tiles: u64, rho: f64| -> f64 {
-        let per_sm = tiles.div_ceil(sms);
-        tiles as f64 / (sms * per_sm) as f64 * (per_sm as f64 / 3.0).min(1.0) * rho
-    };
-    let s64 = score(batch * rows * cols, rho);
-    let s128x64 = score(batch * (m / 128) * cols, 1.0);
+    let cols = grid.n / 64;
+    let s64 = grid.balance(grid.batch * (grid.m / 64) * cols) * rho;
+    let s128x64 = grid.balance(grid.batch * (grid.m / 128) * cols);
     Some(if s64 >= s128x64 {
         t64
     } else {
@@ -399,14 +467,17 @@ mod bda_tests {
     fn coopmat_tile_rtx4060_24_sms_large_l2() {
         use CoopmatTile::*;
         let tile = |m, n, k, a16| coopmat_tile(1, m, n, k, a16, RTX4060);
-        // TinyLlama pp512 (f16 activations): 64x64 won all four GEMMs;
-        // B fits the 24 MiB L2, so the raster stays x-fast.
-        assert_eq!(tile(512, 2048, 2048, true), Some(T64)); // q/o
-        assert_eq!(tile(512, 2560, 2048, true), Some(T64)); // concat QKV
-        assert_eq!(tile(512, 5632, 2048, true), Some(T64)); // gate/up
-        assert_eq!(tile(512, 2048, 5632, true), Some(T64)); // down
-        // Long prompts: 64x64 x-fast keeps winning a16 on the big L2.
-        assert_eq!(tile(1920, 5632, 2048, true), Some(T64));
+        // TinyLlama pp512 (f16 activations), cold weights: 64x64
+        // M-fast won all four GEMMs (the warm-L2 sweep had preferred
+        // x-fast because B stayed resident between repeats).
+        assert_eq!(tile(512, 2048, 2048, true), Some(T64Mfast)); // q/o
+        assert_eq!(tile(512, 2560, 2048, true), Some(T64Mfast)); // concat QKV
+        assert_eq!(tile(512, 5632, 2048, true), Some(T64Mfast)); // gate/up
+        assert_eq!(tile(512, 2048, 5632, true), Some(T64Mfast)); // down
+        // Long prompts: A (7.5 MiB) fits the 24 MiB L2, so M-fast's
+        // A re-reads are cheap.
+        assert_eq!(tile(1920, 5632, 2048, true), Some(T64Mfast));
+        // Single-pass, 2 row blocks: x-fast.
         assert_eq!(tile(128, 2048, 2048, true), Some(T64));
         // f16w (f32 A): 128x64 fills 8 full waves at 768x2048...
         assert_eq!(tile(768, 2048, 2048, false), Some(T128x64));
@@ -423,12 +494,12 @@ mod bda_tests {
     fn coopmat_tile_rtx3070_46_sms_small_l2() {
         use CoopmatTile::*;
         let tile = |m, n, k, a16| coopmat_tile(1, m, n, k, a16, RTX3070);
-        // pp512: QKV 64x64 (+17% over 128x64), gate/up 64x64 M-fast
-        // (35.2 vs 29.1 x-fast vs 33.8 128x64), q/o and down 64x64.
-        assert_eq!(tile(512, 2048, 2048, true), Some(T64));
-        assert_eq!(tile(512, 2560, 2048, true), Some(T64));
+        // pp512, cold weights: 64x64 M-fast wins all four (single
+        // x-fast pass at M=512 for q/o, QKV, down: +2.7-4.8%).
+        assert_eq!(tile(512, 2048, 2048, true), Some(T64Mfast));
+        assert_eq!(tile(512, 2560, 2048, true), Some(T64Mfast));
         assert_eq!(tile(512, 5632, 2048, true), Some(T64Mfast));
-        assert_eq!(tile(512, 2048, 5632, true), Some(T64));
+        assert_eq!(tile(512, 2048, 5632, true), Some(T64Mfast));
         // Long prompts: A and B both exceed the 4 MiB L2 → 128x64.
         assert_eq!(tile(1920, 5632, 2048, true), Some(T128x64));
         assert_eq!(tile(1024, 5632, 2048, true), Some(T128x64));
