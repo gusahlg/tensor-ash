@@ -4,6 +4,11 @@
 
 ### Changed
 
+- **Shaders compile with `glslc -Os`** (was `-O`, with a LOWMEM
+  `-Os` fallback on small hosts): the NVIDIA driver emits
+  byte-identical SASS for both (UCODE hashes, RTX 3070 and 4060), and
+  `-O` needed >3 GB (>6 GB for the tm8_tn8 tiles).
+  `TENSOR_ASH_GLSLC_OPT=-O` restores the old flag.
 - **`llama_ash bench` tg is per-token again by default**: the packed-
   GEMV leg had silently switched tg to `decode_unrolled` (all `tg`
   steps baked into ONE submission, no per-token host round-trip),
