@@ -140,8 +140,10 @@ runtime when the device exposes `bufferDeviceAddress`, with a BDA fallback for
   `bufferDeviceAddress` is required for the BDA kernel families; the selector
   falls back to descriptor-bound variants when it's unavailable.
 - Rust (2024 edition).
-- `glslc` / `shaderc`. `build.rs` compiles `shaders/*.comp` to SPIR-V and
-  embeds the result.
+- `glslc` / `shaderc`. `build.rs` compiles `shaders/*.comp` to SPIR-V with
+  `glslc -Os` and embeds the result (the NVIDIA driver produces identical
+  SASS for `-O` and `-Os`, and `-O` needs >3 GB for some tiles;
+  `TENSOR_ASH_GLSLC_OPT=-O` restores `-O`).
 
 ```bash
 nix-shell
@@ -208,8 +210,15 @@ f32-accumulate tensor rate on GeForce Ampere/Ada.  `F16` has the numerics of
 cuBLAS `CUBLAS_COMPUTE_16F` (what llama.cpp's CUDA backend uses for f16-weight
 prefill GEMMs); `F16Promote` adds f16 partials of at most 128 K into f32
 accumulators (about 3x the f16-output rounding floor).  The heuristic and the
-tuner never pick these classes; unsupported devices fall back to `F32` with a
-warning.  Error and speed tables: `benchmarks/campaign/f16acc.md`.
+tuner never pick these classes.  Two implementations serve them: the GLSL
+f16-accumulator coopmat twins (devices with a 16x16x16 f16/f16/f16/f16
+cooperative-matrix configuration) and, with `ML_PTX=1`, the PTX route below;
+a class that neither serves falls back to `F32` with a warning, and
+`Executor::coopmat_acc()` reports the effective class.  `f16p` is the
+recommended fast mode; `f16` is the llama.cpp-parity mode (1.1% RMS error on
+TinyLlama's down-projection, can overflow at 65504) and never a default.
+Error and speed tables: `benchmarks/campaign/f16acc.md`,
+`benchmarks/campaign/ptx.md`.
 
 Fused epilogues and dependent graphs:
 
@@ -324,14 +333,19 @@ version + shader build. Persisted winners are applied on **every** run —
 tuning enabled or not — whenever `ML_KERNEL` is `auto`. Delete the store (or
 update the driver / rebuild shaders) to reset it.
 
-`ML_KERNEL=auto` is the default. `KERNEL_SPECS` currently contains 57 concrete
-choices. They include the
+`ML_KERNEL=auto` is the default. `KERNEL_SPECS` currently contains 127
+entries, including the explicit-only f16-accumulator twins and generator
+configs. They include the
 descriptor-bound tiles (`large`, `small`, `m64n128`, `m128n64`,
 `m128n64k64`, `m64n32`, `k64`, `bk16`, `v2`, `m64n128k64`,
 `m128n128_t4`, `m256n64`, `v3`), BDA / BDA_V4 and register-tile variants,
 the strict-aligned kernels, and the shape-specialized `row_bda` (`M=1`),
 `col_bda` (`N=1`), and `outer_bda` (`K=1`) kernels. The authoritative names
-and aliases live together in `src/pipeline/catalog.rs`.
+and aliases live together in `src/pipeline/catalog.rs`.  The f32 large-tile
+route is `large_bda_v4t` (A staged k-major so each k-step reads it with
+LDS.128; `large_bda_v4` stays selectable), and odd-K tails run
+`ceil(k_rem/8)*8` k-steps instead of a full BK tile everywhere except the
+128x128 tiles (`benchmarks/campaign/merge-1.md`).
 `ML_DEVICE` accepts `auto`, `discrete`, `integrated`, `virtual`, `cpu`,
 `index:N`, `name:TEXT`, or a bare name substring. It is honored by the
 library entry point (`VulkanContext::new`), so the test suite, `llama_ash`,
@@ -342,7 +356,10 @@ Tensor-core (coopmat) tile routing is SM-count-aware: the SM count comes
 from `VK_NV_shader_sm_builtins` (or the AMD / ARM core-count queries) and an
 L2 lower bound from an NVIDIA device-ID family table.  `ML_SM_COUNT=N` /
 `ML_L2_MB=N` override them for what-if runs; `ML_SM_COUNT=0` restores the
-SM-agnostic rule.  Both values appear in the device diagnostics line.  See
+SM-agnostic rule.  The rule picks 128x64 or 64x64 from per-SM wave balance and
+launches 64x64 M-fastest (`*_m64n64_mfast`) when that streams fewer weight
+bytes; it was fitted with weights evicted from L2 before every GEMM, as in a
+model forward (`ml_bench ab` with `ML_AB_COLD_MB=64`).  Both values appear in the device diagnostics line.  See
 `benchmarks/campaign/coopmat-sm.md`.
 
 Kernels whose workgroup (shared-memory) tiles exceed the device's

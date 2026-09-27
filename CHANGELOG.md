@@ -4,6 +4,28 @@
 
 ### Added
 
+- **PTX backend inside the Vulkan command buffers** (experimental, off by
+  default; `src/ptx`, `benchmarks/campaign/ptx.md`): `ML_PTX=1` enables
+  `VK_NV_cuda_kernel_launch` on the NVIDIA proprietary driver (compute
+  capability >= 8.0; `ML_NO_PTX=1` vetoes; device creation is byte-
+  identical otherwise).  The checked-in PTX (`ptx/*.cu` -> `ptx/*.ptx`,
+  no CUDA toolkit needed to build) is JIT-compiled once per driver and
+  cached; a16 GEMMs (f16 A/B/C, the llama prefill contract) are recorded
+  as `vkCmdCudaLaunchKernelNV` (`mma.sync` + `ldmatrix` + `cp.async`) in
+  single submissions, dependency graphs and prepared command buffers.
+  Precision is the shared `CoopmatAcc` policy: `ML_PTX_GEMM=on`
+  (default with the backend) serves `F16` / `F16Promote`, `all` also
+  `F32` (bit-identical to coopmat1), `off` none.  TinyLlama pp512:
+  `ML_PTX=1 ML_COOPMAT_ACC=f16p` 1.29x (4060) / 1.35x (3070) over f32,
+  `f16` 1.38x / 1.52-1.59x; tokens identical.  The deprecated
+  `ML_PTX_GEMM=f32|f16|f16p` spellings map to the backend switch plus
+  the class (one release, warned).
+- **`ml_bench isa` / `isa-analyze` / `isa-cache`** (`benchmarks/SASS.md`):
+  SASS extraction and census of the routed kernel from the driver's
+  pipeline cache (NVIDIA), via the library's ISA probe API
+  (`MatmulPipeline::create_probe_pipeline`) and opt-in
+  `VK_KHR_pipeline_executable_properties` (`ML_PIPELINE_EXEC_INFO=1`,
+  set by `isa`; off by default).
 - **f16-accumulator tensor-core GEMMs (opt-in numerics class)**:
   `_acc16` (HMMA.*.F16 end to end — the numerics of cuBLAS
   `CUBLAS_COMPUTE_16F`, which llama.cpp CUDA uses for every f16 weight
@@ -18,6 +40,10 @@
   128x128).  RTX 4060 a16 prefill GEMMs 1.40-1.48x, TinyLlama pp512
   12.9k -> 16.1k t/s (f16) / 14.8k (promote), greedy tokens identical;
   RTX 3070 pp512 15.9k -> 20.5k.  `benchmarks/campaign/f16acc.md`.
+  One policy for both implementations (GLSL twins and the PTX route):
+  a class is kept when either serves it, else `F32` with a warning.
+  `f16p` is the recommended fast mode; `f16` is the llama.cpp-parity
+  mode (1.1% RMS on TinyLlama's down-projection; never default).
 - **Generator M1**: one spec-constant coopmat1 module per A storage
   (`SPEC_TILE`, spec ids 16-23) with 15 configs each (`*_coopmat_g_*`,
   `ML_GEN=1` or an `ML_KERNEL` pin), an f16-accumulator module axis and
@@ -35,15 +61,36 @@
   `VulkanContext::sm_count`, `ML_SM_COUNT` override) f16w and a16
   GEMMs choose between 128x64 and 64x64 from per-SM wave balance
   (`ceil(tiles / SMs)`), a 3-CTA occupancy floor and a fitted tile
-  efficiency ratio, and pick the 64x64 CTA raster (x- or M-fastest)
-  that re-streams fewer bytes.  128x64 replaces 128x128 as the large
-  grid tile (the RTX 3070 4096³ "veto" is a tie).  The ratio depends
-  on whether the L2 holds a prefill operand: `l2_bytes_estimate` is an
+  efficiency ratio (`CoopmatGrid`), and launch 64x64 M-fastest when that
+  moves clearly fewer bytes or the x-fast grid is a single tall pass,
+  provided A's re-reads are cheap (<= 8 MiB, or A fits half of a large
+  L2).  The raster rule was refitted on cold-L2 sweeps (weights evicted
+  before every GEMM, `ml_bench ab` `ML_AB_COLD_MB=64`), as in a model
+  forward; the earlier "B fits a large L2 -> x-fast" exception was a
+  warm-L2 artifact.  128x64 replaces 128x128 as the large grid tile
+  (the RTX 3070 4096³ "veto" is a tie).  `l2_bytes_estimate` is an
   NVIDIA device-ID family lower bound (`ML_L2_MB` override, unknown =
-  small).  No SM count keeps the exp/grokmerge rule.  Measured over 77
-  shapes per GPU: RTX 3070 geomean x1.079 with no shape >1% slower,
-  RTX 4060 x1.073 (four large grids 1.2-3.6% slower, where 128x128
-  still edges out 128x64).
+  small).  No SM count keeps the exp/grokmerge rule.  Measured: RTX 4060
+  cold sweep geomean x1.083 over 77 shapes (one shape 2.4% slower), RTX
+  3070 x1.081 (clean 77-shape sweep, none >1% slower); TinyLlama pp512
+  prefill GPU time -2.6% (4060) and -6.8% (3070, 29.38 vs 31.53 ms,
+  5 rotated rounds).  The f16-accumulator classes keep their own
+  measured tile rule (`coopmat_tile_acc` dispatches on the class).
+- **f32 large-tile route is the transposed-A `large_bda_v4t`**
+  (`routing::maybe_to_bda`; from exp/v4t, `reports/night-kernels.md`):
+  A is staged k-major (`AsT[k][m]` uvec4, XOR column swizzle) so each
+  k-step reads it with 2 LDS.128 instead of 8 LDS.32, same 32,768 B
+  shared memory.  +1.4..+9.2% over `large_bda_v4` on the RTX 4060
+  (12/12 shapes), +0.5..+6.7% on the RTX 3070, never slower.
+  `large_bda_v4` stays selectable and a tuner candidate; f16w keeps
+  `f16w_large_bda_v4`.
+- **Odd-K tails run ceil(k_rem/8)*8 k-steps instead of BK** (from
+  exp/oddk) in the BDA / BDA_V4 bodies: +2.6..+12% on odd-K shapes
+  (e.g. RTX 3070 128x1024x520 +12%, 512x512x513 +4%, 1023x1025x1027
+  +2.9%), bit-identical results (the skipped steps multiply zero
+  padding).  The 128x128 tiles keep the full tail (`ODDK_FULL_TAIL`):
+  there it measured -2.4% (3070, 2048x2048x2049) and -1.75% (4060,
+  1024x1024x4097).
 - **New tiles `f16w_coopmat_m64n64_mfast` / `f16w_a16_coopmat_m64n64_mfast`**:
   64x64 launched M-fastest (`RASTER_M_FAST`), so wide-N grids stream B
   from DRAM ~once; RTX 3070 a16 512x5632x2048 29.1 → 35.2 TF/s.
