@@ -706,6 +706,15 @@ kernel_catalog! {
     // `VulkanContext::coopmat2_enabled`.
     F16wCm2 => ("f16w_cm2", 128, 64, 64, "matmul_f16w_cm2.spv", false,
         ["f16w_cm2", "cm2", "cm2_gemm"]),
+    // Transposed-A shared staging for the 128x128 f32 tile (k-major
+    // AsT[k][m] as uvec4, XOR column swizzle): each k-step reads A with
+    // TM/4 = 2 LDS.128 instead of 8 LDS.32; same 32,768 B budget as
+    // `large_bda_v4`.  The auto route for f32 `Large` (routing.rs
+    // `maybe_to_bda`): +1.4..+9.2% vs large_bda_v4 on the 4060 (12/12
+    // shapes), +0.5..+6.7% on the 3070, never negative
+    // (reports/night-kernels.md).  `large_bda_v4` stays selectable.
+    LargeBdaV4t => ("large_bda_v4t", 128, 128, 32,
+        "matmul_f32_large_bda_v4t.spv", false, ["large_bda_v4t"]),
 }
 
 #[cfg(test)]
@@ -770,6 +779,8 @@ mod tests {
         assert_eq!(by_name("f16w_coopmat_m64n64"), 9_728); // 64*5*16 + 32*9*16
         assert_eq!(by_name("f16w_coopmat_m64n128"), 13_824); // 64*5*16 + 32*17*16
         assert_eq!(by_name("f16w_coopmat_m128n64"), 14_848); // 128*5*16 + 32*9*16
+        // v4t: AsT[BK][BM/4] uvec4 (no pad) + Bs[BK][BN/4] uvec4.
+        assert_eq!(by_name("large_bda_v4t"), 32_768); // 32*32*16 + 32*32*16
         // The f16-accumulator twins declare the same staging tiles.
         for (base, bytes) in [
             ("coopmat", 18_944),

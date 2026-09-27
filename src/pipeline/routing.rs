@@ -452,7 +452,13 @@ pub(crate) fn to_f16w(tile: KernelSelection) -> KernelSelection {
 
 pub(crate) fn maybe_to_bda(tile: KernelSelection) -> KernelSelection {
     match tile {
-        KernelSelection::Large => KernelSelection::LargeBdaV4,
+        // The transposed-A 128x128 tile: +1.4..+9.2% (RTX 4060) and
+        // +0.5..+6.7% (RTX 3070) over large_bda_v4 on every measured
+        // shape, incl. every shape auto routes to the large tile
+        // (reports/night-kernels.md).  large_bda_v4 stays selectable
+        // (ML_KERNEL=large_bda_v4, tuner candidate); f16w keeps
+        // F16wLargeBdaV4 (`to_f16w`: no f16w v4t tile yet).
+        KernelSelection::Large => KernelSelection::LargeBdaV4t,
         KernelSelection::Small => KernelSelection::SmallBdaV4,
         KernelSelection::M128N64K64 => KernelSelection::M128N64K64BdaV4,
         // K64 promotes to the TM=8 TN=4 register-tile variant: empirically
@@ -483,7 +489,7 @@ mod bda_tests {
         // rule from silently drifting when new kernels land.
         assert_eq!(
             maybe_to_bda(KernelSelection::Large),
-            KernelSelection::LargeBdaV4
+            KernelSelection::LargeBdaV4t
         );
         assert_eq!(
             maybe_to_bda(KernelSelection::Small),

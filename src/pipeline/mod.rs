@@ -496,6 +496,9 @@ impl MatmulPipeline {
                     K::SmallBdaV4
                 }
                 K::F16wLargeBdaV4 | K::F16wK64BdaV4 => K::F16wSmallBdaV4,
+                // The transposed-A 128x128 tile (32,768 B) falls to the
+                // v4 small tile (small_bda_v4t is not shipped).
+                K::LargeBdaV4t => K::SmallBdaV4,
                 // Wave-fill tiles are ~9.7 KiB; if a future budget
                 // gate empties them, fall back to the 128x128 sibling
                 // (same family, same alignment).

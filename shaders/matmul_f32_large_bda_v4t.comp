@@ -1,0 +1,12 @@
+#version 460
+// 128x128/BK=32 BDA + transposed-A uvec4-AsT variant.
+
+#define BM 128u
+#define BN 128u
+#define BK  32u
+#define TM   8u
+#define TM_RAW 8
+#define TN   8u
+#define TN_RAW 8
+
+#include "matmul_bda_v4t_kernel.glsl"

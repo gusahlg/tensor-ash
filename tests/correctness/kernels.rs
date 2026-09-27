@@ -1,6 +1,9 @@
 use crate::common::*;
 
-use tensor_ash::{KernelSelection, MatmulCall, Tensor};
+use tensor_ash::{
+    Activation, Epilogue, EpilogueBinary, KERNEL_SPECS, KernelSelection, MatmulCall, MatmulOp,
+    Tensor,
+};
 
 #[test]
 #[ignore]
@@ -72,5 +75,99 @@ fn cross_kernel_equivalence() {
             large_out[idx],
             small_out[idx],
         );
+    }
+}
+
+/// The transposed-A v4t tile (`large_bda_v4t`, the f32 Large route) vs
+/// the CPU reference: interior tiles, batched, odd M/N/K, K-tails,
+/// alpha+accumulate, and a fused bias+ReLU epilogue.  Selected
+/// explicitly; a device that gates the tile (32,768 B, shouldn't
+/// happen) skips it instead of failing.  (exp/v4t also covers three
+/// v4t tiles that are not shipped.)
+#[test]
+#[ignore]
+fn v4t_kernels_match_reference() {
+    let kernels = [KernelSelection::LargeBdaV4t];
+    let shapes: &[(u32, u32, u32, u32)] = &[
+        (1, 128, 128, 128),
+        (1, 256, 256, 256),
+        (2, 256, 256, 256),
+        (1, 384, 256, 192),
+        (1, 255, 257, 263),
+        (1, 513, 515, 517),
+        (1, 1000, 1000, 1000),
+        (3, 65, 130, 33),
+    ];
+    for sel in kernels {
+        let Some((ctx, exec)) = make_setup_with_kernel_if_fits(2, 8, sel) else {
+            continue;
+        };
+        let name = KERNEL_SPECS[sel.index().expect("concrete")].name;
+        for &(b, m, n, k) in shapes {
+            let shape = |rows: u32, cols: u32| -> Vec<u32> {
+                if b == 1 {
+                    vec![rows, cols]
+                } else {
+                    vec![b, rows, cols]
+                }
+            };
+            let (gpu, cpu) = run_one(
+                &ctx,
+                &exec,
+                &shape(m, k),
+                &shape(k, n),
+                &shape(m, n),
+                1.0,
+                false,
+                0xABC + (b as u64).wrapping_mul(m as u64 * n as u64 * k as u64),
+                0xDEF + (b as u64).wrapping_mul(m as u64 * n as u64 * k as u64),
+                None,
+            );
+            assert_close(&gpu, &cpu, k, &format!("{name} B={b} {m}x{n}x{k}"));
+        }
+
+        let (m, n, k) = (256u32, 256u32, 256u32);
+        let mut c0 = vec![0.0f32; (m * n) as usize];
+        fill_det(&mut c0, 73);
+        let (gpu, cpu) = run_one(
+            &ctx,
+            &exec,
+            &[m, k],
+            &[k, n],
+            &[m, n],
+            0.5,
+            true,
+            71,
+            72,
+            Some(&c0),
+        );
+        assert_close(&gpu, &cpu, k, &format!("{name} alpha=0.5 accumulate"));
+
+        let (a, ha) = upload_det(&ctx, &exec, &[m, k], 81);
+        let (b, hb) = upload_det(&ctx, &exec, &[k, n], 82);
+        let c = Tensor::uninit_device(&ctx, &[m, n]).unwrap();
+        let (bias, hbias) = upload_det(&ctx, &exec, &[n], 84);
+        exec.run_ops(&[MatmulOp::with_epilogue(
+            MatmulCall {
+                a: &a,
+                b: &b,
+                c: &c,
+                alpha: 1.0,
+                accumulate: false,
+            },
+            Epilogue {
+                bias: Some(&bias),
+                activation: Activation::Relu,
+                binary: EpilogueBinary::None,
+            },
+        )])
+        .unwrap();
+        let mut gpu = vec![0.0f32; (m * n) as usize];
+        exec.download(&c, &mut gpu).unwrap();
+        let mut expect = cpu_bmm(&ha, &hb, None, 1, m, n, k, 1.0, false);
+        for (i, v) in expect.iter_mut().enumerate() {
+            *v = (*v + hbias[i % n as usize]).max(0.0);
+        }
+        assert_close(&gpu, &expect, k, &format!("{name} bias+relu"));
     }
 }
