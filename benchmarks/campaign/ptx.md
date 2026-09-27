@@ -7,6 +7,15 @@ only got binaries/kernels that had already passed there (short batches,
 
 ## Verdict
 
+**Status 2026-09-27: merge-ready** (§7).  The backend is opt-in
+(`ML_PTX=1`, `ML_NO_PTX=1` kill switch, device creation unchanged
+otherwise), precision is the executor policy shared with
+`campaign/f16acc` (`CoopmatAcc`, default `F32`; `f16p` = recommended fast
+mode; `f16` = opt-in llama.cpp-parity mode), the f32 PTX route is
+bit-identical to coopmat1 through single ops, graphs and prepared replay,
+and all GPU gates pass on the 4060 (§7e).  The 3070 re-confirmation of
+this continuation is pending (gaming embargo).
+
 **Feasible, stable, and worth a backend.**  The NVIDIA proprietary
 driver's `VK_NV_cuda_kernel_launch` (rev 2) JIT-compiles PTX (and
 accepts cubins/fatbins) and records CUDA kernel launches into ordinary
@@ -541,7 +550,7 @@ correctness binary `correctness-b859650e2dc3747a` built from `a532a0a`
 
 | gate | result |
 |---|---|
-| `cargo test --release -p tensor-ash --lib` (desktop): `ptx_gate` (vendor, extension, feature, cc, veto, never queried unless requested), route class mapping over 480 shape x SM x class combinations, `ML_PTX_GEMM` parsing incl. deprecated spellings, `CoopmatAcc` | 60 / 60 pass |
+| `cargo test --release -p tensor-ash --lib` (desktop): `ptx_gate` (vendor, extension, feature, cc, veto, never queried unless requested), route class mapping over 360 shape x SM-count x class combinations, `ML_PTX_GEMM` parsing incl. deprecated spellings, `CoopmatAcc` | 60 / 60 pass |
 | `ML_PTX=1 ... ptx::` | **5 / 5 pass** |
 | `ptx_f32_route_is_bitwise_coopmat1`: 8 shapes (128x256x128 ... 4096x4096x256, 64-aligned-only 192x320x64, alpha 0.75), single op, `ExecOp` graph, 2 prepared replays | **bit-identical** to coopmat1 (every f16 output bit) |
 | `ptx_route_in_mixed_graphs_and_prepared_replay`: 512x2048, 9-op graph, PTX GEMMs <-> Vulkan `Binary` with RAW both ways, WAR, WAW and two independent launches | f32 policy: bit-identical to the all-Vulkan graph, immediate and prepared (x2 replays); f16p and f16: prepared == immediate == rerun bitwise; worst rel-RMS vs the f32 graph **1.06e-3 (f16p)**, **4.46e-3 (f16)** (gates 5e-3 / 3e-2; f16 > f16p > 0 asserted, so neither silently ran f32) |
