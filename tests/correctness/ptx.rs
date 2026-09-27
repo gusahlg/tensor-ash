@@ -353,19 +353,23 @@ fn rel_rms(got: &[f32], reference: &[f32]) -> f64 {
     (se / sr.max(f64::MIN_POSITIVE)).sqrt()
 }
 
-/// The accumulator policy degrades loudly, never silently: without a
-/// route serving a class, an executor asking for it runs (and reports)
-/// f32; with one, it keeps the class.
+/// The accumulator policy degrades loudly, never silently: without an
+/// implementation serving a class, an executor asking for it runs (and
+/// reports) f32; with one, it keeps the class.  Two implementations can
+/// serve the f16 classes: the PTX route and the GLSL f16-accumulator
+/// coopmat twins (`coopmat_f16_acc_enabled`; no coopmat path at all also
+/// keeps the class, since nothing would run it).
 #[test]
 #[ignore]
 fn ptx_policy_is_explicit_and_degrades_to_f32() {
     let ctx = VulkanContext::new(false).expect("Vulkan init");
     let pipe = Arc::new(MatmulPipeline::new(&ctx).expect("pipeline"));
+    let glsl_serves = !ctx.coopmat_enabled || ctx.coopmat_f16_acc_enabled;
+    let without_ptx = |acc: CoopmatAcc| if glsl_serves { acc } else { CoopmatAcc::F32 };
     if ctx.cuda_launch.is_none() {
-        // Plain context: no f16-accumulator implementation on this branch.
         for acc in [CoopmatAcc::F16, CoopmatAcc::F16Promote] {
             assert!(!pipe.ptx_serves(acc));
-            assert_eq!(executor(&ctx, &pipe, acc).coopmat_acc(), CoopmatAcc::F32);
+            assert_eq!(executor(&ctx, &pipe, acc).coopmat_acc(), without_ptx(acc));
             assert!(pipe.set_ptx_gemm_mode(PtxGemmMode::All).is_err());
         }
         return;
@@ -381,7 +385,7 @@ fn ptx_policy_is_explicit_and_degrades_to_f32() {
     pipe.set_ptx_gemm_mode(PtxGemmMode::Off).unwrap();
     assert_eq!(
         executor(&ctx, &pipe, CoopmatAcc::F16).coopmat_acc(),
-        CoopmatAcc::F32
+        without_ptx(CoopmatAcc::F16)
     );
     pipe.set_ptx_gemm_mode(PtxGemmMode::Auto).unwrap();
     for acc in [CoopmatAcc::F16, CoopmatAcc::F16Promote] {
