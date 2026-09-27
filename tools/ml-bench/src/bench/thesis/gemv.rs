@@ -200,6 +200,7 @@ pub(crate) fn t2_gemv_efficiency(
             k,
             b_f16: true,
             packed_b,
+            a16: false,
         };
         let result = run_case_warm(ctx, exec, case, iters, warmup, THESIS_WARM)?;
         let item = if packed_b {
@@ -300,6 +301,7 @@ pub(crate) fn t6_coopmat_ceiling(
             k,
             b_f16: true,
             packed_b: false,
+            a16: false,
         };
         let result = run_case_warm(ctx, exec, case, iters, warmup, THESIS_WARM)?;
         let kernel = result.dispatch.kernel;

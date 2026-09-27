@@ -4,6 +4,26 @@
 
 ### Changed
 
+- **SM-count-aware coopmat tile routing** (`pipeline/routing.rs`,
+  `benchmarks/campaign/coopmat-sm.md`): with a shader-core count
+  (`VK_NV_shader_sm_builtins` / AMD / ARM core queries,
+  `VulkanContext::sm_count`, `ML_SM_COUNT` override) f16w and a16
+  GEMMs choose between 128x64 and 64x64 from per-SM wave balance
+  (`ceil(tiles / SMs)`), a 3-CTA occupancy floor and a fitted tile
+  efficiency ratio, and pick the 64x64 CTA raster (x- or M-fastest)
+  that re-streams fewer bytes.  128x64 replaces 128x128 as the large
+  grid tile (the RTX 3070 4096³ "veto" is a tie).  The ratio depends
+  on whether the L2 holds a prefill operand: `l2_bytes_estimate` is an
+  NVIDIA device-ID family lower bound (`ML_L2_MB` override, unknown =
+  small).  No SM count keeps the exp/grokmerge rule.  Measured over 77
+  shapes per GPU: RTX 3070 geomean x1.079 with no shape >1% slower,
+  RTX 4060 x1.073 (four large grids 1.2-3.6% slower, where 128x128
+  still edges out 128x64).
+- **New tiles `f16w_coopmat_m64n64_mfast` / `f16w_a16_coopmat_m64n64_mfast`**:
+  64x64 launched M-fastest (`RASTER_M_FAST`), so wide-N grids stream B
+  from DRAM ~once; RTX 3070 a16 512x5632x2048 29.1 → 35.2 TF/s.
+  BK=64, 256-thread and 64x32-slice retunes of the coopmat tiles lost
+  on both GPUs and are not shipped.
 - **Shaders compile with `glslc -Os`** (was `-O`, with a LOWMEM
   `-Os` fallback on small hosts): the NVIDIA driver emits
   byte-identical SASS for both (UCODE hashes, RTX 3070 and 4060), and
@@ -63,6 +83,18 @@
 
 ### Added
 
+- **`examples/coopmat_occupancy.rs`**: driver register counts
+  (`VK_KHR_pipeline_executable_properties`) and CTAs/SM per coopmat
+  tile on a side device.  `ml_bench` cases take `,a16` (f16 A/B/C) and
+  `ab` records the kernel `auto` dispatched; an explicit coopmat pin
+  applies to the a16 route too.
+- **`ml_bench ab`**: interleaved multi-kernel A/B benchmark in one process.
+  `ML_AB_KERNELS` lists catalog names or `auto`; each entry gets its own
+  pipeline and executor on a shared `VulkanContext`, tensors are allocated
+  once per case, and rounds rotate which kernel runs first. Output is
+  median/min GPU milliseconds across rounds, TF/s, and ratio versus the
+  first kernel (`ML_OUTPUT=csv` adds `b,m,n,k`). A kernel that cannot run
+  a case is `n/a` rather than a fatal error.
 - **Packed-B from the C ABI and ml-bench**: `ta_pack_f16w_row_tiles` /
   `ta_f16w_row_tile_n` (host-only), `ta_matmul_op.packed_b`, and
   `ta_dispatch_info_packed`. `ml-bench cases` accepts `,packed`

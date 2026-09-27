@@ -347,8 +347,10 @@ kernel_catalog! {
         "matmul_f16w_a16_coopmat_m64n64.spv", false,
         ["f16w_a16_coopmat_m64n64", "a16_coopmat_m64"]),
     // Asymmetric wave-fill: 64x128 (wide) and 128x64 (tall).  Same
-    // KHR fragments, 128 threads.  Auto: 128x64 on M<=512 shapes
-    // strictly wider than 4:1 (4060: concat QKV / gate/up).
+    // KHR fragments, 128 threads.  With a known SM count 128x64 is the
+    // large-grid default (it matches or beats 128x128 on every measured
+    // RTX 3070 shape); 64x128 (168 registers -> 3 CTAs/SM) is only
+    // reachable through the SM-agnostic fallback or an explicit pick.
     F16wCoopmatM64N128 => ("f16w_coopmat_m64n128", 64, 128, 32,
         "matmul_f16w_coopmat_m64n128.spv", false,
         ["f16w_coopmat_m64n128", "coopmat_m64n128"]),
@@ -361,6 +363,20 @@ kernel_catalog! {
     F16wA16CoopmatM128N64 => ("f16w_a16_coopmat_m128n64", 128, 64, 32,
         "matmul_f16w_a16_coopmat_m128n64.spv", false,
         ["f16w_a16_coopmat_m128n64", "a16_coopmat_m128n64"]),
+    // 64x64 in column-major (M-fastest) CTA order: consecutive CTAs
+    // share a B column block, so a wide-N grid streams B from DRAM
+    // ~once instead of once per row block.  Auto-routed by the
+    // SM-aware rule when it cuts re-read traffic (routing.rs); on the
+    // RTX 3070 it lifts a16 gate/up 512x5632x2048 from 29.1 to 35.2
+    // TF/s.  The 128x64 / 128x128 M-fast twins, BK=64 (128x64, 64x64),
+    // 128x64 on 256 threads, and 64x128 with 64x32 slices all lost on
+    // both GPUs and were removed (benchmarks/campaign/coopmat-sm.md).
+    F16wCoopmatM64Mfast => ("f16w_coopmat_m64n64_mfast", 64, 64, 32,
+        "matmul_f16w_coopmat_m64n64_mfast.spv", false,
+        ["f16w_coopmat_m64n64_mfast", "coopmat_m64_mfast"]),
+    F16wA16CoopmatM64Mfast => ("f16w_a16_coopmat_m64n64_mfast", 64, 64, 32,
+        "matmul_f16w_a16_coopmat_m64n64_mfast.spv", false,
+        ["f16w_a16_coopmat_m64n64_mfast", "a16_coopmat_m64_mfast"]),
     // Tensor-core GEMM via NV_cooperative_matrix2 (workgroup-scope
     // matrices + tensor addressing) with the fused store epilogue the
     // coopmat1 kernel cannot implement (`coopMatPerElementNV` at

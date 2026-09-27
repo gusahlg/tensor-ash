@@ -17,6 +17,10 @@ pub(super) struct BenchCase {
     /// B is packed `[N/tile_n][K][tile_n]` (append `,packed`; implies
     /// `f16w`). Decode GEMV only: B=1, M=1, N a multiple of 32.
     pub(super) packed_b: bool,
+    /// A and C are f16 too (append `,a16`; implies `f16w`): the
+    /// f16-activations coopmat route llama-ash prefill takes. M, N
+    /// multiples of 64 and K of 32.
+    pub(super) a16: bool,
 }
 
 impl BenchCase {
@@ -29,6 +33,7 @@ impl BenchCase {
             k,
             b_f16: false,
             packed_b: false,
+            a16: false,
         }
     }
 
@@ -58,6 +63,7 @@ impl BenchCase {
         );
         let mut b_f16 = false;
         let mut packed_b = false;
+        let mut a16 = false;
         for flag in fields {
             match flag {
                 "f16w" => {
@@ -72,11 +78,23 @@ impl BenchCase {
                     }
                     packed_b = true;
                 }
+                "a16" => {
+                    if a16 {
+                        bail!("benchmark case '{label}' repeats flag 'a16'");
+                    }
+                    a16 = true;
+                }
                 other => bail!(
                     "benchmark case '{label}' has unknown flag '{other}'; \
-                     expected label,b,m,n,k[,f16w][,packed]"
+                     expected label,b,m,n,k[,f16w][,packed][,a16]"
                 ),
             }
+        }
+        if a16 && packed_b {
+            bail!("benchmark case '{label}' combines 'a16' with 'packed' (no such route)");
+        }
+        if a16 && (!m.is_multiple_of(64) || !n.is_multiple_of(64) || !k.is_multiple_of(32)) {
+            bail!("benchmark case '{label}' is 'a16' but M/N/K are not multiples of (64, 64, 32)");
         }
         Ok(Self {
             label: Cow::Owned(label.into()),
@@ -84,8 +102,9 @@ impl BenchCase {
             m,
             n,
             k,
-            b_f16: b_f16 || packed_b,
+            b_f16: b_f16 || packed_b || a16,
             packed_b,
+            a16,
         })
     }
 }
@@ -235,6 +254,8 @@ mod tests {
         assert!(both.b_f16 && both.packed_b);
         let swapped = BenchCase::parse("up,1,1,5632,2048,packed,f16w").unwrap();
         assert!(swapped.b_f16 && swapped.packed_b);
+        let a16 = BenchCase::parse("qkv,1,512,2560,2048,a16").unwrap();
+        assert!(a16.a16 && a16.b_f16 && !a16.packed_b);
         for invalid in [
             "",
             "odd,1,2,3",
@@ -242,6 +263,11 @@ mod tests {
             "odd,1,2,3,4,5",
             "odd,1,2,3,4,f16w,f16w",
             "odd,1,2,3,4,packed,packed",
+            "q,1,512,2048,2048,a16,a16",
+            "q,1,1,2048,2048,a16,packed",
+            // a16 requires the coopmat alignment (64, 64, 32).
+            "q,1,500,2048,2048,a16",
+            "q,1,512,2048,2040,a16",
         ] {
             assert!(BenchCase::parse(invalid).is_err(), "accepted {invalid}");
         }

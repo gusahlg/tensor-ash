@@ -1,3 +1,4 @@
+mod ab;
 mod cases;
 mod commands;
 mod env;
@@ -36,6 +37,15 @@ pub fn run() -> Result<()> {
 
     // `VulkanContext::new` reads ML_DEVICE itself.
     let ctx = VulkanContext::new(validate)?;
+
+    // `ab` builds one pipeline/executor per ML_AB_KERNELS entry on this
+    // shared context; skip the process-wide ML_KERNEL pipeline so we
+    // do not pay for a fifth catalog in VRAM.
+    if cmd == "ab" {
+        log::info!("{}", ctx.diagnostics());
+        return ab::run(&ctx, n_slots, args);
+    }
+
     let pipe = Arc::new(MatmulPipeline::new_with_kernel_selection(
         &ctx,
         KernelSelection::from_env()?,
@@ -70,7 +80,7 @@ pub fn run() -> Result<()> {
             commands::sweep(&ctx, &exec)?;
         }
         _ => anyhow::bail!(
-            "unknown subcommand '{cmd}'; expected self-check, correctness, sweep, single, cases, concurrent, transfer, prepared, thesis, isa, isa-analyze, isa-cache, or all"
+            "unknown subcommand '{cmd}'; expected self-check, correctness, sweep, single, cases, ab, concurrent, transfer, prepared, thesis, isa, isa-analyze, isa-cache, or all"
         ),
     }
     Ok(())

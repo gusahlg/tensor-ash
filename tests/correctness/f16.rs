@@ -137,10 +137,15 @@ fn f16_routes_pick_f16w_kernels_and_skip_splitk2() {
     // demotion (`in_budget_index`) where it stays empty.
     let large = exec.dispatch_info_for(1, 2048, 2048, 2048, true);
     if ctx.coopmat_enabled {
-        assert_eq!(
-            large.kernel, "f16w_coopmat_aligned",
-            "large route: {large:?}"
-        );
+        // With a shader-core count the SM-aware rule takes 128x64 (it
+        // matches or beats 128x128 on every measured large grid); the
+        // SM-agnostic fallback keeps 128x128.
+        let want = if ctx.sm_count().is_some() {
+            "f16w_coopmat_m128n64"
+        } else {
+            "f16w_coopmat_aligned"
+        };
+        assert_eq!(large.kernel, want, "large route: {large:?}");
     } else if kernel_in_budget(&ctx, KernelSelection::F16wLargeBdaV4) {
         assert_eq!(large.kernel, "f16w_large_bda_v4", "large route: {large:?}");
     } else {
@@ -812,9 +817,11 @@ fn coopmat_routes_and_matches_dual_rounded_reference() {
     assert_close(&gpu, &cpu, k, "coopmat");
 }
 
-/// The asymmetric wave-fill tiles (64x128 / 128x64) are explicit-only
-/// until a heuristic A/B lands; this pins they match the dual-rounded
-/// reference on a shape both tiles cover.
+/// The asymmetric wave-fill tiles (64x128 / 128x64) and the M-fastest
+/// 64x64 raster twins match the dual-rounded reference, pinned
+/// explicitly (auto only reaches them on some shapes / SM counts).
+/// The batched ragged-grid case exercises the M-fast launch-index remap
+/// with rows != cols and a z dimension.
 #[test]
 #[ignore]
 fn coopmat_asymmetric_tiles_match_dual_rounded_reference() {
@@ -823,9 +830,18 @@ fn coopmat_asymmetric_tiles_match_dual_rounded_reference() {
         KernelSelection::F16wCoopmatM128N64,
         KernelSelection::F16wA16CoopmatM64N128,
         KernelSelection::F16wA16CoopmatM128N64,
+        KernelSelection::F16wCoopmatM64Mfast,
+        KernelSelection::F16wA16CoopmatM64Mfast,
     ];
-    let (batch, m, n, k) = (1_u32, 256, 384, 256);
-    for selection in selections {
+    let mfast_only = [
+        KernelSelection::F16wCoopmatM64Mfast,
+        KernelSelection::F16wA16CoopmatM64Mfast,
+    ];
+    let cases = selections
+        .iter()
+        .map(|&s| (s, (1_u32, 256_u32, 384_u32, 256_u32)))
+        .chain(mfast_only.iter().map(|&s| (s, (2, 192, 448, 96))));
+    for (selection, (batch, m, n, k)) in cases {
         let Some((ctx, exec)) = make_setup_with_kernel_if_fits(2, 8, selection) else {
             continue;
         };
@@ -833,11 +849,18 @@ fn coopmat_asymmetric_tiles_match_dual_rounded_reference() {
             continue;
         }
         let a16 = selection_is_a16(selection);
+        let shape = |rows: u32, cols: u32| -> Vec<u32> {
+            if batch == 1 {
+                vec![rows, cols]
+            } else {
+                vec![batch, rows, cols]
+            }
+        };
         let (a, b, host_a, host_b) = if a16 {
-            setup_a16_case(&ctx, &exec, &[m, k], &[k, n], 9800, 9801)
+            setup_a16_case(&ctx, &exec, &shape(m, k), &shape(k, n), 9800, 9801)
         } else {
             let (a, b, mut host_a, host_b) =
-                setup_f16_case(&ctx, &exec, &[m, k], &[k, n], 9800, 9801);
+                setup_f16_case(&ctx, &exec, &shape(m, k), &shape(k, n), 9800, 9801);
             for value in &mut host_a {
                 *value = round_f32_via_f16(*value);
             }
@@ -845,9 +868,9 @@ fn coopmat_asymmetric_tiles_match_dual_rounded_reference() {
             (a, b, host_a, host_b)
         };
         let c = if a16 {
-            Tensor::uninit_device_f16(&ctx, &[m, n]).unwrap()
+            Tensor::uninit_device_f16(&ctx, &shape(m, n)).unwrap()
         } else {
-            Tensor::uninit_device(&ctx, &[m, n]).unwrap()
+            Tensor::uninit_device(&ctx, &shape(m, n)).unwrap()
         };
         exec.run_matmuls(&[MatmulCall {
             a: &a,
@@ -857,23 +880,14 @@ fn coopmat_asymmetric_tiles_match_dual_rounded_reference() {
             accumulate: false,
         }])
         .unwrap();
-        let mut gpu = vec![0.0; (m * n) as usize];
+        let mut gpu = vec![0.0; (batch * m * n) as usize];
         exec.download(&c, &mut gpu).unwrap();
         let cpu = cpu_bmm(&host_a, &host_b, None, batch, m, n, k, 1.0, false);
+        let label = format!("{} B={batch} {m}x{n}x{k}", kernel_sel_name(selection));
         if a16 {
-            assert_close_tol(
-                &gpu,
-                &cpu,
-                a16_tolerance(&cpu, k),
-                &format!("asymmetric {}", kernel_sel_name(selection)),
-            );
+            assert_close_tol(&gpu, &cpu, a16_tolerance(&cpu, k), &label);
         } else {
-            assert_close(
-                &gpu,
-                &cpu,
-                k,
-                &format!("asymmetric {}", kernel_sel_name(selection)),
-            );
+            assert_close(&gpu, &cpu, k, &label);
         }
     }
 }

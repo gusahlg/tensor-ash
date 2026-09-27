@@ -270,7 +270,7 @@ device supports them.
 ## Benchmark binary (`ml_bench`)
 
 Subcommands: `self-check`, `correctness`, `sweep`, `single`, `cases`,
-`concurrent`, `transfer`. Useful env knobs:
+`ab`, `concurrent`, `transfer`. Useful env knobs:
 
 ```bash
 ML_B=4 ML_M=1024 ML_N=1024 ML_K=1024 cargo run --release -p ml-bench -- single
@@ -282,9 +282,22 @@ ML_OUTPUT=csv cargo run --release -p ml-bench -- cases \
   square,1,512,512,512 edge,1,511,513,515
 ML_OUTPUT=csv cargo run --release -p ml-bench -- cases \
   lm_unpacked,1,1,32000,2048,f16w lm_packed,1,1,32000,2048,packed
+ML_AB_KERNELS=k64_bda_v4_tm8_tn4,m128n64k64_bda_v4,auto \
+  cargo run --release -p ml-bench -- ab square_512,1,512,512,512
 # GPU assembly of the routed kernel (NVIDIA): SASS + census, see benchmarks/SASS.md
 ML_ISA_OUT=isa-out cargo run --release -p ml-bench -- isa odd,1,1023,1025,1027
 ```
+
+`ab` compares several kernels on several shapes in one process so GPU clock
+drift between processes does not pollute A/B numbers. `ML_AB_KERNELS` is a
+comma-separated list of catalog names/aliases or `auto` (the normal router);
+each entry gets its own pipeline and executor on a shared `VulkanContext`,
+tensors are allocated once per case, and each round rotates which kernel
+runs first. The table reports median and min GPU milliseconds across rounds,
+TF/s, and the ratio versus the first kernel; `ML_OUTPUT=csv` adds `b,m,n,k`.
+A kernel that cannot run a case (strict `_aligned` tiles, f16w mismatch,
+dispatch limits) is `n/a` rather than a fatal error. Built-in burn-in is
+~300 ms of 4096³ on the first kernel unless `ML_AB_NO_BURN=1`.
 
 `ml_bench isa` sets `ML_PIPELINE_EXEC_INFO=1`, which makes the library enable
 `VK_KHR_pipeline_executable_properties` for that process (off by default).
@@ -300,7 +313,7 @@ version + shader build. Persisted winners are applied on **every** run —
 tuning enabled or not — whenever `ML_KERNEL` is `auto`. Delete the store (or
 update the driver / rebuild shaders) to reset it.
 
-`ML_KERNEL=auto` is the default. `KERNEL_SPECS` currently contains 37 concrete
+`ML_KERNEL=auto` is the default. `KERNEL_SPECS` currently contains 57 concrete
 choices. They include the
 descriptor-bound tiles (`large`, `small`, `m64n128`, `m128n64`,
 `m128n64k64`, `m64n32`, `k64`, `bk16`, `v2`, `m64n128k64`,
@@ -313,6 +326,13 @@ and aliases live together in `src/pipeline/catalog.rs`.
 library entry point (`VulkanContext::new`), so the test suite, `llama_ash`,
 and `ml_bench` all obey it on multi-GPU hosts; unset means `auto`
 (discrete first). The selected device is logged at init.
+
+Tensor-core (coopmat) tile routing is SM-count-aware: the SM count comes
+from `VK_NV_shader_sm_builtins` (or the AMD / ARM core-count queries) and an
+L2 lower bound from an NVIDIA device-ID family table.  `ML_SM_COUNT=N` /
+`ML_L2_MB=N` override them for what-if runs; `ML_SM_COUNT=0` restores the
+SM-agnostic rule.  Both values appear in the device diagnostics line.  See
+`benchmarks/campaign/coopmat-sm.md`.
 
 Kernels whose workgroup (shared-memory) tiles exceed the device's
 `maxComputeSharedMemorySize` are gated off at pipeline build and routing

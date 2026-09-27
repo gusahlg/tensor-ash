@@ -229,6 +229,7 @@ pub(crate) fn t5_prefill_accounting(
             k,
             b_f16: true,
             packed_b,
+            a16: false,
         };
         Ok(run_case_warm(ctx, exec, case, 10, 2, THESIS_WARM)?
             .gpu_ms

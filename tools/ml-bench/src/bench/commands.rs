@@ -117,46 +117,60 @@ pub(super) fn cases(
     Ok(())
 }
 
-pub(super) fn run_case(
-    ctx: &Arc<VulkanContext>,
-    exec: &Executor,
-    case: BenchCase,
-    iters: u32,
-    warmup: u32,
-) -> Result<BenchResult> {
-    run_case_warm(ctx, exec, case, iters, warmup, Duration::ZERO)
+/// Device tensors plus the host fixtures used to fill them and to
+/// sample-validate C. Shared by `cases` and `ab` so both paths upload
+/// the same deterministic A/B.
+pub(super) struct CaseTensors {
+    pub(super) a: Tensor,
+    pub(super) b: Tensor,
+    pub(super) c: Tensor,
+    pub(super) h_a: Vec<f32>,
+    pub(super) h_b: Vec<f32>,
 }
 
-/// [`run_case`] whose warmup also lasts at least `warm_for` of GPU
-/// work.  The host-side setup (fills, packing, uploads) leaves the GPU
-/// idle long enough for the driver to drop to a low P-state (RTX 4060:
-/// 1.1-1.2 GHz SM / 5 GHz memory after ~1 s idle, vs 2.73 / 8.5 GHz
-/// under load), and a few warmup dispatches do not ramp it back:
-/// timing then starts on cold clocks and under-reports compute-bound
-/// shapes by ~2x.
-pub(super) fn run_case_warm(
+/// Allocate A/B/C for `case`, fill from the same seeds `cases` has
+/// always used, and upload through `exec`.
+///
+/// When `requantize_a_for_tensor_core` is true and the executor's
+/// route for this f16w shape is a tensor-core kernel, A is rounded to
+/// f16 and re-uploaded so the CPU reference matches in-shader
+/// quantization. `ab` passes false and keeps a single f32 A shared
+/// across kernels; it rounds a copy at validation time instead.
+pub(super) fn prepare_case_tensors(
     ctx: &Arc<VulkanContext>,
     exec: &Executor,
-    case: BenchCase,
-    iters: u32,
-    warmup: u32,
-    warm_for: Duration,
-) -> Result<BenchResult> {
+    case: &BenchCase,
+    requantize_a_for_tensor_core: bool,
+) -> Result<CaseTensors> {
     let bsz = case.b;
     let m = case.m;
     let n = case.n;
     let k = case.k;
-    let a = Tensor::uninit_device(ctx, &[bsz, m, k])?;
+    // `a16`: A and C are f16 storage (the f16-activations route).
+    let act = |shape: &[u32]| {
+        if case.a16 {
+            Tensor::uninit_device_f16(ctx, shape)
+        } else {
+            Tensor::uninit_device(ctx, shape)
+        }
+    };
+    let a = act(&[bsz, m, k])?;
     let b = if case.b_f16 {
         Tensor::uninit_device_f16(ctx, &[bsz, k, n])?
     } else {
         Tensor::uninit_device(ctx, &[bsz, k, n])?
     };
-    let c = Tensor::uninit_device(ctx, &[bsz, m, n])?;
+    let c = act(&[bsz, m, n])?;
     let mut h_a = vec![0.0f32; host_len(&[bsz, m, k])?];
     let mut h_b = vec![0.0f32; host_len(&[bsz, k, n])?];
     fill_det(&mut h_a, 7);
     fill_det(&mut h_b, 11);
+    if case.a16 {
+        // The device holds halves; the reference must see the same A.
+        for value in &mut h_a {
+            *value = tensor_ash::dtype::round_f32_via_f16(*value);
+        }
+    }
 
     let split_k2 = env_u32("ML_SPLIT_K2", 0);
     if case.packed_b {
@@ -194,7 +208,7 @@ pub(super) fn run_case_warm(
     } else {
         exec.upload(&h_b, &b)?;
     }
-    if case.b_f16 {
+    if case.b_f16 && !case.a16 && requantize_a_for_tensor_core {
         // The tensor-core routes also quantize A (coopmat1 while
         // staging, cm2 in its tensor-load decode callback).
         let kernel = if case.packed_b {
@@ -202,15 +216,73 @@ pub(super) fn run_case_warm(
         } else {
             exec.dispatch_info_for(bsz, m, n, k, true).kernel
         };
-        if kernel.contains("coopmat") || kernel.contains("cm2") {
+        if kernel_quantizes_a(kernel) {
             for value in &mut h_a {
                 *value = tensor_ash::dtype::round_f32_via_f16(*value);
             }
             exec.upload(&h_a, &a)?;
         }
     }
+    Ok(CaseTensors { a, b, c, h_a, h_b })
+}
+
+pub(super) fn kernel_quantizes_a(kernel: &str) -> bool {
+    kernel.contains("coopmat") || kernel.contains("cm2")
+}
+
+/// CPU-side A for [`validate_samples`]. Tensor-core routes quantize A
+/// in-shader; when the shared device tensor was left as f32, round a
+/// copy so the reference matches.
+pub(super) fn reference_a_for_kernel<'a>(
+    h_a: &'a [f32],
+    kernel: &str,
+    b_f16: bool,
+) -> Cow<'a, [f32]> {
+    if b_f16 && kernel_quantizes_a(kernel) {
+        Cow::Owned(
+            h_a.iter()
+                .copied()
+                .map(tensor_ash::dtype::round_f32_via_f16)
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(h_a)
+    }
+}
+
+pub(super) fn run_case(
+    ctx: &Arc<VulkanContext>,
+    exec: &Executor,
+    case: BenchCase,
+    iters: u32,
+    warmup: u32,
+) -> Result<BenchResult> {
+    run_case_warm(ctx, exec, case, iters, warmup, Duration::ZERO)
+}
+
+/// [`run_case`] whose warmup also lasts at least `warm_for` of GPU
+/// work.  The host-side setup (fills, packing, uploads) leaves the GPU
+/// idle long enough for the driver to drop to a low P-state (RTX 4060:
+/// 1.1-1.2 GHz SM / 5 GHz memory after ~1 s idle, vs 2.73 / 8.5 GHz
+/// under load), and a few warmup dispatches do not ramp it back:
+/// timing then starts on cold clocks and under-reports compute-bound
+/// shapes by ~2x.
+pub(super) fn run_case_warm(
+    ctx: &Arc<VulkanContext>,
+    exec: &Executor,
+    case: BenchCase,
+    iters: u32,
+    warmup: u32,
+    warm_for: Duration,
+) -> Result<BenchResult> {
+    let CaseTensors { a, b, c, h_a, h_b } = prepare_case_tensors(ctx, exec, &case, true)?;
+    let bsz = case.b;
+    let m = case.m;
+    let n = case.n;
+    let k = case.k;
 
     let flops = 2.0f64 * bsz as f64 * m as f64 * n as f64 * k as f64;
+    let split_k2 = env_u32("ML_SPLIT_K2", 0);
 
     let run_once = || {
         let call = MatmulCall {
@@ -247,7 +319,7 @@ pub(super) fn run_case_warm(
             stats.gpu_time_ns.map(|ns| ns as f64 / 1e6),
         ));
     }
-    validate_samples(exec, &c, &h_a, &h_b, bsz, m, n, k)?;
+    validate_samples(exec, &c, &h_a, &h_b, bsz, m, n, k, case.a16)?;
     let wall_ms = SampleSummary::new(samples.iter().map(|(wall, _)| *wall))
         .context("benchmark produced no wall-time samples")?;
     let gpu_ms = SampleSummary::new(samples.iter().filter_map(|(_, gpu)| *gpu));
@@ -267,6 +339,8 @@ pub(super) fn run_case_warm(
     // Split factors below 2 execute the normal dispatch path, so report it.
     let dispatch = if case.packed_b {
         exec.dispatch_info_packed(n, k)
+    } else if case.a16 {
+        exec.dispatch_info_a16(bsz, m, n, k)
     } else if split_k2 < 2 {
         exec.dispatch_info_for(bsz, m, n, k, case.b_f16)
     } else {
@@ -286,8 +360,10 @@ pub(super) fn run_case_warm(
 
 /// Validate a fixed number of well-spaced outputs after timing. This catches
 /// broken kernels without turning large benchmark cases into full CPU GEMMs.
+/// `c_f16` widens the budget by the f16 store's rounding (2^-11 relative,
+/// doubled like the accumulation term).
 #[allow(clippy::too_many_arguments)]
-fn validate_samples(
+pub(super) fn validate_samples(
     exec: &Executor,
     c: &Tensor,
     a: &[f32],
@@ -296,6 +372,7 @@ fn validate_samples(
     m: u32,
     n: u32,
     k: u32,
+    c_f16: bool,
 ) -> Result<()> {
     const CHECKS: usize = 8;
     let mut output = vec![0.0; host_len(&[batch, m, n])?];
@@ -303,6 +380,7 @@ fn validate_samples(
     let checks = output.len().min(CHECKS);
     let plane = m as usize * n as usize;
     let mut max_error = 0.0f32;
+    let mut max_budget = 2.0 * tolerance(k);
     let mut worst = 0;
     for sample in 0..checks {
         let index = if checks == 1 {
@@ -320,16 +398,23 @@ fn validate_samples(
                     * b[(batch_index * k as usize + inner) * n as usize + col]
             })
             .sum::<f32>();
+        // Excess error over this sample's budget; the worst one fails.
+        let budget = 2.0 * tolerance(k)
+            + if c_f16 {
+                expected.abs() * 2.0f32.powi(-10)
+            } else {
+                0.0
+            };
         let error = (output[index] - expected).abs();
-        if !error.is_finite() || error > max_error {
+        if !error.is_finite() || error - budget > max_error - max_budget {
             max_error = error;
+            max_budget = budget;
             worst = index;
         }
     }
-    let budget = 2.0 * tolerance(k);
     anyhow::ensure!(
-        max_error <= budget,
-        "sampled correctness failed at output {worst}: error {max_error:.3e} > {budget:.3e}"
+        max_error <= max_budget,
+        "sampled correctness failed at output {worst}: error {max_error:.3e} > {max_budget:.3e}"
     );
     Ok(())
 }
@@ -342,6 +427,7 @@ pub(super) fn single(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
     let case = BenchCase {
         b_f16: false,
         packed_b: false,
+        a16: false,
         label: Cow::Owned(format!("B={b} M={m} N={n} K={k}")),
         b,
         m,
@@ -655,4 +741,33 @@ fn command_path(command: &str) -> String {
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "<missing>".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_quantizes_a_detects_tensor_core_routes() {
+        assert!(kernel_quantizes_a("f16w_coopmat_aligned"));
+        assert!(kernel_quantizes_a("f16w_cm2"));
+        assert!(!kernel_quantizes_a("k64_bda_v4_tm8_tn4"));
+        assert!(!kernel_quantizes_a("f16w_row_bda_k16"));
+    }
+
+    #[test]
+    fn reference_a_for_kernel_only_rounds_tensor_core_f16w() {
+        let a = [0.1f32, 0.2];
+        assert!(matches!(
+            reference_a_for_kernel(&a, "large_bda_v4", true),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            reference_a_for_kernel(&a, "f16w_coopmat_aligned", false),
+            Cow::Borrowed(_)
+        ));
+        let rounded = reference_a_for_kernel(&a, "f16w_coopmat_aligned", true);
+        assert!(matches!(rounded, Cow::Owned(_)));
+        assert_ne!(rounded[0], 0.1);
+    }
 }

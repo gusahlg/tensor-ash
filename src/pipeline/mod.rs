@@ -35,7 +35,8 @@ pub use runtime::MatmulKernel;
 pub(crate) use tuning::{SPLITK2_SPIRV, TuneEntry, TuneKey};
 
 pub(crate) use routing::{
-    coopmat_selection, f16w_row_packed_selection, f16w_row_selection, maybe_to_bda, to_f16w,
+    CoopmatDevice, CoopmatTile, coopmat_selection, f16w_row_packed_selection, f16w_row_selection,
+    maybe_to_bda, to_f16w,
 };
 pub use routing::{f16w_row_tile_n, f16w_row_uses_k16};
 
@@ -342,7 +343,8 @@ impl MatmulPipeline {
                 && m.is_multiple_of(64)
                 && n.is_multiple_of(64)
             {
-                coopmat_selection(batch, m, n, false).expect("M/N are 64-aligned")
+                coopmat_selection(batch, m, n, k, false, self.coopmat_device())
+                    .expect("M/N are 64-aligned")
             } else {
                 // f16-storage B is validated as BDA-capable upstream;
                 // map the tile class onto the nearest f16w sibling.
@@ -397,10 +399,14 @@ impl MatmulPipeline {
                 // Wave-fill tiles are ~9.7 KiB; if a future budget
                 // gate empties them, fall back to the 128x128 sibling
                 // (same family, same alignment).
-                K::F16wCoopmatM64 | K::F16wCoopmatM64N128 | K::F16wCoopmatM128N64 => K::F16wCoopmat,
-                K::F16wA16CoopmatM64 | K::F16wA16CoopmatM64N128 | K::F16wA16CoopmatM128N64 => {
-                    K::F16wA16Coopmat
-                }
+                K::F16wCoopmatM64
+                | K::F16wCoopmatM64Mfast
+                | K::F16wCoopmatM64N128
+                | K::F16wCoopmatM128N64 => K::F16wCoopmat,
+                K::F16wA16CoopmatM64
+                | K::F16wA16CoopmatM64Mfast
+                | K::F16wA16CoopmatM64N128
+                | K::F16wA16CoopmatM128N64 => K::F16wA16Coopmat,
                 // Packed B is a different layout; falling back to the
                 // unpacked row kernel would silently read garbage.
                 K::F16wRowBdaK16Packed | K::F16wRowBdaK16V2Packed => {
@@ -416,6 +422,39 @@ impl MatmulPipeline {
                 ),
             };
         }
+    }
+
+    /// The device inputs of the coopmat tile rule: SM count and the
+    /// L2 lower bound (both `None` off NVIDIA / unknown parts).
+    pub(crate) fn coopmat_device(&self) -> CoopmatDevice {
+        CoopmatDevice {
+            sm_count: self.ctx.sm_count(),
+            l2_bytes: self.ctx.l2_bytes_estimate,
+        }
+    }
+
+    /// Registry index of the f16-activations (a16) coopmat kernel for
+    /// an aligned shape (M, N % 64 == 0, K % 32 == 0; resolution
+    /// enforces it).  An explicit a16 kernel runs as-is; an explicit
+    /// f16w coopmat1 tile — e.g. `ML_KERNEL=f16w_coopmat_m128n64` —
+    /// pins its a16 sibling on this route, so tile A/Bs cover the f16-activation
+    /// prefill path too; every other selection takes the SM-aware
+    /// heuristic.  The tile's own alignment is still checked at
+    /// record time, so a pinned tile that does not divide the shape
+    /// fails rather than reading out of bounds.
+    pub(crate) fn a16_coopmat_index(&self, batch: u32, m: u32, n: u32, k: u32) -> usize {
+        // An explicit a16 kernel (e.g. a retune candidate) runs as-is.
+        if let Some(index) = self.selection.index()
+            && KERNEL_SPECS[index].a_f16()
+        {
+            return index;
+        }
+        let tile = CoopmatTile::of_selection(self.selection)
+            .or_else(|| routing::coopmat_tile(batch, m, n, k, true, self.coopmat_device()))
+            .expect("a16 resolution already requires 64-aligned M/N");
+        tile.selection(true)
+            .index()
+            .expect("a16 coopmat selection is concrete")
     }
 
     /// Epilogue-capable kernel for this shape: the normal heuristic

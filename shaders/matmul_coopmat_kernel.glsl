@@ -18,9 +18,11 @@
 //     C_F16 (optional): C is stored as IEEE half; the f32 accumulator
 //     fragments convert (RNE) at store time, and ACCUMULATE reloads
 //     prior C through the same half view.
+//     RASTER_M_FAST (optional): column-major tile order (see main()).
 //
 // Default layout: 256 threads = 8 subgroups of 32.  Workgroup tile
-// 128x128, BK = 32.  Subgroups tile the output (BM/WM) x SG_N, each
+// 128x128, BK = 32 (a wrapper may define BK 64; the host then checks
+// K % 64 through the catalog's tile_k).  Subgroups tile the output (BM/WM) x SG_N, each
 // owning a WM x WN slice of 16x16 fragments.  The 64x64 wrapper uses
 // 128 threads / 4 subgroups / 32x32 slices.  Shared tiles are staged
 // as uvec4 (8 halves) with a 16-byte row skew, per NVIDIA's
@@ -63,7 +65,9 @@ layout(constant_id = 1) const bool ALPHA_IS_ONE = true;
 layout(constant_id = 2) const bool INTERIOR_ONLY = false;
 layout(constant_id = 3) const bool K_MULTIPLE = false;
 
-const uint BK = 32u;
+#ifndef BK
+#define BK 32u
+#endif
 const uint LM = 16u;
 const uint LN = 16u;
 const uint LK = 16u;
@@ -72,7 +76,7 @@ const uint FRAG_N = WN / LN;
 
 // Shared rows carry a 16-byte (one uvec4 / 8 halves) skew to dodge
 // bank conflicts on the fragment loads.
-const uint A_ROW_V4 = BK / 8u + 1u; // 5 uvec4 per A row
+const uint A_ROW_V4 = BK / 8u + 1u; // 5 (BK=32) or 9 (BK=64) uvec4 per A row
 const uint B_ROW_V4 = BN / 8u + 1u; // 17 (BN=128) or 9 (BN=64) uvec4 per B row
 
 layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer F32V4ReadOnly {
@@ -162,8 +166,20 @@ void load_b_tile(uint b_base, uint block_col, uint k_base, uint tid) {
 
 void main() {
     const uint batch = gl_WorkGroupID.z;
+#ifdef RASTER_M_FAST
+    // CTAs launch x-fastest; remap the linear launch index so that
+    // consecutive CTAs walk M (column-major tile order).  The CTAs in
+    // flight then share one B column block, so B streams from DRAM
+    // about once instead of once per row block — the wide-N / short-M
+    // case where x-fastest order re-reads B (M/BM) times.  Uniform per
+    // workgroup, so coopmat control flow stays uniform.
+    const uint tile_lin = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    const uint block_row = tile_lin % gl_NumWorkGroups.y;
+    const uint block_col = tile_lin / gl_NumWorkGroups.y;
+#else
     const uint block_row = gl_WorkGroupID.y;
     const uint block_col = gl_WorkGroupID.x;
+#endif
     const uint tid = gl_LocalInvocationIndex;
     const uint sg = gl_SubgroupID;
 

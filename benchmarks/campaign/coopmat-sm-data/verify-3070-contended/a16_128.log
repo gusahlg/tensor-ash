@@ -1,0 +1,11 @@
+[2026-09-27T05:43:28Z INFO  tensor_ash::context::init] tensor-ash: using device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329)
+[2026-09-27T05:43:28Z INFO  tensor_ash::context::init] tensor-ash: shader cores: 46 via VK_NV_shader_sm_builtins (queried 46)
+[2026-09-27T05:43:28Z INFO  tensor_ash::context::init] tensor-ash: VK_NV_cooperative_matrix2: features_ok=true (ws=1 fd=1 red=1 conv=1 pe=1 ta=1 bl=1), max_dim=1024, reserved_shmem=8192, flash_config_ok=true -> enabled=true
+[2026-09-27T05:43:28Z INFO  ml_bench::bench] device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2497233024, compute_family=2, timestamps=true (64 bits), shader_cores=46 (VK_NV_shader_sm_builtins), l2>=1 MiB)
+[2026-09-27T05:43:28Z INFO  tensor_ash::pipeline::tuning] tensor-ash: discarding stale tuning store /home/gusahlg/.cache/tensor-ash/tuned_kernels_v10de_2488.txt (driver or shader build changed)
+[2026-09-27T05:43:28Z INFO  tensor_ash::pipeline::tuning] tensor-ash: discarding stale tuning store /home/gusahlg/.cache/tensor-ash/tuned_kernels_v10de_2488.txt (driver or shader build changed)
+[2026-09-27T05:43:28Z INFO  tensor_ash::pipeline::tuning] tensor-ash: discarding stale tuning store /home/gusahlg/.cache/tensor-ash/tuned_kernels_v10de_2488.txt (driver or shader build changed)
+[2026-09-27T05:43:28Z INFO  tensor_ash::pipeline::tuning] tensor-ash: discarding stale tuning store /home/gusahlg/.cache/tensor-ash/tuned_kernels_v10de_2488.txt (driver or shader build changed)
+[2026-09-27T05:43:28Z INFO  tensor_ash::pipeline::tuning] tensor-ash: discarding stale tuning store /home/gusahlg/.cache/tensor-ash/tuned_kernels_v10de_2488.txt (driver or shader build changed)
+[2026-09-27T05:43:28Z INFO  tensor_ash::pipeline::tuning] tensor-ash: discarding stale tuning store /home/gusahlg/.cache/tensor-ash/tuned_kernels_v10de_2488.txt (driver or shader build changed)
+[2026-09-27T05:43:28Z INFO  ml_bench::bench::ab] ab burn-in: 34 x 4096^3 in 304 ms

@@ -40,7 +40,9 @@ pub mod pipeline;
 pub mod tensor;
 
 pub use buffer::{Buffer, BufferLocation};
-pub use context::{DeviceKind, DevicePreference, DeviceSummary, VulkanContext};
+pub use context::{
+    DeviceKind, DevicePreference, DeviceSummary, ShaderCoreSource, ShaderCores, VulkanContext,
+};
 pub use dtype::DType;
 pub use executor::{
     ATTN_DECODE_MAX_CHUNKS, AttnDecodeDesc, BinaryOp, CopyDesc, DispatchInfo, ExecOp, Executor,
