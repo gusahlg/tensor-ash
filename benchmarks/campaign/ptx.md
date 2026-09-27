@@ -22,9 +22,9 @@ interleaved same-process A/Bs against tensor-ash's own route):
 
 | lever | 4060 | 3070 |
 |---|---|---|
-| **TinyLlama-1.1B f16 pp512, PTX f16-accumulate route** (`ML_PTX_GEMM=f16`) vs tensor-ash base | **1.39x** (12.9k -> 17.8-17.9k t/s) | **1.58x** (16.1-16.2k -> 25.5-25.6k t/s) |
+| **TinyLlama-1.1B f16 pp512, PTX f16-accumulate route** (`ML_PTX=1 ML_COOPMAT_ACC=f16`; measured as `ML_PTX_GEMM=f16`, same kernels) vs tensor-ash base | **1.39x** (12.9k -> 17.8-17.9k t/s) | **1.58x** (16.1-16.2k -> 25.5-25.6k t/s) |
 | same vs llama.cpp b9503 CUDA pp512, same day (same accumulate precision: cuBLAS `COMPUTE_16F`) | **1.39x** (vs 12.9k) | **1.61x** (vs 15.8k) |
-| pp512 with `ML_PTX_GEMM=f16p` (f16-rate mma, f32 promotion per k-tile; GEMM error ~3-7x *lower* than llama.cpp's cuBLAS path) | **1.28x** base (16.5-16.7k t/s = 1.28x llama.cpp CUDA) | **1.35x** base (21.7-21.9k t/s = 1.38x llama.cpp CUDA) |
+| pp512 with `ML_COOPMAT_ACC=f16p` (f16-rate mma, f32 promotion per 64-K tile; GEMM error ~3-7x *lower* than llama.cpp's cuBLAS path) | **1.28x** base (16.5-16.7k t/s = 1.28x llama.cpp CUDA) | **1.35x** base (21.7-21.9k t/s = 1.38x llama.cpp CUDA) |
 | f16 tensor-core GEMM, f16 accumulate, vs coopmat1 on the same f16 A/B/C (prefill shapes + squares) | 1.43-2.05x (40-53 TF/s) = 80-104% of cuBLAS 16F (4096^3 with grouped raster beats it) | 1.50-2.00x (48-70 TF/s) = 75-104% of cuBLAS 16F (2048^3/4096^3 match or beat it) |
 | same, f32 accumulate (numerics identical to coopmat1) | 1.00-1.12x | 0.98-1.13x |
 | f32 SIMT SGEMM with a 3/4-stage `cp.async` pipeline vs tensor-ash's best GLSL route | 0.86-1.08x (ties on large) | 0.73-1.01x (ties at 2048/4096) |
@@ -441,72 +441,113 @@ system `libggml-base` and aborts, so it ran with
 | `ML_PTX=1 ML_PTX_GEMM=f32 ... graph:: prepared:: replay::` | 12 / 12 pass |
 | `ML_PTX=1 ML_PTX_GEMM=f16p` / `f16` ... `f16::` | 9 / 13 each: the four a16 max-abs tests fail their f32-accumulate tolerance - expected, these are the reduced-precision modes (quantified above); every non-a16 test still passes |
 
-## 7. Design proposal: a PTX accelerator backend
+## 7. The PTX backend as it lands (merge-ready, 2026-09-27)
 
-Status on this branch: the pieces below marked (done) exist as opt-in
-code; the rest is the proposal.
+Everything in this section is implemented on `campaign/ptx`; the
+closing list is what remains a proposal.
 
-1. **Runtime probe (done).** `VulkanContext` enables
-   `VK_NV_cuda_kernel_launch` (+ `VK_NVX_binary_import`) only when
-   `ML_PTX=1` and the feature bit is set; `ML_NO_PTX=1` always vetoes;
-   device creation is byte-identical otherwise.  Exposed as
-   `ctx.cuda_launch`, `ctx.nvx_binary_import`,
-   `ctx.cuda_compute_capability`.  Proposal: once the route has a GPU
-   gate in `ml_bench thesis`, flip to default-on for NVIDIA proprietary
-   drivers with cc >= 8.0 and keep `ML_NO_PTX=1` as the kill switch.
-2. **Modules (done).** PTX text is embedded (no toolkit at build time).
-   `CudaModule::from_ptx_cached` persists the driver-compiled cubin
-   (`vkGetCudaModuleCacheNV`) under
-   `~/.cache/tensor-ash/ptx_<label>_v<vendor>_<device>_d<driver>_<hash>.cubin`;
-   a cold JIT of the GEMM module costs 0.4-0.7 s (1.5-1.7 s for the
-   current 33-entry experiment module - `ptx/hgemm.ptx` is 1.9 MB; a
-   shipping build should prune it to the ~8 routed kernels), a cached
-   load ~0.1 ms (measured: 3-5 ms for the whole route incl. function
-   lookups).
-   Any load/JIT failure logs and leaves the Vulkan kernels in charge
-   (GLSL fallback is the default path, not an error path).  Lowering
-   the emitted `.version` (nvcc 12.9 writes 8.8) to the lowest ISA the
-   kernels need would widen the driver range.
-3. **Routing (done, opt-in).** `ML_PTX_GEMM=f32|f16|f16p` builds a
-   `PtxRoute` in `MatmulPipeline`; `record_one_matmul` asks
-   `route.select(m, n, k)` for a16 matmuls (f16 A/B/C, batch 1, plain
-   `alpha*A*B`, no fused epilogue/normed-A/store) and records
-   `vkCmdCudaLaunchKernelNV` instead of bind + push + dispatch.  The
-   current tile pick is a small SM-count heuristic
-   (`VK_NV_shader_sm_builtins`: 64x64 / 128x64 below ~2-4 tiles per SM,
-   128x128 above, grouped-raster `_g8` above 16 tiles per SM); the proposal is to make PTX entries
-   ordinary candidates of the existing measured tuner (`ML_TUNE`), keyed
-   by the same `TuneKey`, so the per-device winner (the 4060 and 3070
-   disagree - 24 MB vs 4 MB L2) is measured, not guessed.  Caveat today:
-   with the route on, `ML_TUNE=1` measurements of a16 coopmat candidates
-   actually time the PTX kernel (the recorder substitutes it), so tune
-   with the route off until PTX entries are first-class candidates.
-4. **Graphs / PreparedOps (done by construction).** Because (a) compute
-   barriers order CUDA launches both ways, (b) params are captured at
-   record time, and (c) bound Vulkan state survives a launch, a PTX
-   kernel is just another recorded op: `HazardCursor` barrier placement,
-   graph census, and prepared replay work unchanged.  Buffers are BDA
-   addresses, which tensor-ash already caches per `Buffer`.
-5. **Precision policy.** f16 accumulation must stay an explicit choice
-   (it is ~10x noisier).  Proposal: a per-op precision flag mirroring
-   ggml's `GGML_PREC_DEFAULT/F32` - llama prefill projections may opt
-   into `f16`/`f16p`, attention scores and anything reduction-sensitive
-   stay f32.  `f16p` (f16-rate mma, per-k-tile f32 promotion) is the
-   natural default for projections: measured 2.2-2.4x the f32-accumulate
-   error (5-8x below f16 accumulate, ~3-7x below llama.cpp's cuBLAS path)
-   at 1.28x base pp512 on the 4060, token-exact on the gate prompt.
-6. **Epilogues / fusion next.** The Vulkan route fuses bias, activation,
-   residual and RoPE stores; the PTX kernels should grow the same
-   template epilogues (cheap: registers are already in hand) before they
-   replace fused paths.  The weakest shape vs cuBLAS (512x2048x5632 on
-   the 3070, 75%) did not respond to two-stage split-K; a TN-weight
-   variant and a BK=64 f16p kernel with grouped raster are the next
-   kernel items; int8 `mma.m16n8k32` / int4 `m16n8k64` for the
-   quantization track reuse exactly this scaffolding.
-7. **SASS.** The driver accepts cubins through both extensions and
-   returns its own cubin for `nvdisasm`, so a hand-scheduled SASS kernel
-   can ship as a cubin blob with the PTX as fallback when the device's
-   cc differs.  That is the lever left for f32 SIMT SGEMM.
+### 7a. Two knobs: precision (policy) and backend
+
+Precision is one policy for every f16 tensor-core GEMM backend, shared
+verbatim with `campaign/f16acc` (its §9c "unified API"):
+
+* `tensor_ash::CoopmatAcc { F32, F16, F16Promote }`
+  (`src/pipeline/precision.rs`, byte-identical to f16acc's file),
+  per executor: `ExecutorConfig::coopmat_acc` (default `F32`);
+  `Executor::new` reads `ML_COOPMAT_ACC=f32|f16|f16p` (`promote` alias;
+  invalid value = error).  `Executor::coopmat_acc()` reports the
+  *effective* class.  Never a tuner or heuristic choice.
+* Class contracts: `F32` = f32 accumulation end to end; `F16` = f16
+  accumulation (cuBLAS `COMPUTE_16F` numerics); `F16Promote` = f16
+  partials over at most 128 K promoted into f32.  The PTX kernels
+  qualify: `ta_hgemm_f16p_128x64_k64_s2` promotes every 64 K, the
+  grouped `ta_hgemm_f16p_128x64_s3_g8` every 32 K.
+* A class nobody on the device can serve degrades to `F32` **with a
+  warning** (on this branch: no PTX route; after the merge: no PTX route
+  *and* no f16-accumulator coopmat configuration).  A served class that
+  a particular op cannot take (fused epilogue, accumulate, batch > 1,
+  N or K not a multiple of 8, unaligned address) runs that op at f32:
+  the policy is a permission, never a silent downgrade.
+
+The backend is a separate, device-level decision:
+
+| knob | values | effect |
+|---|---|---|
+| `ML_PTX=1` | unset (default) / `1` | request `VK_NV_cuda_kernel_launch` at context creation |
+| `ML_NO_PTX=1` | kill switch | always wins over `ML_PTX` |
+| `ML_PTX_GEMM` | `on` = `auto` (default), `all`, `off` | which classes the PTX a16 route serves: `on` = `F16` + `F16Promote`; `all` adds `F32`; `off` loads no module |
+| `ML_PTX_GEMM` (deprecated) | `f32` / `f16` / `f16p` | one release: `all` / `on` / `on`, and the class for env-built executors when `ML_COOPMAT_ACC` is unset, with a deprecation warning (every command logged below still reproduces) |
+| `ML_PTX_GEMM_KERNEL` | an hgemm entry | forces that kernel for ops whose policy equals its class |
+
+Rust API: `MatmulPipeline::{ptx_gemm_mode, set_ptx_gemm_mode,
+ptx_serves, ptx_a16_kernel(acc, m, n, k)}`, `tensor_ash::ptx::{PtxGemmMode,
+route_kernel_name, legacy_env_acc}`.  Invalid `ML_PTX_GEMM*` values are
+configuration errors (`MatmulPipeline::new` fails before creating any
+Vulkan object); a failed module load/JIT only logs and leaves every
+matmul on its Vulkan kernel.
+
+### 7b. Defaults and why
+
+| setting | default | reasoning |
+|---|---|---|
+| accumulator policy (library, `ExecutorConfig`, `ML_COOPMAT_ACC` unset) | **`F32`** | tensor-ash's numerics contract and every test tolerance are f32 accumulation; `F32` through PTX is bit-identical to coopmat1 (test below) |
+| llama-ash | **`F32`** (reads `ML_COOPMAT_ACC`) | a reference runner should reproduce the library's numerics; speed modes are one variable away |
+| recommended fast mode | **`ML_COOPMAT_ACC=f16p`** (+ `ML_PTX=1`) | pp512 1.28x (4060) / 1.35x (3070) over base; GEMM error 2.2-2.4x f32-accumulate, i.e. ~3-7x *below* llama.cpp CUDA's cuBLAS path (synthetic data); on real TinyLlama activations f16acc's 128 K-chunk promote stays within 2.4x of the f16-output floor (3.6e-4 rel-RMS on the down-projection vs 1.1e-2 for `F16`) and the PTX kernel promotes 2x more often; tokens identical |
+| `F16` | **opt-in only**, documented as the **llama.cpp-parity mode** | it is exactly llama.cpp b9503's prefill numerics (cuBLAS `COMPUTE_16F`), so it is the like-for-like speed comparison (1.39x / 1.61x llama.cpp CUDA) - but it is ~10x noisier than f32 accumulation, reaches 1.1% RMS / 1.76 absolute error on TinyLlama's down-projection (inputs up to 173; f16acc §3) and can overflow at 65504.  Never a default. |
+| PTX backend (`ML_PTX`) | **off** | provisional (beta) NVIDIA-only extension; 0.4-1.7 s cold JIT per driver version (then a 3-5 ms cubin-cache load); device creation must stay byte-identical for everyone who did not ask |
+| `ML_PTX_GEMM` with the backend on | **`on`** (F16 + F16Promote) | where PTX is the measured-fastest implementation; `F32` stays on coopmat1 because PTX f32 accumulation does not pay end to end (pp512 0.98x on the 4060; +0-13% GEMM-level) |
+
+### 7c. Runtime probe and fallback
+
+`ptx_gate` (`src/context/init.rs`, unit-tested) enables the extension
+only when all hold: `ML_PTX=1`, not `ML_NO_PTX=1`, PCI vendor NVIDIA,
+`VK_NV_cuda_kernel_launch` exposed, `cudaKernelLaunchFeatures`, compute
+capability >= 8.0 (the PTX targets `sm_80`).  The feature/property
+structs are chained into a query only after the extension is known to
+exist, and into `VkDeviceCreateInfo` only when the gate passes, so any
+other case creates exactly the device the code without PTX creates.
+`VK_NVX_binary_import` rides along only when the gate passes.  The
+route then needs `bufferDeviceAddress` and a successful module load
+(`CudaModule::from_ptx_cached`: the driver-compiled cubin persisted
+per device/driver/PTX hash); anything else logs a warning and keeps the
+Vulkan kernels.  Only the hgemm module is loaded (the sgemm module is
+bench-only).
+
+### 7d. Graphs, PreparedOps, hazards
+
+The recorder (`record_one_matmul`) gets `ptx_acc: Option<CoopmatAcc>`
+from `Executor::ptx_acc()`: the executor policy on auto-routed
+pipelines, `None` under an explicit `ML_KERNEL` pin and in the tuner
+(which must time exactly its candidate).  When the route serves that
+class for an a16 op it records `vkCmdCudaLaunchKernelNV` in place of
+bind + push + dispatch - in single submissions, dependency graphs
+(`HazardCursor`), mixed `ExecOp` graphs and prepared command buffers
+alike.  Nothing else changes, because (§2) compute barriers order CUDA
+launches both ways, parameters are captured at record time and a
+launch leaves the bound Vulkan pipeline intact (`bound_pipeline`
+tracking stays valid).  After the merge with f16acc the executor maps
+its policy onto `_acc16`/`_acc16p` kernels; `ptx_acc` and
+`CoopmatAcc::of_kernel_name(kernel.name)` then agree on auto
+pipelines (f16acc's proposal reads the class from the kernel name; on
+this branch alone the a16 kernels carry no class, so the policy is
+passed explicitly).
+
+### 7e. Still a proposal
+
+1. PTX entries as first-class candidates of the measured tuner, keyed
+   by `TuneKey` + class (the 4060 and 3070 disagree on tiles: 24 MB vs
+   4 MB L2); today's pick is `route_kernel_name`'s SM-count heuristic.
+2. Fused epilogues (bias, activation, residual, RoPE store) in the PTX
+   kernels, so fused prefill ops can take the route too.
+3. A pruned route module (8 entries instead of 33: ~4x less cold JIT
+   and binary size; `ptx/hgemm.ptx` is 1.9 MB) and a lowered `.version`
+   (nvcc 12.9 writes 8.8) to widen the driver range.
+4. Default-on for NVIDIA proprietary drivers with cc >= 8.0 once an
+   `ml_bench thesis` GPU gate covers the route; `ML_NO_PTX=1` stays the
+   kill switch.
+5. The parked round-5 kernel (`campaign/ptx-hgemm2-wip`, §8).
+6. int8 `mma.m16n8k32` / int4 `m16n8k64` for the quantization track and
+   hand-scheduled SASS (the driver accepts cubins) for f32 SGEMM.
 
 ## Negative results and dead ends (this track)
 
@@ -539,6 +580,13 @@ code; the rest is the proposal.
 
 ## Reproduction
 
+The 2026-09-26 logs used the experiment spelling `ML_PTX_GEMM=f32|f16|f16p`
+(one knob for backend and precision).  Since 2026-09-27 precision is the
+executor policy and the PTX knob only picks the backend; the old spelling
+still reproduces those runs for one release (deprecation warning), and
+maps as: `ML_PTX_GEMM=f16` = `ML_PTX_GEMM=on ML_COOPMAT_ACC=f16`,
+`f16p` = `on` + `ML_COOPMAT_ACC=f16p`, `f32` = `all` + `ML_COOPMAT_ACC=f32`.
+
 ```console
 # desktop: regenerate PTX (only when ptx/*.cu changes)
 CUDA_HOME=/nix/store/<cuda-merged-12.9> ptx/build.sh [cubin DIR]
@@ -550,15 +598,16 @@ ML_PTX=1 target/release/ml_bench ptx sync       # ML_PTX_SYNC_N / _STEPS / _TRIA
 ML_PTX=1 target/release/ml_bench ptx overhead
 ML_PTX=1 ML_PTX_DUMP_DIR=jit target/release/ml_bench ptx dump
 ML_PTX=1 target/release/ml_bench ptx sgemm [MxNxK ...]   # ML_PTX_KERNELS=a,b ML_ROUNDS ML_ITERS
-ML_PTX=1 target/release/ml_bench ptx hgemm [MxNxK ...]   # (do NOT set ML_PTX_GEMM here)
+ML_PTX=1 target/release/ml_bench ptx hgemm [MxNxK ...]   # TA side = coopmat1: leave ML_COOPMAT_ACC unset
 ML_PTX=1 ML_PTX_SPLITS=2,3,4 ML_PTX_KERNELS=ta_hgemm_f16_128x128_s3_splitk,... \
   target/release/ml_bench ptx hgemm 512x2048x5632          # split-K entries
 # integrated route, end to end (one process per run; alternate modes)
-ML_PTX=1 ML_PTX_GEMM=f16  target/release/llama_ash bench -m tinyllama-1.1b-chat-v1.0.f16.gguf --pp 512 --tg 32
-ML_PTX=1 ML_PTX_GEMM=f16p target/release/llama_ash generate -m ... --ids "<128 ids>" -n 32
-# correctness
+ML_PTX=1 ML_COOPMAT_ACC=f16  target/release/llama_ash bench -m tinyllama-1.1b-chat-v1.0.f16.gguf --pp 512 --tg 32
+ML_PTX=1 ML_COOPMAT_ACC=f16p target/release/llama_ash generate -m ... --ids "<128 ids>" -n 32
+# correctness (GPU tests are --ignored)
 ML_PTX=1 cargo test --release --test correctness -- --ignored --test-threads=1 ptx::
-ML_PTX=1 ML_PTX_GEMM=f32 cargo test --release --test correctness -- --ignored --test-threads=1 f16::
+ML_PTX=1 ML_PTX_GEMM=all cargo test --release --test correctness -- --ignored --test-threads=1 f16:: graph:: prepared:: replay::
+cargo test --release -p tensor-ash --lib   # ptx_gate, route class mapping, ML_PTX_GEMM parsing
 # cuBLAS references (desktop build; louise has the same nix store paths)
 LD_LIBRARY_PATH=<libcublas-12.9.1.4-lib>/lib:/run/opengl-driver/lib \
   cublas_hgemm_bench --iters 30 --warmup 8 512x2048x2048 ...
@@ -568,5 +617,6 @@ LD_LIBRARY_PATH=<libcublas-12.9.1.4-lib>/lib:/run/opengl-driver/lib \
 Raw logs of every run quoted here are checked in under
 `benchmarks/campaign/ptx-logs/` (`4060_*.log`, `3070_*.log`), with the
 exact louise run scripts in `ptx-logs/scripts/run_*.sh` (executed via
-`lgpu c-ptx 'timeout N ~/ta-wt/c-ptx-art/run_X.sh'`; the 3070 batches
-ran the same `ml_bench` / `llama_ash` commands under `gpu3070`).
+`lgpu c-ptx 'timeout N ~/ta-wt/c-ptx-art/run_X.sh'`, or from the synced
+worktree for the `run_v2_*` scripts; the 3070 batches ran the same
+`ml_bench` / `llama_ash` / test commands under `gpu3070`).
