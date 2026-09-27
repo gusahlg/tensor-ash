@@ -28,7 +28,7 @@ kernel-level subset without a model. `cases`
 runs multiple `label,b,m,n,k[,f16w][,packed]` arguments in one process, avoiding repeated
 pipeline startup and GPU clock perturbation in automation. `ab` does the same
 for a multi-kernel comparison: `ML_AB_KERNELS` lists catalog names or `auto`
-(each optionally suffixed `@f32|@f16|@promote` to set that entry's coopmat
+(each optionally suffixed `@f32|@f16|@f16p` to set that entry's coopmat
 accumulator policy, e.g. `auto,auto@f16`), one context is shared, tensors are allocated once per case, and `ML_ROUNDS`
 (default 5) interleaved rounds rotate which kernel runs first. The environment
 knobs are documented in the workspace `README.md`; `ML_DEVICE`, `ML_KERNEL`,

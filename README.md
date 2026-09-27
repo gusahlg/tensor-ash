@@ -200,6 +200,17 @@ Library integrations that should not read process-wide tuning state can use
 `Executor::new_with_config` and `ExecutorConfig`; the compatibility
 `Executor::new` constructor continues to honor `ML_TUNE` for CLI workflows.
 
+Tensor-core accumulator precision is a separate, opt-in numerics class:
+`ExecutorConfig::coopmat_acc` (`CoopmatAcc::F32` default, `F16`,
+`F16Promote`; `ML_COOPMAT_ACC=f32|f16|f16p` for `Executor::new`) routes the
+f16-weight coopmat1 GEMMs to f16-accumulator kernels, which run at twice the
+f32-accumulate tensor rate on GeForce Ampere/Ada.  `F16` has the numerics of
+cuBLAS `CUBLAS_COMPUTE_16F` (what llama.cpp's CUDA backend uses for f16-weight
+prefill GEMMs); `F16Promote` adds f16 partials of at most 128 K into f32
+accumulators (about 3x the f16-output rounding floor).  The heuristic and the
+tuner never pick these classes; unsupported devices fall back to `F32` with a
+warning.  Error and speed tables: `benchmarks/campaign/f16acc.md`.
+
 Fused epilogues and dependent graphs:
 
 ```rust

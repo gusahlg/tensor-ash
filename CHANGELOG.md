@@ -11,7 +11,7 @@
   promoted into f32 accumulators) twins of the 4 coopmat1 tiles x
   {f32 A, f16 A}.  Policy: `ExecutorConfig::coopmat_acc`
   (`CoopmatAcc::{F32, F16, F16Promote}`, default F32) or
-  `ML_COOPMAT_ACC=f16|promote` for env-built executors; never tuned,
+  `ML_COOPMAT_ACC=f16|f16p` (`promote` is an alias) for env-built executors; never tuned,
   never default; gated on `VulkanContext::coopmat_f16_acc_enabled`
   (queried 16x16x16 f16/f16/f16/f16 configuration).  The f16 classes
   route through their own tile rule (`coopmat_tile_acc16`: 64x128 /
@@ -23,7 +23,7 @@
   `ML_GEN=1` or an `ML_KERNEL` pin), an f16-accumulator module axis and
   a `K_UNROLL` body axis; `workgroup_shared_bytes` folds
   `OpSpecConstantOp` (the C8 panic is gone).
-- `ml_bench ab` entries take `@f32|@f16|@promote`; `llama_ash numerics`
+- `ml_bench ab` entries take `@f32|@f16|@f16p`; `llama_ash numerics`
   (real-activation GEMM error vs f64); `LLAMA_ASH_LOGITS_OUT`;
   `examples/coopmat_acc_numerics.rs`.
 
