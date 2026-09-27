@@ -19,7 +19,8 @@
 //! Run (4060 first):  cargo run --release --example coopmat_acc_numerics
 //! `ML_NUMERICS_ROWS` (default 64) sets the sampled rows of part 2;
 //! `ML_NUMERICS_GATE_ONLY=1` stops after part 1; `ML_NUMERICS_SKIP_GEN=1`
-//! leaves the generator configs out of part 1.
+//! leaves the generator configs out of part 1; `ML_NUMERICS_KERNELS=a,b`
+//! adds pinned kernels (e.g. the promote chunk-length variants) to part 2.
 
 use std::sync::Arc;
 
@@ -236,7 +237,9 @@ fn correctness_gate(ctx: &Arc<VulkanContext>) -> Result<usize> {
     let l2 = l2_rows(&host_a, &host_b, k, n, &rows);
     let mut failures = 0;
     println!("## part 1: every coopmat1 kernel, 256x256x1024 unif, full output vs f64");
-    println!("| kernel | acc | max abs err | max err / (2^-11 l2) | rel rms | mean err | verdict |");
+    println!(
+        "| kernel | acc | max abs err | max err / (2^-11 l2) | rel rms | mean err | verdict |"
+    );
     println!("|---|---|---|---|---|---|---|");
     // ML_NUMERICS_SKIP_GEN=1 leaves out the generator (spec-module)
     // configs, e.g. on a GPU where they have not been validated yet.
@@ -262,12 +265,18 @@ fn correctness_gate(ctx: &Arc<VulkanContext>) -> Result<usize> {
         let s = stats(&got, &reference, &l2);
         // Bound in units of 2^-11 * l2 (see ml_bench's acc16_budget):
         // f32 acc ~ output rounding only; f16 acc K/16 roundings of the
-        // running sum; promote 8 roundings of a 128-K chunk partial.
+        // running sum; promote C/16 roundings of each C-deep chunk
+        // partial.
         let c_f16_units = if spec.a_f16() { 8.0 } else { 0.0 };
         let limit = match spec.accumulator() {
             CoopmatAcc::F32 => 1.0 + c_f16_units,
             CoopmatAcc::F16 => (k as f64 / 16.0) + c_f16_units,
-            CoopmatAcc::F16Promote => 8.0 * (k as f64 / 128.0).sqrt() + c_f16_units,
+            CoopmatAcc::F16Promote => {
+                // sqrt(K * C) / 16 roundings for C-deep chunk partials
+                // (8 sqrt(K / 128) at the default C = 128).
+                let chunk = spec.promote_chunk_k().unwrap_or(128).min(k as u32) as f64;
+                (k as f64 * chunk).sqrt() / 16.0 + c_f16_units
+            }
         };
         let ok = s.nonfinite == 0 && s.max_units <= limit;
         if !ok {
@@ -295,10 +304,34 @@ fn error_table(ctx: &Arc<VulkanContext>) -> Result<()> {
         KernelSelection::Auto,
     )?);
     let policies = [CoopmatAcc::F32, CoopmatAcc::F16, CoopmatAcc::F16Promote];
-    let execs = policies
+    // (executor, class label, A storage it applies to: None = both).
+    let mut execs = policies
         .iter()
-        .map(|&acc| executor(ctx, &pipe, acc))
+        .map(|&acc| Ok((executor(ctx, &pipe, acc)?, acc.as_str().to_string(), None)))
         .collect::<Result<Vec<_>>>()?;
+    // ML_NUMERICS_KERNELS: extra pinned coopmat kernels (e.g. the
+    // promote chunk-length variants), each on its own A storage.
+    for name in std::env::var("ML_NUMERICS_KERNELS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let selection = KernelSelection::parse(name)?;
+        let spec = &KERNEL_SPECS[selection
+            .index()
+            .ok_or_else(|| anyhow::anyhow!("ML_NUMERICS_KERNELS: {name} is not concrete"))?];
+        let pinned = Arc::new(MatmulPipeline::new_with_kernel_selection(ctx, selection)?);
+        let label = match spec.promote_chunk_k() {
+            Some(chunk) => format!("promote/{chunk}K (pinned)"),
+            None => format!("{} (pinned)", spec.accumulator().as_str()),
+        };
+        execs.push((
+            executor(ctx, &pinned, CoopmatAcc::F32)?,
+            label,
+            Some(spec.a_f16()),
+        ));
+    }
     let sample = std::env::var("ML_NUMERICS_ROWS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -320,8 +353,8 @@ fn error_table(ctx: &Arc<VulkanContext>) -> Result<()> {
             let reference = reference_rows(&host_a, &host_b, k, n, &rows);
             let l2 = l2_rows(&host_a, &host_b, k, n, &rows);
             let rmax = reference.iter().fold(0.0f64, |acc, r| acc.max(r.abs()));
-            let rrms = (reference.iter().map(|r| r * r).sum::<f64>() / reference.len() as f64)
-                .sqrt();
+            let rrms =
+                (reference.iter().map(|r| r * r).sum::<f64>() / reference.len() as f64).sqrt();
             for a16 in [true, false] {
                 let case = Case {
                     ctx,
@@ -332,7 +365,10 @@ fn error_table(ctx: &Arc<VulkanContext>) -> Result<()> {
                     host_a: &host_a,
                     host_b: &host_b,
                 };
-                for (exec, acc) in execs.iter().zip(policies) {
+                for (exec, acc, only) in &execs {
+                    if only.is_some_and(|only_a16| only_a16 != a16) {
+                        continue;
+                    }
                     let kernel = if a16 {
                         exec.dispatch_info_a16(1, m as u32, n as u32, k as u32)
                             .kernel
@@ -351,7 +387,7 @@ fn error_table(ctx: &Arc<VulkanContext>) -> Result<()> {
                         "| {} | {} | {m}x{n}x{k} | {rmax:.3} | {rrms:.4} | {} | {kernel} | {:.3e} | {:.3e} | {:.3e} | {:+.2e} | {:.2} | {} |",
                         dist.name(),
                         if a16 { "a16" } else { "a32" },
-                        acc.as_str(),
+                        acc,
                         s.max_abs,
                         s.max_over_ref,
                         s.rel_rms,

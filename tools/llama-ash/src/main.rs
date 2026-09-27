@@ -6,7 +6,7 @@
 //!   generate -m <gguf> --ids "1,15043,3186" -n 24 [--ctx 2048]
 //!   numerics -m <gguf> [--ids "..."] [--pp 512] [--ctx 2048]
 //!
-//! `ML_COOPMAT_ACC=f16|promote` routes the prefill's coopmat GEMMs to
+//! `ML_COOPMAT_ACC=f16|f16p` routes the prefill's coopmat GEMMs to
 //! the f16-accumulator kernels (default f32).  `generate` writes the
 //! prefill logits (raw f32 LE) to `LLAMA_ASH_LOGITS_OUT` when set.
 
@@ -315,7 +315,8 @@ fn numerics(args: &Args) -> Result<()> {
             "(ref rounded to f16)",
             &r.f16_store_floor,
         ));
-        for (label, kernel, e) in floor.chain(r.results.iter().map(|(l, k, e)| (l.clone(), *k, e))) {
+        for (label, kernel, e) in floor.chain(r.results.iter().map(|(l, k, e)| (l.clone(), *k, e)))
+        {
             println!(
                 "| {} | {}x{}x{} | {:.3} | {:.4} | {:.3} | {:.4} | {label} | {kernel} | {:.3e} | {:.3e} | {:.3e} | {:.3e} | {:+.2e} | {} |",
                 r.name,

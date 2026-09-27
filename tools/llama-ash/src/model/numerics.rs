@@ -126,7 +126,10 @@ impl Model {
         sample_rows: usize,
     ) -> Result<Vec<GemmNumerics>> {
         self.prefill(tokens)?;
-        let s = self.prefill_scratch.as_ref().expect("prefill built scratch");
+        let s = self
+            .prefill_scratch
+            .as_ref()
+            .expect("prefill built scratch");
         ensure!(
             s.xn.dtype() == DType::F16,
             "gemm numerics needs the f16-activation prefill route (T >= 128, T % 64 == 0, \

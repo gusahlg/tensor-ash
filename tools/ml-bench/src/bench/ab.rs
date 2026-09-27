@@ -50,8 +50,7 @@ pub(super) fn parse_ab_kernels(raw: &str) -> Result<Vec<AbEntry>> {
         let (name, acc) = match token.split_once('@') {
             Some((name, acc)) => (
                 name,
-                CoopmatAcc::parse(acc)
-                    .with_context(|| format!("ML_AB_KERNELS entry '{token}'"))?,
+                CoopmatAcc::parse(acc).with_context(|| format!("ML_AB_KERNELS entry '{token}'"))?,
             ),
             None => (token, CoopmatAcc::F32),
         };
@@ -280,7 +279,7 @@ fn validate_round_zero(exec: &Executor, case: &BenchCase, tensors: &CaseTensors)
         case.n,
         case.k,
         case.a16,
-        CoopmatAcc::of_kernel_name(kernel),
+        kernel,
     )
     .with_context(|| {
         format!(
@@ -299,8 +298,8 @@ fn print_results(
     match mode {
         OutputMode::Table => {
             println!(
-                "{:<24} {:<28} {:>10} {:>10} {:>8} {:>8}  {}",
-                "case", "kernel", "gpu_ms", "gpu_ms_min", "TF/s", "ratio", "route"
+                "{:<24} {:<28} {:>10} {:>10} {:>8} {:>8}  route",
+                "case", "kernel", "gpu_ms", "gpu_ms_min", "TF/s", "ratio"
             );
             println!("{}", "-".repeat(120));
         }
@@ -408,7 +407,10 @@ mod tests {
         assert_eq!(parsed[1].label, "auto@f16");
         assert_eq!(parsed[1].selection, KernelSelection::Auto);
         assert_eq!(parsed[1].acc, CoopmatAcc::F16);
-        assert_eq!(parsed[2].selection, KernelSelection::F16wA16CoopmatM64Acc16p);
+        assert_eq!(
+            parsed[2].selection,
+            KernelSelection::F16wA16CoopmatM64Acc16p
+        );
         assert!(parse_ab_kernels("auto@bf16").is_err());
     }
 

@@ -210,7 +210,9 @@ impl CoopmatTile {
 
 /// (tile, a16, accumulator) of a coopmat1 kernel selection, `None` for
 /// every other kernel.
-pub(crate) fn coopmat1_parts(selection: KernelSelection) -> Option<(CoopmatTile, bool, CoopmatAcc)> {
+pub(crate) fn coopmat1_parts(
+    selection: KernelSelection,
+) -> Option<(CoopmatTile, bool, CoopmatAcc)> {
     COOPMAT1
         .iter()
         .find(|&&(s, ..)| s == selection)

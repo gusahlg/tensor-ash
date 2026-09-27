@@ -6,8 +6,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tensor_ash::{
-    CoopmatAcc, DeviceKind, Executor, MatmulCall, MatmulOp, Tensor, VulkanContext, f16w_row_tile_n,
-    pack_f16w_row_tiles,
+    CoopmatAcc, DeviceKind, Executor, KERNEL_SPECS, MatmulCall, MatmulOp, Tensor, VulkanContext,
+    f16w_row_tile_n, pack_f16w_row_tiles,
 };
 use tensor_ash_test_support::{cpu_bmm, fill_det, max_abs_err, tolerance};
 
@@ -305,18 +305,7 @@ pub(super) fn run_case(
     } else {
         exec.dispatch_info_for(bsz, m, n, k, case.b_f16).kernel
     };
-    validate_samples(
-        exec,
-        &c,
-        &h_a,
-        &h_b,
-        bsz,
-        m,
-        n,
-        k,
-        case.a16,
-        CoopmatAcc::of_kernel_name(routed),
-    )?;
+    validate_samples(exec, &c, &h_a, &h_b, bsz, m, n, k, case.a16, routed)?;
     let wall_ms = SampleSummary::new(samples.iter().map(|(wall, _)| *wall))
         .context("benchmark produced no wall-time samples")?;
     let gpu_ms = SampleSummary::new(samples.iter().filter_map(|(_, gpu)| *gpu));
@@ -367,15 +356,30 @@ pub(super) fn run_case(
 /// walk) stays inside it — a smoke gate against wrong-tile / garbage
 /// output (errors of order `l2` itself), not a precision spec; the
 /// measured error lives in `benchmarks/campaign/f16acc.md`.
-pub(super) fn acc16_budget(acc: CoopmatAcc, k: u32, l2: f32) -> f32 {
+pub(super) fn acc16_budget(acc: CoopmatAcc, promote_k: u32, k: u32, l2: f32) -> f32 {
     match acc {
         CoopmatAcc::F32 => 0.0,
         // Pure f16: K/16 roundings of the full running sum.
         CoopmatAcc::F16 => (k as f32 / 16.0) * 2.0f32.powi(-11) * l2,
-        // Promote: 8 roundings per 128-K chunk partial (|chunk| ~
-        // l2*sqrt(128/K)), chunks add in f32.
-        CoopmatAcc::F16Promote => 8.0 * 2.0f32.powi(-11) * l2 * (k as f32 / 128.0).sqrt(),
+        // Promote with C-deep chunks: C/16 roundings per chunk partial
+        // (|chunk| ~ l2*sqrt(C/K)), K/C chunks added in f32:
+        // sqrt(K*C)/16 roundings of l2 (= 8 sqrt(K/128) at C = 128).
+        CoopmatAcc::F16Promote => {
+            let c = promote_k.min(k) as f32;
+            (k as f32 * c).sqrt() / 16.0 * 2.0f32.powi(-11) * l2
+        }
     }
+}
+
+/// Accumulator class and promote chunk depth (K per f16 partial) of a
+/// routed kernel, for [`acc16_budget`].
+pub(super) fn kernel_acc(kernel: &str) -> (CoopmatAcc, u32) {
+    let chunk = KERNEL_SPECS
+        .iter()
+        .find(|spec| spec.name == kernel)
+        .and_then(|spec| spec.promote_chunk_k())
+        .unwrap_or(128);
+    (CoopmatAcc::of_kernel_name(kernel), chunk)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -389,9 +393,10 @@ pub(super) fn validate_samples(
     n: u32,
     k: u32,
     c_f16: bool,
-    acc: CoopmatAcc,
+    kernel: &str,
 ) -> Result<()> {
     const CHECKS: usize = 8;
+    let (acc, promote_k) = kernel_acc(kernel);
     let mut output = vec![0.0; host_len(&[batch, m, n])?];
     exec.download(c, &mut output)?;
     let checks = output.len().min(CHECKS);
@@ -422,7 +427,7 @@ pub(super) fn validate_samples(
             } else {
                 0.0
             }
-            + acc16_budget(acc, k, l2);
+            + acc16_budget(acc, promote_k, k, l2);
         let error = (output[index] - expected).abs();
         if !error.is_finite() || error - budget > max_error - max_budget {
             max_error = error;

@@ -19,6 +19,8 @@ mod batch;
 mod churn;
 #[path = "correctness/cm2_gemm.rs"]
 mod cm2_gemm;
+#[path = "correctness/coopmat_acc.rs"]
+mod coopmat_acc;
 #[path = "correctness/decoder.rs"]
 mod decoder;
 #[path = "correctness/elementwise.rs"]

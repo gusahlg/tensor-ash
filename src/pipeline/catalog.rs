@@ -41,6 +41,22 @@ impl KernelSpec {
         super::CoopmatAcc::of_kernel_name(self.name)
     }
 
+    /// K elements per f16 partial of an `_acc16p` (promote) kernel:
+    /// `PROMOTE_KT * tile_k`, read from a `_pk<KT>_` name tag
+    /// (default PROMOTE_KT = 4, i.e. 128 K on the BK = 32 tiles).
+    /// `None` for every other accumulator class.
+    pub fn promote_chunk_k(&self) -> Option<u32> {
+        if self.accumulator() != super::CoopmatAcc::F16Promote {
+            return None;
+        }
+        let kt = self
+            .name
+            .split('_')
+            .find_map(|part| part.strip_prefix("pk").and_then(|v| v.parse::<u32>().ok()))
+            .unwrap_or(4);
+        Some(kt * self.tile_k)
+    }
+
     /// Total workgroup (shared) memory the shader declares, in bytes —
     /// the number drivers check against `maxComputeSharedMemorySize`
     /// (VUID-RuntimeSpirv-Workgroup-06530).  Read from the embedded
@@ -484,6 +500,15 @@ kernel_catalog! {
         "matmul_f16w_a16_coopmat_m128n64_acc16.spv", false, ["f16w_a16_coopmat_m128n64_acc16", "a16_coopmat_m128n64_acc16"]),
     F16wA16CoopmatM128N64Acc16p => ("f16w_a16_coopmat_m128n64_acc16p", 128, 64, 32,
         "matmul_f16w_a16_coopmat_m128n64_acc16p.spv", false, ["f16w_a16_coopmat_m128n64_acc16p", "a16_coopmat_m128n64_acc16p"]),
+    // Promote chunk-length sweep on the routed a16 prefill tile
+    // (64x128): PROMOTE_KT = 2 (64 K) and 8 (256 K) beside the default
+    // 4 (128 K) of `f16w_a16_coopmat_m64n128_acc16p`.  Pin-only.
+    F16wA16CoopmatM64N128Pk2Acc16p => ("f16w_a16_coopmat_m64n128_pk2_acc16p", 64, 128, 32,
+        "matmul_f16w_a16_coopmat_m64n128_pk2_acc16p.spv", false,
+        ["f16w_a16_coopmat_m64n128_pk2_acc16p", "a16_coopmat_m64n128_pk2_acc16p"]),
+    F16wA16CoopmatM64N128Pk8Acc16p => ("f16w_a16_coopmat_m64n128_pk8_acc16p", 64, 128, 32,
+        "matmul_f16w_a16_coopmat_m64n128_pk8_acc16p.spv", false,
+        ["f16w_a16_coopmat_m64n128_pk8_acc16p", "a16_coopmat_m64n128_pk8_acc16p"]),
     // Generator milestone M1: coopmat1 configs from ONE spec-constant
     // module per A storage (`matmul_f16w{,_a16}_coopmat_spec`, tile
     // params = spec ids 16-23: BM, BN, BK, WM, WN, THREADS, A_SKEW,
@@ -736,7 +761,11 @@ mod tests {
         ] {
             for fam in ["f16w_", "f16w_a16_"] {
                 for acc in ["_acc16", "_acc16p"] {
-                    assert_eq!(by_name(&format!("{fam}{base}{acc}")), bytes, "{fam}{base}{acc}");
+                    assert_eq!(
+                        by_name(&format!("{fam}{base}{acc}")),
+                        bytes,
+                        "{fam}{base}{acc}"
+                    );
                 }
             }
         }
@@ -794,14 +823,28 @@ mod tests {
 
     #[test]
     fn generated_configs_are_legal_and_consistent() {
-        let generated: Vec<&KernelSpec> = KERNEL_SPECS.iter().filter(|s| s.is_generated()).collect();
-        assert_eq!(generated.len(), 51, "15 configs x {{a32, a16, a16-acc16}} + 6 ku8");
+        let generated: Vec<&KernelSpec> =
+            KERNEL_SPECS.iter().filter(|s| s.is_generated()).collect();
+        assert_eq!(
+            generated.len(),
+            51,
+            "15 configs x {{a32, a16, a16-acc16}} + 6 ku8"
+        );
         for spec in generated {
             let [bm, bn, bk, wm, wn, threads, skew_a, skew_b] =
                 [16, 17, 18, 19, 20, 21, 22, 23].map(|id| spec_value(spec, id));
             assert!(spec.name.contains("_coopmat_g_"), "{}", spec.name);
-            assert_eq!([spec.tile_m, spec.tile_n, spec.tile_k], [bm, bn, bk], "{}", spec.name);
-            assert!(wm % 16 == 0 && wn % 16 == 0 && bk % 16 == 0, "{}", spec.name);
+            assert_eq!(
+                [spec.tile_m, spec.tile_n, spec.tile_k],
+                [bm, bn, bk],
+                "{}",
+                spec.name
+            );
+            assert!(
+                wm % 16 == 0 && wn % 16 == 0 && bk % 16 == 0,
+                "{}",
+                spec.name
+            );
             assert!(bm % wm == 0 && bn % wn == 0, "{}", spec.name);
             assert_eq!(threads, (bm / wm) * (bn / wn) * 32, "{}", spec.name);
             assert_eq!((bm * bk / 8) % threads, 0, "{} A staging", spec.name);
@@ -810,6 +853,39 @@ mod tests {
             // the analytic size (R5).
             let analytic = bm * (bk / 8 + skew_a) * 16 + bk * (bn / 8 + skew_b) * 16;
             assert_eq!(spec.shared_memory_bytes(), analytic, "{}", spec.name);
+        }
+    }
+
+    #[test]
+    fn promote_chunk_k_reads_the_pk_tag() {
+        let by = |name: &str| {
+            KERNEL_SPECS
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+        assert_eq!(
+            by("f16w_a16_coopmat_m64n128_acc16p").promote_chunk_k(),
+            Some(128)
+        );
+        assert_eq!(by("f16w_coopmat_acc16p").promote_chunk_k(), Some(128));
+        assert_eq!(
+            by("f16w_a16_coopmat_m64n128_pk2_acc16p").promote_chunk_k(),
+            Some(64)
+        );
+        assert_eq!(
+            by("f16w_a16_coopmat_m64n128_pk8_acc16p").promote_chunk_k(),
+            Some(256)
+        );
+        assert_eq!(by("f16w_a16_coopmat_m64n128_acc16").promote_chunk_k(), None);
+        assert_eq!(by("f16w_coopmat_aligned").promote_chunk_k(), None);
+        // The chunk variants stage the same tiles as their base kernel.
+        for name in [
+            "f16w_a16_coopmat_m64n128_pk2_acc16p",
+            "f16w_a16_coopmat_m64n128_pk8_acc16p",
+        ] {
+            assert_eq!(by(name).shared_memory_bytes(), 13_824, "{name}");
+            assert!(by(name).a_f16(), "{name}");
         }
     }
 
@@ -829,7 +905,11 @@ mod tests {
                 ("t3", "coopmat_m64n128", 13_824),
                 ("t4", "coopmat_m128n64", 14_848),
             ] {
-                assert_eq!(bytes(&format!("{fam}coopmat_g_{twin}")), expect, "{fam}{twin}");
+                assert_eq!(
+                    bytes(&format!("{fam}coopmat_g_{twin}")),
+                    expect,
+                    "{fam}{twin}"
+                );
                 assert_eq!(bytes(&format!("{fam}{literal}")), expect, "{fam}{literal}");
             }
         }

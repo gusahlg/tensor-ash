@@ -152,7 +152,7 @@ impl Instr {
         }
         let tok = self
             .operands
-            .split(|c: char| c == ' ' || c == ',')
+            .split([' ', ','])
             .find(|t| t.starts_with("0x"))?;
         u32::from_str_radix(tok.trim_start_matches("0x"), 16).ok()
     }
@@ -506,7 +506,8 @@ mod tests {
         let pad = Ctrl::decode(&word(0x7918, 0x7e0u64 << 41));
         assert_eq!(pad.render(), "B------:R-:W-:Y:S00");
         // Round-trip a busy word: wait {0,5}, R0, W5, yield, S05.
-        let code: u64 = (0b100001 << 11) | (0 << 8) | (5 << 5) | 5;
+        // wait mask 0b100001, read barrier 0, write barrier 5, stall 5.
+        let code: u64 = (0b100001 << 11) | (5 << 5) | 5;
         let c = Ctrl::decode(&word(0, code << 41));
         assert_eq!(c.render(), "B0----5:R0:W5:Y:S05");
     }

@@ -191,12 +191,13 @@ impl Executor {
     /// == 0, K % 32 == 0): always an a16 coopmat tile, chosen by the
     /// SM-aware heuristic unless the pipeline pins a coopmat tile.
     pub fn dispatch_info_a16(&self, batch: u32, m: u32, n: u32, k: u32) -> DispatchInfo {
-        let kernel = self
-            .pipeline
-            .kernel_at(
-                self.pipeline
-                    .a16_coopmat_index(batch, m, n, k, self.coopmat_acc),
-            );
+        let kernel = self.pipeline.kernel_at(self.pipeline.a16_coopmat_index(
+            batch,
+            m,
+            n,
+            k,
+            self.coopmat_acc,
+        ));
         DispatchInfo {
             kernel: kernel.name,
             tile: [kernel.tile_m, kernel.tile_n, kernel.tile_k],
@@ -386,7 +387,7 @@ impl Executor {
         let tune = std::env::var("ML_TUNE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        // `ML_COOPMAT_ACC=f16|promote` opts env-configured executors
+        // `ML_COOPMAT_ACC=f16|f16p` opts env-configured executors
         // into the f16-accumulator coopmat twins (default f32).
         let coopmat_acc = CoopmatAcc::from_env()?;
         Self::new_with_config(

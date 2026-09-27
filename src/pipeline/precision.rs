@@ -11,10 +11,18 @@ use anyhow::{Result, bail};
 ///   `CUBLAS_COMPUTE_16F`, which llama.cpp's CUDA backend uses for f16
 ///   weight GEMMs with more than 16 rows at default precision.  Sums
 ///   above 65504 overflow to infinity.
-/// * `F16Promote`: f16 partial fragments over 128 K (4 K-tiles), then
-///   added into f32 accumulators: the error of one chunk partial's f16
+/// * `F16Promote`: f16 partial fragments over at most 128 K, then added
+///   into f32 accumulators: the error of one chunk partial's f16
 ///   rounding instead of the whole running sum's, at the cost of half
-///   again the f32 accumulator registers.
+///   again the f32 accumulator registers.  The routed coopmat1 kernels
+///   promote every 128 K (4 K-tiles); any backend serving this class
+///   (e.g. a PTX `mma` route promoting every 64-K tile) must keep its
+///   chunks at or below 128 K.  The `_pk8_` (256 K) chunk variant is a
+///   pin-only experiment outside the class.
+///
+/// The class, not the backend, is the policy: one value selects the
+/// accumulator for whichever f16 tensor-core GEMM implementation runs
+/// the op.  Strings: `f32`, `f16`, `f16p` ([`Self::as_str`]).
 ///
 /// Never chosen by a heuristic or the tuner: it is a numerics class
 /// the caller opts into through [`crate::ExecutorConfig::coopmat_acc`]
@@ -29,13 +37,15 @@ pub enum CoopmatAcc {
 }
 
 impl CoopmatAcc {
-    /// Parse `f32` / `f16` / `promote` (plus a few spellings).
+    /// Parse `f32` / `f16` / `f16p` (= `promote`; plus a few spellings).
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "f32" | "fp32" | "exact" => Ok(Self::F32),
             "f16" | "fp16" | "fast16" | "acc16" => Ok(Self::F16),
             "promote" | "f16p" | "f16promote" | "f16_promote" | "acc16p" => Ok(Self::F16Promote),
-            other => bail!("invalid coopmat accumulator '{other}', expected f32, f16, or promote"),
+            other => {
+                bail!("invalid coopmat accumulator '{other}', expected f32, f16, or f16p (promote)")
+            }
         }
     }
 
@@ -51,7 +61,8 @@ impl CoopmatAcc {
         match self {
             Self::F32 => "f32",
             Self::F16 => "f16",
-            Self::F16Promote => "f16-promote",
+            // `f16p`: the spelling `ML_PTX_GEMM` uses for the same class.
+            Self::F16Promote => "f16p",
         }
     }
 

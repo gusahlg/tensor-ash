@@ -31,8 +31,8 @@ use tuning::{load_tuned, save_tuned, shader_registry_hash};
 
 pub use abi::{EpilogueKey, KernelVariant, MATMUL_FLAG_NORM_A, MatmulPushConstants};
 pub use catalog::{KERNEL_SPECS, KernelSelection, KernelSpec};
-pub use precision::CoopmatAcc;
 pub(crate) use create::{build_compute_pipeline, create_pc_only_layout};
+pub use precision::CoopmatAcc;
 pub use runtime::MatmulKernel;
 pub(crate) use tuning::{SPLITK2_SPIRV, TuneEntry, TuneKey};
 
@@ -174,9 +174,11 @@ impl MatmulPipeline {
                 .filter(|spec| spec.is_generated())
                 .map(|spec| {
                     let twin = if spec.a_f16() {
-                        spec.name.replacen("f16w_a16_coopmat_g_", "f16w_coopmat_g_", 1)
+                        spec.name
+                            .replacen("f16w_a16_coopmat_g_", "f16w_coopmat_g_", 1)
                     } else {
-                        spec.name.replacen("f16w_coopmat_g_", "f16w_a16_coopmat_g_", 1)
+                        spec.name
+                            .replacen("f16w_coopmat_g_", "f16w_a16_coopmat_g_", 1)
                     };
                     vec![spec.name.to_string(), twin]
                 })
@@ -481,15 +483,26 @@ impl MatmulPipeline {
         k: u32,
         acc: CoopmatAcc,
     ) -> usize {
-        // A pinned generator config: its a16 module twin.
+        // A pinned a16 coopmat1 kernel outside the routing table (a
+        // generator config, a promote chunk-length variant) runs as
+        // pinned; a pinned a32 generator config takes its a16 module
+        // twin.
+        if let Some(index) = self.selection.index() {
+            let spec = &KERNEL_SPECS[index];
+            if spec.a_f16()
+                && spec.name.contains("coopmat")
+                && routing::coopmat1_parts(self.selection).is_none()
+            {
+                return index;
+            }
+        }
         if let Some(index) = self.selection.index()
             && KERNEL_SPECS[index].is_generated()
         {
             let spec = &KERNEL_SPECS[index];
-            if spec.a_f16() {
-                return index;
-            }
-            let twin = spec.name.replacen("f16w_coopmat_g_", "f16w_a16_coopmat_g_", 1);
+            let twin = spec
+                .name
+                .replacen("f16w_coopmat_g_", "f16w_a16_coopmat_g_", 1);
             if let Some(twin) = self.kernel_index(&twin) {
                 return twin;
             }
