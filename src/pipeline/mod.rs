@@ -693,6 +693,16 @@ impl MatmulPipeline {
         self.selection == KernelSelection::Auto
     }
 
+    /// Registry index of an explicit `ML_KERNEL=` / [`KernelSelection`]
+    /// pin, `None` under the auto selector.
+    #[inline]
+    pub(crate) fn explicit_index(&self) -> Option<usize> {
+        match self.selection {
+            KernelSelection::Auto => None,
+            explicit => explicit.index(),
+        }
+    }
+
     /// Whether `shape` already has a measured winner (or tuning is
     /// moot because selection is explicit).
     pub(crate) fn is_tuned(&self, key: TuneKey) -> bool {

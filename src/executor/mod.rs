@@ -303,6 +303,32 @@ impl Executor {
                      support, which this device lacks"
                 );
             }
+            // An explicit pin of an a16 kernel wins, with its tile
+            // alignment checked here (a pinned f16w coopmat1 tile or
+            // generator config still maps to its a16 twin in
+            // `a16_coopmat_index`, which also honors a16 pins; this
+            // branch adds the loud M/N check and covers non-coopmat a16
+            // kernels).  Any other pin leaves a16 on its tiles.
+            if let Some(index) = self
+                .pipeline
+                .explicit_index()
+                .filter(|&index| crate::pipeline::KERNEL_SPECS[index].a_f16())
+            {
+                let spec = &crate::pipeline::KERNEL_SPECS[index];
+                anyhow::ensure!(
+                    dims.m.is_multiple_of(spec.tile_m) && dims.n.is_multiple_of(spec.tile_n),
+                    "pinned kernel {} needs M/N multiples of {}x{}, got {}x{}",
+                    spec.name,
+                    spec.tile_m,
+                    spec.tile_n,
+                    dims.m,
+                    dims.n
+                );
+                return Ok(OpPlan {
+                    kernel: index,
+                    splitk2: None,
+                });
+            }
             return Ok(OpPlan {
                 kernel: self.pipeline.a16_coopmat_index(
                     dims.batch,
