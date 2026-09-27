@@ -47,6 +47,8 @@ mod outer;
 mod prepared;
 #[path = "correctness/property.rs"]
 mod property;
+#[path = "correctness/ptx.rs"]
+mod ptx;
 #[path = "correctness/replay.rs"]
 mod replay;
 #[path = "correctness/row.rs"]

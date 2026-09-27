@@ -1,0 +1,59 @@
+== ptx sync: n=16777216 u32 (64 MiB/buffer), steps=32, trials=3
+chain      barrier          trial   mismatches     gpu_ms
+VkCuda     Compute              0            0     10.308
+VkCuda     Compute              1            0     10.286
+VkCuda     Compute              2            0     10.287
+VkCuda     AllCommands          0            0     10.336
+VkCuda     AllCommands          1            0     10.330
+VkCuda     AllCommands          2            0     10.333
+VkCuda     ExecOnly             0            0     10.659
+VkCuda     ExecOnly             1            0     10.311
+VkCuda     ExecOnly             2            0     10.287
+VkCuda     None                 0       131456     10.181
+VkCuda     None                 1       145664     10.186
+VkCuda     None                 2       135328     10.174
+CudaAlt    Compute              0            0     10.309
+CudaAlt    Compute              1            0     10.298
+CudaAlt    Compute              2            0     10.307
+CudaAlt    AllCommands          0            0     10.329
+CudaAlt    AllCommands          1            0     10.333
+CudaAlt    AllCommands          2            0     10.331
+CudaAlt    ExecOnly             0            0     10.282
+CudaAlt    ExecOnly             1            0     10.345
+CudaAlt    ExecOnly             2            0     10.371
+CudaAlt    None                 0       109376     10.916
+CudaAlt    None                 1        98496     10.198
+CudaAlt    None                 2       100448     10.577
+CudaOnly   Compute              0            0     10.516
+CudaOnly   Compute              1            0     10.502
+CudaOnly   Compute              2            0     10.469
+CudaOnly   AllCommands          0            0     10.497
+CudaOnly   AllCommands          1            0     10.503
+CudaOnly   AllCommands          2            0     10.505
+CudaOnly   ExecOnly             0            0     10.440
+CudaOnly   ExecOnly             1            0     10.491
+CudaOnly   ExecOnly             2            0     10.501
+CudaOnly   None                 0            0     10.378
+CudaOnly   None                 1            0     10.374
+CudaOnly   None                 2            0     10.327
+VkOnly     Compute              0            0     10.455
+VkOnly     Compute              1            0     10.493
+VkOnly     Compute              2            0     10.477
+VkOnly     AllCommands          0            0     10.511
+VkOnly     AllCommands          1            0     10.486
+VkOnly     AllCommands          2            0     10.479
+VkOnly     ExecOnly             0            0     10.432
+VkOnly     ExecOnly             1            0     10.425
+VkOnly     ExecOnly             2            0     10.424
+VkOnly     None                 0            0     10.322
+VkOnly     None                 1            0     10.325
+VkOnly     None                 2            0     10.324
+== ptx overhead: 256 launches per command buffer, 9 reps (median)
+variant                                gpu_ms gpu_us/launch   cpu_us/rec   counter
+empty cb (timestamps only)             0.0001        0.096        0.051         -
+CUDA probe_bump, no barrier            0.0324        0.127        1.100       104
+CUDA probe_bump, compute barrier       0.4361        1.704        1.888       256
+Vulkan 1-WG dispatch, no barrier       0.0520        0.203        1.021         -
+Vulkan 1-WG dispatch, barrier          0.2697        1.053        2.067         -
+stamp pair (no barrier): A [0.0..17.4] us, B [0.0..17.4] us rel. to A start; overlap=true; vk-timestamp span 21.0 us
+stamp pair (barrier): A [0.0..17.4] us, B [19.5..36.9] us rel. to A start; overlap=false; vk-timestamp span 39.4 us

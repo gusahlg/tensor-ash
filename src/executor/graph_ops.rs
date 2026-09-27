@@ -610,6 +610,7 @@ impl Executor {
                         dims,
                         self.pipeline.kernel_at(plan.kernel),
                         &mut bound,
+                        self.ptx_acc(),
                     )?;
                 }
                 Planned::Elementwise(dispatch) => {

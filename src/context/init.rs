@@ -372,6 +372,23 @@ pub(super) fn create(
         if enable_coopmat2 {
             enabled_device_extensions.push(COOPMAT2_EXTENSION_NAME.as_ptr());
         }
+        // VK_NV_cuda_kernel_launch (+ VK_NVX_binary_import for cubins):
+        // PTX kernels recorded into our own command buffers.  Strictly
+        // opt-in — `ML_PTX=1` requests it, `ML_NO_PTX=1` vetoes it — so
+        // device creation is unchanged unless asked for, and on
+        // drivers/devices without the extension (see `ptx_gate`).
+        let ptx = probe_cuda_kernel_launch(
+            &instance,
+            physical_device,
+            device_properties.vendor_id,
+            &device_extensions,
+        );
+        if ptx.enable_cuda_launch {
+            enabled_device_extensions.push(ash::nv::cuda_kernel_launch::NAME.as_ptr());
+        }
+        if ptx.enable_nvx_binary_import {
+            enabled_device_extensions.push(ash::nvx::binary_import::NAME.as_ptr());
+        }
 
         let priorities = [1.0];
         let queue_ci = [vk::DeviceQueueCreateInfo::default()
@@ -403,6 +420,8 @@ pub(super) fn create(
             .vulkan_memory_model_device_scope(memory_model_device_scope);
         let mut coopmat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
             .cooperative_matrix(enable_coopmat);
+        let mut cuda_launch_features = vk::PhysicalDeviceCudaKernelLaunchFeaturesNV::default()
+            .cuda_kernel_launch_features(true);
         let mut device_ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_ci)
             .enabled_features(&features)
@@ -412,6 +431,9 @@ pub(super) fn create(
         }
         if f16_storage_supported {
             device_ci = device_ci.push_next(&mut vulkan11);
+        }
+        if ptx.enable_cuda_launch {
+            device_ci = device_ci.push_next(&mut cuda_launch_features);
         }
         if enable_coopmat {
             device_ci = device_ci.push_next(&mut coopmat);
@@ -443,6 +465,12 @@ pub(super) fn create(
             .context("create_device")?;
         let device = scopeguard::guard(device, |device| device.destroy_device(None));
         let queue = device.get_device_queue(compute_family, 0);
+        let cuda_launch = ptx
+            .enable_cuda_launch
+            .then(|| ash::nv::cuda_kernel_launch::Device::new(&instance, &device));
+        let nvx_binary_import = ptx
+            .enable_nvx_binary_import
+            .then(|| ash::nvx::binary_import::Device::new(&instance, &device));
 
         let pipeline_cache_path = pipeline_cache_path_for(&device_summary);
         let pipeline_cache = create_pipeline_cache(&device, pipeline_cache_path.as_deref());
@@ -481,6 +509,9 @@ pub(super) fn create(
             timestamp_period_ns: device_properties.limits.timestamp_period as f64,
             timestamp_valid_bits,
             timestamps_supported,
+            cuda_launch,
+            nvx_binary_import,
+            cuda_compute_capability: ptx.compute_capability,
             buffer_device_address_enabled: buffer_device_address_supported,
             f16_storage_enabled: f16_storage_supported,
             coopmat_enabled: enable_coopmat,
@@ -493,6 +524,192 @@ pub(super) fn create(
             debug_loader,
             debug_messenger,
         })
+    }
+}
+
+/// Outcome of the opt-in `VK_NV_cuda_kernel_launch` probe.
+struct PtxProbe {
+    enable_cuda_launch: bool,
+    enable_nvx_binary_import: bool,
+    compute_capability: Option<(u32, u32)>,
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+const NVIDIA_VENDOR_ID: u32 = 0x10de;
+
+/// The checked-in PTX targets `sm_80` (cp.async, ldmatrix,
+/// mma.m16n8k16): Ampere and newer.
+const PTX_MIN_COMPUTE_CAPABILITY: (u32, u32) = (8, 0);
+
+/// Why the PTX backend stays off.  `NotRequested` is the default and
+/// silent; every other reason is logged, because the caller asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PtxOff {
+    NotRequested,
+    Vetoed,
+    NotNvidia(u32),
+    NoExtension,
+    NoFeature,
+    ComputeCapability(u32, u32),
+}
+
+/// Pure gate of the opt-in PTX backend (unit-tested below): requested
+/// (`ML_PTX=1`), not vetoed (`ML_NO_PTX=1` always wins), an NVIDIA
+/// device, the extension exposed, then `query` — only called once the
+/// extension is known to exist, since chaining its structs into a
+/// feature/property query is invalid otherwise — must report the
+/// feature bit and a compute capability the PTX can run on.
+fn ptx_gate(
+    requested: bool,
+    vetoed: bool,
+    vendor_id: u32,
+    extension_present: bool,
+    query: impl FnOnce() -> (bool, (u32, u32)),
+) -> std::result::Result<(u32, u32), PtxOff> {
+    if !requested {
+        return Err(PtxOff::NotRequested);
+    }
+    if vetoed {
+        return Err(PtxOff::Vetoed);
+    }
+    if vendor_id != NVIDIA_VENDOR_ID {
+        return Err(PtxOff::NotNvidia(vendor_id));
+    }
+    if !extension_present {
+        return Err(PtxOff::NoExtension);
+    }
+    let (feature, cc) = query();
+    if !feature {
+        return Err(PtxOff::NoFeature);
+    }
+    if cc < PTX_MIN_COMPUTE_CAPABILITY {
+        return Err(PtxOff::ComputeCapability(cc.0, cc.1));
+    }
+    Ok(cc)
+}
+
+/// Decide whether to enable `VK_NV_cuda_kernel_launch` (and
+/// `VK_NVX_binary_import`, the cubin loader DXVK-NVAPI uses).  Off
+/// unless `ML_PTX=1`; `ML_NO_PTX=1` always wins.  The extension is
+/// provisional (vulkan_beta.h) and NVIDIA-proprietary-only.  When the
+/// gate says no, nothing is enabled or chained: device creation is
+/// byte-for-byte what it is without the PTX code.
+unsafe fn probe_cuda_kernel_launch(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    vendor_id: u32,
+    device_extensions: &[vk::ExtensionProperties],
+) -> PtxProbe {
+    let has = |name: &CStr| {
+        device_extensions
+            .iter()
+            .any(|ext| unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) } == name)
+    };
+    let gate = ptx_gate(
+        env_flag("ML_PTX"),
+        env_flag("ML_NO_PTX"),
+        vendor_id,
+        has(ash::nv::cuda_kernel_launch::NAME),
+        || unsafe {
+            let mut features = vk::PhysicalDeviceCudaKernelLaunchFeaturesNV::default();
+            let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut features);
+            instance.get_physical_device_features2(physical_device, &mut features2);
+            let mut props = vk::PhysicalDeviceCudaKernelLaunchPropertiesNV::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut props);
+            instance.get_physical_device_properties2(physical_device, &mut props2);
+            (
+                features.cuda_kernel_launch_features == vk::TRUE,
+                (
+                    props.compute_capability_major,
+                    props.compute_capability_minor,
+                ),
+            )
+        },
+    );
+    match gate {
+        Ok(cc) => {
+            let nvx_present = has(ash::nvx::binary_import::NAME);
+            log::info!(
+                "tensor-ash: PTX backend on: VK_NV_cuda_kernel_launch sm_{}{} \
+                 VK_NVX_binary_import={nvx_present}",
+                cc.0,
+                cc.1
+            );
+            PtxProbe {
+                enable_cuda_launch: true,
+                enable_nvx_binary_import: nvx_present,
+                compute_capability: Some(cc),
+            }
+        }
+        Err(reason) => {
+            match reason {
+                PtxOff::NotRequested => {}
+                PtxOff::Vetoed => log::info!("tensor-ash: PTX backend vetoed by ML_NO_PTX=1"),
+                other => log::warn!(
+                    "tensor-ash: ML_PTX=1 but the PTX backend is unavailable ({other:?}); \
+                     every kernel stays on Vulkan"
+                ),
+            }
+            PtxProbe {
+                enable_cuda_launch: false,
+                enable_nvx_binary_import: false,
+                compute_capability: None,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ptx_gate_tests {
+    use super::{NVIDIA_VENDOR_ID, PtxOff, ptx_gate};
+
+    const AMPERE: (bool, (u32, u32)) = (true, (8, 6));
+
+    #[test]
+    fn off_unless_requested_and_never_queries() {
+        let gate = ptx_gate(false, false, NVIDIA_VENDOR_ID, true, || {
+            panic!("queried without a request")
+        });
+        assert_eq!(gate, Err(PtxOff::NotRequested));
+    }
+
+    #[test]
+    fn veto_wins() {
+        let gate = ptx_gate(true, true, NVIDIA_VENDOR_ID, true, || panic!("queried"));
+        assert_eq!(gate, Err(PtxOff::Vetoed));
+    }
+
+    #[test]
+    fn other_vendors_and_missing_extension_never_query() {
+        for vendor in [0x1002, 0x8086, 0x13b5, 0x10005] {
+            let gate = ptx_gate(true, false, vendor, true, || panic!("queried"));
+            assert_eq!(gate, Err(PtxOff::NotNvidia(vendor)));
+        }
+        let gate = ptx_gate(true, false, NVIDIA_VENDOR_ID, false, || panic!("queried"));
+        assert_eq!(gate, Err(PtxOff::NoExtension));
+    }
+
+    #[test]
+    fn feature_bit_and_compute_capability() {
+        assert_eq!(
+            ptx_gate(true, false, NVIDIA_VENDOR_ID, true, || (false, (8, 9))),
+            Err(PtxOff::NoFeature)
+        );
+        assert_eq!(
+            ptx_gate(true, false, NVIDIA_VENDOR_ID, true, || (true, (7, 5))),
+            Err(PtxOff::ComputeCapability(7, 5))
+        );
+        assert_eq!(
+            ptx_gate(true, false, NVIDIA_VENDOR_ID, true, || AMPERE),
+            Ok((8, 6))
+        );
+        assert_eq!(
+            ptx_gate(true, false, NVIDIA_VENDOR_ID, true, || (true, (9, 0))),
+            Ok((9, 0))
+        );
     }
 }
 

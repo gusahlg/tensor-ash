@@ -1,0 +1,9 @@
+## ptx:: ML_PTX=1
+test ptx::ptx_f32_route_is_bitwise_coopmat1 ... ok
+test ptx::ptx_hgemm_kernels_match_reference ... ok
+test ptx::ptx_launches_order_with_vulkan_dispatches ... ok
+test ptx::ptx_policy_is_explicit_and_degrades_to_f32 ... ok
+test ptx::ptx_route_in_mixed_graphs_and_prepared_replay ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 138 filtered out; finished in 3.20s
+## f16:: graph:: prepared:: replay:: with ML_PTX_GEMM=all
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 118 filtered out; finished in 11.70s

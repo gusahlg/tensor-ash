@@ -1,0 +1,61 @@
+heavy(louise): waiting for lock held by: tensor-ash: build-night-coopmat (since 16:57, pid 92571)
+### smem
+dynamic smem  16384 B: launched, gpu 0.0038 ms, bad blocks 0/48
+dynamic smem  32768 B: launched, gpu 0.0039 ms, bad blocks 0/48
+dynamic smem  49152 B: launched, gpu 0.0045 ms, bad blocks 0/48
+dynamic smem  65536 B: launched, gpu 0.0074 ms, bad blocks 0/48
+dynamic smem  98304 B: launched, gpu 0.0096 ms, bad blocks 0/48
+dynamic smem 101376 B: launched, gpu 0.0095 ms, bad blocks 0/48
+smem rc=0
+### sync
+== ptx sync: n=16777216 u32 (64 MiB/buffer), steps=32, trials=3
+chain      barrier          trial   mismatches     gpu_ms
+VkCuda     Compute              0            0     15.078
+VkCuda     Compute              1            0     15.064
+VkCuda     Compute              2            0     15.066
+VkCuda     AllCommands          0            0     15.343
+VkCuda     AllCommands          1            0     15.307
+VkCuda     AllCommands          2            0     15.316
+VkCuda     ExecOnly             0            0     15.081
+VkCuda     ExecOnly             1            0     15.078
+VkCuda     ExecOnly             2            0     14.994
+VkCuda     None                 0        80288     15.056
+VkCuda     None                 1        78144     15.068
+VkCuda     None                 2        74112     15.058
+CudaOnly   Compute              0            0     16.627
+CudaOnly   Compute              1            0     16.626
+CudaOnly   Compute              2            0     16.628
+CudaOnly   AllCommands          0            0     16.895
+CudaOnly   AllCommands          1            0     16.888
+CudaOnly   AllCommands          2            0     16.860
+CudaOnly   ExecOnly             0            0     16.628
+CudaOnly   ExecOnly             1            0     16.629
+CudaOnly   ExecOnly             2            0     16.629
+CudaOnly   None                 0            0     16.624
+CudaOnly   None                 1            0     16.593
+CudaOnly   None                 2            0     16.624
+VkOnly     Compute              0            0     16.580
+VkOnly     Compute              1            0     16.574
+VkOnly     Compute              2            0     16.574
+VkOnly     AllCommands          0            0     16.817
+VkOnly     AllCommands          1            0     16.849
+VkOnly     AllCommands          2            0     16.858
+VkOnly     ExecOnly             0            0     16.582
+VkOnly     ExecOnly             1            0     16.578
+VkOnly     ExecOnly             2            0     16.580
+VkOnly     None                 0            0     16.602
+VkOnly     None                 1            0     16.598
+VkOnly     None                 2            0     16.605
+sync rc=0
+### overhead
+== ptx overhead: 256 launches per command buffer, 9 reps (median)
+variant                                gpu_ms gpu_us/launch   cpu_us/rec   counter
+empty cb (timestamps only)             0.0001        0.064        0.030         -
+CUDA probe_bump, no barrier            0.0299        0.117        0.362       168
+CUDA probe_bump, compute barrier       0.3765        1.471        0.753       256
+Vulkan 1-WG dispatch, no barrier       0.0760        0.297        0.345         -
+Vulkan 1-WG dispatch, barrier          0.2193        0.856        0.792         -
+stamp pair (no barrier): A [0.0..12.3] us, B [0.0..12.3] us rel. to A start; overlap=true; vk-timestamp span 15.3 us
+stamp pair (barrier): A [0.0..12.3] us, B [13.3..25.6] us rel. to A start; overlap=false; vk-timestamp span 28.9 us
+overhead rc=0
+exit=0

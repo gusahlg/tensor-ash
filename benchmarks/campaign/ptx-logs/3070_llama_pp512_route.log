@@ -1,0 +1,16 @@
+heavy: waiting for lock held by: tensor-ash: tabuild (since 18:35, pid 497067)
+# off
+[2026-09-26T16:39:35Z INFO  llama_ash] prefill timing: 70.430 ms GPU vs 71.706 ms wall (1.276 ms host)
+| pp512       |    512 |    0.072 |  7140.26 |
+# f16
+[2026-09-26T16:39:36Z INFO  tensor_ash::ptx::route] tensor-ash: PTX a16 route on: accum=F16 forced=None sm_count=46 (modules ready in 20.7 ms)
+[2026-09-26T16:39:54Z INFO  llama_ash] prefill timing: 20.987 ms GPU vs 21.042 ms wall (0.055 ms host)
+| pp512       |    512 |    0.021 | 24332.20 |
+# off
+[2026-09-26T16:40:12Z INFO  llama_ash] prefill timing: 33.243 ms GPU vs 33.315 ms wall (0.073 ms host)
+| pp512       |    512 |    0.033 | 15368.25 |
+# f16
+[2026-09-26T16:40:13Z INFO  tensor_ash::ptx::route] tensor-ash: PTX a16 route on: accum=F16 forced=None sm_count=46 (modules ready in 3.7 ms)
+[2026-09-26T16:40:31Z INFO  llama_ash] prefill timing: 20.062 ms GPU vs 20.149 ms wall (0.087 ms host)
+| pp512       |    512 |    0.020 | 25411.04 |
+gpu3070: EMBARGO — the user is gaming on this desktop; the RTX 3070 is OFF LIMITS until the embargo file is removed. Do ALL GPU work on louise-pc (lgpu). Record any 3070-only step as PENDING in your report (do not retry in a loop). Reason: user gaming on the desktop (set 2026-09-26 18:40); 3070 GPU work embargoed, desktop builds throttled

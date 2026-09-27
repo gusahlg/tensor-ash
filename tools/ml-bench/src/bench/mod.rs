@@ -14,6 +14,9 @@ use tensor_ash::{Executor, KernelSelection, MatmulPipeline, VulkanContext};
 
 use env::{env_bool, env_string, env_usize};
 
+// `ml_bench ptx ...`: VK_NV_cuda_kernel_launch probes and PTX GEMMs.
+mod ptx;
+
 pub fn run() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -71,6 +74,7 @@ pub fn run() -> Result<()> {
         "single" => commands::single(&ctx, &exec)?,
         "cases" => commands::cases(&ctx, &exec, args)?,
         "concurrent" => commands::concurrent(ctx.clone(), exec.clone())?,
+        "ptx" => ptx::run(&ctx, &exec, args)?,
         "transfer" => commands::transfer(&ctx, &exec)?,
         "prepared" => commands::prepared(&ctx, &exec)?,
         "thesis" => thesis::run(&ctx, &exec, args)?,

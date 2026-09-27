@@ -1,0 +1,42 @@
+## llama.cpp CUDA b9503
+# off
+[2026-09-26T17:46:49Z INFO  llama_ash] prefill timing: 31.466 ms GPU vs 31.513 ms wall (0.048 ms host)
+| pp512       |    512 |    0.032 | 16247.14 |
+# f16
+[2026-09-26T17:47:06Z INFO  llama_ash] prefill timing: 19.959 ms GPU vs 20.040 ms wall (0.081 ms host)
+| pp512       |    512 |    0.020 | 25549.05 |
+# f16p
+[2026-09-26T17:47:23Z INFO  llama_ash] prefill timing: 23.425 ms GPU vs 23.550 ms wall (0.125 ms host)
+| pp512       |    512 |    0.024 | 21740.88 |
+/run/current-system/sw/lib/libggml-base.so.0(+0x1b37d) [0x7aabb2b4237d]
+/run/current-system/sw/lib/libggml-base.so.0(ggml_print_backtrace+0x216) [0x7aabb2b42836]
+/run/current-system/sw/lib/libggml-base.so.0(ggml_abort+0x144) [0x7aabb2b429f4]
+/nix/store/ind13p2n8svx0m9w38lv8qqm5pdn6l8d-llama-cpp-9503/bin/libggml-cpu-alderlake.so(+0x1a4a9) [0x7aab99a7a4a9]
+/nix/store/604gsr59rj7dzd0nrhp143rpvf7gyiaz-gcc-15.3.0-lib/lib/libgomp.so.1(+0x221ce) [0x7aabb31821ce]
+/nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61/lib/libc.so.6(+0x9dd53) [0x7aabb1e9dd53]
+/nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61/lib/libc.so.6(+0x12563c) [0x7aabb1f2563c]
+timeout: the monitored command dumped core
+/run/current-system/sw/lib/libggml-base.so.0(+0x1b37d) [0x7aabb2b4237d]
+/run/current-system/sw/lib/libggml-base.so.0(ggml_print_backtrace+0x216) [0x7aabb2b42836]
+/run/current-system/sw/lib/libggml-base.so.0(ggml_abort+0x144) [0x7aabb2b429f4]
+/nix/store/ind13p2n8svx0m9w38lv8qqm5pdn6l8d-llama-cpp-9503/bin/libggml-cpu-alderlake.so(+0x1a4a9) [0x7aab99a7a4a9]
+/nix/store/604gsr59rj7dzd0nrhp143rpvf7gyiaz-gcc-15.3.0-lib/lib/libgomp.so.1(+0x221ce) [0x7aabb31821ce]
+/nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61/lib/libc.so.6(+0x9dd53) [0x7aabb1e9dd53]
+/nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61/lib/libc.so.6(+0x12563c) [0x7aabb1f2563c]
+| llama 1B F16                   |   2.05 GiB |     1.10 B | CUDA       |  -1 |   1 |           pp512 |   15847.45 ± 1869.38 |
+| llama 1B F16                   |   2.05 GiB |     1.10 B | CUDA       |  -1 |   1 |            tg32 |        176.46 ± 0.49 |
+# off
+[2026-09-26T17:48:13Z INFO  llama_ash] prefill timing: 31.693 ms GPU vs 31.897 ms wall (0.204 ms host)
+| pp512       |    512 |    0.032 | 16051.45 |
+# f16
+[2026-09-26T17:48:30Z INFO  llama_ash] prefill timing: 19.808 ms GPU vs 19.983 ms wall (0.175 ms host)
+| pp512       |    512 |    0.020 | 25621.52 |
+# f16p
+[2026-09-26T17:48:47Z INFO  llama_ash] prefill timing: 23.301 ms GPU vs 23.382 ms wall (0.080 ms host)
+| pp512       |    512 |    0.023 | 21897.65 |
+# off
+generated_ids: 29879,29871,29896,29929,29929,29929,29871,29896,29929,29929,29947,29871,29896,29929,29929,29955,29871,29896,29929,29929,29953,29871,29896,29929,29929,29945,29871,29896,29929,29929,29946,29871
+# f16p
+generated_ids: 29879,29871,29896,29929,29929,29929,29871,29896,29929,29929,29947,29871,29896,29929,29929,29955,29871,29896,29929,29929,29953,29871,29896,29929,29929,29945,29871,29896,29929,29929,29946,29871
+# f16
+generated_ids: 29879,29871,29896,29929,29929,29929,29871,29896,29929,29929,29947,29871,29896,29929,29929,29955,29871,29896,29929,29929,29953,29871,29896,29929,29929,29945,29871,29896,29929,29929,29946,29871

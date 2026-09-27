@@ -139,6 +139,7 @@ impl Executor {
                     resolved,
                     &plans,
                     None,
+                    self.ptx_acc(),
                 )
             } else {
                 record_matmul_commands(
@@ -149,6 +150,7 @@ impl Executor {
                     ops,
                     resolved,
                     &plans,
+                    self.ptx_acc(),
                 )
             }
         })

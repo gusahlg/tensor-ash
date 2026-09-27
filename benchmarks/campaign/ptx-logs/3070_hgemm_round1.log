@@ -1,0 +1,64 @@
+heavy: waiting for lock held by: sighurt: servo build (m1 local) (since 17:50, pid 332706)
+[2026-09-26T15:50:50Z INFO  ml_bench::bench] device #0: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.329, vendor=0x10de, device=0x2488, driver=2497233024, compute_family=2, timestamps=true (64 bits)) slots=2 kernel=auto
+== ptx hgemm on NVIDIA GeForce RTX 3070 (JIT 2.4 ms)
+shape                ta_ms    TF/s | ptx kernel                    ptx_ms    TF/s  ptx/ta | ta_relrms ptx_relrms ptx_maxabs
+512x2048x2048       0.1293   33.21 | ta_hgemm_f32_128x128_s3       0.1515   28.36   0.854 |   2.05e-4   2.05e-4   8.78e-4
+[2026-09-26T15:50:50Z INFO  ml_bench::bench::ptx] 512x2048x2048 ta_hgemm_f32_128x128_s3 spread: ta min 0.1262 p90 0.1301 | ptx min 0.1505 p90 0.1518 (ms); ref rms 9.265e-1
+512x2048x2048       0.1292   33.24 | ta_hgemm_f32_128x64_s3        0.1346   31.90   0.960 |   2.05e-4   2.05e-4   8.78e-4
+[2026-09-26T15:50:50Z INFO  ml_bench::bench::ptx] 512x2048x2048 ta_hgemm_f32_128x64_s3 spread: ta min 0.1273 p90 0.1313 | ptx min 0.1334 p90 0.1351 (ms); ref rms 9.265e-1
+512x2048x2048       0.1290   33.30 | ta_hgemm_f32_64x64_s4         0.1213   35.40   1.063 |   2.05e-4   2.05e-4   8.78e-4
+[2026-09-26T15:50:50Z INFO  ml_bench::bench::ptx] 512x2048x2048 ta_hgemm_f32_64x64_s4 spread: ta min 0.1271 p90 0.1310 | ptx min 0.1199 p90 0.1228 (ms); ref rms 9.265e-1
+512x2048x2048       0.1300   33.03 | ta_hgemm_f16_128x128_s3       0.0894   48.04   1.454 |   2.05e-4   2.41e-3   9.62e-3
+[2026-09-26T15:50:50Z INFO  ml_bench::bench::ptx] 512x2048x2048 ta_hgemm_f16_128x128_s3 spread: ta min 0.1273 p90 0.1319 | ptx min 0.0883 p90 0.0901 (ms); ref rms 9.265e-1
+512x2048x2048       0.1303   32.96 | ta_hgemm_f16_128x256_s3       0.1078   39.85   1.209 |   2.05e-4   2.41e-3   9.62e-3
+[2026-09-26T15:50:50Z INFO  ml_bench::bench::ptx] 512x2048x2048 ta_hgemm_f16_128x256_s3 spread: ta min 0.1273 p90 0.1324 | ptx min 0.1069 p90 0.1083 (ms); ref rms 9.265e-1
+512x2048x2048       0.1299   33.06 | ta_hgemm_f16_128x64_s3        0.0833   51.58   1.560 |   2.05e-4   2.41e-3   9.62e-3
+[2026-09-26T15:50:50Z INFO  ml_bench::bench::ptx] 512x2048x2048 ta_hgemm_f16_128x64_s3 spread: ta min 0.1273 p90 0.1318 | ptx min 0.0825 p90 0.0841 (ms); ref rms 9.265e-1
+512x5632x2048       0.3281   36.00 | ta_hgemm_f32_128x128_s3       0.3074   38.43   1.068 |   2.14e-4   2.14e-4   9.93e-4
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 512x5632x2048 ta_hgemm_f32_128x128_s3 spread: ta min 0.3258 p90 0.3302 | ptx min 0.3065 p90 0.3081 (ms); ref rms 8.895e-1
+512x5632x2048       0.3309   35.69 | ta_hgemm_f32_128x64_s3        0.3462   34.11   0.956 |   2.14e-4   2.14e-4   9.93e-4
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 512x5632x2048 ta_hgemm_f32_128x64_s3 spread: ta min 0.3292 p90 0.3361 | ptx min 0.3407 p90 0.3487 (ms); ref rms 8.895e-1
+512x5632x2048       0.3443   34.31 | ta_hgemm_f32_64x64_s4         0.4424   26.70   0.778 |   2.14e-4   2.14e-4   9.93e-4
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 512x5632x2048 ta_hgemm_f32_64x64_s4 spread: ta min 0.3286 p90 0.3472 | ptx min 0.4226 p90 0.4498 (ms); ref rms 8.895e-1
+512x5632x2048       0.3341   35.35 | ta_hgemm_f16_128x128_s3       0.1866   63.31   1.791 |   2.14e-4   2.39e-3   9.94e-3
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 512x5632x2048 ta_hgemm_f16_128x128_s3 spread: ta min 0.3323 p90 0.3356 | ptx min 0.1858 p90 0.1869 (ms); ref rms 8.895e-1
+512x5632x2048       0.3343   35.33 | ta_hgemm_f16_128x256_s3       0.2159   54.70   1.548 |   2.14e-4   2.39e-3   9.94e-3
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 512x5632x2048 ta_hgemm_f16_128x256_s3 spread: ta min 0.3274 p90 0.3351 | ptx min 0.2122 p90 0.2167 (ms); ref rms 8.895e-1
+512x5632x2048       0.3292   35.88 | ta_hgemm_f16_128x64_s3        0.2459   48.03   1.339 |   2.14e-4   2.39e-3   9.94e-3
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 512x5632x2048 ta_hgemm_f16_128x64_s3 spread: ta min 0.3270 p90 0.3308 | ptx min 0.2442 p90 0.2504 (ms); ref rms 8.895e-1
+512x2048x5632       0.3509   33.66 | ta_hgemm_f32_128x128_s3       0.4034   29.28   0.870 |   2.15e-4   2.15e-4   1.77e-3
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 512x2048x5632 ta_hgemm_f32_128x128_s3 spread: ta min 0.3462 p90 0.3559 | ptx min 0.4016 p90 0.4042 (ms); ref rms 1.533e0
+512x2048x5632       0.3515   33.61 | ta_hgemm_f32_128x64_s3        0.3587   32.93   0.980 |   2.15e-4   2.15e-4   1.77e-3
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 512x2048x5632 ta_hgemm_f32_128x64_s3 spread: ta min 0.3478 p90 0.3563 | ptx min 0.3571 p90 0.3610 (ms); ref rms 1.533e0
+512x2048x5632       0.3628   32.56 | ta_hgemm_f32_64x64_s4         0.3718   31.76   0.976 |   2.15e-4   2.15e-4   1.77e-3
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 512x2048x5632 ta_hgemm_f32_64x64_s4 spread: ta min 0.3502 p90 0.3666 | ptx min 0.3572 p90 0.3839 (ms); ref rms 1.533e0
+512x2048x5632       0.3634   32.50 | ta_hgemm_f16_128x128_s3       0.2428   48.64   1.497 |   2.15e-4   3.81e-3   3.14e-2
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 512x2048x5632 ta_hgemm_f16_128x128_s3 spread: ta min 0.3579 p90 0.3669 | ptx min 0.2403 p90 0.2436 (ms); ref rms 1.533e0
+512x2048x5632       0.3620   32.62 | ta_hgemm_f16_128x256_s3       0.2860   41.30   1.266 |   2.15e-4   3.81e-3   3.14e-2
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 512x2048x5632 ta_hgemm_f16_128x256_s3 spread: ta min 0.3585 p90 0.3650 | ptx min 0.2848 p90 0.2864 (ms); ref rms 1.533e0
+512x2048x5632       0.3625   32.59 | ta_hgemm_f16_128x64_s3        0.2648   44.61   1.369 |   2.15e-4   3.81e-3   3.14e-2
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 512x2048x5632 ta_hgemm_f16_128x64_s3 spread: ta min 0.3581 p90 0.3653 | ptx min 0.2624 p90 0.2682 (ms); ref rms 1.533e0
+2048x2048x2048      0.5146   33.38 | ta_hgemm_f32_128x128_s3       0.4566   37.62   1.127 |   2.16e-4   2.16e-4   9.54e-4
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 2048x2048x2048 ta_hgemm_f32_128x128_s3 spread: ta min 0.5117 p90 0.5167 | ptx min 0.4555 p90 0.4574 (ms); ref rms 9.504e-1
+2048x2048x2048      0.5150   33.36 | ta_hgemm_f32_128x64_s3        0.4995   34.40   1.031 |   2.16e-4   2.16e-4   9.54e-4
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 2048x2048x2048 ta_hgemm_f32_128x64_s3 spread: ta min 0.5122 p90 0.5163 | ptx min 0.4987 p90 0.5004 (ms); ref rms 9.504e-1
+2048x2048x2048      0.5189   33.11 | ta_hgemm_f32_64x64_s4         0.4781   35.93   1.085 |   2.16e-4   2.16e-4   9.54e-4
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 2048x2048x2048 ta_hgemm_f32_64x64_s4 spread: ta min 0.5142 p90 0.5303 | ptx min 0.4555 p90 0.4945 (ms); ref rms 9.504e-1
+2048x2048x2048      0.5236   32.81 | ta_hgemm_f16_128x128_s3       0.2784   61.70   1.881 |   2.16e-4   2.27e-3   9.64e-3
+[2026-09-26T15:50:51Z INFO  ml_bench::bench::ptx] 2048x2048x2048 ta_hgemm_f16_128x128_s3 spread: ta min 0.5198 p90 0.5317 | ptx min 0.2730 p90 0.2794 (ms); ref rms 9.504e-1
+2048x2048x2048      0.5204   33.01 | ta_hgemm_f16_128x256_s3       0.3186   53.92   1.633 |   2.16e-4   2.27e-3   9.64e-3
+[2026-09-26T15:50:52Z INFO  ml_bench::bench::ptx] 2048x2048x2048 ta_hgemm_f16_128x256_s3 spread: ta min 0.5138 p90 0.5235 | ptx min 0.3142 p90 0.3193 (ms); ref rms 9.504e-1
+2048x2048x2048      0.5189   33.11 | ta_hgemm_f16_128x64_s3        0.2871   59.83   1.807 |   2.16e-4   2.27e-3   9.64e-3
+[2026-09-26T15:50:52Z INFO  ml_bench::bench::ptx] 2048x2048x2048 ta_hgemm_f16_128x64_s3 spread: ta min 0.5146 p90 0.5228 | ptx min 0.2858 p90 0.2906 (ms); ref rms 9.504e-1
+4096x4096x4096      3.7288   36.86 | ta_hgemm_f32_128x128_s3       3.6221   37.94   1.029 |   1.99e-4   1.99e-4   9.70e-4
+[2026-09-26T15:50:53Z INFO  ml_bench::bench::ptx] 4096x4096x4096 ta_hgemm_f32_128x128_s3 spread: ta min 3.6107 p90 3.7579 | ptx min 3.4738 p90 3.6297 (ms); ref rms 1.297e0
+4096x4096x4096      3.8107   36.07 | ta_hgemm_f32_128x64_s3        3.8282   35.90   0.995 |   1.99e-4   1.99e-4   9.70e-4
+[2026-09-26T15:50:53Z INFO  ml_bench::bench::ptx] 4096x4096x4096 ta_hgemm_f32_128x64_s3 spread: ta min 3.6275 p90 3.8718 | ptx min 3.6542 p90 3.8749 (ms); ref rms 1.297e0
+4096x4096x4096      3.8140   36.03 | ta_hgemm_f32_64x64_s4         5.2506   26.18   0.726 |   1.99e-4   1.99e-4   9.70e-4
+[2026-09-26T15:50:53Z INFO  ml_bench::bench::ptx] 4096x4096x4096 ta_hgemm_f32_64x64_s4 spread: ta min 3.6262 p90 3.8421 | ptx min 5.2039 p90 5.2699 (ms); ref rms 1.297e0
+4096x4096x4096      3.9318   34.96 | ta_hgemm_f16_128x128_s3       2.1396   64.24   1.838 |   1.99e-4   3.19e-3   2.41e-2
+[2026-09-26T15:50:54Z INFO  ml_bench::bench::ptx] 4096x4096x4096 ta_hgemm_f16_128x128_s3 spread: ta min 3.6245 p90 4.1008 | ptx min 1.9905 p90 2.1828 (ms); ref rms 1.297e0
+4096x4096x4096      3.8120   36.05 | ta_hgemm_f16_128x256_s3       2.4798   55.42   1.537 |   1.99e-4   3.19e-3   2.41e-2
+[2026-09-26T15:50:54Z INFO  ml_bench::bench::ptx] 4096x4096x4096 ta_hgemm_f16_128x256_s3 spread: ta min 3.6266 p90 3.8410 | ptx min 2.3610 p90 2.5040 (ms); ref rms 1.297e0
+4096x4096x4096      4.0592   33.86 | ta_hgemm_f16_128x64_s3        2.4248   56.68   1.674 |   1.99e-4   3.19e-3   2.41e-2
+[2026-09-26T15:50:54Z INFO  ml_bench::bench::ptx] 4096x4096x4096 ta_hgemm_f16_128x64_s3 spread: ta min 3.6273 p90 4.2487 | ptx min 2.2135 p90 2.5778 (ms); ref rms 1.297e0

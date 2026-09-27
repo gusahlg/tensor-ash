@@ -1,0 +1,44 @@
+heavy(louise): waiting for lock held by: sighurt: benchmark baseline: rounds 2-3 of 6 (since 09:14, pid 150151)
+## binary target/release/deps/correctness-b859650e2dc3747a
+## ptx:: with ML_PTX=1 (ML_PTX_GEMM default = auto)
+test ptx::ptx_f32_route_is_bitwise_coopmat1 ... ok
+test ptx::ptx_hgemm_kernels_match_reference ... ok
+test ptx::ptx_launches_order_with_vulkan_dispatches ... ok
+test ptx::ptx_policy_is_explicit_and_degrades_to_f32 ... ok
+test ptx::ptx_route_in_mixed_graphs_and_prepared_replay ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 138 filtered out; finished in 3.78s
+## ptx:: without ML_PTX (plain device creation; policy test takes the degrade branch)
+test ptx::ptx_f32_route_is_bitwise_coopmat1 ... ok
+test ptx::ptx_hgemm_kernels_match_reference ... ok
+test ptx::ptx_launches_order_with_vulkan_dispatches ... ok
+test ptx::ptx_policy_is_explicit_and_degrades_to_f32 ... ok
+test ptx::ptx_route_in_mixed_graphs_and_prepared_replay ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 138 filtered out; finished in 1.99s
+## ptx:: with ML_PTX=1 ML_NO_PTX=1 (veto)
+test ptx::ptx_f32_route_is_bitwise_coopmat1 ... ok
+test ptx::ptx_hgemm_kernels_match_reference ... ok
+test ptx::ptx_launches_order_with_vulkan_dispatches ... ok
+test ptx::ptx_policy_is_explicit_and_degrades_to_f32 ... ok
+test ptx::ptx_route_in_mixed_graphs_and_prepared_replay ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 138 filtered out; finished in 1.96s
+## ptx:: with ML_PTX=1 ML_PTX_GEMM=off
+test ptx::ptx_f32_route_is_bitwise_coopmat1 ... ok
+test ptx::ptx_hgemm_kernels_match_reference ... ok
+test ptx::ptx_launches_order_with_vulkan_dispatches ... ok
+test ptx::ptx_policy_is_explicit_and_degrades_to_f32 ... ok
+test ptx::ptx_route_in_mixed_graphs_and_prepared_replay ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 138 filtered out; finished in 2.31s
+## f16:: graph:: prepared:: replay:: with the PTX route serving f32 (ML_PTX_GEMM=all)
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 118 filtered out; finished in 13.84s
+## same suites, control without PTX
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 118 filtered out; finished in 13.45s
+## invalid settings are errors
+[2026-09-27T07:47:27Z INFO  tensor_ash::context::init] tensor-ash: PTX backend on: VK_NV_cuda_kernel_launch sm_89 VK_NVX_binary_import=true
+Error: invalid ML_PTX_GEMM 'bogus', expected on (auto), all or off
+Caused by:
+    invalid coopmat accumulator 'bf16', expected f32, f16, or f16p (promote)
+## deprecated ML_PTX_GEMM=f16p still reaches the f16p class (warning expected)
+[2026-09-27T07:47:29Z WARN  tensor_ash::ptx::route] tensor-ash: ML_PTX_GEMM=f16p is deprecated: it now means ML_PTX_GEMM=on + ML_COOPMAT_ACC=f16p; set those instead
+[2026-09-27T07:47:29Z INFO  tensor_ash::executor] tensor-ash: coopmat accumulator policy: f16p (a16 GEMMs through the PTX route; other GEMMs keep f32 accumulation)
+| pp512       |    512 |    0.031 | 16640.33 |
+EXIT 0

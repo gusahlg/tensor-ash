@@ -223,6 +223,14 @@ impl Executor {
         }
     }
 
+    /// Accumulator class at which the recorder may hand this
+    /// executor's a16 GEMMs to the PTX route (`crate::ptx`): the
+    /// effective policy on auto-routed pipelines, `None` when an
+    /// explicit `ML_KERNEL` selection pins the Vulkan kernels.
+    pub(crate) fn ptx_acc(&self) -> Option<CoopmatAcc> {
+        self.pipeline.is_auto().then_some(self.coopmat_acc)
+    }
+
     /// Resolve the complete route for one shape.  `splitk2_eligible`
     /// captures the call form (single plain non-accumulating op, or a
     /// graph op); the measured or conservative untuned split-K2 route is
@@ -390,6 +398,9 @@ impl Executor {
         // `ML_COOPMAT_ACC=f16|f16p` opts env-configured executors
         // into the f16-accumulator coopmat twins (default f32).
         let coopmat_acc = CoopmatAcc::from_env()?;
+        // Deprecated `ML_PTX_GEMM=f32|f16|f16p` (one release): the class
+        // when `ML_COOPMAT_ACC` is unset, with a warning.
+        let coopmat_acc = crate::ptx::legacy_env_acc(coopmat_acc);
         Self::new_with_config(
             ctx,
             pipeline,
@@ -412,18 +423,26 @@ impl Executor {
         }
         let n_slots = config.n_slots.max(1);
         let max_calls_per_submit = config.max_calls_per_submit.max(1);
-        let coopmat_acc = if config.coopmat_acc != CoopmatAcc::F32
-            && ctx.coopmat_enabled
-            && !ctx.coopmat_f16_acc_enabled
-        {
+        // Two implementations can serve a reduced-precision policy: the
+        // GLSL f16-accumulator coopmat twins (`coopmat_f16_acc_enabled`)
+        // and the PTX a16 route (`crate::ptx`, `ML_PTX=1`).  Keep the
+        // class when either serves it (or when there is no coopmat path
+        // at all, so nothing would change); otherwise every GEMM keeps
+        // f32 accumulation, loudly.
+        let served = config.coopmat_acc == CoopmatAcc::F32
+            || !ctx.coopmat_enabled
+            || ctx.coopmat_f16_acc_enabled
+            || pipeline.ptx_serves(config.coopmat_acc);
+        let coopmat_acc = if served {
+            config.coopmat_acc
+        } else {
             log::warn!(
                 "tensor-ash: coopmat accumulator policy {} unsupported on this device \
-                 (no 16x16x16 f16-accumulator configuration); using f32",
+                 (no 16x16x16 f16-accumulator coopmat configuration and no PTX route, \
+                 see ML_PTX / ML_PTX_GEMM); using f32",
                 config.coopmat_acc.as_str()
             );
             CoopmatAcc::F32
-        } else {
-            config.coopmat_acc
         };
         if coopmat_acc != CoopmatAcc::F32 {
             log::info!(
