@@ -76,3 +76,8 @@ Louise trees: `~/ta-wt/cm-base` (7cfca58 grokmerge build), `cm-sm`
   (−2.6%, 6/6 rounds), 100df0d 39.87 (`pp512_final_4060.log`).
 - Report §9, §11, §12 written.  Remaining = 3070 items only (embargo);
   commands in §9 / §11, scripts in `coopmat-sm-data/jobs/`.
+- 08:25 4060 15-round large-shape A/B (`large-4060/`): 128x64 wins 15/16.
+- 08:36-09:20 waited for the 3070 embargo (`$SP/work/coopmat/final3070.sh`,
+  guarded); still embargoed at 09:20 -> all 3070 items PENDING.  Rerun
+  `final3070.sh` when the embargo file is gone, then `python3 coldfit.py`
+  and fill §9 / §12.5 of the report.

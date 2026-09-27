@@ -582,7 +582,10 @@ Expected from the clean per-GEMM 3070 data (§12.3/§5): q/o +3%, QKV
 
 ## 11. Follow-ups
 
-- **3070, PENDING (embargo)**: pp512 A/B (§9 command); the 15-round
+- **3070, PENDING (embargo, still in force at 09:20 on 2026-09-27)**: one
+  script does all of it, one guarded `gpu3070` hold per item, once the
+  embargo has been gone for 5 min: `$SP/work/coopmat/final3070.sh` (copy in
+  `coopmat-sm-data/jobs/`; results to `$SP/work/coopmat/results/`).  Items: pp512 A/B (§9 command); the 15-round
   128x128-vs-128x64 A/B (`$SP/work/coopmat/large3070.sh` (copy in `coopmat-sm-data/jobs/`), §12.5); the
   remaining cold batches (`ML_AB_COLD_MB=64 $SP/work/coopmat/run3070.sh
   cold-3070 a16_128 a16_256 a16_1024 a16_1920 t128 m256 m384 sq m768
