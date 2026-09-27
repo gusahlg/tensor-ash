@@ -5,6 +5,7 @@
     python3 analysis.py policies     # §6: tile-choice regret of each policy
     python3 analysis.py rule         # §7: shipped rule vs exp/grokmerge on the sweeps
     python3 analysis.py verify DIR GPU [--md]   # §8: same-run new-auto vs old pick
+    python3 analysis.py eval DIR GPU     # replay candidate rules on one same-run sweep
 
 Needs numpy + scipy.  Run from this directory.
 """
@@ -242,12 +243,43 @@ def cmd_verify(d, gpu, md):
                   f" | {nm(old)} | {nm(new)} | {1/(1+r):.3f} |")
 
 
+def cmd_eval(d, gpu, rules=None):
+    """Replay candidate rules on one same-run sweep (pinned cells incl. 64x64m)."""
+    hw = GPUS[gpu]
+    shapes = load_dir(d)
+    rules = rules or {
+        "grokmerge": lambda s: grokmerge(s),
+        "shipped(L2 table)": lambda s: shipped(s, hw["sms"], hw["l2"]),
+        "shipped(small L2)": lambda s: shipped(s, hw["sms"], MIB),
+    }
+    tiles_all = ORDER + ["64x64m"]
+    for name, rule in rules.items():
+        reg, gain, worse = [], [], []
+        for case, s in sorted(shapes.items()):
+            c = s["cells"]
+            ms = {t: c[t]["ms"] for t in tiles_all if t in c}
+            pick, old = rule(s), grokmerge(s)
+            if pick not in ms or old not in ms:
+                continue
+            best = min(ms.values())
+            reg.append(ms[pick] / best - 1)
+            gain.append(ms[old] / ms[pick])
+            if ms[pick] / ms[old] - 1 > 0.01:
+                worse.append((case, pick, old, ms[pick] / ms[old] - 1))
+        print(f"{gpu} {name:22s}: n={len(reg)} regret mean {st.mean(reg)*100:.2f}% max {max(reg)*100:.1f}%  "
+              f"geomean vs grokmerge x{st.geometric_mean(gain):.3f}  slower>1%: {len(worse)}")
+        for w in worse:
+            print(f"      slower {w[0]:18s} pick {w[1]:7s} old {w[2]:7s} {w[3]*100:+.1f}%")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "rule"
     if cmd == "model":
         cmd_model()
     elif cmd == "rule":
         cmd_rule()
+    elif cmd == "eval":
+        cmd_eval(sys.argv[2], sys.argv[3])
     elif cmd == "verify":
         cmd_verify(sys.argv[2], sys.argv[3], "--md" in sys.argv)
     elif cmd == "policies":
