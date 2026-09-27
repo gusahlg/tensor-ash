@@ -13,8 +13,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=TENSOR_ASH_GLSLC_LOWMEM");
-    println!("cargo:rerun-if-env-changed=TENSOR_ASH_GLSLC_VMEM_KB");
+    println!("cargo:rerun-if-env-changed=TENSOR_ASH_GLSLC_OPT");
 
     let entries = std::fs::read_dir(&shader_dir)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", shader_dir.display()));
@@ -44,45 +43,22 @@ fn main() {
         } else {
             "--target-env=vulkan1.2"
         };
-        // glslc's performance passes (-O) need >3 GB on a few fully-unrolled
-        // bodies (the BK=64 TM=8/TN=8 tiles, the dh128 flash kernels).  With
-        // TENSOR_ASH_GLSLC_LOWMEM=1 each -O compile runs under an address-
-        // space cap (TENSOR_ASH_GLSLC_VMEM_KB, default 2.6 GB) and falls back
-        // to -Os (same semantics, ~140 MB; the driver re-optimizes) when it
-        // would exceed it.  `*_os` wrappers are deliberate -Os builds.
-        let lowmem = std::env::var_os("TENSOR_ASH_GLSLC_LOWMEM").is_some_and(|v| v != "0");
-        let vmem_kb =
-            std::env::var("TENSOR_ASH_GLSLC_VMEM_KB").unwrap_or_else(|_| "2600000".into());
-        let mut opt = if stem.ends_with("_os") { "-Os" } else { "-O" };
-        let run = |opt: &str, capped: bool| {
-            if capped {
-                Command::new("bash")
-                    .arg("-c")
-                    .arg(format!(
-                        "ulimit -v {vmem_kb} && exec glslc {target_env} {opt} \"$0\" -o \"$1\""
-                    ))
-                    .arg(&path)
-                    .arg(&out)
-                    .status()
-            } else {
-                Command::new("glslc")
-                    .args([target_env, opt])
-                    .arg(&path)
-                    .arg("-o")
-                    .arg(&out)
-                    .status()
-            }
-        };
-        let mut status = run(opt, lowmem && opt == "-O").unwrap_or_else(|e| {
-            panic!("failed to invoke glslc (is the Vulkan SDK installed and on PATH?): {e}")
-        });
-        if !status.success() && lowmem && opt == "-O" {
-            println!(
-                "cargo:warning={stem}: glslc -O exceeded the {vmem_kb} KB LOWMEM cap; using -Os"
-            );
-            opt = "-Os";
-            status = run(opt, false).expect("glslc -Os fallback");
-        }
+        // Every shader compiles with -Os.  The NVIDIA driver re-optimizes
+        // from SPIR-V and emits byte-identical SASS for -O and -Os builds
+        // (14/14 shaders on RTX 3070 and 4060, benchmarks/SASS.md on
+        // campaign/sass), while -O needs >3 GB (>6 GB for the tm8_tn8
+        // tiles) on the fully-unrolled bodies and -Os ~140 MB.
+        // TENSOR_ASH_GLSLC_OPT overrides the flag (e.g. `-O`).
+        let opt = std::env::var("TENSOR_ASH_GLSLC_OPT").unwrap_or_else(|_| "-Os".into());
+        let status = Command::new("glslc")
+            .args([target_env, opt.as_str()])
+            .arg(&path)
+            .arg("-o")
+            .arg(&out)
+            .status()
+            .unwrap_or_else(|e| {
+                panic!("failed to invoke glslc (is the Vulkan SDK installed and on PATH?): {e}")
+            });
 
         if !status.success() {
             panic!("glslc failed for {}", path.display());
