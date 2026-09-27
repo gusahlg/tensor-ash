@@ -260,8 +260,11 @@ impl Model {
             output: &s.last_n,
             eps: self.cfg.rms_eps,
         });
-        // Same packed M=1 GEMV as decode: the unpacked N=32000 row
-        // walk strides 64 KiB per K step (7.4x slower on AD107).
+        // Same packed M=1 GEMV as decode: bitwise identical to the
+        // row-major walk (same inner-product order), so the row-major
+        // copy is not kept (-131 MB).  Time-neutral: the auto-routed
+        // unpacked head (f16w_row_bda_k16_v2) runs 0.512 ms vs 0.510 ms
+        // packed on the RTX 4060 (benchmarks/campaign/integrate.md §4.1).
         ops.push(ExecOp::Matmul(
             MatmulOp::new(mm(&s.last_n, &self.lm_head_p, &s.logits)).with_packed_b(),
         ));
