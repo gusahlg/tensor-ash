@@ -7,6 +7,7 @@ use ash::vk;
 
 use super::{CudaFunction, CudaModule, KernelArg, kernels};
 use crate::context::VulkanContext;
+use crate::pipeline::CoopmatAcc;
 
 /// One f32 SGEMM entry in `ptx/sgemm.cu`.
 #[derive(Copy, Clone, Debug)]
@@ -43,7 +44,7 @@ pub const SGEMM_KERNELS: &[SgemmKernel] = &[
 
 impl SgemmKernel {
     pub fn supports(&self, _m: u32, n: u32, k: u32) -> bool {
-        !self.vec4 || (k % 4 == 0 && n % 4 == 0)
+        !self.vec4 || (k.is_multiple_of(4) && n.is_multiple_of(4))
     }
 
     /// Total shared memory: `stages * (BM*(BK+4) + BK*BN)` floats.
@@ -253,13 +254,56 @@ impl HgemmKernel {
         self.name.contains("_f16p_")
     }
 
+    /// Accumulator class, in the executor's precision-policy terms.
+    pub fn acc(&self) -> CoopmatAcc {
+        match (self.f16_acc, self.promoted()) {
+            (false, _) => CoopmatAcc::F32,
+            (true, false) => CoopmatAcc::F16,
+            (true, true) => CoopmatAcc::F16Promote,
+        }
+    }
+
+    /// Look an entry of [`HGEMM_KERNELS`] up by name.
+    pub fn by_name(name: &str) -> Option<&'static HgemmKernel> {
+        HGEMM_KERNELS.iter().find(|k| k.name == name)
+    }
+
+    /// Record `C = alpha*A*B` through `func` (this entry's function):
+    /// f16 A/B row-major, dense batch, grid `(N/BN, M/BM, batch)`.
+    ///
+    /// # Safety
+    /// As [`PtxGemm::cmd_hgemm`]; `func` must be this entry's function.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn cmd_launch(
+        &self,
+        func: &CudaFunction,
+        cb: vk::CommandBuffer,
+        a: u64,
+        b: u64,
+        c: u64,
+        (m, n, k, batch): (u32, u32, u32, u32),
+        alpha: f32,
+    ) {
+        let grid = [n.div_ceil(self.bn), m.div_ceil(self.bm), batch];
+        let args = [
+            KernelArg::U64(a),
+            KernelArg::U64(b),
+            KernelArg::U64(c),
+            KernelArg::I32(m as i32),
+            KernelArg::I32(n as i32),
+            KernelArg::I32(k as i32),
+            KernelArg::F32(alpha),
+        ];
+        unsafe { func.cmd_launch(cb, grid, [self.threads, 1, 1], self.smem_bytes(), &args) };
+    }
+
     /// Dynamic shared memory: `stages * (BM*BK + BK*BN)` halves.
     pub fn smem_bytes(&self) -> u32 {
         self.stages * (self.bm * self.bk + self.bk * self.bn) * 2
     }
 
     pub fn supports(&self, _m: u32, n: u32, k: u32) -> bool {
-        k % 8 == 0 && n % 8 == 0
+        k.is_multiple_of(8) && n.is_multiple_of(8)
     }
 }
 
@@ -444,16 +488,6 @@ impl PtxGemm {
         alpha: f32,
     ) {
         let (kern, func) = &self.hgemm[index];
-        let grid = [n.div_ceil(kern.bn), m.div_ceil(kern.bm), batch];
-        let args = [
-            KernelArg::U64(a),
-            KernelArg::U64(b),
-            KernelArg::U64(c),
-            KernelArg::I32(m as i32),
-            KernelArg::I32(n as i32),
-            KernelArg::I32(k as i32),
-            KernelArg::F32(alpha),
-        ];
-        unsafe { func.cmd_launch(cb, grid, [kern.threads, 1, 1], kern.smem_bytes(), &args) };
+        unsafe { kern.cmd_launch(func, cb, a, b, c, (m, n, k, batch), alpha) };
     }
 }

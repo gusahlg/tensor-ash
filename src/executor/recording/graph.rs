@@ -46,6 +46,7 @@ pub(in crate::executor) fn record_matmul_graph_commands(
     resolved: &[ResolvedMatmul],
     plans: &[OpPlan],
     splitk2: Option<&GraphSplitK2<'_>>,
+    ptx_acc: Option<crate::pipeline::CoopmatAcc>,
 ) -> Result<()> {
     let mut bound_pipeline = vk::Pipeline::null();
     let mut written: Vec<vk::Buffer> = Vec::new();
@@ -123,6 +124,7 @@ pub(in crate::executor) fn record_matmul_graph_commands(
             dims,
             pipeline.kernel_at(op_plan.kernel),
             &mut bound_pipeline,
+            ptx_acc,
         )?;
 
         read.push(a);

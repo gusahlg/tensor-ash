@@ -6,7 +6,7 @@ use ash::vk;
 
 use crate::context::VulkanContext;
 use crate::matmul::{MatmulOp, ResolvedMatmul};
-use crate::pipeline::{KernelVariant, MatmulPipeline};
+use crate::pipeline::{CoopmatAcc, KernelVariant, MatmulPipeline};
 
 use super::OpPlan;
 
@@ -61,6 +61,7 @@ fn ensure_kernel_alignment(kernel_name: &str, tile: [u32; 3], shape: [u32; 3]) -
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn record_matmul_commands(
     ctx: &VulkanContext,
     pipeline: &MatmulPipeline,
@@ -69,6 +70,7 @@ pub(super) fn record_matmul_commands(
     ops: &[MatmulOp<'_>],
     resolved: &[ResolvedMatmul],
     plans: &[OpPlan],
+    ptx_acc: Option<CoopmatAcc>,
 ) -> Result<()> {
     let mut bound_pipeline = vk::Pipeline::null();
     for (((set, op), dims), plan) in descriptor_sets
@@ -87,6 +89,7 @@ pub(super) fn record_matmul_commands(
             dims,
             pipeline.kernel_at(plan.kernel),
             &mut bound_pipeline,
+            ptx_acc,
         )?;
     }
 
@@ -96,6 +99,10 @@ pub(super) fn record_matmul_commands(
 /// Record one dispatch with an explicitly-chosen kernel.  The regular
 /// paths resolve the kernel from the submission's per-op plans; the
 /// auto-tuner forces each candidate in turn.
+///
+/// `ptx_acc` is the executor's accumulator policy when the PTX route
+/// may replace an a16 coopmat kernel (see `Executor::ptx_acc`); `None`
+/// records exactly `kernel` (tuning, explicit pins).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record_one_matmul(
     ctx: &VulkanContext,
@@ -106,6 +113,7 @@ pub(super) fn record_one_matmul(
     dims: &ResolvedMatmul,
     kernel: &crate::pipeline::MatmulKernel,
     bound_pipeline: &mut vk::Pipeline,
+    ptx_acc: Option<CoopmatAcc>,
 ) -> Result<()> {
     ensure_kernel_alignment(
         kernel.name,
@@ -150,32 +158,34 @@ pub(super) fn record_one_matmul(
     }
 
     let call = &op.call;
-    // Opt-in PTX route: an a16 matmul (f16 A/B/C, batch 1, plain
-    // C = alpha*A*B) records vkCmdCudaLaunchKernelNV instead of the
+    // PTX route (`crate::ptx`): an a16 matmul (f16 A/B/C, batch 1,
+    // plain C = alpha*A*B, unpacked B) whose accumulator class the
+    // route serves records vkCmdCudaLaunchKernelNV instead of the
     // coopmat dispatch.  Barriers around it are the caller's usual
-    // compute barriers, which order CUDA launches too.
-    if kernel.a_f16()
+    // compute barriers, which order CUDA launches too, and the bound
+    // Vulkan pipeline survives the launch (`bound_pipeline` stays valid).
+    if let Some(acc) = ptx_acc
+        && kernel.a_f16()
         && dims.batch == 1
+        && !dims.packed_b
         && !call.accumulate
         && op.epilogue.is_none()
         && op.normed_a.is_none()
         && op.store.is_none()
         && ctx.buffer_device_address_enabled
         && let Some(route) = pipeline.ptx_route.as_ref()
-        && let Some(index) = route.select(dims.m, dims.n, dims.k)
+        && let Some(index) = route.select(acc, dims.m, dims.n, dims.k)
     {
-        unsafe {
-            route.record(
-                cb,
-                index,
-                call.a.device_address(),
-                call.b.device_address(),
-                call.c.device_address(),
-                (dims.m, dims.n, dims.k),
-                call.alpha,
-            );
+        let (a, b, c) = (
+            call.a.device_address(),
+            call.b.device_address(),
+            call.c.device_address(),
+        );
+        // The kernels issue 16-byte cp.async / stores.
+        if (a | b | c) % 16 == 0 {
+            unsafe { route.record(cb, index, a, b, c, (dims.m, dims.n, dims.k), call.alpha) };
+            return Ok(());
         }
-        return Ok(());
     }
     let max_groups = ctx.device_properties.limits.max_compute_work_group_count;
     let (a_ptr, b_ptr, c_ptr) = if ctx.buffer_device_address_enabled {

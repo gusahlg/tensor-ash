@@ -6,6 +6,7 @@
 mod abi;
 mod catalog;
 mod create;
+mod precision;
 mod routing;
 mod runtime;
 mod selection;
@@ -28,6 +29,7 @@ use tuning::{load_tuned, save_tuned, shader_registry_hash};
 pub use abi::{EpilogueKey, KernelVariant, MATMUL_FLAG_NORM_A, MatmulPushConstants};
 pub use catalog::{KERNEL_SPECS, KernelSelection, KernelSpec};
 pub(crate) use create::{build_compute_pipeline, create_pc_only_layout};
+pub use precision::CoopmatAcc;
 pub use runtime::MatmulKernel;
 pub(crate) use tuning::{SPLITK2_SPIRV, TuneEntry, TuneKey};
 
@@ -79,9 +81,11 @@ pub struct MatmulPipeline {
     tune_save: Mutex<()>,
     /// Hash binding persisted winners to this exact shader build.
     shader_hash: u64,
-    /// Opt-in PTX route for the a16 family (`ML_PTX=1` +
-    /// `ML_PTX_GEMM=f32|f16|f16p`); `None` keeps every matmul on the
-    /// Vulkan kernels.  See [`crate::ptx::PtxRoute`].
+    /// PTX route for the a16 family: present on a context created with
+    /// `ML_PTX=1` where `VK_NV_cuda_kernel_launch` is usable, unless
+    /// `ML_PTX_GEMM=off`; `None` keeps every matmul on the Vulkan
+    /// kernels.  Which accumulator classes it serves is its
+    /// [`crate::ptx::PtxGemmMode`].  See [`crate::ptx::PtxRoute`].
     pub(crate) ptx_route: Option<crate::ptx::PtxRoute>,
 }
 
@@ -98,6 +102,10 @@ impl MatmulPipeline {
         ctx: &Arc<VulkanContext>,
         selection: KernelSelection,
     ) -> Result<Self> {
+        // Invalid ML_PTX_GEMM* settings fail here, before any Vulkan
+        // object exists; a failed PTX load only logs and keeps the
+        // Vulkan kernels.
+        let ptx_route = crate::ptx::PtxRoute::from_env(ctx)?;
         unsafe {
             let bindings = (0u32..3)
                 .map(|i| {
@@ -244,21 +252,52 @@ impl MatmulPipeline {
                 tuned: RwLock::new(tuned),
                 tune_save: Mutex::new(()),
                 shader_hash,
-                // A failed PTX JIT must not take the Vulkan path down.
-                ptx_route: crate::ptx::PtxRoute::from_env(ctx).unwrap_or_else(|err| {
-                    log::warn!("tensor-ash: PTX a16 route disabled: {err:#}");
-                    None
-                }),
+                ptx_route,
             })
         }
     }
 
-    /// The PTX kernel an a16 (f16 A/B/C) batch-1 matmul of this shape
-    /// would record instead of its coopmat kernel, when the opt-in PTX
-    /// route is on.
-    pub fn ptx_a16_kernel(&self, m: u32, n: u32, k: u32) -> Option<&'static str> {
+    /// The PTX kernel an a16 (f16 A/B/C) batch-1 plain matmul of this
+    /// shape records instead of its coopmat kernel on an executor whose
+    /// accumulator policy is `acc`; `None` = the Vulkan kernel.
+    pub fn ptx_a16_kernel(&self, acc: CoopmatAcc, m: u32, n: u32, k: u32) -> Option<&'static str> {
+        if !self.is_auto() {
+            return None;
+        }
         let route = self.ptx_route.as_ref()?;
-        route.select(m, n, k).map(|i| route.kernel_name(i))
+        route.select(acc, m, n, k).map(|i| route.kernel(i).name)
+    }
+
+    /// Accumulator classes the PTX route serves (`Off` without a route).
+    pub fn ptx_gemm_mode(&self) -> crate::ptx::PtxGemmMode {
+        self.ptx_route
+            .as_ref()
+            .map_or(crate::ptx::PtxGemmMode::Off, |route| route.mode())
+    }
+
+    /// Change which accumulator classes the PTX route serves for
+    /// matmuls recorded from now on (tests, A/B experiments).  Fails
+    /// when asked to serve something without a route; executors whose
+    /// policy is no longer served fall back to f32-accumulate coopmat1.
+    pub fn set_ptx_gemm_mode(&self, mode: crate::ptx::PtxGemmMode) -> Result<()> {
+        match self.ptx_route.as_ref() {
+            Some(route) => route.set_mode(mode),
+            None if mode == crate::ptx::PtxGemmMode::Off => {}
+            None => bail!(
+                "no PTX route on this pipeline (needs ML_PTX=1, VK_NV_cuda_kernel_launch, \
+                 and ML_PTX_GEMM != off at creation)"
+            ),
+        }
+        Ok(())
+    }
+
+    /// Whether the PTX route would serve a16 matmuls at class `acc`.
+    pub fn ptx_serves(&self, acc: CoopmatAcc) -> bool {
+        self.is_auto()
+            && self
+                .ptx_route
+                .as_ref()
+                .is_some_and(|route| route.serves(acc))
     }
 
     pub fn select_kernel(&self, batch: u32, m: u32, n: u32, k: u32) -> &MatmulKernel {

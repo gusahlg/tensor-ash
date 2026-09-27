@@ -272,6 +272,7 @@ impl Executor {
                         resolved,
                         plans,
                         graph_splitk2.as_ref(),
+                        self.ptx_acc(),
                     )?;
                 } else {
                     record_matmul_commands(
@@ -282,6 +283,7 @@ impl Executor {
                         ops,
                         resolved,
                         plans,
+                        self.ptx_acc(),
                     )?;
                 }
                 Ok(())

@@ -528,7 +528,7 @@ fn sync(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
 
     println!(
         "== ptx sync: n={n} u32 ({} MiB/buffer), steps={steps}, trials={trials}",
-        n as u64 * 4 >> 20
+        (n as u64 * 4) >> 20
     );
     println!(
         "{:<10} {:<12} {:>9} {:>12} {:>10}",
@@ -615,7 +615,7 @@ fn sync(ctx: &Arc<VulkanContext>, exec: &Executor) -> Result<()> {
                         }
                     }
                 })?;
-                let fin = if steps % 2 == 0 { &x } else { &y };
+                let fin = if steps.is_multiple_of(2) { &x } else { &y };
                 let got = download_u32(exec, fin, n as usize)?;
                 let bad = got
                     .iter()
@@ -1045,7 +1045,7 @@ fn sgemm(ctx: &Arc<VulkanContext>, exec: &Executor, args: &[String]) -> Result<(
             exec.download(&c_px, &mut h_px)?;
             let e_px = err_stats(&h_px, &refs);
             let tol = 1e-5 * (k as f64).sqrt() * 4.0 + 1e-4;
-            if !(e_px.max_abs <= tol.max(4.0 * e_ta.max_abs)) {
+            if e_px.max_abs.is_nan() || e_px.max_abs > tol.max(4.0 * e_ta.max_abs) {
                 println!(
                     "{m}x{n}x{k} {}: VALIDATION FAILED max_abs {:.3e} (ta {:.3e}) — not timed",
                     kern.name, e_px.max_abs, e_ta.max_abs
@@ -1184,7 +1184,7 @@ fn hgemm(ctx: &Arc<VulkanContext>, exec: &Executor, args: &[String]) -> Result<(
             } else {
                 (4.0 * rel(&e_ta)).max(2e-3)
             };
-            if !(rel(&e_px) <= gate) {
+            if rel(&e_px).is_nan() || rel(&e_px) > gate {
                 println!(
                     "{m}x{n}x{k} {}: VALIDATION FAILED rel_rms {:.3e} (ta {:.3e}, gate {gate:.1e}) — not timed",
                     kern.name,
@@ -1261,7 +1261,7 @@ fn hgemm(ctx: &Arc<VulkanContext>, exec: &Executor, args: &[String]) -> Result<(
                 } else {
                     (4.0 * rel(&e_ta)).max(2e-3)
                 };
-                if !(rel(&e_px) <= gate) {
+                if rel(&e_px).is_nan() || rel(&e_px) > gate {
                     println!(
                         "{m}x{n}x{k} {label}: VALIDATION FAILED rel_rms {:.3e} — not timed",
                         rel(&e_px)
