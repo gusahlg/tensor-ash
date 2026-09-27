@@ -458,7 +458,7 @@ hand-written tile of the same run / best new config - 1:
 * **a16 f16-acc axis: S2 fails** (no shape >= 3% in both runs): the
   accumulator-aware tile rule (64x128) is within +-3% of all 15 configs.
 * Median noise: the same kernel measured as `auto` and pinned in one run
-  differs by up to 5% at the median on gu/dn/2048^3 (minima agree within
+  differs by up to 3-5% at the median on gu/dn/2048^3 (minima agree within
   0.5%), so single-run S2 margins of 3-5% on those shapes are at the noise
   floor; see the auto-vs-pinned control in §8b.
 
@@ -524,6 +524,53 @@ kernel* from its literal twin (+-10%): any config that wins in the spec
 module must be re-measured as its literal wrapper before it is routed.
 The one real search signal (a32 qkv, n6 = 64x128 with 8 warps, +5%) is the
 first candidate for a literal wrapper.
+
+## 8. Promote chunk length, tests, noise control (2026-09-27, RTX 4060)
+
+Job: `f16acc-scripts/job10.sh` (log `results/job10-louise.log`), binary built
+from 4016328's tree by `job9.sh` (glslc -O, fast Rust profile, louise-pc).
+
+### 8a. Promote chunk length (PROMOTE_KT 2 / 4 / 8 = 64 / 128 / 256 K), a16 64x128
+
+Pin-only kernels `f16w_a16_coopmat_m64n128_pk{2,8}_acc16p` beside the routed
+`_acc16p` (128 K).  Numerics: `ML_NUMERICS_SKIP_GEN=1
+ML_NUMERICS_KERNELS=a16_coopmat_m64n128_pk2_acc16p,a16_coopmat_m64n128_acc16p,a16_coopmat_m64n128_pk8_acc16p
+coopmat_acc_numerics` (`results/numerics-pk-4060.md`; all 26 gate kernels ok,
+the policy rows reproduce §3a/§3b digit for digit).  Speed: `ML_ROUNDS=9
+ML_ITERS=30 ML_AB_KERNELS=auto,auto@f16,<the three> ml_bench ab qo qkv gu dn s2k`
+(`results/ab-pk-a16-4060.txt`).
+
+| chunk | rel RMS err, unif K=2048 / 5632 | rel RMS err, llm K=2048 / 5632 | gate max err (u) | qo | qkv | gu | dn | 2048³ |
+|---|---|---|---|---|---|---|---|---|
+| f32 acc (route) | 2.08e-4 / 2.07e-4 | 2.07e-4 / 2.07e-4 | 3.13 | 0.172 | 0.217 | 0.451 | 0.462 | 0.746 |
+| promote 64 K | 4.87e-4 / 4.86e-4 | 4.48e-4 / 4.69e-4 | 5.81 | 0.131 | 0.177 | 0.339 | 0.347 | 0.497 |
+| **promote 128 K (routed)** | 6.39e-4 / 6.39e-4 | 5.89e-4 / 6.17e-4 | 7.2-7.8 | 0.127 | 0.170 | 0.329 | 0.335 | 0.481 |
+| promote 256 K | 8.70e-4 / 8.68e-4 | 8.87e-4 / 8.67e-4 | 12.20 | 0.123 | 0.163 | 0.329 | 0.337 | 0.476 |
+| f16 acc (route) | 2.36e-3 / 3.90e-3 | 1.98e-3 / 4.00e-3 | 33.2 | 0.122 | 0.151 | 0.298 | 0.313 | 0.434 |
+
+(GPU ms, median of 9 interleaved rounds.)  The error grows like sqrt(C)
+(x1.31 and x1.36 per doubling) and is flat in K; the speed gain per doubling
+is 3-4% from 64 to 128 K and 0-4% from 128 to 256 K, still 6-10% short of pure
+f16 on gu/dn/2048³ (the f32 fragments cost registers, §5).  **128 K stays the
+routed chunk**; 256 K is outside the class contract (§9a) for <= 4% speed;
+64 K (the PTX track's f16p chunk) costs 3-4% for 24% less error — a
+sub-class not worth a second policy value.
+
+### 8b. Tests and noise control
+
+* `cargo test --release -p tensor-ash --test correctness -- --ignored
+  --test-threads=1 coopmat_acc`: **4/4 pass** (`results/tests-coopmat-acc-4060.txt`);
+  `... f16::` (a16 suite, regression): **13/13 pass** (`results/tests-f16-4060.txt`).
+* CPU (job9, louise): `cargo test --release -p tensor-ash --lib` 61 pass,
+  ml-bench 33 + llama-ash 4 pass; `cargo clippy --release -p tensor-ash -p
+  ml-bench -p llama-ash --all-targets -- -D warnings` clean after fixing
+  three pre-existing ml-bench lints (ab header, isa census); `cargo fmt --all`.
+* Auto vs pinned, same kernels twice in one process (`results/ab-autopin-a16-4060.txt`):
+  identical kernels agree within 0-1% at the median on qo/qkv/dn and within
+  3.4% on gu (0.446 vs 0.432, minima 0.414 / 0.414) and 1.2% on 2048³.  So the
+  median noise floor of a 9-round ab is ~1% on the smaller prefill shapes and
+  ~3% on gu — above S1's +-2% gate on that shape, well below the 5-12%
+  twin deviations of §7b.
 
 ## 9. Precision policy (merge-ready) and one policy for both backends
 
@@ -599,3 +646,16 @@ Code the PTX branch would change: `src/ptx/route.rs` (drop `PtxAccum`,
 `from_env` parses on/off, `select` takes `CoopmatAcc`),
 `src/executor/recording.rs` (pass `CoopmatAcc::of_kernel_name(kernel.name)`),
 `tests/correctness/ptx.rs` (set the class through `ExecutorConfig`).
+
+## 10. Verdicts
+
+| question | verdict | evidence |
+|---|---|---|
+| llama.cpp b9503 CUDA prefill precision | f16 in / **f16 accumulate** (`CUBLAS_COMPUTE_16F`) / f16 out, converted to f32 after; every LLaMA weight GEMM with > 16 rows on Turing..Hopper | §1: source + cuBLAS log (302/302 calls) |
+| E1 (>= 1.25x on >= 3 prefill shapes, acceptable numerics) | **PASS**: f16 acc 1.40-1.48x (4060) / 1.39-1.54x (3070) on all 4 prefill shapes; promote 1.30-1.34x (4060) | §4a; numerics §3, tokens §6b |
+| end to end, pp512 | f16 acc **1.247x** (4060, 12.9k -> 16.1k t/s) / **1.282x** (3070, 16.0k -> 20.6k); promote 1.152x / 1.289x; vs llama.cpp CUDA 1.17x / 1.22x | §6a |
+| numerics | f16 acc = llama.cpp CUDA's class (rel RMS 2-4e-3, 1.1e-2 on real down-proj); promote 3x the f16-output floor; 32/32 greedy tokens identical to f32 and to llama.cpp on 4 of 5 prompts (5th: same EOS) on both GPUs | §3, §6b |
+| promote chunk | keep 128 K (64 K: -3-4% speed, -24% error; 256 K: +0-4%, +36% error) | §8a |
+| M1 S1 (twin parity) | **FAIL**, also with the K_UNROLL rescue (driver register allocation differs from the literal twin: -12% .. +6%) | §7, §7b |
+| M1 S2 (search signal) | formally pass on a32 (qkv, dn), substantively one new config (a32 qkv n6 +5%); a16 f32: routing fix only; acc16 axis: fail | §7, §7a |
+| Tier | **C** (generated literal wrappers; spec module = exploratory only) | §7b |
