@@ -317,14 +317,19 @@ demotes to an in-budget sibling; the NVIDIA proprietary driver keeps the
 
 ### Experimental: PTX kernels inside the Vulkan command buffers
 
-On the NVIDIA proprietary driver, `ML_PTX=1` enables
-`VK_NV_cuda_kernel_launch` (`ML_NO_PTX=1` vetoes; device creation is
-unchanged otherwise).  `src/ptx` then JIT-compiles the checked-in PTX
+On the NVIDIA proprietary driver (compute capability >= 8.0), `ML_PTX=1`
+enables `VK_NV_cuda_kernel_launch` (`ML_NO_PTX=1` vetoes; device creation
+is unchanged otherwise).  `src/ptx` then JIT-compiles the checked-in PTX
 (`ptx/*.cu` -> `ptx/*.ptx`, no CUDA toolkit needed to build) and records
-CUDA kernel launches next to the Vulkan dispatches.  `ML_PTX_GEMM=f32|f16|f16p`
-routes a16 matmuls (f16 A/B/C, the llama prefill contract) through
-`mma.sync` kernels; `f16` is f16 accumulation (what llama.cpp's cuBLAS
-path does, ~10x noisier than f32), `f16p` promotes to f32 every k-tile.
+CUDA kernel launches next to the Vulkan dispatches.  The PTX route runs
+a16 matmuls (f16 A/B/C, the llama prefill contract) through `mma.sync`
+kernels at the executor's accumulator policy (`ExecutorConfig::coopmat_acc`
+/ `ML_COOPMAT_ACC`, default `f32`): `ML_COOPMAT_ACC=f16p` (f16-rate mma,
+promoted to f32 every 64-K tile) is the recommended fast mode;
+`ML_COOPMAT_ACC=f16` is pure f16 accumulation, llama.cpp CUDA's own
+prefill numerics (~10x noisier than f32; opt-in only).  `ML_PTX_GEMM=on`
+(default) serves those two classes, `all` also f32 (bit-identical to
+coopmat1), `off` none.
 `ml_bench ptx <probe|smem|sync|state|overhead|dump|sgemm|hgemm>` is the
 harness; findings and numbers are in `benchmarks/campaign/ptx.md`.
 
